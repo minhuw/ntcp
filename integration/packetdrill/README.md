@@ -273,6 +273,17 @@ ntcp accounts send-buffer capacity in payload bytes. Linux accounts queued
 allocation threshold. Partial-write lengths and writable notifications can differ
 between the two models.
 
+The receive side charges held segments by their memory (`truesize`) as Linux
+does, but sizes are configured in window bytes. Linux derives both the advertised
+window and the receive memory limit (`sk_rcvbuf`) from `scaling_ratio`, which
+starts at 50% (`TCP_DEFAULT_SCALING_RATIO`) until the first full-size segment
+measures it (`tcp_measure_rcv_mss`). Before that measurement Linux offers half of
+its buffer. ntcp offers the configured window in full (a 1:1 ratio) and starts its
+memory limit at twice that window, Linux's 50%, so small segments that fill the
+offered window still fit. The first full-size segment sets both ratios to the
+measured one. A script that checks `win` while only small segments are held can
+therefore see a larger window than Linux would offer.
+
 The `ntcp-ported` suite tests ntcp's accounting with source-derived fixtures:
 
 | Fixture | Adaptation |

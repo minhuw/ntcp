@@ -1120,6 +1120,265 @@ impl RxQueue {
     }
 }
 
+// The most bytes a collapse copies into one heap frame: Linux's tcp_collapse
+// copies into order-0 skbs (SKB_MAX_ORDER(0, 0), a page less
+// skb_shared_info); an ntcp frame has no shared info, so a page.
+const COLLAPSE_CHUNK: usize = 4096;
+
+// Frames to copy in a collapse: each with its stream offset and PUSH mark.
+type Collapsed = alloc::vec::Vec<(u64, RxFrame, bool)>;
+
+// Copies `sources`, contiguous frames in stream order, into heap frames of
+// at most COLLAPSE_CHUNK bytes, each marked PUSH if a source it takes
+// bytes from was: the frames that replace them, and how many sources were
+// copied whole (and so dropped). An allocation refusal stops the copy, as
+// Linux's alloc_skb failure stops tcp_collapse: the source being copied is
+// advanced past the bytes copied and returned with the rest uncopied.
+fn collapse_frames(sources: Collapsed) -> Result<(Collapsed, u32), Collapsed> {
+    let total: usize = sources.iter().map(|(_, frame, _)| frame.len()).sum();
+    let mut out = Collapsed::new();
+    if out
+        .try_reserve_exact(total.div_ceil(COLLAPSE_CHUNK) + sources.len())
+        .is_err()
+    {
+        return Err(sources);
+    }
+    let mut freed = 0;
+    let mut chunk: Option<(u64, alloc::vec::Vec<u8>, bool)> = None;
+    let mut sources = sources.into_iter();
+    while let Some((mut start, mut frame, push)) = sources.next() {
+        while !frame.is_empty() {
+            if chunk
+                .as_ref()
+                .is_none_or(|(_, bytes, _)| bytes.len() == COLLAPSE_CHUNK)
+            {
+                if let Some((at, bytes, push)) = chunk.take() {
+                    out.push((at, RxFrame::from_vec(bytes), push));
+                }
+                let mut bytes = alloc::vec::Vec::new();
+                let size = COLLAPSE_CHUNK
+                    .min(frame.len() + sources.as_slice().iter().map(|s| s.1.len()).sum::<usize>());
+                if bytes.try_reserve_exact(size).is_err() {
+                    out.push((start, frame, push));
+                    out.extend(sources);
+                    return Ok((out, freed));
+                }
+                chunk = Some((start, bytes, false));
+            }
+            let (_, bytes, marked) = chunk.as_mut().unwrap();
+            let take = frame.len().min(bytes.capacity() - bytes.len());
+            bytes.extend_from_slice(&frame[..take]);
+            *marked |= push;
+            frame.advance(take);
+            start += take as u64;
+        }
+        freed += 1;
+    }
+    if let Some((at, bytes, push)) = chunk {
+        out.push((at, RxFrame::from_vec(bytes), push));
+    }
+    Ok((out, freed))
+}
+
+// What a prune of the out-of-order queue dropped: frames and bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Pruned {
+    pub frames: u32,
+    pub bytes: usize,
+}
+
+impl RxQueue {
+    // The truesize of the frame an insertion of `len` new bytes would hold:
+    // the lent frame's (`Endpoint::input_frame`), or a copy's.
+    pub(crate) fn incoming_truesize(&self, len: usize) -> usize {
+        match &self.lend {
+            Some(Lend {
+                frame: Some(frame),
+                taken: false,
+                ..
+            }) => frame.truesize(),
+            _ => len,
+        }
+    }
+
+    // A collapse drops the frames it copies whole, which must not include
+    // a lent frame its input took (that input still reads its bytes):
+    // collapses run before an input takes its frame (tcp_try_rmem_schedule
+    // before queueing), so none is taken.
+    fn assert_lend_untaken(&self) {
+        assert!(self.lend.as_ref().is_none_or(|lend| !lend.taken));
+    }
+
+    // Collapse is worth it for a frame whose window cost, `win` of its
+    // truesize with RX_ENTRY_TRUESIZE, passes its length (Linux
+    // tcp_collapse's bloated skb).
+    fn bloated(frame: &RxFrame, win: &impl Fn(usize) -> usize) -> bool {
+        win(frame.truesize() + RX_ENTRY_TRUESIZE) > frame.len()
+    }
+
+    // Linux's tcp_collapse_ofo_queue: each run of contiguous out-of-order
+    // frames is copied, from its first bloated frame on, into page-sized
+    // heap frames; a run of one small frame is left (and once such tiny
+    // runs hold `limit` / 8 of truesize, collapsing stops). Runs, anchors
+    // and SACK state are unchanged: the bytes held are. The frames copied
+    // whole, Linux's TCPRcvCollapsed.
+    pub(crate) fn collapse_ofo(&mut self, limit: usize, win: impl Fn(usize) -> usize) -> u32 {
+        self.assert_lend_untaken();
+        let mut collapsed = 0;
+        let mut sum_tiny = 0;
+        let mut at = 0;
+        while let Some((&start, &end)) = self.runs.range(at..).next() {
+            at = end;
+            let mut entries = self.ofo.range(start..end);
+            let (_, head) = entries.next().unwrap();
+            if entries.next().is_none() && ((end - start) as usize) < COLLAPSE_CHUNK - 320 {
+                sum_tiny += head.frame.truesize() + RX_ENTRY_TRUESIZE;
+                if sum_tiny > limit >> 3 {
+                    break;
+                }
+                continue;
+            }
+            let Some((&from, _)) = self
+                .ofo
+                .range(start..end)
+                .find(|(_, seg)| Self::bloated(&seg.frame, &win))
+            else {
+                continue;
+            };
+            let mut sources = Collapsed::new();
+            if sources
+                .try_reserve_exact(self.ofo.range(from..end).count())
+                .is_err()
+            {
+                break;
+            }
+            while let Some(entry) = self.ofo.range(from..end).next().map(|(&k, _)| k) {
+                let seg = self.ofo.remove(&entry).unwrap();
+                self.frames -= seg.frame.truesize();
+                self.entries -= 1;
+                sources.push((entry, seg.frame, seg.push));
+            }
+            let (frames, freed) = match collapse_frames(sources) {
+                Ok(done) => done,
+                Err(sources) => (sources, 0),
+            };
+            collapsed += freed;
+            for (start, frame, push) in frames {
+                self.hold(&frame);
+                self.ofo.insert(start, OfoSeg { frame, push });
+            }
+        }
+        collapsed
+    }
+
+    // Linux's tcp_collapse of sk_receive_queue from the read point: the
+    // in-order frames from the first bloated one on are copied into
+    // page-sized heap frames. The frames copied whole.
+    pub(crate) fn collapse_inorder(&mut self, win: impl Fn(usize) -> usize) -> u32 {
+        self.assert_lend_untaken();
+        let Some(first) = self
+            .inorder
+            .iter()
+            .position(|frame| Self::bloated(frame, &win))
+        else {
+            return 0;
+        };
+        // The deque's room for every frame the copy can produce, and the
+        // list of sources, are taken first: a refusal collapses nothing.
+        let bytes: usize = self.inorder.iter().skip(first).map(|f| f.len()).sum();
+        let count = self.inorder.len() - first;
+        let mut sources = Collapsed::new();
+        if sources.try_reserve_exact(count).is_err()
+            || self
+                .inorder
+                .try_reserve(bytes.div_ceil(COLLAPSE_CHUNK) + count)
+                .is_err()
+        {
+            return 0;
+        }
+        let mut at = self.read
+            + self
+                .inorder
+                .iter()
+                .take(first)
+                .map(|f| f.len() as u64)
+                .sum::<u64>();
+        for frame in self.inorder.drain(first..) {
+            self.frames -= frame.truesize();
+            self.entries -= 1;
+            let len = frame.len() as u64;
+            sources.push((at, frame, false));
+            at += len;
+        }
+        let (frames, freed) = match collapse_frames(sources) {
+            Ok(done) => done,
+            Err(sources) => (sources, 0),
+        };
+        for (_, frame, _) in frames {
+            self.hold(&frame);
+            self.inorder.push_back(frame);
+        }
+        freed
+    }
+
+    // Linux's tcp_prune_ofo_queue for an arrival at `incoming`: drops
+    // out-of-order frames from the last one down, stopping at one that
+    // starts before the arrival (which would then land last), `limit` / 8
+    // of truesize at a time while the queue's memory passes `limit` (`rmem`
+    // over sk_rcvbuf) or `pressure` holds. If anything was dropped, the SACK
+    // state is reset (tcp_sack_reset): reported blocks, the latest
+    // arrival's and any pending D-SACK go, as do the report anchors in the
+    // dropped ranges.
+    // This is RFC 2018 section 8's reneging; the duvet exceptions that say
+    // it is not selected are rewritten with the other annotations (n0bw
+    // stage 1 C7). The sender keeps all data until cumulatively
+    // acknowledged.
+    pub(crate) fn prune_ofo(&mut self, incoming: Seq, limit: usize, pressure: bool) -> Pruned {
+        let mut pruned = Pruned::default();
+        let incoming = self.offset(incoming).unwrap_or(self.read);
+        let mut goal = (limit >> 3) as isize;
+        while let Some((&start, seg)) = self.ofo.last_key_value() {
+            if incoming > start {
+                break;
+            }
+            goal -= (seg.frame.truesize() + RX_ENTRY_TRUESIZE) as isize;
+            let seg = self.ofo.remove(&start).unwrap();
+            pruned.frames += 1;
+            pruned.bytes += seg.frame.len();
+            self.ofo_bytes -= seg.frame.len();
+            self.release(seg.frame);
+            let (&run, _) = self.runs.range(..=start).next_back().unwrap();
+            if run == start {
+                self.runs.remove(&run);
+            } else {
+                self.runs.insert(run, start);
+            }
+            drop(self.anchors.split_off(&start));
+            if (self.ofo.is_empty() || goal <= 0) && {
+                if self.rmem() <= limit && !pressure {
+                    true
+                } else {
+                    goal = (limit >> 3) as isize;
+                    false
+                }
+            } {
+                break;
+            }
+        }
+        if pruned.frames != 0 {
+            self.reported = [None; 4];
+            self.latest = None;
+            self.dsack = None;
+            self.pending_first = self.find_pending(self.read);
+            if self.anchors.is_empty() {
+                self.report_debt = 0;
+            }
+            self.shed();
+        }
+        pruned
+    }
+}
+
 #[cfg(test)]
 impl RxQueue {
     // Every held frame: its stream offset, length and truesize.

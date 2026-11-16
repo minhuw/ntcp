@@ -29,6 +29,10 @@ use local_repair::{ControlUndo, RepairUndo};
 mod ptb;
 use ptb::PtbRepair;
 
+// Linux's SOCK_MIN_RCVBUF (include/net/sock.h): the least receive memory a
+// socket has, whatever its SO_RCVBUF.
+const SOCK_MIN_RCVBUF: usize = 2048 + 256;
+
 // Caller-owned ticks in CallerTimebase units; deadlines use the same unit.
 // The caller supplies monotonic, consistent-rate time in its real or simulated
 // time domain, with precision at least as fine as the wire timestamp tick and
@@ -1084,6 +1088,17 @@ pub(crate) struct Connection {
     // Set by the Endpoint for each input: whether its memory is in
     // pressure (tcp_under_memory_pressure), which stops rcv_ssthresh growth.
     pub(crate) memory_pressure: bool,
+    // Set by the Endpoint for each input: the budget's room for this
+    // connection's receive memory (Linux's sk_rmem_schedule ->
+    // __sk_mem_raise_allocated for SK_MEM_RECV), and whether the budget is
+    // below its low threshold (sk_memory_allocated < tcp_mem[0]).
+    pub(crate) receive_room: usize,
+    pub(crate) receive_memory_low: bool,
+    // What the receive memory rules did, for the Endpoint to take.
+    pub(crate) receive_events: crate::memory::ReceiveMemoryEvents,
+    // A segment refused for memory: the next segment sent advertises a zero
+    // window, which moves no edge (Linux's ICSK_ACK_NOMEM, tcp_select_window).
+    ack_nomem: bool,
     // Why the segment input last took was discarded, for the Endpoint to
     // take and record: Linux's tcp_rcv_state_process returns its reason.
     pub(crate) dropped: Option<crate::DropReason>,
@@ -1153,6 +1168,8 @@ pub(crate) struct Connection {
     // is tuned and the window_clamp DRS may raise it to (tcp_rmem[2]).
     receive_tuned: bool,
     receive_max: usize,
+    // Linux's tcp_rmem[0]: receive memory always granted under pressure.
+    receive_min: usize,
     // The receiver's RTT estimate, Linux's rcv_rtt_est: eight times the
     // smoothed microseconds, 0 before the first sample; the sequence that
     // ends the window being timed and when its timing began; the last
@@ -1179,6 +1196,11 @@ pub(crate) struct Connection {
     // 1:1 until then (Linux starts at 1:2, TCP_DEFAULT_SCALING_RATIO: n0bw
     // decision Q2, as buffer sizes are configured in window bytes, D2).
     rcv_scaling: (u32, u32),
+    // The ratio that turns window_clamp into the receive memory limit
+    // (Linux's sk_rcvbuf, `receive_limit`): Linux's 1:2 until the same
+    // measurement sets it to `rcv_scaling` (n0bw decision Q2), so the
+    // frames of a window offered before then have room for their overhead.
+    rcv_limit_scaling: (u32, u32),
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1492,6 +1514,10 @@ impl Connection {
             hold_establishment: false,
             local_refusals: false,
             memory_pressure: false,
+            receive_room: usize::MAX,
+            receive_memory_low: true,
+            receive_events: crate::memory::ReceiveMemoryEvents::default(),
+            ack_nomem: false,
             dropped: None,
             sample: None,
             sample_departure: None,
@@ -1531,6 +1557,7 @@ impl Connection {
             refresh_work: false,
             receive_tuned,
             receive_max: receive_sizes.max,
+            receive_min: receive_sizes.min,
             rcv_rtt_us8: 0,
             rcv_rtt_seq: Seq(0),
             rcv_rtt_time: None,
@@ -1544,6 +1571,7 @@ impl Connection {
                 u32::MAX
             },
             rcv_scaling: (1, 1),
+            rcv_limit_scaling: (1, 2),
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -6490,15 +6518,17 @@ impl Connection {
     // segment of `size` bytes (the GSO size of an aggregate) whose `len`
     // accepted bytes were held in a frame of `truesize`: when the segment is
     // at least the receive MSS estimate and differs from it, the ratio
-    // becomes this segment's. The window_clamp stays (D2); the limit moves.
+    // becomes this segment's, for the window and the limit alike. The
+    // window_clamp stays (D2); the limit moves.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7
-    //= reason=The window the receive memory backs follows the measured payload-to-truesize ratio of full-size in-order segments, as Linux's scaling_ratio, so a window offered is a window the memory can hold. Deliberate deviation from Linux (n0bw Q2): the ratio starts at 1:1, not Linux's 1:2 (TCP_DEFAULT_SCALING_RATIO = 128/256), because receive sizes are configured in window bytes (n0bw D2), so the configured window is offered in full before the first measurement; held frames still count RX_ENTRY_TRUESIZE each.
+    //= reason=The window the receive memory backs follows the measured payload-to-truesize ratio of full-size in-order segments, as Linux's scaling_ratio, so a window offered is a window the memory can hold. Deliberate deviation from Linux (n0bw Q2): Linux derives both the window and the memory limit (sk_rcvbuf) from scaling_ratio, which starts at 50% (TCP_DEFAULT_SCALING_RATIO = 128/256), so it offers half its buffer until the first measurement. ntcp configures receive sizes in window bytes (n0bw D2): its window ratio starts at 1:1, so the configured window is offered in full, while its memory limit starts at Linux's 50% (twice the window), so the frames of that window, each counting RX_ENTRY_TRUESIZE, have room for their overhead; the first full-size in-order segment sets both to the measured ratio.
     //# Hence, implementers should take care to not open the TCP window
     //# drastically beyond the requirements of the connection.
     fn measure_receive_scaling(&mut self, size: usize, len: usize, truesize: usize) {
         let rcv_mss = usize::from(self.received_mss.value(self.receive_mss()));
         if size > rcv_mss && len != 0 && truesize != 0 {
             self.rcv_scaling = (len as u32, (truesize + RX_ENTRY_TRUESIZE) as u32);
+            self.rcv_limit_scaling = self.rcv_scaling;
         }
     }
 
@@ -6553,6 +6583,126 @@ impl Connection {
             window >>= 1;
         }
         0
+    }
+
+    // Linux's sk_rcvbuf under n0bw D2: the receive memory window_clamp
+    // needs at the limit's scaling ratio (tcp_space_from_win; twice the
+    // clamp until the first measurement, as Linux's initial sk_rcvbuf is
+    // twice its window), and never below SOCK_MIN_RCVBUF, the truesize of
+    // one 2 KiB skb (TCP_SKB_MIN_TRUESIZE, 2048 + 256 on x86_64), to which
+    // Linux clamps every SO_RCVBUF.
+    pub(crate) fn receive_limit(&self) -> usize {
+        let (len, truesize) = self.rcv_limit_scaling;
+        ((self.config.receive_capacity as u64 * u64::from(truesize) / u64::from(len)) as usize)
+            .max(SOCK_MIN_RCVBUF)
+    }
+
+    // Whether receive memory below tcp_rmem[0] (always granted under
+    // pressure, as __sk_mem_raise_allocated guarantees SK_MEM_RECV).
+    pub(crate) fn receive_below_min(&self) -> bool {
+        self.receive.rmem() < self.receive_min
+    }
+
+    // Linux's tcp_try_rmem_schedule for a segment whose frame would hold
+    // `incoming` bytes of truesize (with RX_ENTRY_TRUESIZE), arriving at
+    // `seq`: if the queue is past its limit or the budget has no room for
+    // it, prune (`prune_queue`), then drop out-of-order data until the
+    // budget has room. False if the segment cannot be taken.
+    fn try_rmem_schedule(&mut self, seq: Seq, incoming: usize) -> bool {
+        let storage = self.receive.storage();
+        // The Endpoint's room for this input, plus what pruning freed.
+        let room = |c: &Self| {
+            c.receive_room
+                .saturating_add(storage.saturating_sub(c.receive.storage()))
+        };
+        if self.receive.rmem() <= self.receive_limit() && incoming <= room(self) {
+            return true;
+        }
+        if !self.prune_queue(seq) {
+            return false;
+        }
+        while incoming > room(self) {
+            if !self.prune_ofo(seq) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // Linux's tcp_prune_ofo_queue, counted (OfoPruned, the frames dropped).
+    fn prune_ofo(&mut self, seq: Seq) -> bool {
+        let pruned = self
+            .receive
+            .prune_ofo(seq, self.receive_limit(), self.memory_pressure);
+        if pruned.frames == 0 {
+            return false;
+        }
+        self.receive_events.ofo_pruned += 1;
+        self.receive_events.pruned_frames += u64::from(pruned.frames);
+        self.receive_events.pruned_bytes += pruned.bytes as u64;
+        self.refresh_work = true;
+        true
+    }
+
+    // Linux's tcp_prune_queue: past the limit, clamp the window
+    // (tcp_clamp_window); else under pressure lower rcv_ssthresh to 4
+    // advmss (tcp_adjust_rcv_ssthresh). Then, while still past the limit:
+    // collapse the out-of-order runs and the in-order frames, then drop
+    // out-of-order data. False if none of it brought the queue within its
+    // limit (RcvPruned). rcv_ssthresh is lowered only on a tuned
+    // direction: a fixed or locked one keeps offering its whole window, as
+    // nothing would raise it again (grow_window runs on tuned ones only).
+    fn prune_queue(&mut self, seq: Seq) -> bool {
+        self.receive_events.prune_called += 1;
+        let advmss = u32::from(self.advertised_payload_mss());
+        if self.receive.rmem() >= self.receive_limit() {
+            self.clamp_window();
+        } else if self.memory_pressure && self.receive_tuned {
+            self.rcv_ssthresh = self.rcv_ssthresh.min(4 * advmss);
+        }
+        if self.receive.rmem() <= self.receive_limit() {
+            return true;
+        }
+        let limit = self.receive_limit();
+        let (len, truesize) = self.rcv_scaling;
+        let win = |space: usize| (space as u64 * u64::from(len) / u64::from(truesize)) as usize;
+        let mut collapsed = self.receive.collapse_ofo(limit, win);
+        if self.receive.readable() != 0 {
+            collapsed += self.receive.collapse_inorder(win);
+        }
+        self.receive_events.rcv_collapsed += u64::from(collapsed);
+        if self.receive.rmem() <= self.receive_limit() {
+            return true;
+        }
+        self.prune_ofo(seq);
+        if self.receive.rmem() <= self.receive_limit() {
+            return true;
+        }
+        self.receive_events.rcv_pruned += 1;
+        false
+    }
+
+    // Linux's tcp_clamp_window, the queue at or past its limit: a tuned
+    // direction outside pressure, with the budget below its low threshold,
+    // raises window_clamp to the window whose limit is the memory held
+    // (Linux raises sk_rcvbuf to sk_rmem_alloc), at most receive_max; if
+    // the queue is still past the limit, rcv_ssthresh drops to 2 advmss.
+    fn clamp_window(&mut self) {
+        if self.receive_tuned
+            && !self.memory_pressure
+            && self.receive_memory_low
+            && self.config.receive_capacity < self.receive_max
+        {
+            let (len, truesize) = self.rcv_limit_scaling;
+            let held = ((self.receive.rmem() as u64 * u64::from(len) / u64::from(truesize))
+                as usize)
+                .min(self.receive_max);
+            self.config.receive_capacity = self.config.receive_capacity.max(held);
+        }
+        if self.receive_tuned && self.receive.rmem() > self.receive_limit() {
+            self.rcv_ssthresh = (self.config.receive_capacity.min(u32::MAX as usize) as u32)
+                .min(2 * u32::from(self.advertised_payload_mss()));
+        }
     }
 
     // What the receive window model (receive_window_model_tests) reads:
@@ -8849,6 +8999,31 @@ impl Connection {
             // FIN itself is not a byte of data for D-SACK.
             self.receive.record_duplicate(seq, payload.len());
             self.sack_omit = false;
+        }
+        // Receive memory, in Linux's order (tcp_data_queue,
+        // tcp_data_queue_ofo): schedule, prune, then refuse.
+        if count != 0 {
+            let incoming = self.receive.incoming_truesize(count) + RX_ENTRY_TRUESIZE;
+            if !self.try_rmem_schedule(start, incoming) {
+                if offset != 0 {
+                    // tcp_data_queue_ofo: TCPOFODrop.
+                    self.receive_events.ofo_drops += 1;
+                    self.dropped = Some(DropReason::ProtoMem);
+                    return;
+                }
+                // tcp_data_queue: a zero-window ACK now (ICSK_ACK_NOMEM |
+                // ICSK_ACK_NOW); the segment is dropped if unread data is
+                // queued (TCPRcvQDrop), else taken by force
+                // (sk_forced_mem_schedule): an in-order segment into an
+                // empty queue is never refused.
+                self.ack_nomem = true;
+                self.immediate_ack();
+                if self.receive.readable() != 0 {
+                    self.receive_events.rcv_queue_drops += 1;
+                    self.dropped = Some(DropReason::ProtoMem);
+                    return;
+                }
+            }
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# Segments with higher beginning sequence numbers SHOULD be held for later
@@ -11271,7 +11446,9 @@ impl Connection {
         // Reactive resets carry no receive credit or unused ACK value;
         // local ABORT retains its existing default/opt-in wire format.
         let reset_reply = reset.is_some() && self.reset_reply;
-        let window = if reset_reply {
+        // After a refusal for memory, one segment offers a zero window,
+        // which moves no edge (the edge only moves forward).
+        let window = if reset_reply || self.ack_nomem && !syn {
             0
         } else {
             self.advertised_window(syn)
@@ -11816,6 +11993,7 @@ impl Connection {
             //# last segment sent.  Last.ACK.sent will equal RCV.NXT except when
             //# <ACK>s have been delayed.
             self.last_ack_sent = self.receive.next();
+            self.ack_nomem = false;
             self.ack_pending =
                 self.sack_send && (sack_limited || self.receive.has_pending_report());
             self.ack_deadline = None;

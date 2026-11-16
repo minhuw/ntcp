@@ -512,6 +512,17 @@ pub struct Counters {
     // entries the writes allocated ran out: the entry stays whole and
     // that SACK block yields no loss inference about it.
     pub ledger_split_refusals: u64,
+    // Receive memory (ntcp::MemoryCounters, Linux's MIB names): prunes
+    // started (PruneCalled), failed (RcvPruned) and dropping out-of-order
+    // data (OfoPruned); frames collapsed (TCPRcvCollapsed); segments
+    // dropped for memory, in order with unread data queued (TCPRcvQDrop)
+    // and out of order (TCPOFODrop).
+    pub prune_called: u64,
+    pub rcv_pruned: u64,
+    pub ofo_pruned: u64,
+    pub rcv_collapsed: u64,
+    pub rcv_queue_drops: u64,
+    pub ofo_drops: u64,
     // Every discard by reason (`ntcp::DropReason`), which `discarded` sums:
     // Linux's per-reason kfree_skb counts. tcp_checksum_errors is
     // `TcpCsum`; ip_header_errors is `IpCsum` plus the IPv4 share of

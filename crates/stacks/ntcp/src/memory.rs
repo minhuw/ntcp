@@ -92,6 +92,54 @@ pub struct MemoryCounters {
     /// inference about it until a block or the cumulative ACK covers all
     /// of it.
     pub ledger_split_refusals: u64,
+    /// Receive queue prunes started, Linux's PruneCalled: a segment found
+    /// the queue past its limit (`rmem` over the receive buffer the window
+    /// clamp needs) or the budget without room for it.
+    pub prune_called: u64,
+    /// Prunes that collapsing and dropping out-of-order data could not
+    /// bring within the limit, Linux's RcvPruned: the segment is dropped.
+    pub rcv_pruned: u64,
+    /// Prunes that dropped out-of-order data (and reset SACK), Linux's
+    /// OfoPruned.
+    pub ofo_pruned: u64,
+    /// Received frames copied into larger ones to free memory, Linux's
+    /// TCPRcvCollapsed.
+    pub rcv_collapsed: u64,
+    /// In-order segments dropped for memory while unread data was queued,
+    /// Linux's TCPRcvQDrop (DropReason::ProtoMem).
+    pub rcv_queue_drops: u64,
+    /// Out-of-order segments dropped for memory, Linux's TCPOFODrop
+    /// (DropReason::ProtoMem).
+    pub ofo_drops: u64,
+}
+
+// What a connection's receive memory rules did since the Endpoint last
+// took them (`Connection::receive_events`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReceiveMemoryEvents {
+    pub prune_called: u64,
+    pub rcv_pruned: u64,
+    pub ofo_pruned: u64,
+    pub rcv_collapsed: u64,
+    pub rcv_queue_drops: u64,
+    pub ofo_drops: u64,
+    // Out-of-order frames dropped (DropReason::TcpOfoQueuePrune), and
+    // their bytes.
+    pub pruned_frames: u64,
+    pub pruned_bytes: u64,
+}
+
+impl ReceiveMemoryEvents {
+    pub(crate) fn add(&mut self, other: Self) {
+        self.prune_called += other.prune_called;
+        self.rcv_pruned += other.rcv_pruned;
+        self.ofo_pruned += other.ofo_pruned;
+        self.rcv_collapsed += other.rcv_collapsed;
+        self.rcv_queue_drops += other.rcv_queue_drops;
+        self.ofo_drops += other.ofo_drops;
+        self.pruned_frames += other.pruned_frames;
+        self.pruned_bytes += other.pruned_bytes;
+    }
 }
 
 /// One budget of buffer memory for a group of endpoints, each driven on its

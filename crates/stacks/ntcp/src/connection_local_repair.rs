@@ -19,6 +19,7 @@ pub(super) struct RepairUndo {
     last_sent: Instant,
     last_ack_sent: Seq,
     ack_pending: bool,
+    ack_nomem: bool,
     ack_deadline: Option<Instant>,
     unacked_segments: u8,
     unacked_bytes: u32,
@@ -168,6 +169,7 @@ impl RepairUndo {
             last_sent: a.last_sent,
             last_ack_sent: a.last_ack_sent,
             ack_pending: a.ack_pending,
+            ack_nomem: a.ack_nomem,
             ack_deadline: a.ack_deadline,
             unacked_segments: a.unacked_segments,
             unacked_bytes: a.unacked_bytes,
@@ -416,6 +418,7 @@ impl Connection {
         self.last_sent = undo.last_sent;
         self.last_ack_sent = undo.last_ack_sent;
         self.ack_pending = undo.ack_pending;
+        self.ack_nomem = undo.ack_nomem;
         self.ack_deadline = undo.ack_deadline;
         self.unacked_segments = undo.unacked_segments;
         self.unacked_bytes = undo.unacked_bytes;

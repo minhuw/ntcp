@@ -1193,11 +1193,16 @@ fn socket_buffer_semantics_inherit_at_syn_and_resize_readiness() {
     a.execute(client, Op::Set(SOL_SOCKET, SO_SNDBUF, 8192))
         .unwrap();
     assert_ne!(a.execute(client, Op::Ready).unwrap().value & EPOLLOUT, 0);
+    // Shrinking the receive buffer keeps every byte queued: the queued 8192
+    // bytes stay held under the new minimum (Linux never drops held skbs
+    // for a smaller sk_rcvbuf). Segments arriving after the shrink beyond
+    // SOCK_MIN_RCVBUF of receive memory would be refused instead
+    // (tcp_prune_queue, then PROTO_MEM), so the data is queued first.
+    pump(&mut a, &mut b);
     b.execute(server, Op::Set(SOL_SOCKET, SO_RCVBUF, 0))
         .unwrap();
     pump(&mut a, &mut b);
     assert_ne!(b.execute(server, Op::Ready).unwrap().value & EPOLLIN, 0);
-    // The pre-shrink promised window accepts and retains all queued bytes.
     assert_eq!(
         b.execute(server, Op::Read(8192)).unwrap().bytes,
         vec![42; 8192]

@@ -807,11 +807,14 @@ fn memory_pressure_stops_the_window_growth() {
 }
 
 // Received data is charged as it is held and returned as it is read
-// (sk_rmem_alloc, sock_rfree). Input takes a segment whatever the budget
-// (Budget::raise never refuses; Linux's refusal at the cap, collapse and
-// prune come with the receive memory rules, n0bw stage 1 C6), so a
-// transfer whose budget is capped at what it held when the window first
-// grew completes, and every frame read returns to the budget.
+// (sk_rmem_alloc, sock_rfree). With the budget capped at what it held when
+// the window first grew, the receive memory rules run in Linux's order
+// (sk_rmem_schedule, tcp_prune_queue, then the drop): here prunes start
+// (PruneCalled) and succeed without collapsing or dropping (tcp_clamp_window
+// or the budget's room), as the reader keeps up; a refusal would be
+// counted with its PROTO_MEM drop and answered by a zero window that moves
+// no edge (ICSK_ACK_NOMEM). The transfer completes within the cap and every
+// frame read returns to the budget.
 #[test]
 fn received_data_past_the_cap_is_charged_and_returned_at_read() {
     let mut phase = 0;
@@ -829,7 +832,20 @@ fn received_data_past_the_cap_is_charged_and_returned_at_read() {
     assert_eq!(phase, 1);
     assert!(link.b.buffer_bytes() <= cap);
     assert_eq!(link.b.memory_refused_growths, 0);
-    let edges = right_edges(&link.from_b, 5);
+    let counters = link.b.memory_counters();
+    assert!(counters.prune_called != 0, "{counters:?}");
+    assert_eq!(
+        link.b.drop_counts()[crate::DropReason::ProtoMem],
+        counters.rcv_queue_drops + counters.ofo_drops
+    );
+    // Every window but a refusal's zero never retracts.
+    let open: Vec<Vec<u8>> = link
+        .from_b
+        .iter()
+        .filter(|p| window_field(p) != 0)
+        .cloned()
+        .collect();
+    let edges = right_edges(&open, 5);
     assert!(
         edges
             .windows(2)

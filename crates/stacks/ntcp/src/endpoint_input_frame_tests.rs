@@ -113,13 +113,17 @@ fn addresses() -> (core::net::SocketAddr, core::net::SocketAddr) {
 }
 
 fn endpoints() -> (Endpoint, Endpoint, ListenerId, ConnectionId) {
+    endpoints_with(1024)
+}
+
+fn endpoints_with(receive: usize) -> (Endpoint, Endpoint, ListenerId, ConnectionId) {
     let config = EndpointConfig {
         max_connections: 8,
         max_listeners: 2,
         connection: ConnectionConfig {
             mss: 64,
             send_capacity: 1024,
-            receive_capacity: 1024,
+            receive_capacity: receive,
             nagle: false,
             ..ConnectionConfig::default()
         },
@@ -177,13 +181,16 @@ enum Step {
 // A duplex transfer through a network that loses, delays, duplicates,
 // reorders and corrupts segments, both sides writing, reading at random and
 // closing: every packet sent, input disposition and byte read, in order.
+// The receive buffer holds 32 frames of a 2304 B element: frames of
+// 64 B segments in a 1024 B buffer would leave the receive memory rules
+// nothing but drops (Linux would prune and drop as well).
 fn faulty_duplex(trial: u64, mode: Mode) -> Vec<Step> {
     fn random(seed: &mut u64) -> u64 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         *seed >> 17
     }
     let mut trace = Vec::new();
-    let (mut a, mut b, listener, client) = endpoints();
+    let (mut a, mut b, listener, client) = endpoints_with(32 * 2304);
     pump(&mut a, &mut b, mode, 0);
     let server = b.accept(listener).unwrap();
     a.set_user_timeout(client, 1_000_000_000).unwrap();

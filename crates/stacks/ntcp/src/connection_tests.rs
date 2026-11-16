@@ -9902,9 +9902,14 @@ fn sack_full_reports_do_not_starve_low_mss_data() {
 //# out-of-sequence TCP segment (e.g., queue it for later delivery
 //# to the user).
 fn timestamp_fragmentation_retains_every_allowed_byte() {
+    // 128 one-byte out-of-order frames take 128 * (1 + RX_ENTRY_TRUESIZE)
+    // = 24704 bytes of receive memory: the buffer is sized to hold them (at
+    // sack_config's 8192, a limit of 16384 before the ratio is measured, the
+    // receive memory rules prune past 85).
     let (mut a, _) = pair(
         ConnectionConfig {
             timestamps: true,
+            receive_capacity: 32768,
             ..sack_config(128)
         },
         u32::MAX - 100,

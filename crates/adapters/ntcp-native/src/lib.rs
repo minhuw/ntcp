@@ -1078,6 +1078,12 @@ impl<P: PacketIo> Network<P> {
             memory_refused_opens: memory.memory_refused_opens + self.counters.memory_refused_opens,
             memory_refused_growths: memory.memory_refused_growths,
             ledger_split_refusals: memory.ledger_split_refusals,
+            prune_called: memory.prune_called,
+            rcv_pruned: memory.rcv_pruned,
+            ofo_pruned: memory.ofo_pruned,
+            rcv_collapsed: memory.rcv_collapsed,
+            rcv_queue_drops: memory.rcv_queue_drops,
+            ofo_drops: memory.ofo_drops,
             out_segments: self
                 .tcp_segments
                 .saturating_sub(loss.retransmitted_segments),

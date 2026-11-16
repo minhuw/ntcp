@@ -782,6 +782,8 @@ pub struct Endpoint {
     // ponytail: conservative FIFO loss retention until eviction; add path-qualified
     // aging only when measured deployment behavior warrants it.
     setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
+    // What the connections' receive memory rules did (MemoryCounters).
+    receive_memory: crate::memory::ReceiveMemoryEvents,
     // The frame `input_frame` is processing until it lends it to its
     // connection (`lent`, the slot), or gets it back: the segment borrows its
     // bytes until that input returns.
@@ -1015,6 +1017,7 @@ impl Endpoint {
             budget,
             ingress: None,
             lent: None,
+            receive_memory: crate::memory::ReceiveMemoryEvents::default(),
         })
     }
 
@@ -4062,9 +4065,14 @@ impl Endpoint {
                 });
             let authorization =
                 authority.map(|id| self.crossing_syn_authorization(id, tuple, segment));
+            let receive_room =
+                self.receive_growth_room(&self.slots[index].as_ref().unwrap().connection);
+            let receive_memory_low = self.budget.allocated() < self.memory().low;
             let slot = self.slots[index].as_mut().unwrap();
             slot.connection.hold_establishment = hold;
             slot.connection.memory_pressure = self.budget.under_pressure();
+            slot.connection.receive_room = receive_room;
+            slot.connection.receive_memory_low = receive_memory_low;
             slot.received_dscp = Some(traffic_class >> 2);
             if let Some(frame) = self.ingress.take() {
                 slot.connection.lend_frame(frame);
@@ -4084,6 +4092,7 @@ impl Endpoint {
                     .map(|()| false)
             };
             let dropped = slot.connection.dropped.take();
+            let events = core::mem::take(&mut slot.connection.receive_events);
             let admitted = admitted?;
             if admitted {
                 slot.fast_open_owner = authority;
@@ -4100,6 +4109,9 @@ impl Endpoint {
                     self.count_listen_drop(true);
                 }
                 self.drop_segment(reason, tuple, segment);
+            }
+            if events != crate::memory::ReceiveMemoryEvents::default() {
+                self.receive_memory_events(events, tuple);
             }
             // The data the input took into, or released from, the receive
             // queue, as Linux charges an skb when it is queued.
@@ -4589,6 +4601,37 @@ impl Endpoint {
             connection.send_tuned() && !connection.send_below_min(),
             charge,
         )
+    }
+
+    // The budget's room for a connection's receive memory: Linux's
+    // __sk_mem_raise_allocated for SK_MEM_RECV, which grants a socket below
+    // tcp_rmem[0] whatever pressure.
+    fn receive_growth_room(&self, connection: &Connection) -> usize {
+        self.growth_room(!connection.receive_below_min(), connection.buffer_charge())
+    }
+
+    // Counts what a connection's receive memory rules did, and records the
+    // out-of-order frames a prune dropped.
+    #[cold]
+    #[inline(never)]
+    fn receive_memory_events(
+        &mut self,
+        events: crate::memory::ReceiveMemoryEvents,
+        tuple: ScopedTuple,
+    ) {
+        self.receive_memory.add(events);
+        let frames = events.pruned_frames;
+        let len = events.pruned_bytes.checked_div(frames).unwrap_or(0) as usize;
+        for _ in 0..frames {
+            self.drops
+                .record(DropReason::TcpOfoQueuePrune, self.now, len, || {
+                    crate::DropSubject::Transport {
+                        protocol: 6,
+                        source: tuple.tuple.remote,
+                        destination: tuple.tuple.local,
+                    }
+                });
+        }
     }
 
     // What the hard cap leaves, and when `pressured`, Linux's limits past
@@ -6163,6 +6206,12 @@ impl Endpoint {
             memory_refused_opens: self.memory_refused_opens,
             memory_refused_growths: self.memory_refused_growths,
             ledger_split_refusals: self.ledger_split_refusals,
+            prune_called: self.receive_memory.prune_called,
+            rcv_pruned: self.receive_memory.rcv_pruned,
+            ofo_pruned: self.receive_memory.ofo_pruned,
+            rcv_collapsed: self.receive_memory.rcv_collapsed,
+            rcv_queue_drops: self.receive_memory.rcv_queue_drops,
+            ofo_drops: self.receive_memory.ofo_drops,
         }
     }
 
@@ -9446,6 +9495,10 @@ mod input_frame_tests;
 #[cfg(test)]
 #[path = "receive_window_model_tests.rs"]
 mod receive_window_model_tests;
+
+#[cfg(test)]
+#[path = "receive_memory_tests.rs"]
+mod receive_memory_tests;
 
 #[cfg(all(test, feature = "packet-test-controls"))]
 mod timestamp_default_control_tests {
