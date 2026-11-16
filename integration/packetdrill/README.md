@@ -29,9 +29,16 @@ The Nix dev shell provides the pinned upstream source and the patched runner.
 the runner, the plugin and Python share one glibc:
 
 ```sh
-nix develop -c cargo build -p ntcp-packetdrill
+nix develop -c cargo build -p ntcp-packetdrill --profile packetdrill
 nix develop -c python3 integration/packetdrill/run.py --suite upstream --variant ipv4
 ```
+
+The `packetdrill` cargo profile is `release` with debug assertions and overflow
+checks enabled. Scripts time packets to the millisecond, and an unoptimized plugin
+segments a large send too slowly: the last segment of a ten-segment flight leaves
+several milliseconds late, which fails the expected packet's timing. `run.py`
+loads `target/packetdrill/libntcp_packetdrill.so` by default; pass `--plugin`
+for a plugin built in another target directory.
 
 `run.py` checks the source tree against the NAR hash in `flake.lock`, and the
 runner against the provenance file beside it: source revision and NAR hash, patch
@@ -108,17 +115,6 @@ and caps the tail-loss probe deadline at RTO, as specified by
 from Linux's RTT-variation estimator can therefore change probe timing.
 
 Script: `cubic/cubic-rto-ss-ca-cwnd-bump.pkt`.
-
-### Nagle policy
-
-ntcp uses original Nagle: a short segment waits while previously sent data is
-unacknowledged. Linux uses Minshall's variant, which allows the short segment
-when only full-sized segments remain outstanding.
-[RFC 9293 §3.7.4](https://www.rfc-editor.org/rfc/rfc9293#section-3.7.4) specifies
-original Nagle; [Appendix A.3](https://www.rfc-editor.org/rfc/rfc9293#appendix-A.3)
-discusses Minshall's modification.
-
-Script: `fastopen/client/nonblocking-sendto-over-mss.pkt`.
 
 ### Fast Open negative-response caching
 

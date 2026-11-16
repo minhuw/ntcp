@@ -433,17 +433,19 @@ fn host_bridge_preloaded_process_and_lifecycle() {
         .arg(root.join("Cargo.toml"));
     #[cfg(feature = "tfo-linux-cookie")]
     build.args(["--features", "tfo-linux-cookie"]);
-    if library
+    // The test binary's own profile directory: debug is the dev profile.
+    let profile = library
         .parent()
         .unwrap()
         .parent()
         .unwrap()
         .file_name()
-        .unwrap()
-        == "release"
-    {
-        build.arg("--release");
-    }
+        .unwrap();
+    build.arg("--profile").arg(if profile == "debug" {
+        "dev".as_ref()
+    } else {
+        profile
+    });
     build.arg("--target-dir").arg(
         library
             .parent()

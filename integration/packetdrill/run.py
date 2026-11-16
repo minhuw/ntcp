@@ -1305,7 +1305,7 @@ def main():
     parser.add_argument('--runner', type=Path,
                         help='explicit patched executable produced by build_runner.py or the flake')
     parser.add_argument('--plugin', type=Path,
-                        default=ROOT / 'target/debug/libntcp_packetdrill.so')
+                        default=ROOT / 'target/packetdrill/libntcp_packetdrill.so')
     parser.add_argument('--suite', choices=['smoke', 'sack', 'upstream-raw', 'upstream', 'ntcp-ported'], default='smoke')
     parser.add_argument('--variant', action='append',
                         choices=['native-ipv4', *PIN['variants']],

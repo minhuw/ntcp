@@ -4,3 +4,11 @@ resolver = "3"
 
 [workspace.package]
 rust-version = "1.99"
+
+# The packetdrill plugin (`--profile packetdrill`): optimized, since an unoptimized
+# build segments a large send too slowly for the scripts' packet timing, with the debug
+# cross-checks and overflow checks kept on.
+[profile.packetdrill]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
