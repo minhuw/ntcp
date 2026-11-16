@@ -658,8 +658,8 @@ fn split_in_recovery(ipv4: bool, rack: bool) {
             .unwrap()
     );
     let end = f.0.wrapping_add(fragment as u32);
-    // PRR: prr_out grew by exactly the accepted fragment.
-    assert_eq!(a.prr.unwrap().counters().2 - prr_before, fragment as u64);
+    // PRR: prr_out grew by exactly the accepted fragment, one packet.
+    assert_eq!(a.prr.unwrap().counters().2 - prr_before, 1);
     let after = a.sack_recovery.unwrap();
     // The accepted fragment is a new transmission record; the suffix keeps
     // its original record.
@@ -689,18 +689,18 @@ fn split_in_recovery(ipv4: bool, rack: bool) {
     let mut suffix = Vec::new();
     for t in 2..12 {
         let before = a.prr.map(|p| p.counters().2);
-        let mut bytes_out = 0;
+        let mut packets_out = 0;
         for bytes in poll(&mut a, now + t, 8) {
             let s = span(&a, &bytes);
             if s.0.at_or_after(end) && f.1.after(s.0) {
                 suffix.push((s.0, s.1));
             }
-            bytes_out += u64::from(payload_len(&a, &bytes));
+            packets_out += u64::from(payload_len(&a, &bytes) != 0);
             input(&mut b, &bytes, now + t);
         }
         if let (Some(before), Some(p)) = (before, a.prr) {
-            // Every emitted byte is charged to prr_out exactly once.
-            assert_eq!(p.counters().2 - before, bytes_out);
+            // Every emitted data packet is charged to prr_out exactly once.
+            assert_eq!(p.counters().2 - before, packets_out);
         }
         drain(&mut b, &mut a, now + t);
         if a.ptb_idle() {

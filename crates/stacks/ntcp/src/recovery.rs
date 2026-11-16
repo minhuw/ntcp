@@ -1671,13 +1671,16 @@ impl Congestion {
     }
 }
 
-// RFC 9937 section 6, byte units; selection is composed by Connection.
-// Sending policy only: data selection is composed separately by Connection.
+// RFC 9937 section 6 counted in packets, as Linux's tcp_cwnd_reduction
+// (tcp_input.c): prr_delivered, prr_out, RecoverFS, inflight and ssthresh are
+// packets (original wire packets, Linux's tcp_skb_pcount units), and SndCnt
+// admits whole packets of up to SMSS each, so a lost segment is resent whole
+// as tcp_xmit_retransmit_queue resends a whole skb. Selection is composed by
+// Connection.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Prr {
     recover_fs: u32,
-    mss: u32,
-    dupack_bytes: u32,
+    dupacks: u32,
     delivered: u64,
     out: u64,
     credit: u32,
@@ -1688,11 +1691,10 @@ impl Prr {
     //# At the beginning of a congestion control response episode initiated
     //# by the congestion control algorithm, a data sender using PRR MUST
     //# initialize the PRR state.
-    pub(crate) fn new(flight: u32, mss: u32) -> Self {
+    pub(crate) fn new(flight: u32) -> Self {
         Self {
             recover_fs: flight,
-            mss,
-            dupack_bytes: 0,
+            dupacks: 0,
             delivered: 0,
             out: 0,
             credit: 0,
@@ -1709,36 +1711,34 @@ impl Prr {
         self.recover_fs = self.recover_fs.saturating_add(delivered);
     }
 
-    pub(crate) fn set_mss(&mut self, mss: u32) {
-        self.mss = mss;
+    // Linux's reno sacked_out counts every duplicate ACK, those before
+    // recovery too (tcp_add_reno_sack): their packets left the network, as
+    // RFC 5681 section 3.2 step 4 inflates cwnd by them. They lower
+    // inflight, not this episode's DeliveredData.
+    pub(crate) fn include_prior_duplicates(&mut self, count: u32) {
+        self.dupacks = self.dupacks.saturating_add(count).min(self.recover_fs);
     }
 
-    // RFC 9937 §6.2: estimates are deducted on cumulative progress and bounded
-    // by the fixed episode flight, even for extraneous duplicate ACKs.
+    // One duplicate ACK estimates one delivered packet (Linux
+    // tcp_add_reno_sack). A cumulative ACK delivers the hole it fills and
+    // what its packets exceed the estimates by; the rest consume estimates
+    // (Linux tcp_remove_reno_sacks: "One ACK acked hole. The rest eat
+    // duplicate ACKs."). Delivery stays bounded by the fixed episode flight,
+    // even for extraneous duplicate ACKs (RFC 9937 section 6.2).
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Duplicate estimates are deducted across partial cumulative progress; no-SACK wire trace asserts current entry duplicate, short retransmit, zero-delivery ACK and final completion. No obsolete SACK-only exemption.
-    //# In recovery without SACK,
-    //# DeliveredData is estimated to be 1 SMSS on each received duplicate
-    //# ACK (i.e., SND.UNA did not change).  When SND.UNA advances (i.e., a
-    //# full or partial ACK), DeliveredData is the change in SND.UNA, minus 1
-    //# SMSS for each preceding duplicate ACK.
-    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Repeated extraneous duplicates cannot increase delivered above 10000-byte episode RecoverFS; capped ACK preserves counters, credit and cwnd, through wrap.
+    //= reason=Repeated extraneous duplicates cannot increase delivered above the 10-packet episode RecoverFS; capped ACK preserves counters, credit and cwnd, through wrap.
     //# As a mitigation, if not using SACK, then PRR
     //# disallows incrementing DeliveredData when the total bytes delivered
     //# in a PRR episode would exceed the estimated data outstanding upon
     //# entering recovery (RecoverFS).
     pub(crate) fn non_sack_delivery(&mut self, cumulative: u32, duplicate: bool) -> u32 {
         let delivered = if cumulative != 0 {
-            let delivered = cumulative.saturating_sub(self.dupack_bytes);
-            self.dupack_bytes = self.dupack_bytes.saturating_sub(cumulative);
+            let delivered = cumulative.saturating_sub(self.dupacks).max(1);
+            self.dupacks = self.dupacks.saturating_sub(cumulative - 1);
             delivered
         } else if duplicate {
-            self.dupack_bytes = self
-                .dupack_bytes
-                .saturating_add(self.mss)
-                .min(self.recover_fs);
-            self.mss
+            self.dupacks = self.dupacks.saturating_add(1).min(self.recover_fs);
+            1
         } else {
             0
         };
@@ -1749,14 +1749,10 @@ impl Prr {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Subtracts capped duplicate-delivery estimate from the lost/retransmitted payload ledger; wire integration additionally asserts committed partial retransmission pipe and delivery cap in rfc9937_no_sack_wire_delivery_cap_zero_ack_and_completion.
-    //# For non-SACK-enabled connections,
-    //# instead of subtracting out bytes SACKed in the SACK scoreboard,
-    //# senders MUST subtract out: min(RecoverFS, 1 SMSS for each preceding
-    //# duplicate ACK in the fast recovery episode); the min() with RecoverFS
-    //# is to protect against misbehaving receivers [Savage99].
+    // The capped duplicate estimate (packets) leaves the packets in flight,
+    // as Linux's reno sacked_out enters tcp_packets_in_flight.
     pub(crate) fn non_sack_pipe(&self, pipe_without_delivery_estimates: u32) -> u32 {
-        pipe_without_delivery_estimates.saturating_sub(self.dupack_bytes.min(self.recover_fs))
+        pipe_without_delivery_estimates.saturating_sub(self.dupacks.min(self.recover_fs))
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-9.3
@@ -1766,14 +1762,14 @@ impl Prr {
     //# congestion control actions taken upon the losses detected by RACK-
     //# TLP.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Zero delivery preserves the episode counters and credit.
+    //= reason=Zero delivery preserves the episode counters and credit, as Linux's tcp_cwnd_reduction returns on newly_acked_sacked <= 0.
     //# if (DeliveredData is 0)
     //#    Return
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Byte counters accumulate current ACK only; independent per-ACK oracle and wire traces cover signed SACK trimming and no-SACK capped delivery.
+    //= reason=Packet counters accumulate the current ACK's newly delivered packets only (Linux prr_delivered += newly_acked_sacked); independent per-ACK oracle and wire traces cover signed SACK trimming and no-SACK capped delivery.
     //# prr_delivered += DeliveredData
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Widened byte multiplication with ceil division; threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors; independent modern equation tests are used.
+    //= reason=Widened packet multiplication with ceil division (Linux div_u64(ssthresh * prr_delivered + d - 1, d)); threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors.
     //# if (inflight > ssthresh) {
     //#    // Proportional Rate Reduction
     //#    // This uses integer division, rounding up:
@@ -1781,7 +1777,7 @@ impl Prr {
     //#    out = DIV_ROUND_UP(prr_delivered * ssthresh, RecoverFS)
     //#    SndCnt = out - prr_out
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Current-delivery MAX, optional safe SMSS and target headroom are directly asserted after prior forced output; unsafe/safe values differ by one MSS. Connection SafeACK input evidence gap is tracked separately, not waived here.
+    //= reason=Current-delivery MAX, optional SafeACK packet and target headroom are directly asserted after prior forced output; unsafe/safe values differ by one packet (Linux sndcnt++), the packet form of SMSS. Connection SafeACK input evidence gap is tracked separately, not waived here.
     //# } else {
     //#    // PRR-CRB by default
     //#    SndCnt = MAX(prr_delivered - prr_out, DeliveredData)
@@ -1793,13 +1789,13 @@ impl Prr {
     //#    SndCnt = MIN(ssthresh - inflight, SndCnt)
     //# }
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Nonzero delivery only; failure consumes nothing, successful short output prevents another floor. This test injects the equation state then exercises real transactional output; timer entry has a separate bounded first-repair contract.
+    //= reason=Nonzero delivery only; failure consumes nothing, successful output prevents another floor. One packet, the packet form of SMSS (Linux max(sndcnt, prr_out ? 0 : 1)). This test injects the equation state then exercises real transactional output; timer entry has a separate bounded first-repair contract.
     //# if (prr_out is 0 AND SndCnt is 0) {
     //#    // Force a fast retransmit upon entering recovery
     //#    SndCnt = SMSS
     //# }
     //= https://www.rfc-editor.org/rfc/rfc9937#section-13
-    //= reason=PRR counts bytes, not segments: 137-byte ACKs/97-byte committed output, ceil rounding and zero duplicates are asserted. No assertion of universal malicious-receiver security; no-SACK artificial delivery is independently capped.
+    //= reason=PRR counts packets, as Linux: a packet counts as delivered only once all of it is cumulatively acknowledged or SACKed (RACK's packet tally), so ACKs that split a segment deliver nothing until its last byte is covered. no-SACK artificial delivery is independently capped.
     //# Implementers that change PRR from counting bytes to segments have to
     //# be cautious about the effects of ACK splitting attacks [Savage99],
     //# where the receiver acknowledges partial segments for the purpose of
@@ -1824,20 +1820,22 @@ impl Prr {
             self.delivered
                 .saturating_sub(self.out)
                 .max(u64::from(delivered))
-                .saturating_add(if safe_ack { u64::from(self.mss) } else { 0 })
+                .saturating_add(u64::from(safe_ack))
                 .min(u64::from(threshold - pipe))
         };
         self.credit = credit.min(u64::from(u32::MAX)) as u32;
         if self.out == 0 && self.credit == 0 {
-            self.credit = self.mss;
+            self.credit = 1;
         }
     }
 
-    // RFC 6675 section 5 first repair, composed with RFC 8985 timer entry;
-    // not DeliveredData or the RFC 9937 per-ACK floor. Caller owns fresh entry.
-    pub(crate) fn admit_timer_repair(&mut self, pipe: u32, cwnd: u32) {
+    // RFC 6675 section 5 (4.3) first repair, composed with RFC 8985 timer
+    // entry: one packet, whatever pipe holds, as Linux's tcp_rack_reo_timeout
+    // gets from tcp_cwnd_reduction(sk, 1, ...) (prr_out is 0, so sndcnt >= 1).
+    // Not DeliveredData: no delivery is invented. Caller owns fresh entry.
+    pub(crate) fn admit_timer_repair(&mut self) {
         if self.delivered == 0 && self.out == 0 {
-            self.credit = self.mss.min(cwnd.saturating_sub(pipe));
+            self.credit = 1;
         }
     }
 
@@ -1858,19 +1856,22 @@ impl Prr {
         (self.recover_fs, self.delivered, self.out)
     }
 
+    // Packets SndCnt still admits.
     pub(crate) fn credit(&self) -> u32 {
         self.credit
     }
 
+    // A repair admitted as one packet and split by a racing MSS decrease
+    // sends each piece, which counts, as Linux charges each fragment's pcount.
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.3
+    //= reason=prr_out counts the packets sent (Linux prr_out += tcp_skb_pcount / sent_pkts in tcp_xmit_retransmit_queue and tcp_write_xmit), fresh and retransmitted, whatever their size.
     //# On any data transmission or retransmission, PRR executes the
     //# following:
     //#
     //#    prr_out += (data sent)
-    pub(crate) fn sent(&mut self, bytes: u32) {
-        debug_assert!(bytes <= self.credit);
-        self.out = self.out.saturating_add(u64::from(bytes));
-        self.credit = self.credit.saturating_sub(bytes);
+    pub(crate) fn sent(&mut self, packets: u32) {
+        self.out = self.out.saturating_add(u64::from(packets));
+        self.credit = self.credit.saturating_sub(packets);
     }
 }
 
@@ -1879,29 +1880,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timer_first_repair_bounds_and_accounting_are_separate_from_ack_floor() {
-        for (pipe, cwnd, expected) in [
-            (5000, 5000, 0),
-            (6000, 5000, 0),
-            (4750, 5000, 250),
-            (2000, 5000, 1000),
-        ] {
-            let mut p = Prr::new(9000, 1000);
+    fn timer_first_repair_is_one_packet_and_separate_from_ack_floor() {
+        // Linux's tcp_rack_reo_timeout calls tcp_cwnd_reduction(sk, 1, ..):
+        // with prr_out 0, sndcnt >= 1 whatever inflight holds against cwnd.
+        for (pipe, cwnd) in [(5, 5), (6, 5), (4, 5), (2, 5)] {
+            let mut p = Prr::new(9);
             p.acknowledge(0, pipe, cwnd, false);
             assert_eq!(p.credit(), 0);
-            p.admit_timer_repair(pipe, cwnd);
-            assert_eq!(p.credit(), expected);
-            assert_eq!(p.counters(), (9000, 0, 0));
+            p.admit_timer_repair();
+            assert_eq!(p.credit(), 1);
+            assert_eq!(p.counters(), (9, 0, 0));
             p.acknowledge(0, 0, cwnd, true);
-            assert_eq!(p.credit(), expected);
-            if expected != 0 {
-                p.sent(expected.min(97));
-                p.finish_timer_repair();
-                assert_eq!(p.counters(), (9000, 0, u64::from(expected.min(97))));
-                assert_eq!(p.credit(), 0);
-                p.admit_timer_repair(0, cwnd); // Even mistaken re-entry cannot mint after output.
-                assert_eq!(p.credit(), 0);
-            }
+            assert_eq!(p.credit(), 1);
+            p.sent(1);
+            p.finish_timer_repair();
+            assert_eq!(p.counters(), (9, 0, 1));
+            assert_eq!(p.credit(), 0);
+            p.admit_timer_repair(); // Even mistaken re-entry cannot mint after output.
+            assert_eq!(p.credit(), 0);
         }
     }
 
@@ -1925,65 +1921,62 @@ mod tests {
     //#    SndCnt = MIN(ssthresh - inflight, SndCnt)
     //# }
     fn rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit() {
-        let mut empty_after_ack = Prr::new(0, 1000);
-        empty_after_ack.include_entry_delivery(1000);
-        assert_eq!(empty_after_ack.counters(), (1000, 0, 0));
+        let mut empty_after_ack = Prr::new(0);
+        empty_after_ack.include_entry_delivery(1);
+        assert_eq!(empty_after_ack.counters(), (1, 0, 0));
         for safe in [false, true] {
-            let mut p = Prr::new(10_000, 1000);
-            p.acknowledge(1, 5000, 5000, safe);
-            assert_eq!(p.credit(), 1000); // Force only when the computed count is zero.
+            let mut p = Prr::new(10);
+            p.acknowledge(1, 5, 5, safe);
+            assert_eq!(p.credit(), 1); // Force only when the computed count is zero.
             let before = p.counters();
-            p.acknowledge(0, 0, 5000, true);
+            p.acknowledge(0, 0, 5, true);
             assert_eq!(p.counters(), before);
-            assert_eq!(p.credit(), 1000); // Failed output / changed estimator cannot revoke it.
-            p.sent(1000);
-            p.acknowledge(1000, 1000, 5000, safe);
-            assert_eq!(p.credit(), if safe { 2000 } else { 1000 }); // MAX includes current delivery.
+            assert_eq!(p.credit(), 1); // Failed output / changed estimator cannot revoke it.
+            p.sent(1);
+            p.acknowledge(1, 1, 5, safe);
+            assert_eq!(p.credit(), if safe { 2 } else { 1 }); // MAX includes current delivery.
             p.sent(p.credit());
-            p.acknowledge(1000, 5000, 5000, safe);
-            assert_eq!(p.credit(), 0); // No forced SMSS after any committed output.
+            p.acknowledge(1, 5, 5, safe);
+            assert_eq!(p.credit(), 0); // No forced packet after any committed output.
         }
-        let mut p = Prr::new(u32::MAX, 1000);
+        let mut p = Prr::new(u32::MAX);
         p.acknowledge(u32::MAX, u32::MAX, u32::MAX - 1, false);
         assert_eq!(p.credit(), u32::MAX - 1); // Widen before multiplication / rounding.
     }
 
     #[test]
-    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= type=test
-    //= reason=Subtracts capped duplicate-delivery estimate from the lost/retransmitted payload ledger; wire integration additionally asserts committed partial retransmission pipe and delivery cap in rfc9937_no_sack_wire_delivery_cap_zero_ack_and_completion.
-    //# For non-SACK-enabled connections,
-    //# instead of subtracting out bytes SACKed in the SACK scoreboard,
-    //# senders MUST subtract out: min(RecoverFS, 1 SMSS for each preceding
-    //# duplicate ACK in the fast recovery episode); the min() with RecoverFS
-    //# is to protect against misbehaving receivers [Savage99].
-    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= type=test
-    //= reason=Duplicate estimates are deducted across partial cumulative progress; no-SACK wire trace asserts current entry duplicate, short retransmit, zero-delivery ACK and final completion. No obsolete SACK-only exemption.
-    //# In recovery without SACK,
-    //# DeliveredData is estimated to be 1 SMSS on each received duplicate
-    //# ACK (i.e., SND.UNA did not change).  When SND.UNA advances (i.e., a
-    //# full or partial ACK), DeliveredData is the change in SND.UNA, minus 1
-    //# SMSS for each preceding duplicate ACK.
     fn rfc9937_non_sack_estimates_cap_delivery_and_deduct_prior_duplicates() {
-        let mut p = Prr::new(5000, 1000);
+        // One packet per duplicate ACK, the packet form of 1 SMSS.
+        let mut p = Prr::new(5);
         for i in 1..=2 {
             let d = p.non_sack_delivery(0, true);
-            assert_eq!(d, 1000);
-            let pipe = p.non_sack_pipe(4000);
-            assert_eq!(pipe, 5000 - i * 1000 - 1000);
-            p.acknowledge(d, pipe, 2500, false);
+            assert_eq!(d, 1);
+            let pipe = p.non_sack_pipe(4);
+            assert_eq!(pipe, 5 - i - 1);
+            p.acknowledge(d, pipe, 2, false);
         }
-        assert_eq!(p.non_sack_delivery(1500, false), 0);
-        assert_eq!(p.non_sack_pipe(3500), 3000);
-        assert_eq!(p.non_sack_delivery(1000, false), 500);
-        p.acknowledge(500, 2500, 2500, false);
+        // One ACK acked the hole; the rest eat duplicate estimates (Linux
+        // tcp_remove_reno_sacks).
+        assert_eq!(p.non_sack_delivery(1, false), 1);
+        assert_eq!(p.non_sack_pipe(3), 1);
+        p.acknowledge(1, 1, 2, false);
+        assert_eq!(p.non_sack_delivery(2, false), 1);
+        assert_eq!(p.non_sack_pipe(3), 2);
+        p.acknowledge(1, 2, 2, false);
         for _ in 0..20 {
             let d = p.non_sack_delivery(0, true);
-            p.acknowledge(d, p.non_sack_pipe(2500), 2500, false);
+            p.acknowledge(d, p.non_sack_pipe(2), 2, false);
         }
-        assert_eq!(p.counters().1, 5000);
-        assert_eq!(p.non_sack_delivery(5000, false), 0);
+        assert_eq!(p.counters().1, 5);
+        assert_eq!(p.non_sack_delivery(5, false), 0);
+        // Duplicates before recovery lower inflight, not delivery, capped
+        // by RecoverFS.
+        let mut p = Prr::new(5);
+        p.include_prior_duplicates(2);
+        assert_eq!(p.non_sack_pipe(4), 2);
+        assert_eq!(p.counters(), (5, 0, 0));
+        p.include_prior_duplicates(10);
+        assert_eq!(p.non_sack_pipe(9), 4);
         assert_eq!(p.non_sack_pipe(0), 0);
     }
 
@@ -2128,19 +2121,13 @@ mod tests {
     }
 
     #[test]
-    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
-    //= type=test
-    //= reason=Connection selects the congestion target; constructor zeros byte counters. Entry wire traces separately assert the actual target.
-    //# ssthresh = CongCtrlAlg()      // Target flight size in recovery
-    //# prr_delivered = 0             // Total bytes delivered in recovery
-    //# prr_out = 0                   // Total bytes sent in recovery
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
     //= type=test
-    //= reason=Byte counters accumulate current ACK only; independent per-ACK oracle and wire traces cover signed SACK trimming and no-SACK capped delivery.
+    //= reason=Packet counters accumulate current ACK only; independent per-ACK oracle and wire traces cover signed SACK trimming and no-SACK capped delivery.
     //# prr_delivered += DeliveredData
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
     //= type=test
-    //= reason=Widened byte multiplication with ceil division; threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors; independent modern equation tests are used.
+    //= reason=Widened packet multiplication with ceil division; threshold equality selects reduction branch. Large integer overflow vector in rfc9937_safe_unsafe_zero_delivery_and_forced_first_transmit and independent wire oracle supplement the vectors; independent modern equation tests are used.
     //# if (inflight > ssthresh) {
     //#    // Proportional Rate Reduction
     //#    // This uses integer division, rounding up:
@@ -2149,27 +2136,27 @@ mod tests {
     //#    SndCnt = out - prr_out
     //= https://www.rfc-editor.org/rfc/rfc9937#section-13
     //= type=test
-    //= reason=PRR counts bytes, not segments: 137-byte ACKs/97-byte committed output, ceil rounding and zero duplicates are asserted. No assertion of universal malicious-receiver security; no-SACK artificial delivery is independently capped.
+    //= reason=PRR counts packets, as Linux: one- and two-packet ACKs, per-packet committed output, ceil rounding and zero duplicates are asserted here; prr_active_delivery_matches_signed_scoreboard_delta and tlp_partial_sack_then_full_tail_delivery_cannot_inflate_prr_credit assert that ACKs splitting a segment deliver nothing until it is whole. No assertion of universal malicious-receiver security; no-SACK artificial delivery is independently capped.
     //# Implementers that change PRR from counting bytes to segments have to
     //# be cautious about the effects of ACK splitting attacks [Savage99],
     //# where the receiver acknowledges partial segments for the purpose of
     //# confusing the sender's congestion accounting.
     fn rfc9937_zero_entry_and_credit_across_pipe_branches() {
-        for threshold in [1000, 5000, 7000, 10_000] {
-            let mut p = Prr::new(10_000, 1000);
-            assert_eq!(p.counters(), (10_000, 0, 0));
-            assert_eq!(p.credit(), 0);
+        for threshold in [1, 5, 7, 10] {
+            let mut p = Prr::new(10);
+            assert_eq!(p.counters(), (10, 0, 0));
             assert_eq!(p.credit(), 0);
             for i in 0..100 {
-                // Exercise headroom discontinuities, small ACKs, duplicate ACKs,
-                // banked credit and byte-accurate output without changing epochs.
-                let delivered = if i % 3 == 0 { 0 } else { 137 };
+                // Exercise headroom discontinuities, one- and two-packet ACKs,
+                // duplicate ACKs, banked credit and per-packet output without
+                // changing epochs.
+                let delivered = if i % 3 == 0 { 0 } else { 1 + i as u32 % 2 };
                 let pipe = [0, threshold - 1, threshold, threshold + 1][i % 4];
                 let old_credit = p.credit();
                 p.acknowledge(delivered, pipe, threshold, false);
                 let mut allowed = if pipe > threshold {
                     (p.delivered * u64::from(threshold))
-                        .div_ceil(10_000)
+                        .div_ceil(10)
                         .saturating_sub(p.out)
                 } else {
                     p.delivered
@@ -2180,54 +2167,129 @@ mod tests {
                 if delivered == 0 {
                     allowed = u64::from(old_credit);
                 } else if p.out == 0 && allowed == 0 {
-                    allowed = 1000;
+                    allowed = 1;
                 }
                 assert_eq!(u64::from(p.credit()), allowed);
-                let bytes = p.credit().min(97);
-                p.sent(bytes);
-                assert_eq!(u64::from(p.credit()), allowed - u64::from(bytes));
+                let packets = p.credit().min(1);
+                p.sent(packets);
+                assert_eq!(u64::from(p.credit()), allowed - u64::from(packets));
             }
         }
     }
 
     #[test]
     fn prr_crb_proportional_conservative_bound_and_no_duplicate_credit() {
-        let mut prr = Prr::new(10_000, 1000);
-        prr.acknowledge(3000, 7000, 5000, false);
-        assert_eq!(prr.credit(), 1500);
-        prr.sent(1000);
-        assert_eq!(prr.credit(), 500);
-        prr.acknowledge(1000, 3000, 5000, false);
-        assert_eq!(prr.credit(), 2000);
-        prr.sent(2000);
-        // The two emitted MSS raise pipe from 3000 to 5000. An unchanged
+        let mut prr = Prr::new(10);
+        // ceil(3 * 5 / 10) packets: the proportional share rounds up to whole
+        // packets, as Linux's div_u64(ssthresh * prr_delivered + d - 1, d).
+        prr.acknowledge(3, 7, 5, false);
+        assert_eq!(prr.credit(), 2);
+        prr.sent(1);
+        assert_eq!(prr.credit(), 1);
+        prr.acknowledge(1, 3, 5, false);
+        assert_eq!(prr.credit(), 2);
+        prr.sent(2);
+        // The two emitted packets raise pipe from 3 to 5. An unchanged
         // duplicate ACK supplies no further credit at the threshold.
-        prr.acknowledge(0, 5000, 5000, false);
+        prr.acknowledge(0, 5, 5, false);
         assert_eq!(prr.credit(), 0);
-        prr.acknowledge(1000, 1000, 5000, false);
-        assert_eq!(prr.credit(), 2000);
+        prr.acknowledge(1, 1, 5, false);
+        assert_eq!(prr.credit(), 2);
+    }
+
+    // Linux 6.12 tcp_cwnd_reduction, transcribed in its signed packet
+    // arithmetic, with RecoverFS as the divisor where Linux has prior_cwnd.
+    // Returns the cwnd headroom: cwnd - inflight = sndcnt.
+    fn linux_sndcnt(
+        prr_delivered: &mut i64,
+        prr_out: i64,
+        newly_acked_sacked: i64,
+        inflight: i64,
+        ssthresh: i64,
+        recover_fs: i64,
+        safe: bool,
+    ) -> Option<i64> {
+        let delta = ssthresh - inflight;
+        if newly_acked_sacked <= 0 {
+            return None;
+        }
+        *prr_delivered += newly_acked_sacked;
+        let mut sndcnt = if delta < 0 {
+            (ssthresh * *prr_delivered + recover_fs - 1) / recover_fs - prr_out
+        } else {
+            let mut sndcnt = (*prr_delivered - prr_out).max(newly_acked_sacked);
+            if safe {
+                sndcnt += 1;
+            }
+            sndcnt.min(delta)
+        };
+        sndcnt = sndcnt.max(if prr_out != 0 { 0 } else { 1 });
+        Some(sndcnt)
+    }
+
+    #[test]
+    fn credit_matches_linux_tcp_cwnd_reduction_packet_model() {
+        // Deterministic LCG over episodes of ACKs and whole-packet sends.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        for _ in 0..2000 {
+            let recover_fs = 1 + next(64) as u32;
+            let ssthresh = 1 + next(u64::from(recover_fs)) as u32;
+            let mut p = Prr::new(recover_fs);
+            let (mut delivered, mut out) = (0i64, 0i64);
+            for _ in 0..32 {
+                let newly = next(4) as u32;
+                let inflight = next(2 * u64::from(recover_fs)) as u32;
+                let safe = next(2) == 1;
+                let before = p.credit();
+                p.acknowledge(newly, inflight, ssthresh, safe);
+                match linux_sndcnt(
+                    &mut delivered,
+                    out,
+                    i64::from(newly),
+                    i64::from(inflight),
+                    i64::from(ssthresh),
+                    i64::from(recover_fs),
+                    safe,
+                ) {
+                    // A negative sndcnt sets cwnd below inflight: no packet.
+                    Some(sndcnt) => assert_eq!(i64::from(p.credit()), sndcnt.max(0)),
+                    None => assert_eq!(p.credit(), before),
+                }
+                assert_eq!(p.counters().1, delivered as u64);
+                let sent = next(u64::from(p.credit()) + 1) as u32;
+                p.sent(sent);
+                out += i64::from(sent);
+                assert_eq!(p.counters().2, out as u64);
+            }
+        }
     }
 
     #[test]
     fn prr_duplicate_ack_preserves_banked_credit_without_minting_delivery() {
-        for (pipe, expected) in [(7000, 1500), (3000, 2000)] {
-            let mut prr = Prr::new(10_000, 1000);
-            prr.acknowledge(3000, pipe, 5000, false);
+        for (pipe, expected) in [(7, 2), (3, 2)] {
+            let mut prr = Prr::new(10);
+            prr.acknowledge(3, pipe, 5, false);
             assert_eq!(prr.credit(), expected);
             for _ in 0..4 {
                 // also the state after repeated failed output
-                prr.acknowledge(0, pipe, 5000, false);
+                prr.acknowledge(0, pipe, 5, false);
                 assert_eq!(prr.credit(), expected);
-                assert_eq!(prr.delivered, 3000);
+                assert_eq!(prr.delivered, 3);
                 assert_eq!(prr.out, 0);
             }
-            prr.sent(1000);
+            prr.sent(1);
             // Reflect the successful retransmission in pipe. The proportional
             // bound is retained on zero delivery in either RFC9937 branch.
-            prr.acknowledge(0, pipe + 1000, 5000, false);
-            assert_eq!(prr.credit(), if pipe > 5000 { 500 } else { 1000 });
-            assert_eq!(prr.delivered, 3000);
-            assert_eq!(prr.out, 1000);
+            prr.acknowledge(0, pipe + 1, 5, false);
+            assert_eq!(prr.credit(), 1);
+            assert_eq!(prr.delivered, 3);
+            assert_eq!(prr.out, 1);
         }
     }
 

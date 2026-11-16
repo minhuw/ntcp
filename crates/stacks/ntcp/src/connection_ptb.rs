@@ -244,7 +244,7 @@ impl Connection {
         let end = start.wrapping_add(count as u32);
         if count != 0 {
             if let Some(prr) = &mut self.prr {
-                prr.sent(count as u32);
+                prr.sent(1); // One accepted fragment.
                 if last {
                     prr.finish_timer_repair();
                 }
@@ -524,7 +524,8 @@ impl Connection {
         };
         self.ptb_sync();
         let credit = match self.prr {
-            Some(prr) => prr.credit(),
+            // Whole packets (Linux's PRR): one admits the repair whole.
+            Some(prr) => prr.credit().saturating_mul(packet_mss as u32),
             None if self.ptb.restart => u32::MAX,
             None => self.congestion.cwnd().saturating_sub(self.ptb_estimate()),
         } as usize;
@@ -535,8 +536,9 @@ impl Connection {
             // window edge; congestion credit must cover what remains of it.
             let limit = self.retry_limit(left, len as u32) as usize;
             let count = limit.min(credit);
-            // PRR may clip a repair; otherwise wait for a full segment's
-            // credit (or the whole permitted run) rather than dribble bytes.
+            // PRR's packet admits the repair whole; otherwise wait for a full
+            // segment's credit (or the whole permitted run) rather than
+            // dribble bytes.
             if count == 0 || self.prr.is_none() && credit < limit.min(self.mss) {
                 return None;
             }

@@ -136,7 +136,7 @@ fn early_ack_handoff_entry_delivery_matches_established_including_wrap() {
                     assert_eq!(a.acknowledged, 500);
                     assert_eq!(a.send.len(), 3500);
                     assert!(a.sack_recovery.is_some());
-                    assert_eq!(a.prr.unwrap().counters(), (4000, 3500, 0));
+                    assert_eq!(a.prr.unwrap().counters(), (5, 4, 0)); // Five packets: four delivered.
                     assert_eq!(a.rack.delivered_segments, 4);
                     assert_eq!(a.transport_info().delivered_segments, 5); // Plus SYN, once.
                     assert_eq!(a.take_events().acknowledged, Some(500));

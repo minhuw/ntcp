@@ -43,14 +43,14 @@ fn cubic_ecn_prr_safe_entry_output_multiple_acks_and_handoff() {
             assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
             assert_eq!(a.congestion.cwnd(), 5000);
             assert_eq!(a.congestion.ecn_prr_end(), Some(end));
-            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-            assert_eq!(a.prr.unwrap().credit(), 2000);
+            assert_eq!(a.prr.unwrap().counters(), (4, 1, 0));
+            assert_eq!(a.prr.unwrap().credit(), 2);
             assert!(!a.retx_pending && !a.congestion.in_recovery());
             assert_eq!(a.rack.counts().lost, 0);
             // Failed output consumes neither credit nor the first-fresh CWR.
             a.write(&[2; 8000]).unwrap();
             assert_eq!(a.transmit(51, &mut [0; 20]), Err(Error::OutputTooSmall));
-            assert_eq!(a.prr.unwrap().credit(), 2000);
+            assert_eq!(a.prr.unwrap().credit(), 2);
             for i in 0..2 {
                 let bytes = packet(&mut a, 52);
                 let seg = wire::parse(ip(a.tuple()), &bytes).unwrap();
@@ -58,18 +58,18 @@ fn cubic_ecn_prr_safe_entry_output_multiple_acks_and_handoff() {
                 assert_eq!(seg.payload.len(), 1000);
                 assert_eq!(seg.header.flags & CWR != 0, i == 0);
             }
-            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 2000));
+            assert_eq!(a.prr.unwrap().counters(), (4, 1, 2));
             assert!(a.transmit(52, &mut [0; 1500]).unwrap().is_none());
             assert_eq!(a.congestion.ecn_prr_end(), Some(end)); // CWR output is not completion.
             ack(&mut a, 60, base.wrapping_add(2000), true, &[]);
             assert_eq!(a.congestion.unsuppressed_cwnd(), 7000); // Repeated ECE does not re-reduce.
-            assert_eq!(a.prr.unwrap().counters(), (4000, 2000, 2000));
-            assert_eq!(a.prr.unwrap().credit(), 2000);
+            assert_eq!(a.prr.unwrap().counters(), (4, 2, 2));
+            assert_eq!(a.prr.unwrap().credit(), 2);
             assert_eq!(a.congestion.cwnd(), 6000);
             // A non-ECE ACK inside the episode must not grow the logical target.
             ack(&mut a, 70, base.wrapping_add(3000), false, &[]);
             assert_eq!(a.congestion.unsuppressed_cwnd(), 7000);
-            assert_eq!(a.prr.unwrap().counters(), (4000, 3000, 2000));
+            assert_eq!(a.prr.unwrap().counters(), (4, 3, 2));
             ack(&mut a, 80, end, true, &[]);
             assert!(a.prr.is_none());
             assert_eq!(a.congestion.ecn_prr_end(), None);
@@ -111,7 +111,7 @@ fn cubic_ecn_prr_signed_sack_delivery_replay_and_loss_takeover() {
                 true,
                 &[(base.wrapping_add(2000).0, end.0)],
             );
-            assert_eq!(a.prr.unwrap().counters(), (3000, 2000, 0));
+            assert_eq!(a.prr.unwrap().counters(), (3, 2, 0));
             let before = a.prr.unwrap().counters();
             let credit = a.prr.unwrap().credit();
             ack(
@@ -124,7 +124,7 @@ fn cubic_ecn_prr_signed_sack_delivery_replay_and_loss_takeover() {
             assert_eq!(a.prr.unwrap().counters(), before);
             assert_eq!(a.prr.unwrap().credit(), credit);
             ack(&mut a, 53, base.wrapping_add(3000), false, &[]);
-            assert_eq!(a.prr.unwrap().counters(), (3000, 3000, 0)); // Only unsacked hole is new.
+            assert_eq!(a.prr.unwrap().counters(), (3, 3, 0)); // Only unsacked hole is new.
             ack(&mut a, 54, end, true, &[]);
             assert!(a.prr.is_none());
             assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
@@ -182,7 +182,7 @@ fn cubic_ecn_prr_small_flight_fin_and_cancellations() {
         if fin {
             ack(&mut a, 60, base.wrapping_add(4000), true, &[]);
             assert!(a.prr.is_some()); // FIN is part of the boundary, not delivered payload.
-            assert_eq!(a.prr.unwrap().counters(), (4000, 4000, 0));
+            assert_eq!(a.prr.unwrap().counters(), (4, 4, 0));
             ack(&mut a, 70, end, true, &[]);
             assert!(a.prr.is_none());
             assert_eq!(a.congestion.cwnd(), a.congestion.ssthresh());
@@ -273,7 +273,7 @@ fn cubic_ecn_prr_rack_timer_replaces_episode_without_ack_replay() {
     assert!(a.sack_recovery.is_some());
     assert_eq!(a.congestion.ecn_prr_end(), None);
     assert_eq!(a.congestion.ssthresh(), 7000);
-    assert_eq!(a.prr.unwrap().counters(), (6000, 0, 0));
+    assert_eq!(a.prr.unwrap().counters(), (6, 0, 0));
     assert_eq!(a.prr.unwrap().credit(), 0); // Timer is not another copy of the ACK.
     assert!(a.transmit(deadline, &mut [0; 1500]).unwrap().is_none());
 }
@@ -318,7 +318,7 @@ fn cubic_ecn_prr_loss_ending_ack_starts_new_logical_event() {
         assert!(a.congestion.ecn_prr_end().is_some());
         assert_eq!(a.congestion.ssthresh(), target);
         assert_eq!(a.congestion.unsuppressed_cwnd(), target);
-        assert_eq!(a.prr.unwrap().counters().1, if sack { 1000 } else { 4000 });
+        assert_eq!(a.prr.unwrap().counters().1, if sack { 1 } else { 4 });
         let end = a.snd_nxt;
         ack(&mut a, now + 1, end, true, &[]);
         assert!(a.prr.is_none());
@@ -342,7 +342,7 @@ fn cubic_ecn_prr_reserved_pacing_and_mss_preserve_logical_target() {
     assert_eq!(seg.header.sequence, base.wrapping_add(4000).0);
     assert_eq!(seg.payload.len(), 1000);
     let counters = a.prr.unwrap().counters();
-    assert_eq!(counters, (4000, 1000, 1000));
+    assert_eq!(counters, (4, 1, 1));
     let mut departure = a.last_departure.unwrap();
     a.accept_reserved_output(100_002, &mut departure, 0, 500, false)
         .unwrap();
@@ -356,7 +356,7 @@ fn cubic_ecn_prr_reserved_pacing_and_mss_preserve_logical_target() {
     assert_eq!(a.prr.unwrap().credit(), 0);
     assert!(a.transmit(due, &mut bytes).unwrap().is_none());
     a.lower_mss(500).unwrap();
-    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 2000));
+    assert_eq!(a.prr.unwrap().counters(), (4, 1, 2));
     assert_eq!(a.congestion.unsuppressed_cwnd(), 3500);
     assert_eq!(a.congestion.cwnd(), 2500);
     assert_eq!(a.congestion.ssthresh(), 3500);
@@ -487,20 +487,27 @@ fn cubic_ecn_prr_entry_ack_pmtu_verification_rollback() {
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, 540);
         assert_eq!(a.congestion.ssthresh(), 3500);
         assert_eq!(a.congestion.unsuppressed_cwnd(), 3500);
-        assert_eq!(a.congestion.cwnd(), 3500);
         if !ending {
+            // In packets: three 1000-byte packets in flight, a 7-packet
+            // target at the 500-byte SMSS, and CRB's one delivered packet
+            // plus SafeACK's: two 500-byte packets. Admission is
+            // (3 + 2) * SMSS. Linux keeps sent skbs' pcount across an MSS
+            // change the same way.
+            assert_eq!(a.congestion.cwnd(), 2500);
             assert_eq!(a.congestion.ecn_prr_end(), Some(end));
-            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-            assert_eq!(a.prr.unwrap().credit(), 500);
+            assert_eq!(a.prr.unwrap().counters(), (4, 1, 0));
+            assert_eq!(a.prr.unwrap().credit(), 2);
             a.write(&[2; 2000]).unwrap();
-            let bytes = packet(&mut a, now + 1);
-            let seg = wire::parse(ip(a.tuple()), &bytes).unwrap();
-            assert_eq!(seg.header.sequence, end.0);
-            assert_eq!(seg.payload.len(), 500);
-            assert_ne!(seg.header.flags & CWR, 0);
+            for i in 0..2 {
+                let bytes = packet(&mut a, now + 1);
+                let seg = wire::parse(ip(a.tuple()), &bytes).unwrap();
+                assert_eq!(seg.header.sequence, end.wrapping_add(i * 500).0);
+                assert_eq!(seg.payload.len(), 500);
+                assert_eq!(seg.header.flags & CWR != 0, i == 0);
+            }
             assert_eq!(a.prr.unwrap().credit(), 0);
             assert!(a.transmit(now + 1, &mut [0; 1500]).unwrap().is_none());
-            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 500));
+            assert_eq!(a.prr.unwrap().counters(), (4, 1, 2));
             ack(&mut a, now + 2, end, true, &[]);
         }
         assert!(a.prr.is_none());
@@ -598,15 +605,17 @@ fn cubic_ecn_prr_entry_ack_pmtu_growth_does_not_inflate_target() {
 
 #[test]
 fn cubic_ecn_prr_new_ece_below_threshold_cancels_old_admission() {
-    let mut a = sender(true, false, 0, 1000);
+    // The first ECE ACK delivers a whole packet: PRR counts packets, and
+    // a partial ACK of one would deliver none and admit nothing.
+    let mut a = sender(true, false, 0, 2000);
     a.congestion.prr_window(3000);
     let base = a.snd_una;
-    ack(&mut a, 50, base.wrapping_add(500), true, &[]);
+    ack(&mut a, 50, base.wrapping_add(1000), true, &[]);
     assert_eq!(a.congestion.unsuppressed_cwnd(), 2100);
     assert!(a.prr.is_some());
     a.write(&[2; 1000]).unwrap();
     packet(&mut a, 51);
-    ack(&mut a, 60, base.wrapping_add(1500), true, &[]);
+    ack(&mut a, 60, base.wrapping_add(2500), true, &[]);
     assert_eq!(a.congestion.cwnd(), 1470);
     assert_eq!(a.congestion.ssthresh(), 2000);
     assert!(a.prr.is_none());
@@ -739,19 +748,19 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
     assert!(a.next_deadline().unwrap() > 305_000);
 
     assert_eq!(a.congestion.ecn_prr_end(), Some(Seq(4001)));
-    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-    assert_eq!(a.prr.unwrap().credit(), 2000);
+    assert_eq!(a.prr.unwrap().counters(), (4, 1, 0));
+    assert_eq!(a.prr.unwrap().credit(), 2);
     assert_eq!(
         (a.transport_info().cwnd, a.transport_info().mss),
         (5000, 1000)
     );
     // Equation-only control with the same inputs: do not mutate the connection.
-    let mut unsafe_equation = Prr::new(4000, 1000);
-    unsafe_equation.acknowledge(1000, 3000, 7000, false);
-    assert_eq!(unsafe_equation.credit(), 1000);
+    let mut unsafe_equation = Prr::new(4);
+    unsafe_equation.acknowledge(1, 3, 7, false);
+    assert_eq!(unsafe_equation.credit(), 1);
     inject(&mut a, 305_001, Seq(1), Seq(1001), ACK | ECE, 320, &[]);
-    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-    assert_eq!(a.prr.unwrap().credit(), 2000);
+    assert_eq!(a.prr.unwrap().counters(), (4, 1, 0));
+    assert_eq!(a.prr.unwrap().credit(), 2);
     assert_eq!(a.congestion.ssthresh(), 7000);
     assert!(a.transmit(305_001, &mut [0; 1500]).unwrap().is_none());
     assert!(a.ecn_cwr_pending);
@@ -766,7 +775,7 @@ fn packetdrill_passive_ecn_cwr_prr_characterization() {
         );
         assert_eq!(seg.header.flags & CWR != 0, i == 0);
     }
-    assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 2000));
+    assert_eq!(a.prr.unwrap().counters(), (4, 1, 2));
     assert_eq!(a.prr.unwrap().credit(), 0);
     assert_eq!(a.data_flight(), 5000);
     assert!(!a.ecn_cwr_pending);

@@ -915,10 +915,10 @@ fn sack_recovery_coexistence(ipv4: bool, rack: bool, prr: bool, algorithm: Conge
         assert_eq!(a.consecutive_timeouts, 0);
         let out_before = a.prr.map(|p| p.counters().2);
         let burst = poll(&mut a, t, 32);
-        let mut bytes_out = 0;
+        let mut packets_out = 0;
         for bytes in &burst {
             let s = span(&a, bytes);
-            bytes_out += payload_len(&a, bytes) as u64;
+            packets_out += u64::from(payload_len(&a, bytes) != 0);
             if s.0.after(high) || s.0 == high {
                 continue;
             }
@@ -933,8 +933,8 @@ fn sack_recovery_coexistence(ipv4: bool, rack: bool, prr: bool, algorithm: Conge
             }
         }
         if let (Some(before), Some(p)) = (out_before, a.prr) {
-            // prr_out counts each emitted byte exactly once.
-            assert_eq!(p.counters().2 - before, bytes_out);
+            // prr_out counts each emitted data packet exactly once.
+            assert_eq!(p.counters().2 - before, packets_out);
         }
         // The receiver gets every repair; the held originals arrive in order.
         for bytes in &burst {

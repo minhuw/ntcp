@@ -789,7 +789,7 @@ fn early_response_actual_partial_sack_prr_and_fin_wait() {
         assert_eq!(a.state, State::SynReceived);
         assert_eq!(a.fin_sequence, None);
         acknowledge(&mut a, 200_000, 500, &[(1000, 4000)]);
-        assert_eq!(a.prr.unwrap().counters(), (4000, 3500, 0));
+        assert_eq!(a.prr.unwrap().counters(), (5, 4, 0)); // Five packets: four delivered.
         assert_eq!(a.acknowledged, 500);
         acknowledge(&mut a, 210_000, 4000, &[]);
         let bytes = emit_at_us(&mut a, 220_000, false);

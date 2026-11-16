@@ -2227,14 +2227,6 @@ impl Rack {
         Some((first.start, first.start.wrapping_add(size)))
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-    //= reason=Valid payload ledger: unsacked and not-needs_retransmit intervals count once; successful retransmission clears needs_retransmit for only emitted bytes. Exact reordered original, lost-copy and replacement pipe values are asserted. SYN/FIN sequence space is not payload data.
-    //# SACK-enabled connections using RACK-TLP loss detection
-    //# [RFC8985] or other loss detection algorithms MUST calculate inflight
-    //# by starting with SND.NXT - SND.UNA, subtracting out bytes SACKed in
-    //# the scoreboard, subtracting out bytes marked lost in the scoreboard,
-    //# and adding bytes in the scoreboard that have been retransmitted since
-    //# they were last marked lost.
     pub(crate) fn pipe(&self) -> u32 {
         self.tally.pipe
     }
@@ -2444,9 +2436,10 @@ impl Rack {
     // Packet-unit consumers must distinguish the original wire segments of a
     // single logical admission. ACK/SACK splits preserve these boundaries;
     // later retry repacketization must not create extra original packets.
-    // Linux-style queued packetization statistics are independent of the
-    // original-wire identities consumed by RACK/TLP. Commit, not selection,
-    // supplies boundaries and retry status; ACK/SACK splits retain them.
+    // Linux-style queued packetization (TCP_INFO's counts and PRR's packets,
+    // Linux's skbs) is independent of the original-wire identities consumed
+    // by RACK/TLP. Commit, not selection, supplies boundaries and retry
+    // status; ACK/SACK splits retain them.
     pub(crate) fn diagnostic_packet_counts(&self) -> Counts {
         self.tally.units
     }

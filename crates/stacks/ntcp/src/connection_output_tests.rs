@@ -31,17 +31,20 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
         }
         assert!(!a.sack_send && a.prr.is_some());
         let before = a.prr.unwrap();
-        assert_eq!(before.counters(), (10_000, 1000, 0));
-        assert_eq!(before.credit(), 500);
+        assert_eq!(before.counters(), (10, 1, 0));
+        assert_eq!(before.credit(), 1);
         a.lower_mss(250).unwrap();
         assert_eq!(a.prr.unwrap().counters(), before.counters());
         assert_eq!(a.prr.unwrap().credit(), before.credit());
-        assert_eq!(outputs(&mut a, 50, base), vec![(0, 250), (250, 250)]);
-        assert_eq!(a.prr.unwrap().counters(), (10_000, 1000, 500));
+        // One packet of credit is one segment of the new SMSS.
+        assert_eq!(outputs(&mut a, 50, base), vec![(0, 250)]);
+        assert_eq!(a.prr.unwrap().counters(), (10, 1, 1));
         inject(&mut a, 51, seq, base, ACK, window, &[]);
-        assert_eq!(a.prr.unwrap().counters(), (10_000, 1250, 500));
-        assert_eq!(a.prr.unwrap().credit(), 125);
-        // Keep the old 1000-byte estimate plus the new 250-byte estimate.
+        assert_eq!(a.prr.unwrap().counters(), (10, 2, 1));
+        assert_eq!(a.prr.unwrap().credit(), 1);
+        // The cumulative ACK of the two pieces of the first packet delivers
+        // the hole and eats one duplicate estimate (Linux
+        // tcp_remove_reno_sacks); a partial one delivers no packet.
         for (now, advance) in [(52, 1000), (53, 1250)] {
             inject(
                 &mut a,
@@ -52,10 +55,10 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
                 window,
                 &[],
             );
-            assert_eq!(a.prr.unwrap().counters(), (10_000, 1250, 500));
-            assert_eq!(a.prr.unwrap().credit(), 125);
+            assert_eq!(a.prr.unwrap().counters(), (10, 3, 1));
+            assert_eq!(a.prr.unwrap().credit(), 2);
         }
-        assert_eq!(prr_packet(&mut a, 53).1, 125);
+        assert_eq!(prr_packet(&mut a, 53).1, 250);
 
         let mut a = rack_flight(iss);
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
@@ -65,13 +68,13 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
         assert_eq!(a.prr.unwrap().counters(), before.counters());
         assert_eq!(a.prr.unwrap().credit(), before.credit());
         strict_ack(&mut a, 200_001, 1000, &[(7000, 10_000)]);
-        assert_eq!(a.prr.unwrap().counters(), (10_000, 4000, 1000));
-        assert_eq!(a.prr.unwrap().credit(), 3250); // 3000 bytes plus SafeACK's new MSS.
+        assert_eq!(a.prr.unwrap().counters(), (10, 4, 1));
+        assert_eq!(a.prr.unwrap().credit(), 4); // 3 packets plus SafeACK's.
         let base = a.snd_una;
         let ranges = outputs(&mut a, 200_001, base);
-        assert!(ranges.iter().all(|&(_, len)| len <= 250));
-        assert_eq!(ranges.iter().map(|&(_, len)| len).sum::<usize>(), 3250);
-        assert_eq!(a.prr.unwrap().counters(), (10_000, 4000, 4250));
+        assert!(ranges.iter().all(|&(_, len)| len == 250));
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(a.prr.unwrap().counters(), (10, 4, 5));
         assert_eq!(a.prr.unwrap().credit(), 0);
 
         let mut a = rack_flight(iss);
@@ -83,10 +86,11 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
         assert_eq!(a.prr.unwrap().counters(), before.counters());
         assert_eq!(a.prr.unwrap().credit(), before.credit());
         // Isolate the forced-first equation, then exercise real output/rollback.
-        a.prr.as_mut().unwrap().acknowledge(1, 5000, 5000, false);
-        assert_eq!(a.prr.unwrap().credit(), 250);
+        a.prr.as_mut().unwrap().acknowledge(1, 5, 5, false);
+        assert_eq!(a.prr.unwrap().credit(), 1);
         assert_eq!(prr_packet(&mut a, 225_000).1, 250);
-        a.prr.as_mut().unwrap().acknowledge(1, 6000, 5000, false);
+        // ceil(2 * 4 / 9) - 1 = 0.
+        a.prr.as_mut().unwrap().acknowledge(1, 6, 4, false);
         assert_eq!(a.prr.unwrap().credit(), 0);
         let base = a.snd_una;
         assert!(outputs(&mut a, 225_000, base).is_empty());
@@ -104,7 +108,7 @@ fn active_prr_mss_lowering_preserves_bytes_and_updates_allowances() {
 //# The slow start and congestion avoidance algorithms MUST be used by a TCP sender to control the amount of outstanding data being injected into the network.
 //= https://www.rfc-editor.org/rfc/rfc5681#section-3
 //= type=test
-//= reason=Policy-specific output bounds, not an unconditional waiver: ordinary min(rwnd,cwnd), controlled Limited Transmit extension, RFC6675 pipe, RFC9937 PRR byte credit, RFC8985 modified recovery and single accounted TLP probe. Shrink allows only prescribed old-data retry/probe exceptions. Literal half-flight segments-per-RTT is separately unresolved.
+//= reason=Policy-specific output bounds, not an unconditional waiver: ordinary min(rwnd,cwnd), controlled Limited Transmit extension, RFC6675 pipe, RFC9937 PRR packet credit, RFC8985 modified recovery and single accounted TLP probe. Shrink allows only prescribed old-data retry/probe exceptions. Literal half-flight segments-per-RTT is separately unresolved.
 //# In some situations, it may be beneficial for a TCP sender to be more conservative than the algorithms allow; however, a TCP MUST NOT be more aggressive than the following algorithms allow (that is, MUST NOT send data when the value of cwnd computed by the following algorithms would not allow the data to be sent).
 //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
 //= type=test
@@ -243,7 +247,7 @@ fn selected_recovery_output_policy_matrix() {
             outputs(&mut a, 200_000, base),
             vec![(0, 1000), (1000, 1000), (2000, 1000)]
         );
-        assert_eq!(a.prr.unwrap().counters(), (10_000, 3000, 3000));
+        assert_eq!(a.prr.unwrap().counters(), (10, 3, 3));
 
         // Timer-driven RACK entry admits one repair without inventing ACK delivery.
         let mut a = rack_flight(iss);
@@ -251,11 +255,11 @@ fn selected_recovery_output_policy_matrix() {
         strict_ack(&mut a, 200_000, 0, &[(7000, 8000)]);
         a.timeout(225_000).unwrap();
         assert_eq!(outputs(&mut a, 225_000, base), vec![(0, 1000)]);
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 1000));
+        assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
         strict_ack(&mut a, 226_000, 0, &[(7000, 9000)]);
-        assert_eq!(a.prr.unwrap().credit(), 1000);
+        assert_eq!(a.prr.unwrap().credit(), 1);
         assert_eq!(outputs(&mut a, 226_000, base), vec![(1000, 1000)]);
-        assert_eq!(a.prr.unwrap().counters(), (9000, 1000, 2000));
+        assert_eq!(a.prr.unwrap().counters(), (9, 1, 2));
         strict_ack(&mut a, 227_000, 0, &[(7000, 9000)]);
         assert_eq!(outputs(&mut a, 227_000, base), vec![]);
     }
@@ -447,7 +451,7 @@ fn half_flight_segment_output_observations() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
 //= type=test
-//= reason=Real advancing ACK with fresh SACK evidence marks loss through both RACK and RFC6675; independently calculated credit excludes the extra SMSS, without target clipping; the rescue counterpart independently proves genuine safe advancement grants it.
+//= reason=Real advancing ACK with fresh SACK evidence marks loss through both RACK and RFC6675; independently calculated packet credit excludes the extra packet, without target clipping; the rescue counterpart independently proves genuine safe advancement grants it.
 //# SafeACK = (SND.UNA advances and no further loss indicated)
 fn rfc9937_safe_ack_advancing_new_loss_denies_extra_smss() {
     for iss in [0, u32::MAX - 4999] {
@@ -460,19 +464,21 @@ fn rfc9937_safe_ack_advancing_new_loss_denies_extra_smss() {
             assert_eq!(a.snd_una, base.wrapping_add(500));
             assert!(a.rack.counts().lost > 0);
             assert!(!a.retx_pending);
-            assert_eq!(a.prr.unwrap().counters(), (10_000, 3500, 0));
+            assert_eq!(a.prr.unwrap().counters(), (10, 3, 0));
             assert_eq!(a.sack_recovery.unwrap().pipe, 0);
+            assert_eq!(a.prr_in_flight(), 0);
             assert_eq!(a.congestion.ssthresh(), 4750);
-            // DeliveredData = 500 cumulative + 3000 newly SACKed.
-            // Unsafe: min(4750 - 0, max(3500 - 0, 3500)) = 3500.
-            // Safe would grant 4500: neither target nor entry floor hides SMSS.
-            assert_eq!(a.prr.unwrap().credit(), 3500);
-            assert_eq!(a.congestion.cwnd(), 3500);
+            // DeliveredData = 3 newly SACKed packets; the 500 cumulative
+            // bytes complete none. Target: 4750 bytes hold 4 packets.
+            // Unsafe: min(4 - 0, max(3 - 0, 3)) = 3.
+            // Safe would grant 4: neither target nor entry floor hides it.
+            assert_eq!(a.prr.unwrap().credit(), 3);
+            assert_eq!(a.congestion.cwnd(), 3000);
             assert_eq!(
                 outputs(&mut a, 200_000, base),
-                vec![(500, 500), (1000, 1000), (2000, 1000), (3000, 1000)]
+                vec![(500, 500), (1000, 1000), (2000, 1000)]
             );
-            assert_eq!(a.prr.unwrap().counters(), (10_000, 3500, 3500));
+            assert_eq!(a.prr.unwrap().counters(), (10, 3, 3));
             assert_eq!(a.prr.unwrap().credit(), 0);
         }
     }
@@ -481,7 +487,7 @@ fn rfc9937_safe_ack_advancing_new_loss_denies_extra_smss() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
 //= type=test
-//= reason=Real RFC6675 retransmissions establish HighRxt and RescueRxt; an advancing ACK with no new loss indicates a tail rescue and denies an extra SMSS. Identical flight with queued new data instead grants the safe bonus; independent byte equations and parsed output distinguish them.
+//= reason=Real RFC6675 retransmissions establish HighRxt and RescueRxt; an advancing ACK with no new loss indicates a tail rescue and denies an extra SMSS. Identical flight with queued new data instead grants the safe bonus; independent packet equations and parsed output distinguish them.
 //# SafeACK = (SND.UNA advances and no further loss indicated)
 fn rfc9937_safe_ack_advancing_rescue_denies_extra_smss() {
     for iss in [0, u32::MAX - 4999] {
@@ -490,69 +496,53 @@ fn rfc9937_safe_ack_advancing_rescue_denies_extra_smss() {
             a.config.rack = false;
             let base = a.snd_una;
             let sacks = [(5000, 8000), (9500, 10_000)];
-            strict_ack(&mut a, 200_000, 0, &sacks);
-            assert_eq!(
-                outputs(&mut a, 200_000, base),
-                vec![(0, 1000), (1000, 1000), (2000, 1000), (3000, 500)]
-            );
-            strict_ack(&mut a, 201_000, 1000, &sacks);
-            assert_eq!(
-                outputs(&mut a, 201_000, base),
-                vec![(3500, 500), (4000, 500)]
-            );
-            strict_ack(&mut a, 202_000, 2000, &sacks);
-            assert_eq!(
-                outputs(&mut a, 202_000, base),
-                vec![(4500, 500), (8000, 500)]
-            );
-            strict_ack(&mut a, 203_000, 3000, &sacks);
-            assert_eq!(
-                outputs(&mut a, 203_000, base),
-                vec![(8500, 500), (9000, 500)]
-            );
+            // Each ACK delivers one more packet and PRR admits one whole
+            // repair: lost holes first, then the speculative ones above
+            // HighRxt, the last only 500 bytes long.
+            for (ack, sent) in [
+                (0, vec![(0, 1000), (1000, 1000), (2000, 1000)]),
+                (1000, vec![(3000, 1000)]),
+                (2000, vec![(4000, 1000)]),
+                (3000, vec![(8000, 1000)]),
+                (4000, vec![(9000, 500)]),
+            ] {
+                let now = 200_000 + u64::from(ack);
+                strict_ack(&mut a, now, ack, &sacks);
+                assert_eq!(outputs(&mut a, now, base), sent);
+            }
             let recovery = a.sack_recovery.unwrap();
             assert!(!recovery.entry_pending);
             assert_eq!(recovery.high_rxt, base.wrapping_add(9500));
             assert_eq!(recovery.rescue_rxt, Some(base.wrapping_add(1000)));
-            assert_eq!(recovery.pipe, 5000);
-            assert_eq!(a.prr.unwrap().counters(), (10_000, 6500, 6500));
-            assert_eq!(a.rack.counts().lost, 2); // Original lost head, cleared by the ACK.
+            assert_eq!(a.prr.unwrap().counters(), (10, 7, 7));
             assert!(!a.retx_pending);
             if new_data {
                 a.write(&[0x66; 4000]).unwrap();
             }
-            // Cumulative ACK trims 3000 previously SACKed bytes and delivers
-            // 2000 lost/retransmitted + 1000 speculatively retransmitted bytes.
-            // It creates no loss; the only remaining hole is [9000,9500),
-            // below HighRxt, and HighACK has passed the entry RescueRxt.
-            rack_sack(&mut a, 204_000, 9000, &[(9500, 10_000)]);
+            // Cumulative ACK trims previously SACKed packets and delivers
+            // the repaired and speculatively retransmitted ones. It creates
+            // no loss; the only remaining hole is [9000,9500), below
+            // HighRxt, and HighACK has passed the entry RescueRxt.
+            rack_sack(&mut a, 205_000, 9000, &[(9500, 10_000)]);
             assert_eq!(a.snd_una, base.wrapping_add(9000));
             assert_eq!(a.rack.counts().lost, 0);
             assert!(!a.retx_pending);
-            assert_eq!(a.prr.unwrap().counters(), (10_000, 9500, 6500));
-            assert_eq!(a.sack_recovery.unwrap().pipe, 1000);
+            assert_eq!(a.prr.unwrap().counters(), (10, 9, 7));
+            assert_eq!(a.prr_in_flight(), 2);
             assert_eq!(a.congestion.ssthresh(), 5000);
-            // Unsafe: min(5000 - 1000, max(9500 - 6500, 3000)) = 3000.
-            // Safe, when NextSeg can send new data instead: 3000 + SMSS = 4000.
-            let credit = if new_data { 4000 } else { 3000 };
+            // Unsafe: min(5 - 2, max(9 - 7, 2)) = 2 packets.
+            // Safe, when NextSeg can send new data instead: one more.
+            let credit = if new_data { 3 } else { 2 };
             assert_eq!(a.prr.unwrap().credit(), credit);
-            assert_eq!(a.congestion.cwnd(), 1000 + credit);
-            let sent = outputs(&mut a, 204_000, base);
+            assert_eq!(a.congestion.cwnd(), (2 + credit) * 1000);
+            let sent = outputs(&mut a, 205_000, base);
             if new_data {
-                assert_eq!(
-                    sent,
-                    vec![
-                        (10_000, 1000),
-                        (11_000, 1000),
-                        (12_000, 1000),
-                        (13_000, 1000)
-                    ]
-                );
+                assert_eq!(sent, vec![(10_000, 1000), (11_000, 1000), (12_000, 1000)]);
                 assert_eq!(a.prr.unwrap().credit(), 0);
                 assert_eq!(a.sack_recovery.unwrap().rescue_rxt, recovery.rescue_rxt);
             } else {
                 assert_eq!(sent, vec![(9000, 500)]);
-                assert_eq!(a.prr.unwrap().credit(), 2500);
+                assert_eq!(a.prr.unwrap().credit(), 1);
                 assert_eq!(a.sack_recovery.unwrap().high_rxt, recovery.high_rxt);
                 assert_eq!(
                     a.sack_recovery.unwrap().rescue_rxt,
@@ -671,10 +661,10 @@ fn pacing_recovery_budget_exit_and_control() {
         a.config.rack = rack;
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
         let before = a.prr.unwrap();
-        assert!(before.credit() >= 1000);
+        assert!(before.credit() >= 2);
         let first = prr_packet(&mut a, 200_000);
         assert_eq!(first.1, 1000);
-        assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 1000);
+        assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 1);
         let deadline = a.pacing_deadline.unwrap();
         let snapshot = a.prr.unwrap().counters();
         assert!(a.transmit(200_000, &mut [0; 1500]).unwrap().is_none());
@@ -706,7 +696,7 @@ fn pacing_recovery_budget_exit_and_control() {
         assert!(a.retx_pending);
         assert_eq!(a.prr.unwrap().counters(), snapshot);
         let sent = prr_packet(&mut a, deadline).1;
-        assert!(sent as u32 <= before.credit() - 1000);
+        assert!(sent <= a.mss && before.credit() >= 2);
         assert!(!a.retx_pending);
         let exit_deadline = a.pacing_deadline.unwrap();
         a.write(&[0x55; 6000]).unwrap();
@@ -859,19 +849,25 @@ fn pacing_no_sack_retries_with_default_policy() {
     for _ in 0..3 {
         inject(&mut a, now, seq, una, ACK, window, &[]);
     }
-    assert_eq!(a.prr.unwrap().counters(), (10_000, 1000, 0));
-    assert_eq!(a.prr.unwrap().credit(), 500);
-    assert_eq!(prr_packet(&mut a, now).1, 500);
+    assert_eq!(a.prr.unwrap().counters(), (10, 1, 0));
+    assert_eq!(a.prr.unwrap().credit(), 1);
+    assert_eq!(prr_packet(&mut a, now).1, 1000);
     let deadline = a.pacing_deadline.unwrap();
-    // Further delivered-byte estimates grant credit, but not elapsed time.
-    inject(&mut a, now, seq, una, ACK, window, &[]);
+    // The lost head went whole; queue new data for the next credit.
+    a.write(&[0x66; 1000]).unwrap();
+    // Further delivery estimates grant credit, but not elapsed time. Three
+    // more duplicates bring inflight 9 - 6 = 4 below the 5-packet target,
+    // where CRB admits one packet.
+    for _ in 0..3 {
+        inject(&mut a, now, seq, una, ACK, window, &[]);
+    }
     let counters = a.prr.unwrap().counters();
     let credit = a.prr.unwrap().credit();
     assert!(credit != 0);
     assert!(a.transmit(now, &mut [0; 1500]).unwrap().is_none());
     assert!(a.transmit(deadline - 1, &mut [0; 1500]).unwrap().is_none());
     assert_eq!(a.prr.unwrap().counters(), counters);
-    assert!(prr_packet(&mut a, deadline).1 as u32 <= credit);
+    assert_eq!(prr_packet(&mut a, deadline).1, 1000);
 }
 
 #[test]
@@ -908,7 +904,7 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
             }
             rack_sack(&mut a, 20_000, 0, &[(1000, 3000), (8000, 9000)]);
             // Earlier ACKs' 2 MSS do not belong to this recovery episode.
-            assert_eq!(a.prr.unwrap().counters(), (8000, 1000, 0));
+            assert_eq!(a.prr.unwrap().counters(), (8, 1, 0));
             assert_eq!(a.congestion.ssthresh(), 7000);
             assert_eq!(a.rack.counts().lost, 6);
             assert_eq!(a.rack.pipe(), 1000); // Only the unsacked tail is in flight.
@@ -919,14 +915,14 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
                 Some((base.wrapping_add(3000), base.wrapping_add(4000)))
             );
 
-            // Partial cumulative ACK: 4000 deltaUNA - 2000 old SACK = 2000
+            // Partial cumulative ACK: 4 packets deltaUNA - 2 old SACKed = 2
             // DeliveredData. Outstanding holes [4000,8000) were already lost.
             rack_sack(&mut a, ack_time, 4000, &[(8000, 9000)]);
             assert_eq!(a.snd_una, base.wrapping_add(4000));
             assert!(!a.retx_pending);
-            assert_eq!(a.prr.unwrap().counters(), (8000, 3000, 1000));
+            assert_eq!(a.prr.unwrap().counters(), (8, 3, 1));
             let new_loss = ack_time == 32_000;
-            let credit = if new_loss { 2000 } else { 3000 };
+            let credit = if new_loss { 2 } else { 3 };
             assert_eq!(a.rack.counts().lost, if new_loss { 5 } else { 4 });
             assert_eq!(a.rack.pipe(), if new_loss { 0 } else { 1000 });
             assert_eq!(a.sack_recovery.unwrap().pipe, a.rack.pipe());
@@ -934,12 +930,12 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
             // 10ms). RFC8985's timestamp ordering makes the 10ms tail eligible,
             // despite its higher sequence number: 10 + 12 + 2.5 < 32ms.
             // This is NEW loss, not the old pending holes. RFC9937 requires
-            // min(7000 - 0, max(3000 - 1000, 2000)) = 2000, without SafeACK.
+            // min(7 - 0, max(3 - 1, 2)) = 2 packets, without SafeACK.
             // At 28ms the retry sample is ambiguous (8ms < minRTT); the tail
-            // remains in flight. With no new loss SafeACK adds one MSS:
-            // min(7000 - 1000, max(3000 - 1000, 2000) + 1000) = 3000.
+            // remains in flight. With no new loss SafeACK adds one packet:
+            // min(7 - 1, max(3 - 1, 2) + 1) = 3.
             assert_eq!(a.prr.unwrap().credit(), credit);
-            assert_eq!(a.congestion.cwnd(), a.rack.pipe() + credit);
+            assert_eq!(a.congestion.cwnd(), a.rack.pipe() + credit * 1000);
             let before = a.prr.unwrap();
             assert_eq!(
                 a.transmit(ack_time, &mut [0; 20]),
@@ -949,7 +945,7 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
             assert_eq!(a.prr.unwrap().credit(), credit);
             assert_eq!(
                 outputs(&mut a, ack_time, base),
-                (0..credit / 1000)
+                (0..credit)
                     .map(|i| (4000 + i * 1000, 1000))
                     .collect::<Vec<_>>()
             );
@@ -960,11 +956,14 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
             assert_eq!(a.prr.unwrap().counters(), before);
             assert_eq!(a.prr.unwrap().credit(), 0);
             assert!(outputs(&mut a, ack_time, base).is_empty());
-            // Fresh SACK-only delivery earns one MSS, never the SafeACK bonus.
+            // Fresh SACK-only delivery earns one packet, never the SafeACK bonus.
             rack_sack(&mut a, ack_time, 4000, &[(8000, 10_000)]);
-            assert_eq!(a.prr.unwrap().counters(), (8000, 4000, before.2));
-            assert_eq!(a.prr.unwrap().credit(), 1000);
-            assert_eq!(outputs(&mut a, ack_time, base), vec![(4000 + credit, 1000)]);
+            assert_eq!(a.prr.unwrap().counters(), (8, 4, before.2));
+            assert_eq!(a.prr.unwrap().credit(), 1);
+            assert_eq!(
+                outputs(&mut a, ack_time, base),
+                vec![(4000 + credit * 1000, 1000)]
+            );
             assert_eq!(a.prr.unwrap().credit(), 0);
         }
     }
@@ -981,13 +980,13 @@ fn cubic_prr_safe_ack_known_loss_vs_new_tail_loss_wire() {
 //# congestion response per the aforementioned principle in [RFC5681].
 //= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
 //= type=test
-//= reason=Lost retransmission leaves RecoverFS at 10000, accumulated delivery at 9000 and output at 8000 before committing more bytes, including wrapped sequence space.
+//= reason=Lost retransmission leaves RecoverFS at 10 packets, accumulated delivery at 9 and output at 8 before committing more, including wrapped sequence space.
 //# Upon entering fast
 //# recovery, PRR initializes RecoverFS, and RecoverFS remains constant
 //# during a given fast recovery episode.
 //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
 //= type=test
-//= reason=SACK-only lost-copy ACK uses CRB without a SafeACK bonus; credit is exactly 2000, not 900 after an erroneous second reduction. Parsed wire emits a 1000-byte retry and 1000 fresh bytes; failed output preserves state. Advancing fresh-loss denial is covered separately by rfc9937_safe_ack_advancing_new_loss_denies_extra_smss.
+//= reason=SACK-only lost-copy ACK uses CRB without a SafeACK bonus; credit is exactly 2 packets, not fewer after an erroneous second reduction. Parsed wire emits a 1000-byte retry and 1000 fresh bytes; failed output preserves state. Advancing fresh-loss denial is covered separately by rfc9937_safe_ack_advancing_new_loss_denies_extra_smss.
 //# SafeACK = (SND.UNA advances and no further loss indicated)
 fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
     for iss in [0, u32::MAX - 4999] {
@@ -1039,7 +1038,7 @@ fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
         ] {
             rack_sack(&mut a, now, ack, &[(lo, hi)]);
             if now == 44_000 {
-                assert_eq!(a.prr.unwrap().counters(), (10_000, 7000, 6000));
+                assert_eq!(a.prr.unwrap().counters(), (10, 7, 6));
                 assert_eq!(
                     (
                         a.congestion.cwnd(),
@@ -1047,11 +1046,11 @@ fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
                         a.rack.pipe(),
                         a.prr.unwrap().credit()
                     ),
-                    (7000, 7000, 5000, 2000)
+                    (7000, 7000, 5000, 2)
                 );
             }
             if now == 46_000 {
-                assert_eq!(a.prr.unwrap().counters(), (10_000, 9000, 8000));
+                assert_eq!(a.prr.unwrap().counters(), (10, 9, 8));
                 assert_eq!(
                     (
                         a.congestion.cwnd(),
@@ -1059,7 +1058,7 @@ fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
                         a.rack.pipe(),
                         a.prr.unwrap().credit()
                     ),
-                    (6000, 7000, 4000, 2000)
+                    (6000, 7000, 4000, 2)
                 );
                 assert_eq!(
                     a.rack.lowest_lost(1000),
@@ -1075,7 +1074,7 @@ fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
                     ),
                     (15, 10, 1, 0)
                 );
-                // CRB: min(7000 - 4000, max(9000 - 8000, 2000)) = 2000;
+                // CRB: min(7 - 4, max(9 - 8, 2)) = 2 packets;
                 // this loss-indicating ACK receives no SafeACK bonus.
                 let before = (
                     a.transport_info(),
@@ -1090,7 +1089,7 @@ fn rfc9937_cubic_lost_retransmission_preserves_target_credit_and_wire() {
             }
             assert_eq!(outputs(&mut a, now, base), expected);
             if now == 46_000 {
-                assert_eq!(a.prr.unwrap().counters(), (10_000, 9000, 10_000));
+                assert_eq!(a.prr.unwrap().counters(), (10, 9, 10));
                 assert_eq!((a.rack.pipe(), a.prr.unwrap().credit()), (6000, 0));
                 assert_eq!(a.congestion.ssthresh(), 7000);
             }
@@ -1975,9 +1974,9 @@ fn eor_final_payload_fin_respects_window_cwnd_and_prr_admission() {
         (6, false, None), // Only a prefix fits.
         (8, false, None), // Payload fits but FIN does not.
         (64, true, None), // Reduced cwnd admits payload, not payload + FIN.
+        // No PRR credit. One packet of it would admit payload and FIN
+        // together, as one segment.
         (64, false, Some(0)),
-        (64, false, Some(2)),
-        (64, false, Some(4)),
     ] {
         let (mut a, _) = pair(config(64, 8), 100);
         a.write_with_options(b"abcd", false, true).unwrap();
@@ -1990,7 +1989,7 @@ fn eor_final_payload_fin_respects_window_cwnd_and_prr_admission() {
             assert_eq!(a.congestion.cwnd(), 8);
         }
         if let Some(credit) = prr_credit {
-            let mut prr = Prr::new(a.flight(), a.mss as u32);
+            let mut prr = Prr::new(a.rack.diagnostic_packet_counts().unacked);
             prr.acknowledge(credit, 0, 8, false);
             assert_eq!(prr.credit(), credit);
             a.prr = Some(prr);
@@ -2256,7 +2255,8 @@ fn eor_cork_flush_does_not_bypass_cwnd_or_prr_credit_and_tlp_respects_boundary()
             .all(|&(offset, len)| !(offset < 300 && offset + len as u32 > 300
                 || offset < 1000 && offset + len as u32 > 1000))
     );
-    assert!(ranges.iter().map(|&(_, n)| n).sum::<usize>() <= credit as usize);
+    // One packet per credit: the short EOR records each take one.
+    assert_eq!(ranges.len(), credit as usize);
     assert_eq!(a.transmit(200_000, &mut [0; 1500]), Ok(None));
 
     let (mut a, _) = tlp_baseline_pair(u32::MAX - 999);
@@ -2573,7 +2573,7 @@ fn general_pacing_recovery_control_and_hystart() {
         strict_ack(&mut a, 200_000, 0, &[(7000, 10_000)]);
         let before = a.prr.unwrap();
         assert_eq!(prr_packet(&mut a, 200_000).1, 1000);
-        assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 1000);
+        assert_eq!(a.prr.unwrap().counters().2, before.counters().2 + 1);
         let deadline = a.pacing_deadline.unwrap();
         let debt = a.pacer;
         let credit = a.prr.unwrap().counters();

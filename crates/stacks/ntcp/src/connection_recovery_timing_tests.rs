@@ -139,7 +139,7 @@ fn retransmit_delay_characterization() {
             if !sack {
                 assert_eq!(a.duplicate_acks, 3);
                 assert!(a.congestion.in_fast_recovery());
-                assert_eq!(a.prr.unwrap().counters(), (5840, 1460, 1460));
+                assert_eq!(a.prr.unwrap().counters(), (4, 1, 1));
             }
             let mut events: Vec<(u64, Vec<(u32, u32)>)> =
                 [25_000, 27_000, 30_000, 40_000, 100_000, 200_000]
@@ -186,7 +186,7 @@ fn retransmit_delay_characterization() {
                     assert!(a.congestion.in_recovery());
                     assert_eq!(a.rack.counts().lost, if shift { 7 } else { 3 });
                     let p = a.prr.unwrap();
-                    assert_eq!(p.counters(), (if shift { 9000 } else { 3000 }, 0, 1000));
+                    assert_eq!(p.counters(), (if shift { 9 } else { 3 }, 0, 1));
                     assert_eq!(p.credit(), 0);
                     assert!(!a.sack_recovery.unwrap().entry_pending);
                 }
@@ -244,8 +244,8 @@ fn timer_sender(scale: u64, iss: u32) -> Connection {
     assert!(a.prr.is_none());
     a.timeout(225_000 * scale).unwrap();
     assert_eq!(a.rack.counts().lost, 7);
-    assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
-    assert_eq!(a.prr.unwrap().credit(), 1000);
+    assert_eq!(a.prr.unwrap().counters(), (9, 0, 0));
+    assert_eq!(a.prr.unwrap().credit(), 1);
     assert_eq!(a.rack.pipe(), 2000);
     assert_eq!(a.congestion.cwnd(), 3000);
     assert_eq!(a.congestion.recovery_target(), 5000);
@@ -266,12 +266,12 @@ fn timer_repair_failed_selection_short_commit_and_episode_end() {
             assert_eq!(a.transmit(now, &mut [0; 1500]), Ok(None));
             a.snd_wnd = 65_535;
             assert_eq!(a.prr.unwrap().counters(), before.counters());
-            assert_eq!(a.prr.unwrap().credit(), 1000);
+            assert_eq!(a.prr.unwrap().credit(), 1);
             assert_eq!(a.sack_recovery.unwrap().high_rxt, recovery.high_rxt);
             assert!(a.sack_recovery.unwrap().entry_pending);
             strict_ack(&mut a, now + scale, 0, &[(7000, 8000)]);
-            assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
-            assert_eq!(a.prr.unwrap().credit(), 1000); // Zero ACK preserves, not mints.
+            assert_eq!(a.prr.unwrap().counters(), (9, 0, 0));
+            assert_eq!(a.prr.unwrap().credit(), 1); // Zero ACK preserves, not mints.
             a.config.send_ip_payload_limit = 270;
             let bytes = packet(&mut a, now + scale);
             let segment = wire::parse(ip(tuple()), &bytes).unwrap();
@@ -279,8 +279,8 @@ fn timer_repair_failed_selection_short_commit_and_episode_end() {
                 (segment.header.sequence, segment.payload.len()),
                 (iss.wrapping_add(1), 250)
             );
-            assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
-            assert_eq!(a.prr.unwrap().credit(), 0); // A short repair consumes admission.
+            assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
+            assert_eq!(a.prr.unwrap().credit(), 0); // A short repair is a whole packet.
             assert!(!a.sack_recovery.unwrap().entry_pending);
             assert_eq!(a.congestion.cwnd(), 3000);
             assert_eq!(a.congestion.recovery_target(), 5000);
@@ -289,10 +289,10 @@ fn timer_repair_failed_selection_short_commit_and_episode_end() {
                 a.timeout(now + i * scale).unwrap();
                 strict_ack(&mut a, now + i * scale, 0, &[(7000, 8000)]);
                 assert_eq!(a.transmit(now + i * scale, &mut [0; 1500]), Ok(None));
-                assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
+                assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
                 assert_eq!(a.prr.unwrap().credit(), 0);
             }
-            assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
+            assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
             strict_ack(&mut a, now + 5 * scale, 10_000, &[]);
             assert!(a.prr.is_none() && a.sack_recovery.is_none());
             assert_eq!(a.congestion.cwnd(), 5000);
@@ -321,26 +321,28 @@ fn timer_repair_reservation_charges_only_accepted_fragments() {
         let n = a.transmit_selected(now, &mut bytes, true).unwrap().unwrap();
         let segment = wire::parse(ip(tuple()), &bytes[..n]).unwrap();
         assert_eq!((segment.header.sequence, segment.payload.len()), (1, 1000));
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
-        assert_eq!(a.prr.unwrap().credit(), 1000);
+        assert_eq!(a.prr.unwrap().counters(), (9, 0, 0));
+        assert_eq!(a.prr.unwrap().credit(), 1);
         a.reject_reserved_output(); // Immutable selection remains owned for retry.
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
-        assert_eq!(a.prr.unwrap().credit(), 1000);
+        assert_eq!(a.prr.unwrap().counters(), (9, 0, 0));
+        assert_eq!(a.prr.unwrap().credit(), 1);
         let mut d = a.last_departure.unwrap();
         assert_eq!(
             a.accept_reserved_output(now - 1, &mut d, 0, 250, false),
             Err(Error::TimeWentBackwards)
         );
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
+        assert_eq!(a.prr.unwrap().counters(), (9, 0, 0));
         a.accept_reserved_output(now + scale, &mut d, 0, 250, false)
             .unwrap();
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
-        assert_eq!(a.prr.unwrap().credit(), 750);
+        // The first accepted fragment takes the timer's one packet; the
+        // rest of the same selected repair charges nothing more.
+        assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
+        assert_eq!(a.prr.unwrap().credit(), 0);
         a.reject_reserved_output();
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 250));
+        assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
         a.accept_reserved_output(now + 2 * scale, &mut d, 250, 750, true)
             .unwrap();
-        assert_eq!(a.prr.unwrap().counters(), (9000, 0, 1000));
+        assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
         assert_eq!(a.prr.unwrap().credit(), 0);
         assert_eq!(a.transmit(now + 2 * scale, &mut bytes), Ok(None));
         strict_ack(&mut a, now + 3 * scale, 0, &[(7000, 8000)]);
@@ -349,30 +351,34 @@ fn timer_repair_reservation_charges_only_accepted_fragments() {
 }
 
 #[test]
-fn timer_repair_respects_pipe_and_pacing_and_cannot_repeat_on_active_timer() {
+fn timer_repair_is_one_packet_over_pipe_respects_pacing_and_cannot_repeat_on_active_timer() {
+    // Linux's tcp_rack_reo_timeout calls tcp_cwnd_reduction(sk, 1, ..):
+    // with prr_out 0 that admits one packet even when inflight is above
+    // the target, so the lost head goes at once.
     let mut a = rack_flight(0);
     rack_sack(&mut a, 200_000, 0, &[(1000, 2000)]);
     a.timeout(225_000).unwrap();
     assert_eq!(a.rack.counts().lost, 1);
-    assert!(a.rack.pipe() >= a.congestion.cwnd());
-    assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
-    assert_eq!(a.prr.unwrap().credit(), 0);
+    assert!(a.prr_in_flight() >= a.prr_target());
+    assert_eq!(a.prr.unwrap().counters(), (9, 0, 0));
+    assert_eq!(a.prr.unwrap().credit(), 1);
+    assert_eq!(prr_packet(&mut a, 225_000), (1, 1000));
     assert_eq!(a.transmit(225_000, &mut [0; 1500]), Ok(None));
 
     let mut a = timer_sender(1, 0);
     a.config.prr_pacing = true;
     a.pacing_deadline = Some(226_000);
     assert_eq!(a.transmit(225_000, &mut [0; 1500]), Ok(None));
-    assert_eq!(a.prr.unwrap().counters(), (9000, 0, 0));
-    assert_eq!(a.prr.unwrap().credit(), 1000);
+    assert_eq!(a.prr.unwrap().counters(), (9, 0, 0));
+    assert_eq!(a.prr.unwrap().credit(), 1);
     assert_eq!(prr_packet(&mut a, 226_000), (1, 1000));
-    assert_eq!(a.prr.unwrap().counters(), (9000, 0, 1000));
+    assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
     // Inject a second timer event without ACK delivery, independently of when
     // the detector would arm it. Active recovery must never re-admit a repair.
     a.rack.deadline = Some(227_000);
     a.loss_timer = Some((LossTimer::Rack, 227_000));
     a.timeout(227_000).unwrap();
-    assert_eq!(a.prr.unwrap().counters(), (9000, 0, 1000));
+    assert_eq!(a.prr.unwrap().counters(), (9, 0, 1));
     assert_eq!(a.prr.unwrap().credit(), 0);
     assert!(!a.start_sack_recovery());
     assert_eq!(a.transmit(227_000, &mut [0; 1500]), Ok(None));
@@ -435,8 +441,8 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
             assert!(a.retx_pending);
             assert!(a.sack_recovery.is_none());
             let p = a.prr.unwrap();
-            assert_eq!(p.counters(), (5840, 1460, 0));
-            assert_eq!(p.credit(), 1460);
+            assert_eq!(p.counters(), (4, 1, 0));
+            assert_eq!(p.credit(), 1);
             assert_eq!(a.rack.counts().lost, 1);
             let emitted = output(&mut a, 300_000);
             let first = emitted.iter().find(|(_, _, len)| *len != 0).unwrap();
@@ -444,7 +450,7 @@ fn no_sack_first_flight_heuristic_and_reno_policy_control() {
             assert_eq!(first.1, base.0);
             assert_eq!(first.2, 1460);
 
-            assert_eq!(a.prr.unwrap().counters().2, first.2 as u64);
+            assert_eq!(a.prr.unwrap().counters().2, 1);
             assert_eq!(a.prr.unwrap().credit(), 0);
         }
     }
@@ -489,15 +495,15 @@ fn initial_heuristic_wire_ack_validation_and_both_handshake_roles() {
                 assert_eq!(a.congestion.ack_history(), history);
                 assert_eq!(a.congestion.in_fast_recovery(), duplicate == 3);
             }
-            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-            assert_eq!(a.prr.unwrap().credit(), 1000);
+            assert_eq!(a.prr.unwrap().counters(), (4, 1, 0));
+            assert_eq!(a.prr.unwrap().credit(), 1);
             // Failed encoding cannot consume PRR credit. Endpoint reservation
             // rejection is separately exercised at its transactional boundary.
             assert_eq!(a.transmit(60, &mut [0; 20]), Err(Error::OutputTooSmall));
-            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 0));
-            assert_eq!(a.prr.unwrap().credit(), 1000);
+            assert_eq!(a.prr.unwrap().counters(), (4, 1, 0));
+            assert_eq!(a.prr.unwrap().credit(), 1);
             assert_eq!(output(&mut a, 60), vec![(60, base.0, 1000)]);
-            assert_eq!(a.prr.unwrap().counters(), (4000, 1000, 1000));
+            assert_eq!(a.prr.unwrap().counters(), (4, 1, 1));
             assert_eq!(a.prr.unwrap().credit(), 0);
             let boundary = a.snd_nxt;
             inject(&mut a, 70, seq, boundary, ACK, 32_000, &[]);
@@ -658,8 +664,8 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
         assert_eq!(repairs, vec![(20_000, 1, 1000)]);
         // Service *all* deadlines in order, including any RACK deadline
         // between the three SACKs and the next scripted cumulative ACK.
-        let recover_fs = 8000;
-        assert_eq!(a.prr.unwrap().counters(), (recover_fs, 1000, 1000));
+        let recover_fs = 8;
+        assert_eq!(a.prr.unwrap().counters(), (recover_fs, 1, 1));
         assert_eq!(a.prr.unwrap().credit(), 0);
         assert_eq!((a.rack.counts().lost, a.rack.counts().sacked), (6, 3));
         assert_eq!(a.sack_recovery.unwrap().high_rxt, Seq(1001));
@@ -679,8 +685,8 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
             &[],
             &[(8001, 9001)],
         );
-        assert_eq!(a.prr.unwrap().counters(), (recover_fs, 3000, 1000));
-        assert_eq!(a.prr.unwrap().credit(), 2000);
+        assert_eq!(a.prr.unwrap().counters(), (recover_fs, 3, 1));
+        assert_eq!(a.prr.unwrap().credit(), 2);
         assert_eq!(a.congestion.recovery_target(), 7000);
         let ledger_delivery = rack_before.acknowledge(
             Seq(4001),
@@ -708,10 +714,10 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
         assert_eq!(rack_before.lowest_lost(1000), Some((Seq(9001), Seq(10001))));
         assert_eq!(rack_before.pipe(), 0);
         // RACK detection reduced pipe: further_loss=true, hence SafeACK=false.
-        // RFC9937: min(7000-0, max(3000-1000,2000)+0) = 2000.
+        // RFC9937: min(7-0, max(3-1,2)+0) = 2 packets.
         let after_ack = output(&mut a, 32_000);
         assert_eq!(after_ack, vec![(32_000, 4001, 1000), (32_000, 5001, 1000)]);
-        assert_eq!(a.prr.unwrap().counters(), (recover_fs, 3000, 3000));
+        assert_eq!(a.prr.unwrap().counters(), (recover_fs, 3, 3));
         assert_eq!(a.prr.unwrap().credit(), 0);
         assert_eq!(a.rack.lowest_lost(1000), Some((Seq(6001), Seq(7001))));
         if continuation != "prefix-only" {
@@ -736,15 +742,15 @@ fn stale_ack_prr_prefix_and_counterfactual_delivery() {
                 );
                 assert_eq!(a.snd_una, una);
                 assert_eq!((a.snd_wnd, a.wl1, a.wl2), window);
-                assert_eq!(a.prr.unwrap().counters().1, p.1 + 2000);
-                assert_eq!(a.prr.unwrap().credit(), 2000);
+                assert_eq!(a.prr.unwrap().counters().1, p.1 + 2);
+                assert_eq!(a.prr.unwrap().credit(), 2);
                 assert_eq!(a.rack.counts().sacked, 3);
                 assert_eq!(
                     output(&mut a, 34_000),
                     vec![(34_000, 7001, 1000), (34_000, 9001, 1000)]
                 );
                 assert_eq!(a.snd_nxt, Seq(10001));
-                assert_eq!(a.prr.unwrap().counters(), (recover_fs, 5000, 5000));
+                assert_eq!(a.prr.unwrap().counters(), (recover_fs, 5, 5));
                 let before = a.prr.unwrap().counters();
                 inject_sack(
                     &mut a,

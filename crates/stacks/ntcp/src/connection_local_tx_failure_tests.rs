@@ -126,7 +126,7 @@ fn local_rack_failure_selection_rejection_acceptance_and_encoding_controls() {
                 a.accept_reserved_output(110_000, &mut departure, 0, 1000, true)
                     .unwrap();
                 let accepted = a.prr.unwrap().counters();
-                assert_eq!(accepted.2, selected.2 + 1000);
+                assert_eq!(accepted.2, selected.2 + 1);
                 assert!(!a.prr.unwrap().timer_repair());
                 inject_sack(
                     &mut a,
@@ -158,12 +158,13 @@ fn local_repair_accepted_prefix_cannot_be_cancelled_or_refund_prr() {
     a.accept_reserved_output(100_000, &mut departure, 0, 500, false)
         .unwrap();
     assert!(!a.cancel_reserved_repair());
-    assert_eq!(a.prr.unwrap().counters().2, 500);
+    // The first accepted fragment takes the repair's one packet.
+    assert_eq!(a.prr.unwrap().counters().2, 1);
     assert_eq!(a.transport_info().retransmitted, 1);
     a.accept_reserved_output(110_000, &mut departure, 500, 500, true)
         .unwrap();
     assert!(!a.cancel_reserved_repair());
-    assert_eq!(a.prr.unwrap().counters().2, 1000);
+    assert_eq!(a.prr.unwrap().counters().2, 1);
     assert!(!a.prr.unwrap().timer_repair());
 }
 
@@ -255,7 +256,8 @@ fn local_repair_cancel_restores_receive_sack_debt_and_partial_retry_history() {
     let mut d = a.last_departure.unwrap();
     a.accept_reserved_output(96_000, &mut d, 0, count, true)
         .unwrap();
-    assert_eq!(a.prr.unwrap().counters().2, count as u64);
+    assert!(count != 0);
+    assert_eq!(a.prr.unwrap().counters().2, 1);
 }
 
 #[test]
@@ -263,9 +265,9 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
     let mut a = local_sender();
     let before = a.prr.unwrap().counters();
     let target = a.congestion.recovery_target();
-    assert_eq!(before, (1000, 0, 0));
+    assert_eq!(before, (1, 0, 0));
     assert_eq!(a.rack.pipe(), 0);
-    assert_eq!(a.prr.unwrap().credit(), 1000);
+    assert_eq!(a.prr.unwrap().credit(), 1);
     assert_eq!((a.congestion.cwnd(), target), (1000, 2000));
     let admission = 1000;
     for at in [90_000, 91_000] {
@@ -279,7 +281,7 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
         assert_eq!(a.transport_info().retransmitted, 0);
         assert!(a.cancel_reserved_repair());
         assert_eq!(a.prr.unwrap().counters(), before);
-        assert_eq!(a.prr.unwrap().credit(), 1000);
+        assert_eq!(a.prr.unwrap().credit(), 1);
         assert_eq!(a.congestion.cwnd(), admission);
         assert_eq!(a.congestion.recovery_target(), target);
         assert_eq!(a.transport_info().reordering_events, 2);
@@ -297,7 +299,7 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
     );
     assert_eq!(a.receive_used, 1000);
     assert_eq!(a.prr.unwrap().counters(), before);
-    assert_eq!(a.prr.unwrap().credit(), 1000);
+    assert_eq!(a.prr.unwrap().credit(), 1);
     assert_eq!(a.congestion.cwnd(), admission);
     let mut bytes = [0; 2048];
     let n = a
@@ -313,7 +315,7 @@ fn rack_timer_prr_window_survives_rejection_and_zero_delivery() {
     let mut departure = a.last_departure.unwrap();
     a.accept_reserved_output(96_000, &mut departure, 0, 1000, true)
         .unwrap();
-    assert_eq!(a.prr.unwrap().counters(), (1000, 0, 1000));
+    assert_eq!(a.prr.unwrap().counters(), (1, 0, 1));
     assert_eq!(a.prr.unwrap().credit(), 0);
     assert_eq!(a.transport_info().retransmitted, 1);
     assert_eq!(a.congestion.recovery_target(), target);

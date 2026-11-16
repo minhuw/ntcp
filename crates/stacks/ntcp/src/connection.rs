@@ -2537,14 +2537,59 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9937#section-3
-    //= reason=Normal output subtracts flight from cwnd; recovery_credit bounds selected recovery by pipe or strict PRR byte credit, with PRR setting cwnd=inflight+SndCnt. RFC9937 section5 recommends RACK-TLP composition: its sole congestion-control exception is one accounted outstanding probe (RFC8985 sections7.3/9.3), not unrestricted recovery. RFC3042 section2 Limited Transmit is separately bounded to two SMSS without changing cwnd. ordinary_output_policy_matrix, selected_recovery_output_policy_matrix and probe_and_shrink_output_policy_matrix assert these distinct policies.
+    //= reason=Normal output subtracts flight from cwnd; recovery_credit bounds selected recovery by pipe or strict PRR packet credit (whole packets of up to SMSS), with PRR setting cwnd=inflight+SndCnt in packets. RFC9937 section5 recommends RACK-TLP composition: its sole congestion-control exception is one accounted outstanding probe (RFC8985 sections7.3/9.3), not unrestricted recovery. RFC3042 section2 Limited Transmit is separately bounded to two SMSS without changing cwnd. ordinary_output_policy_matrix, selected_recovery_output_policy_matrix and probe_and_shrink_output_policy_matrix assert these distinct policies.
     //# At any given time, a connection MUST
     //# NOT send data if inflight (see below) matches or exceeds cwnd.
     fn recovery_credit(&self, recovery: SackRecovery) -> u32 {
         self.prr.map_or_else(
             || self.congestion.cwnd().saturating_sub(recovery.pipe),
-            |prr| prr.credit(),
+            |prr| self.prr_bytes(prr),
         )
+    }
+
+    // PRR admits whole packets: Linux's tcp_cwnd_reduction sets cwnd in
+    // packets, and tcp_xmit_retransmit_queue and tcp_write_xmit send whole
+    // skbs within it. A packet carries up to one SMSS, so a credit of n
+    // admits n segments of any size, never a segment cut to a byte remainder.
+    fn prr_bytes(&self, prr: Prr) -> u32 {
+        prr.credit().saturating_mul(self.mss as u32)
+    }
+
+    // PRR's packets are RACK's transmission units, Linux's skbs: an
+    // original packet, or each piece a repair cut it into, as
+    // tcp_retransmit_skb's tcp_fragment splits an skb. A unit counts as
+    // delivered once all of it is cumulatively acknowledged or SACKed.
+    // Those neither (Linux packets_out - sacked_out) are PRR's RecoverFS,
+    // and the drop in them is an ACK's DeliveredData (tcp_newly_delivered).
+    fn prr_unsacked(&self) -> u32 {
+        let c = self.rack.diagnostic_packet_counts();
+        c.unacked.saturating_sub(c.sacked)
+    }
+
+    // PRR's inflight in packets, Linux's tcp_packets_in_flight:
+    // packets_out - (sacked_out + lost_out) + retrans_out.
+    fn prr_in_flight(&self) -> u32 {
+        let c = self.rack.diagnostic_packet_counts();
+        c.unacked
+            .saturating_sub(c.sacked + c.lost)
+            .saturating_add(c.retransmitted)
+    }
+
+    // PRR's ssthresh in packets, as Linux keeps snd_ssthresh: the packets
+    // that hold the byte target, rounded up. A partly acknowledged or short
+    // packet leaves the byte target a fraction of SMSS above a whole count;
+    // Linux's packet ssthresh still counts that packet, and rounding down
+    // would leave the headroom byte PRR had, but no packet to use it.
+    fn prr_target(&self) -> u32 {
+        self.congestion.recovery_target().div_ceil(self.mss as u32)
+    }
+
+    // cwnd = inflight + SndCnt, in packets (Linux tcp_snd_cwnd_set), as bytes.
+    fn set_prr_window(&mut self, pipe: u32, prr: Prr) {
+        self.congestion.prr_window(
+            pipe.saturating_add(prr.credit())
+                .saturating_mul(self.mss as u32),
+        );
     }
 
     //= https://www.rfc-editor.org/rfc/rfc2018#section-5.1
@@ -2583,21 +2628,6 @@ impl Connection {
     //# the current volume of in-flight data is limited by a congestion
     //# window (cwnd) and the target volume of in-flight data during that
     //# reduction is a fixed value given by ssthresh.
-    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
-    //= reason=Connection selects the congestion target; constructor zeros byte counters. Entry wire traces separately assert the actual target.
-    //# ssthresh = CongCtrlAlg()      // Target flight size in recovery
-    //# prr_delivered = 0             // Total bytes delivered in recovery
-    //# prr_out = 0                   // Total bytes sent in recovery
-    //= https://www.rfc-editor.org/rfc/rfc9937#section-6.1
-    //= reason=Snapshot post-ACK unsacked payload and add current signed delivery, excluding earlier SACKs; exact 9000 RecoverFS/6000 delivery plus wrap and later invariance asserted by independent strict_ack oracle.
-    //# RecoverFS = SND.NXT - SND.UNA
-    //# // Bytes SACKed before entering recovery will not be
-    //# // marked as delivered during recovery:
-    //# RecoverFS -= (bytes SACKed in scoreboard)
-    //# // Include the (common) case of selectively ACKed bytes:
-    //# RecoverFS += (bytes newly SACKed)
-    //# // Include the (rare) case of cumulatively ACKed bytes:
-    //# RecoverFS += (bytes newly cumulatively acknowledged)
     fn start_sack_recovery(&mut self) -> bool {
         let probe = self.pmtud.as_ref().and_then(|p| p.eligible_probe_loss());
         if self.sack_guard.is_some()
@@ -2624,11 +2654,7 @@ impl Connection {
             pipe: self.recovery_pipe(self.snd_una),
         });
         if self.config.prr && self.sack_send && self.rack.valid() {
-            self.prr = Some(Prr::new(
-                self.scoreboard
-                    .unsacked_bytes(self.snd_una, self.data_high()),
-                self.mss as u32,
-            ));
+            self.prr = Some(Prr::new(self.prr_unsacked()));
         }
         self.retx_pending = false;
         self.limited_pending = false;
@@ -3461,7 +3487,7 @@ impl Connection {
             && let Some(prr) = &mut self.prr
             && prr.timer_repair()
         {
-            prr.sent(count as u32);
+            prr.sent(u32::from(count != 0)); // One accepted fragment.
             if finished {
                 prr.finish_timer_repair();
             }
@@ -4367,9 +4393,6 @@ impl Connection {
             self.congestion.set_mss(effective as u32);
         }
         self.cancel_divergent_ecn_prr();
-        if let Some(prr) = &mut self.prr {
-            prr.set_mss(effective as u32);
-        }
         if let Some(mut recovery) = self.sack_recovery {
             recovery.pipe = self.recovery_pipe(recovery.high_rxt);
             self.sack_recovery = Some(recovery);
@@ -7706,8 +7729,7 @@ impl Connection {
         .then(|| {
             (
                 self.snd_nxt,
-                self.scoreboard
-                    .unsacked_bytes(self.snd_una, self.data_high()),
+                self.prr_unsacked(),
                 self.congestion.unsuppressed_cwnd(),
                 self.mss as u32,
             )
@@ -7718,11 +7740,8 @@ impl Connection {
         let prr_was_active = self.prr.is_some();
         let ordinary_prr = prr_was_active && !ecn_prr_was_active && self.sack_recovery.is_none();
         let mut further_loss = false;
-        let delivery_una = self.snd_una;
-        let sackd_before = self.flight()
-            - self
-                .scoreboard
-                .unsacked_bytes(self.snd_una, self.data_high());
+        let unacked_before = self.rack.diagnostic_packet_counts().unacked;
+        let unsacked_before = self.prr_unsacked();
         let mut dsack = false;
         let mut reo_grew = false;
         let tlp_flight = self.data_flight();
@@ -8065,7 +8084,14 @@ impl Connection {
                 self.loss_events.reno_recoveries += 1;
                 self.refresh_work = true;
                 if self.config.prr {
-                    self.prr = Some(Prr::new(self.data_flight(), self.mss as u32));
+                    let mut prr = Prr::new(self.rack.diagnostic_packet_counts().unacked);
+                    if !self.sack_recovery_enabled() {
+                        // This ACK's duplicate is its delivery estimate below.
+                        prr.include_prior_duplicates(
+                            u32::from(self.duplicate_acks).saturating_sub(1),
+                        );
+                    }
+                    self.prr = Some(prr);
                 }
                 self.note_iw_loss(self.snd_una);
                 self.note_probe_loss(self.snd_una, false);
@@ -8100,7 +8126,7 @@ impl Connection {
                 self.congestion.complete_prr();
                 self.prr = None;
             } else {
-                self.prr = Some(Prr::new(flight, self.mss as u32));
+                self.prr = Some(Prr::new(flight));
                 started_ecn_prr = true;
             }
         }
@@ -8111,33 +8137,23 @@ impl Connection {
         //= reason=Current entry ACK is processed; ending ACK clears PRR without running its per-ACK steps, before ordinary output. No deferred causative ACK replay; timer/default trace asserts that separately.
         //# On every ACK starting or during fast recovery, excluding the ACK that
         //# concludes a PRR episode, PRR executes the following steps.
-        //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-        //= reason=Signed scoreboard delta prevents recounting SACKed bytes when cumulative ACK trims them; current advancing entry ACK and wrapped sequence space are asserted. Bare negotiated-SACK duplicates grant no estimates in rfc9937_negotiated_sack_bare_duplicates_do_not_estimate_delivery.
-        //# With SACK, DeliveredData can be computed precisely as the
-        //# change in SND.UNA, plus the signed change in quantity of data marked
-        //# SACKed in the scoreboard.  Thus, in the special case when there are
-        //# no SACKed sequence ranges in the scoreboard before or after the ACK,
-        //# DeliveredData is the change in SND.UNA.
         //= https://www.rfc-editor.org/rfc/rfc9937#section-11.2
         //= reason=No PRR outside response; wire matrix asserts ordinary slow start and avoidance. strict_prr_default_timer_entry_and_current_ack_epoch asserts no pre-entry PRR/delivery replay; exit traces assert ordinary reduced-cwnd handoff.
         //# PRR does not modify
         //# the congestion control cwnd increase or decrease mechanisms outside
         //# of congestion control response episodes.
-        let cumulative_delivery = self.snd_una.distance_from(delivery_una);
         if let Some(mut prr) = self.prr {
-            let sackd_after = self.flight()
-                - self
-                    .scoreboard
-                    .unsacked_bytes(self.snd_una, self.data_high());
+            // Whole packets, as Linux's tcp_newly_delivered: a packet counts
+            // once all of it is cumulatively acknowledged or SACKed.
             let sack_accounting = self.sack_recovery_enabled();
             let delivered = if !sack_accounting {
-                prr.non_sack_delivery(cumulative_delivery, duplicate)
+                let cumulative =
+                    unacked_before.saturating_sub(self.rack.diagnostic_packet_counts().unacked);
+                prr.non_sack_delivery(cumulative, duplicate)
             } else {
-                // Signed delta includes trimming of previously SACKed bytes.
-                let delta = i64::from(cumulative_delivery) + i64::from(sackd_after)
-                    - i64::from(sackd_before);
-                debug_assert!(delta >= 0);
-                delta.max(0) as u32
+                // The drop in unSACKed packets: newly SACKed plus newly
+                // cumulatively acknowledged, less those SACKed before.
+                unsacked_before.saturating_sub(self.prr_unsacked())
             };
             if sack_accounting && !started_ecn_prr && (!prr_was_active || new_response) {
                 prr.include_entry_delivery(delivered);
@@ -8145,9 +8161,11 @@ impl Connection {
             if self.sack_recovery.is_none() && self.retx_pending {
                 self.rack.mark_head_lost();
             }
-            let pipe = self
-                .sack_recovery
-                .map_or_else(|| prr.non_sack_pipe(self.rack.pipe()), |r| r.pipe);
+            let pipe = if self.sack_recovery.is_none() {
+                prr.non_sack_pipe(self.prr_in_flight())
+            } else {
+                self.prr_in_flight()
+            };
             // RFC6675 rescue selection is itself evidence of further loss.
             let rescue_indicated = !self.rack_enabled()
                 && self.sack_recovery.is_some_and(|r| {
@@ -8166,16 +8184,15 @@ impl Connection {
                             .is_some()
                 });
             //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-            //= reason=strict_ack independently checks per-ACK byte window and credit; shrinking nonzero rwnd clips committed output without consuming unsent credit. Normal supported TCP window range is bounded by MAX_WINDOW.
+            //= reason=In packets, as Linux's tcp_snd_cwnd_set(tp, tcp_packets_in_flight(tp) + sndcnt), kept as bytes of SMSS each; strict_ack independently checks per-ACK window and credit; shrinking nonzero rwnd clips committed output without consuming unsent credit. Normal supported TCP window range is bounded by MAX_WINDOW.
             //# cwnd = inflight + SndCnt
             //= https://www.rfc-editor.org/rfc/rfc9937#section-6.2
-            //= reason=Advancing ACKs receive the extra SMSS only when loss detection, pending retransmission and RFC6675 rescue selection indicate no further loss. Real advancing-loss/rescue ACK regressions in connection_output_tests compare the denied bonus against safe advancement and parsed output.
+            //= reason=Advancing ACKs receive the extra packet (Linux FLAG_SND_UNA_ADVANCED && !newly_lost) only when loss detection, pending retransmission and RFC6675 rescue selection indicate no further loss. Real advancing-loss/rescue ACK regressions in connection_output_tests compare the denied bonus against safe advancement and parsed output.
             //# SafeACK = (SND.UNA advances and no further loss indicated)
             let safe_ack = advancing && !further_loss && !self.retx_pending && !rescue_indicated;
-            prr.acknowledge(delivered, pipe, self.congestion.recovery_target(), safe_ack);
+            prr.acknowledge(delivered, pipe, self.prr_target(), safe_ack);
             if delivered != 0 {
-                self.congestion
-                    .prr_window(pipe.saturating_add(prr.credit()));
+                self.set_prr_window(pipe, prr);
             } else if !new_response
                 && !ecn_reduced
                 && let Some(window) = prr_window_before
@@ -10140,7 +10157,7 @@ impl Connection {
         {
             sack_segment = self
                 .rack
-                .lowest_lost((repair_packet_mss as u32).min(prr.credit()))
+                .lowest_lost(repair_packet_mss as u32)
                 .map(|(left, right)| (left, right, false, false));
         }
         // RFC 6675 §5.1 recommends filling the newly reported holes after an
@@ -10262,7 +10279,9 @@ impl Connection {
         {
             seq = left;
             let credit = self.retry_limit(seq, right.distance_from(left));
-            let credit = self.prr.map_or(credit, |prr| credit.min(prr.credit()));
+            let credit = self
+                .prr
+                .map_or(credit, |prr| credit.min(self.prr_bytes(prr)));
             count = self.send.copy(
                 seq.distance_from(self.send_base) as usize,
                 &mut self.scratch[..(right.distance_from(left) as usize)
@@ -10334,7 +10353,7 @@ impl Connection {
                 .min(self.congestion.cwnd())
                 .saturating_sub(start.distance_from(self.snd_una));
             if let Some(prr) = self.prr {
-                credit = credit.min(prr.credit());
+                credit = credit.min(self.prr_bytes(prr));
             } else if let Some(recovery) = self.sack_recovery {
                 credit = credit.min(self.recovery_credit(recovery));
             }
@@ -10397,7 +10416,7 @@ impl Connection {
                 limit
             } else {
                 self.prr
-                    .map_or(limit, |prr| limit.min(prr.credit() as usize))
+                    .map_or(limit, |prr| limit.min(self.prr_bytes(prr) as usize))
             };
             count = self.send.copy(offset, &mut self.scratch[..limit]);
             retransmitted = seq != self.snd_nxt;
@@ -10507,7 +10526,9 @@ impl Connection {
             } else if self.sack_recovery.is_none()
                 && let Some(prr) = self.prr
             {
-                self.snd_wnd.saturating_sub(self.flight()).min(prr.credit()) as usize
+                self.snd_wnd
+                    .saturating_sub(self.flight())
+                    .min(self.prr_bytes(prr)) as usize
             } else if let Some(recovery) = self.sack_recovery {
                 if recovery.entry_pending || self.recovery_credit(recovery) < self.mss as u32 {
                     0
@@ -10803,11 +10824,11 @@ impl Connection {
                 && self.congestion.ecn_prr_end().is_none()
                 && cwnd < self.congestion.ssthresh();
             // Extend only an already-admissible full-sized fresh segment.
-            // Recovery (PRR, RFC 6675 pipe, RACK losses) admits new data from
-            // a byte credit each segment consumes, and sending new data marks
-            // no loss for a repair to take first, so a group within the credit
-            // is what scalar selection sends: Linux likewise sends TSO skbs
-            // within PRR's quota. Repairs retain their separate, immutable
+            // Recovery (PRR's packets, RFC 6675 pipe, RACK losses) admits new
+            // data from a credit each segment consumes, and sending new data
+            // marks no loss for a repair to take first, so a group within the
+            // credit is what scalar selection sends: Linux likewise sends TSO
+            // skbs within PRR's quota. Repairs retain their separate, immutable
             // reservation/undo policy.
             // Keep protocol scratch/MTU unchanged: only the first segment is
             // encoded here; separately reserved storage retains the whole range.
@@ -10883,11 +10904,14 @@ impl Connection {
                 };
                 let record = self.send.record_len(offset, bounded);
                 // Each segment of the group becomes its own ledger entry.
+                // PRR's credit is packets: one per segment, whatever SMSS
+                // its byte form allows past option space.
                 let limit = buffer
                     .limits
                     .max_segments
                     .min(group_limit)
-                    .min(self.rack.fresh_room());
+                    .min(self.rack.fresh_room())
+                    .min(self.prr.map_or(usize::MAX, |prr| prr.credit() as usize));
                 let full = (record / wire_mss).min(limit);
                 // A short last segment ends the group, as it may end a Linux
                 // TSO skb (tcp_mss_split_point), exactly when scalar selection
@@ -11688,7 +11712,10 @@ impl Connection {
                 // Timer-entry credit belongs to this lost-head repair only.
                 // Reservations account actual accepted fragments, not selection.
                 if !reserve || !prr.timer_repair() {
-                    prr.sent(count as u32);
+                    prr.sent(
+                        segmentation
+                            .map_or(1, |s| s.payload_len.div_ceil(s.segment_payload_len) as u32),
+                    );
                     prr.finish_timer_repair();
                 }
             }
@@ -12378,16 +12405,16 @@ impl Connection {
             let fresh_episode = self.prr.is_none() && self.sack_recovery.is_none();
             self.detect_rack();
             let fresh_entry = fresh_episode && self.sack_recovery.is_some_and(|r| r.entry_pending);
-            if let Some(prr) = &mut self.prr
+            if let Some(mut prr) = self.prr
                 && fresh_entry
             {
-                prr.admit_timer_repair(self.rack.pipe(), self.congestion.cwnd());
+                prr.admit_timer_repair();
+                self.prr = Some(prr);
                 // Timer entry has its own first-repair grant. Represent that
                 // allowance like ACK-driven PRR, without changing its fixed
                 // congestion target or inventing delivery. Later timers keep
                 // the active episode's window and accounting intact.
-                self.congestion
-                    .prr_window(self.rack.pipe().saturating_add(prr.credit()));
+                self.set_prr_window(self.prr_in_flight(), prr);
             }
         }
         // PTO takes precedence at an RTO-capped tie. Attempts do not back off

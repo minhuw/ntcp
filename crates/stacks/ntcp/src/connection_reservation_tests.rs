@@ -1088,7 +1088,7 @@ fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
         }
         strict_ack(&mut a, 224_000, 1000, &[(4000, 12000)]);
         let before = a.prr.unwrap();
-        assert!(before.credit() >= 2000, "{before:?}");
+        assert!(before.credit() >= 2, "{before:?}");
         let next = a.snd_nxt;
         let mut payload = [0; 8000];
         let mut bytes = [0; 2048];
@@ -1097,16 +1097,18 @@ fn actual_group_flush_prr_new_data_charges_existing_credit_once() {
         let s = d.segmentation.unwrap();
         assert_eq!(Seq(d.start), next);
         assert!(s.payload_len >= 2000);
-        assert!(s.payload_len as u32 <= before.credit());
+        // One packet of credit per segment.
+        let segments = s.payload_len.div_ceil(s.segment_payload_len) as u32;
+        assert!(segments <= before.credit());
         assert_ne!(s.terminal_flags & PSH, 0);
         let selected = a.prr.unwrap();
         assert_eq!(selected.counters().0, before.counters().0);
         assert_eq!(selected.counters().1, before.counters().1);
         assert_eq!(
             selected.counters().2,
-            before.counters().2 + s.payload_len as u64
+            before.counters().2 + u64::from(segments)
         );
-        assert_eq!(selected.credit(), before.credit() - s.payload_len as u32);
+        assert_eq!(selected.credit(), before.credit() - segments);
         let counters = selected.counters();
         for offset in (0..s.payload_len).step_by(s.segment_payload_len) {
             a.accept_reserved_output(
@@ -1378,16 +1380,16 @@ fn gso_in_recovery_ends_where_scalar_admission_does() {
         initial_window: InitialWindow::Iw10,
         ..config(4096, 100)
     };
-    // PRR admits by its credit (600) while cwnd leaves 200: scalar output
-    // pushes the segment that fills cwnd and goes on, so the group ends
-    // with that segment.
+    // PRR admits by its credit (6 packets) while cwnd leaves 200: scalar
+    // output pushes the segment that fills cwnd and goes on, so the group
+    // ends with that segment.
     let (mut a, _) = pair(cfg.clone(), 0);
     let (mut scalar, _) = pair(cfg.clone(), 0);
     for c in [&mut a, &mut scalar] {
         c.write(&[1; 1000]).unwrap();
-        let mut prr = Prr::new(1000, 100);
-        prr.acknowledge(1000, 2000, 600, false);
-        assert_eq!(prr.credit(), 600);
+        let mut prr = Prr::new(10);
+        prr.acknowledge(10, 20, 6, false);
+        assert_eq!(prr.credit(), 6);
         c.prr = Some(prr);
         c.congestion.prr_window(200);
     }
@@ -1396,14 +1398,15 @@ fn gso_in_recovery_ends_where_scalar_admission_does() {
     assert_ne!(s.terminal_flags & PSH, 0);
     assert_eq!(gso_matches_scalar(&mut a, &mut scalar, 40).payload_len, 400);
 
-    // SACK recovery admits a segment only with an SMSS of credit: 450
-    // sends four full segments, and the 50-byte rest waits.
+    // Four packets of credit send four full segments of 450 queued bytes,
+    // and the 50-byte rest waits for a fifth.
     let (mut a, _) = pair(cfg.clone(), 0);
     let (mut scalar, _) = pair(cfg, 0);
     for c in [&mut a, &mut scalar] {
         c.write(&[1; 450]).unwrap();
-        let mut prr = Prr::new(1000, 100);
-        prr.acknowledge(1000, 2000, 450, false);
+        let mut prr = Prr::new(10);
+        prr.acknowledge(10, 20, 4, false);
+        assert_eq!(prr.credit(), 4);
         c.prr = Some(prr);
         c.sack_recovery = Some(SackRecovery {
             recovery_point: c.snd_nxt,

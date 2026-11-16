@@ -334,23 +334,16 @@ fn no_sack_cubic_cwnd_basis_repair_and_recovery_completion() {
     }
     inject(&mut a, 300000, Seq(1), Seq(1), ACK, 257, &[]);
     let prr = a.prr.unwrap();
-    assert_eq!(prr.counters(), (5840, 1460, 0));
+    assert_eq!(prr.counters(), (4, 1, 0));
     assert_eq!(a.congestion.recovery_target(), 10220);
-    assert_eq!(prr.non_sack_pipe(a.rack.pipe()), 2920);
-    assert_eq!(prr.credit(), 1460);
+    // Four packets, one lost and three estimated delivered by the three
+    // duplicates, as Linux's reno sacked_out counts them.
+    assert_eq!(prr.non_sack_pipe(a.prr_in_flight()), 0);
+    assert_eq!(prr.credit(), 1);
     assert_eq!(drain(&mut a, 300000), [(1, 1460, false)]);
-    assert_eq!(a.prr.unwrap().counters(), (5840, 1460, 1460));
+    assert_eq!(a.prr.unwrap().counters(), (4, 1, 1));
     assert!(ack(&mut a, 400000, 5841, &[]).is_empty());
     assert!(a.prr.is_none());
     assert_eq!(a.congestion.cwnd(), 10220);
     assert_eq!(a.send.len(), 0);
-}
-
-#[test]
-fn prr_fractional_headroom_stays_byte_exact() {
-    let mut p = Prr::new(5840, 1460);
-    let delivered = p.non_sack_delivery(0, true);
-    assert_eq!(delivered, 1460);
-    p.acknowledge(delivered, 2920, 4088, false);
-    assert_eq!(p.credit(), 1168);
 }

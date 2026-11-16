@@ -1,1 +1,69 @@
 # Unresolved RFC9937 obligations/evidence; not conformance waivers.
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.1"
+reason = "Deliberate Linux-compatible deviation: PRR counts packets, not bytes. prr_delivered and prr_out start at zero as here, but count packets, as Linux's tcp_init_cwnd_reduction and tcp_cwnd_reduction keep tp->prr_delivered and tp->prr_out in packets (tcp_skb_pcount units). A packet is a RACK transmission unit: an original packet, or each piece a repair cut it into, as tcp_fragment splits an skb. SndCnt therefore admits whole segments of up to SMSS each, so a lost segment is resent whole as tcp_xmit_retransmit_queue resends a whole skb, instead of being cut to a byte remainder. Section 13 anticipates segment counting; a packet counts as delivered only once all of it is acknowledged or SACKed, so split ACKs mint nothing."
+quote = '''
+ssthresh = CongCtrlAlg()      // Target flight size in recovery
+prr_delivered = 0             // Total bytes delivered in recovery
+prr_out = 0                   // Total bytes sent in recovery
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.1"
+reason = "Deliberate Linux-compatible deviation: RecoverFS is the same quantity in packets, the transmission units neither cumulatively acknowledged nor SACKed (Linux packets_out - sacked_out) after the entering ACK, plus the packets that ACK delivered. Linux divides by prior_cwnd, in packets; ntcp keeps this RFC's flight-based RecoverFS and only changes its unit. The ssthresh it is compared with is the byte target rounded up to whole SMSS packets."
+quote = '''
+RecoverFS = SND.NXT - SND.UNA
+// Bytes SACKed before entering recovery will not be
+// marked as delivered during recovery:
+RecoverFS -= (bytes SACKed in scoreboard)
+// Include the (common) case of selectively ACKed bytes:
+RecoverFS += (bytes newly SACKed)
+// Include the (rare) case of cumulatively ACKed bytes:
+RecoverFS += (bytes newly cumulatively acknowledged)
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+reason = "Deliberate Linux-compatible deviation: with SACK, DeliveredData is the drop in transmission units neither cumulatively acknowledged nor SACKed (newly acknowledged plus newly SACKed packets, less packets SACKed before that the ACK covers), as Linux's tcp_newly_delivered counts tp->delivered in packets. A SACK or ACK of part of a packet delivers nothing until the packet is complete, as Linux's tcp_match_skb_to_sack marks only whole segments."
+quote = '''
+With SACK, DeliveredData can be computed precisely as the
+change in SND.UNA, plus the signed change in quantity of data marked
+SACKed in the scoreboard.  Thus, in the special case when there are
+no SACKed sequence ranges in the scoreboard before or after the ACK,
+DeliveredData is the change in SND.UNA.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+reason = "Deliberate Linux-compatible deviation: without SACK, each duplicate ACK estimates one delivered packet (Linux tcp_add_reno_sack), and a cumulative ACK delivers the hole it fills plus what its packets exceed the earlier estimates by, at least one packet; the rest consume estimates (Linux tcp_remove_reno_sacks: one ACK acked the hole, the rest eat duplicate ACKs). Delivery stays capped by RecoverFS as section 6.2 requires."
+quote = '''
+In recovery without SACK,
+DeliveredData is estimated to be 1 SMSS on each received duplicate
+ACK (i.e., SND.UNA did not change).  When SND.UNA advances (i.e., a
+full or partial ACK), DeliveredData is the change in SND.UNA, minus 1
+SMSS for each preceding duplicate ACK.
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+reason = "Deliberate Linux-compatible deviation: without SACK, inflight subtracts one packet per duplicate ACK, including the duplicates before the episode that triggered fast retransmit, capped by RecoverFS, as Linux's reno sacked_out counts every duplicate ACK (tcp_add_reno_sack) and enters tcp_packets_in_flight. Those packets left the network (RFC 5681 section 3.2 step 4 inflates cwnd by them). With only the episode's duplicates, inflight equals the packet target when every packet beyond a hole was delivered, and recovery waits for a timer."
+quote = '''
+For non-SACK-enabled connections,
+instead of subtracting out bytes SACKed in the SACK scoreboard,
+senders MUST subtract out: min(RecoverFS, 1 SMSS for each preceding
+duplicate ACK in the fast recovery episode); the min() with RecoverFS
+is to protect against misbehaving receivers [Savage99].
+'''
+
+[[exception]]
+target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.2"
+reason = "Deliberate Linux-compatible deviation: PRR's inflight is the same expression in packets, Linux's tcp_packets_in_flight: transmission units outstanding, less those SACKed and those marked lost, plus those retransmitted since they were last marked lost (packets_out - (sacked_out + lost_out) + retrans_out), from the RACK ledger's per-unit tally. The byte pipe of the same ledger still bounds non-PRR RFC 6675/RACK recovery."
+quote = '''
+SACK-enabled connections using RACK-TLP loss detection
+[RFC8985] or other loss detection algorithms MUST calculate inflight
+by starting with SND.NXT - SND.UNA, subtracting out bytes SACKed in
+the scoreboard, subtracting out bytes marked lost in the scoreboard,
+and adding bytes in the scoreboard that have been retransmitted since
+they were last marked lost.
+'''

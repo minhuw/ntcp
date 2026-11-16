@@ -230,11 +230,16 @@ fn isolated_probe_cc_real_receiver_recovery_matrix() {
                                 );
                             }
                             assert!(bytes.len() as u32 + u32::from(ip_header) <= low);
-                            sent += segment.payload.len() as u64;
+                            // PRR counts packets.
+                            sent += u64::from(!segment.payload.is_empty());
                             if let Some(p) = a.prr {
                                 assert_eq!(p.counters().0, initial_prr.unwrap().0);
                                 assert_eq!(p.counters().2, sent);
-                                assert!(p.counters().1 <= u64::from(p.counters().0));
+                                // Delivery counts transmission units: with SACK a
+                                // repair cut into pieces adds units after entry,
+                                // as tcp_fragment adds skbs, so only the no-SACK
+                                // estimate is capped by RecoverFS.
+                                assert!(a.sack_send || p.counters().1 <= u64::from(p.counters().0));
                             }
                             let active = a.prr.map(|p| p.counters());
                             real_ack(&mut a, &mut b, &bytes, now, false);
@@ -1152,7 +1157,9 @@ fn isolated_probe_cc_rack_lost_retry_commits_without_resetting_prr() {
                 let after = a.prr.unwrap().counters();
                 let before = counters.unwrap();
                 assert_eq!(after.0, before.0);
-                assert_eq!(after.1, before.1 + second_segment.payload.len() as u64);
+                // The retry's second piece is a packet of its own, as the
+                // second skb tcp_fragment leaves: SACKing it delivers one.
+                assert_eq!(after.1, before.1 + 1);
                 assert_eq!(after.2, before.2);
                 assert_eq!(a.congestion.ssthresh(), target);
             } else {
