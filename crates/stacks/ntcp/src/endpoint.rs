@@ -6655,6 +6655,24 @@ impl Endpoint {
         self.abandon_transmit(token.0)
     }
 
+    /// Whether a poll for connection `id` (`poll_reserved_transmit_for`)
+    /// would select it now: the rest of its reservation, none of whose
+    /// attempts is outstanding, or, without a reservation, its entry in the
+    /// ready queue. Its selection may still find nothing to send (Nagle,
+    /// the windows, pacing). A lookup, not a pass over the queue.
+    pub fn output_selectable(&self, id: ConnectionId) -> bool {
+        if self.generations.get(id.slot) != Some(&id.generation) {
+            return false;
+        }
+        match self.reservation_of(Some(id)) {
+            Some(index) => self.reservations[index]
+                .current
+                .as_ref()
+                .is_some_and(|r| r.attempt.is_none()),
+            None => self.output.contains(id.slot),
+        }
+    }
+
     pub fn is_output_reserved(&self, id: ConnectionId) -> bool {
         let reserved = self.reservation_of(Some(id)).is_some();
         debug_assert_eq!(
@@ -7775,10 +7793,26 @@ impl Endpoint {
                 self.cleanup_one();
             }
             let stateless_held = self.reservation_of(None).is_some();
-            let next = self.output.iter().find(|&index| {
-                let id = self.id(index);
-                !self.is_output_reserved(id) && selected.is_none_or(|owner| owner == Some(id))
-            });
+            let search = || {
+                self.output.iter().find(|&index| {
+                    let id = self.id(index);
+                    !self.is_output_reserved(id) && selected.is_none_or(|owner| owner == Some(id))
+                })
+            };
+            // A selected connection is looked up in the ready queue, not
+            // searched for: the entry the search finds, without a walk of
+            // every ready connection.
+            let next = match selected {
+                Some(Some(id)) => {
+                    let next = (self.output.contains(id.slot)
+                        && self.id(id.slot) == id
+                        && !self.is_output_reserved(id))
+                    .then_some(id.slot);
+                    debug_assert_eq!(next, search());
+                    next
+                }
+                _ => search(),
+            };
             if !stateless_held
                 && self.stateless_pending()
                 && selected.is_none_or(|owner| owner.is_none())

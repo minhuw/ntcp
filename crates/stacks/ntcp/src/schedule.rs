@@ -35,6 +35,10 @@ impl ReadyQueue {
         self.first.is_none()
     }
 
+    pub(crate) fn contains(&self, index: usize) -> bool {
+        self.links[index].queued
+    }
+
     pub(crate) fn push(&mut self, index: usize) {
         if self.links[index].queued {
             return;
