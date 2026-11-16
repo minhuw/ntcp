@@ -1720,12 +1720,10 @@ impl Endpoint {
     }
 
     // Return `bytes` to the budget. Every return wakes the writers waiting
-    // for memory that it can feed (`wake_memory_waiters`), as Linux's
-    // sk_stream_write_space follows a release: a connection's storage
-    // released, reclaimed or shrunk, and the end of pressure, which lets
-    // the writers pressure held back grow again. A wake visits only the
-    // waiters it wakes and one more, so a return with none waiting costs
-    // one check.
+    // for memory (`wake_memory_waiters`): a connection's storage released,
+    // reclaimed or shrunk, and the end of pressure, which lets the writers
+    // pressure held back grow again. A wake visits only the waiters it
+    // wakes and one more, so a return with none waiting costs one check.
     fn uncharge(&mut self, bytes: usize) {
         let memory = self.memory();
         self.budget.reduce(bytes, self.now, memory);
@@ -4647,7 +4645,18 @@ impl Endpoint {
     fn memory_throttled(&mut self, index: usize) {
         self.memory_throttled_writes += 1;
         self.memory_refused_growths += 1;
+        // A member of shared buffer memory flags its waiters for the others
+        // to wake it, then looks for memory they returned meanwhile and
+        // wakes its other waiters with it. Not this one: its write, under
+        // way, takes what its storage holds, and a wake now would let the
+        // write grow with no budget; it looks again at its retry.
+        self.memory_waiters.remove(index);
+        self.budget.set_waiting(true);
+        if self.budget.poll_returns() {
+            self.wake_memory_waiters();
+        }
         self.memory_waiters.push(index);
+        self.budget.set_waiting(true);
         if self.slots[index].as_ref().unwrap().memory_retry.is_none() {
             let retry = self.now.saturating_add(self.memory_retry_delay());
             let slot = self.slots[index].as_mut().unwrap();
@@ -4655,27 +4664,21 @@ impl Endpoint {
             // A write refused whole refreshes nothing.
             self.deadlines.set(index, slot.deadline());
         }
-        // A member of shared buffer memory flags its waiters for the others
-        // to wake it, then looks for memory they returned meanwhile.
-        self.budget.set_waiting(true);
-        if self.budget.poll_returns() {
-            self.wake_memory_waiters();
-        }
     }
 
-    // Memory came back to the budget. As Linux's sk_stream_write_space
-    // wakes a writer once sk_stream_memory_free holds again, wake the
-    // connections whose writes were refused, oldest first, while the growth
-    // each needed fits what is free, each counted against it so that one
-    // release does not wake more than it can feed. The first that does not
-    // fit ends the wake and moves to the end, so that a connection wanting
-    // more than is ever free holds up no other: a wake visits the
-    // connections it wakes and one more. A woken connection that finds less
-    // than it needed is refused again and waits at the end.
-    // Under pressure, a connection whose growth the pressure would refuse
-    // (`send_growth_room`) does not fit: it waits for pressure to end.
+    // Memory came back to the budget: wake the connections whose writes
+    // were refused, oldest first, each to try its growth again with its next
+    // write (sk_stream_wait_memory's writer retrying sk_wmem_schedule). A
+    // woken connection is writable if `stream_writable` holds (Linux's
+    // sk_stream_write_space test); one whose write is refused again waits at
+    // the end. Linux wakes no writer on another socket's return (its
+    // writers retry after vm_wait, `memory_throttled`); ntcp's returns
+    // wake them so that memory one connection frees reaches another at once.
+    // A connection that may grow nothing now (`send_growth_room`: no room
+    // under the cap, or pressure holding it to its fair share) is not woken:
+    // it ends the wake and moves to the end, so that it holds up no other
+    // and a wake visits the connections it wakes and one more.
     fn wake_memory_waiters(&mut self) {
-        let mut room = self.buffer_room();
         loop {
             let Some(index) = self.memory_waiters.iter().next() else {
                 self.budget.set_waiting(false);
@@ -4684,15 +4687,10 @@ impl Endpoint {
             self.memory_waiters.remove(index);
             // Reclaim takes a connection off the list.
             let connection = &self.slots[index].as_ref().unwrap().connection;
-            let wanted = connection.send_memory_wanted().unwrap_or(0);
-            let allowed = self
-                .send_growth_room(connection, connection.buffer_charge())
-                .min(room);
-            if wanted > allowed {
+            if self.send_growth_room(connection, connection.buffer_charge()) == 0 {
                 self.memory_waiters.push(index);
                 break;
             }
-            room -= wanted;
             let slot = self.slots[index].as_mut().unwrap();
             slot.memory_retry = None;
             slot.connection.memory_released();
@@ -4702,14 +4700,12 @@ impl Endpoint {
 
     // The waiter at `index` reached its retry (`memory_throttled`): as
     // sk_stream_wait_memory returns after vm_wait for tcp_sendmsg to try
-    // sk_wmem_schedule again, it is woken if the growth it wanted fits now,
-    // and otherwise waits another random delay. Its caller refreshes it.
+    // sk_wmem_schedule again, it is woken if it may grow now, and otherwise
+    // waits another random delay. Its caller refreshes it.
     fn retry_memory(&mut self, index: usize) {
         let slot = self.slots[index].as_ref().unwrap();
         let connection = &slot.connection;
-        let wanted = connection.send_memory_wanted().unwrap_or(0);
-        let allowed = self.send_growth_room(connection, connection.buffer_charge());
-        if wanted > allowed {
+        if self.send_growth_room(connection, connection.buffer_charge()) == 0 {
             let retry = self.now.saturating_add(self.memory_retry_delay());
             self.slots[index].as_mut().unwrap().memory_retry = Some(retry);
             return;
@@ -4785,7 +4781,7 @@ impl Endpoint {
             // Span storage refused for memory admits nothing: the payload
             // waits for memory as a copied write would.
             if result == Err(Error::NoMemory) {
-                self.slot_mut(id)?.connection.throttle_send(0);
+                self.slot_mut(id)?.connection.throttle_send();
                 self.memory_throttled(id.slot);
                 return Err(Error::WouldBlock.into());
             }
@@ -9781,11 +9777,10 @@ mod memory_wait_tests {
         assert_eq!(ring(&a), crate::connection::SEND_RING_RESERVE);
     }
     // A writer refused the growth of its own ring, whose queue the peer
-    // then acknowledges whole, freeing that ring, is woken by the return:
-    // the growth it waits for is now a page of ring, not the doubling of
-    // the ring it no longer holds, and it is writable, as Linux's
-    // sk_stream_write_space finds sk_stream_is_writeable once the ACK
-    // emptied sk_wmem_queued.
+    // then acknowledges whole, freeing that ring, is woken by the return
+    // and is writable, as Linux's sk_stream_write_space finds
+    // sk_stream_is_writeable once the ACK emptied sk_wmem_queued; its next
+    // write grows a ring again from a page.
     #[test]
     fn a_refused_writer_whose_ring_an_ack_frees_is_woken() {
         let (mut a, mut b, listener) = endpoints();
@@ -9802,14 +9797,6 @@ mod memory_wait_tests {
         assert!(sent < data.len());
         assert_eq!(a.memory_throttled_writes(), 1);
         assert_eq!(a.send_admission_room(client, None), Ok(0));
-        let wanted = |a: &Endpoint| {
-            a.slot(client)
-                .unwrap()
-                .connection
-                .send_memory_wanted()
-                .unwrap()
-        };
-        let doubling = wanted(&a);
         let mut read = Vec::new();
         for now in 1..256 {
             exchange(&mut a, &mut b, now);
@@ -9826,7 +9813,6 @@ mod memory_wait_tests {
         assert_eq!(read, data[..sent]);
         // The ring went back to the budget, and with it the writer's wait.
         assert_eq!(ring(&a), 0);
-        assert!(doubling > 2 * 4096, "{doubling}");
         assert!(a.memory_waiters.is_empty());
         assert!(writable(&mut a, client));
         sent += a.write(client, &data[sent..]).unwrap();
@@ -10311,15 +10297,10 @@ mod memory_wait_tests {
         assert_eq!(a.memory_waiters.iter().collect::<Vec<_>>(), [writer.slot]);
         assert!(!a.memory_pressure() || a.buffer_bytes() > a.config.buffer_memory().low);
         assert!(!writable(&mut a, writer));
-        let wanted = a
-            .slot(writer)
-            .unwrap()
-            .connection
-            .send_memory_wanted()
-            .unwrap();
-        assert!(records >= wanted, "{records} {wanted}");
         // The other connection's timestamp records shrink.
+        let charged = a.buffer_bytes();
         a.set_rx_timestamp_capacity(other, 0).unwrap();
+        assert_eq!(a.buffer_bytes(), charged - records);
         assert!(a.memory_waiters.is_empty());
         assert!(writable(&mut a, writer));
         assert_eq!(a.write(writer, &[1; 9]), Ok(9));
@@ -10472,6 +10453,157 @@ mod memory_wait_tests {
         assert!(a.memory_waiters.is_empty());
         assert!(a.send_admission_room(writer, None).unwrap() > 0);
         assert!(writable(&mut a, writer));
+    }
+
+    // A writer with nothing queued is writable, as Linux's tcp_poll finds
+    // __sk_stream_is_writeable without asking for memory, also while the
+    // budget refuses the storage its write needs: the write finds
+    // WouldBlock. Each return wakes it, whether or not it brings enough:
+    // after one too small for a send ring its write is refused again, and
+    // after the next it goes through.
+    #[test]
+    fn a_writable_writer_refused_memory_is_woken_by_each_return_until_its_write_fits() {
+        let (mut a, mut b, listener) = endpoints();
+        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        let (few, _) = connect(&mut a, &mut b, listener, 40001);
+        let (many, _) = connect(&mut a, &mut b, listener, 40002);
+        let records = |a: &Endpoint, id: ConnectionId| {
+            a.slot(id).unwrap().connection.rx_timestamps.storage_bytes()
+        };
+        a.set_rx_timestamp_capacity(few, 1).unwrap();
+        a.set_rx_timestamp_capacity(many, 1024).unwrap();
+        let (small, large) = (records(&a, few), records(&a, many));
+        assert!(small > 0 && small < crate::connection::SEND_RING_RESERVE);
+        assert!(large > 2 * crate::connection::SEND_RING_RESERVE, "{large}");
+        writable(&mut a, writer);
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        assert_eq!(a.stream_writable(writer, None), Ok(true));
+        assert_eq!(a.write(writer, &[1; 9]), Err(Error::WouldBlock.into()));
+        assert_eq!(a.memory_throttled_writes(), 1);
+        assert_eq!(a.stream_writable(writer, None), Ok(true));
+        assert_eq!(a.send_admission_room(writer, None), Ok(0));
+        assert!(!writable(&mut a, writer));
+        // Too little for a send ring: woken, and refused again.
+        a.set_rx_timestamp_capacity(few, 0).unwrap();
+        assert!(a.memory_waiters.is_empty());
+        assert!(writable(&mut a, writer));
+        assert_eq!(a.write(writer, &[1; 9]), Err(Error::WouldBlock.into()));
+        assert_eq!(a.memory_throttled_writes(), 2);
+        assert!(!writable(&mut a, writer));
+        // Enough.
+        a.set_rx_timestamp_capacity(many, 0).unwrap();
+        assert!(a.memory_waiters.is_empty());
+        assert!(writable(&mut a, writer));
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        assert_eq!(a.memory_throttled_writes(), 2);
+        assert!(!a.slot(writer).unwrap().connection.send_memory_throttled());
+    }
+
+    // Under pressure a return wakes the waiters that may grow: a fixed send
+    // direction the full cap refused is woken, while a tuned one holding its
+    // fair share stays until pressure ends (__sk_mem_raise_allocated).
+    // Neither one's writability asks for memory: the fixed one is writable
+    // throughout, and the tuned one is not, because the refusal moderated
+    // its limit to what it queued (sk_stream_moderate_sndbuf).
+    #[test]
+    fn under_pressure_a_return_wakes_a_writer_below_its_fair_share_only() {
+        let mut a = Endpoint::new(tuned(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(tuned(), [2; 32], 0, |_| true).unwrap();
+        let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
+        // `big`'s large receive ring keeps it above its fair share.
+        let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
+        let big = a
+            .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
+            .unwrap();
+        exchange(&mut a, &mut b, 0);
+        b.accept(listener).unwrap();
+        let (fixed, _) = connect(&mut a, &mut b, listener, 40001);
+        let (other, _) = connect(&mut a, &mut b, listener, 40002);
+        a.set_send_buffer(fixed, 1024).unwrap();
+        assert_eq!(a.write(big, &[1; 200]), Ok(200));
+        assert_eq!(a.write(fixed, &[2; 20]), Ok(20));
+        a.set_rx_timestamp_capacity(other, 1024).unwrap();
+        let records = a
+            .slot(other)
+            .unwrap()
+            .connection
+            .rx_timestamps
+            .storage_bytes();
+        drain(&mut a, 1);
+        writable(&mut a, big);
+        writable(&mut a, fixed);
+        // The cap is full, and pressure stays on after the return below.
+        let charged = a.buffer_bytes();
+        a.config.max_buffer_bytes = charged;
+        enter_pressure(&mut a, charged - 1, 1);
+        let big_charge = a.slot(big).unwrap().connection.buffer_charge();
+        let connection = &a.slot(big).unwrap().connection;
+        assert_eq!(a.send_growth_room(connection, big_charge), 0);
+        assert!(taken(a.write(fixed, &[2; 400])) < 400);
+        assert!(taken(a.write(big, &[1; 300])) < 300);
+        assert_eq!(a.memory_throttled_writes(), 2);
+        assert_eq!(a.stream_writable(fixed, None), Ok(true));
+        assert_eq!(a.stream_writable(big, None), Ok(false));
+        assert!(!writable(&mut a, fixed) && !writable(&mut a, big));
+        let waiting = |a: &Endpoint, id| a.slot(id).unwrap().connection.send_memory_throttled();
+        // Another connection's records go back; pressure stays.
+        a.set_rx_timestamp_capacity(other, 0).unwrap();
+        assert_eq!(a.buffer_bytes(), charged - records);
+        assert!(a.memory_pressure());
+        assert!(!waiting(&a, fixed) && waiting(&a, big));
+        assert!(writable(&mut a, fixed));
+        assert!(!writable(&mut a, big));
+        assert!(taken(a.write(fixed, &[2; 400])) > 0);
+        // Pressure ends: the tuned writer is woken, writable once ACKs
+        // drain its moderated limit.
+        a.config.buffer_pressure_bytes = Some(a.config.max_buffer_bytes);
+        a.config.buffer_low_bytes = Some(a.config.max_buffer_bytes);
+        a.charge(1);
+        a.uncharge(1);
+        assert!(!a.memory_pressure());
+        assert!(!waiting(&a, big));
+        assert!(a.memory_waiters.is_empty());
+        assert_eq!(a.stream_writable(big, None), Ok(false));
+    }
+
+    // A refused write of a group member that finds another member's return
+    // too small for its growth wakes no other waiter it cannot feed and
+    // not itself: its write takes what its storage holds, WouldBlock here,
+    // and nothing grows past the group's cap. (Its refusal looks for
+    // returns to wake its member's other waiters; waking itself there
+    // would end its wait inside the write, which would then grow its
+    // storage with no budget.)
+    #[test]
+    fn a_refused_write_does_not_wake_itself_on_a_return_too_small_for_it() {
+        let (mut a, mut b, listener) = endpoints();
+        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        assert_eq!(a.write(writer, &[1; 9]), Ok(9));
+        writable(&mut a, writer);
+        b.charge(10_000);
+        let base = a.buffer_bytes() + b.buffer_bytes();
+        let memory = crate::BufferMemory {
+            low: 0,
+            pressure: base,
+            high: base,
+        };
+        let group = crate::SharedBufferMemory::new(2, Some(memory), 1).unwrap();
+        a.share_buffer_memory(&group, 0).unwrap();
+        b.share_buffer_memory(&group, 1).unwrap();
+        let data = long_data();
+        let room = held(&a, writer);
+        assert_eq!(a.write(writer, &data), Ok(room));
+        assert!(group.waiting(0));
+        b.uncharge(100);
+        assert!(b.take_memory_returned());
+        assert_eq!(
+            a.write(writer, &data[room..]),
+            Err(Error::WouldBlock.into())
+        );
+        assert_eq!(a.memory_throttled_writes(), 2);
+        assert!(a.slot(writer).unwrap().connection.send_memory_throttled());
+        assert!(group.waiting(0));
+        assert!(group.buffer_bytes() <= memory.high);
+        assert_eq!(a.budget.allocated(), a.buffer_bytes() + b.buffer_bytes());
     }
 
     // A member that leaves publishes its reserve and takes its whole charge

@@ -776,8 +776,13 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
             0
         }
     };
+    let mut taken = taken;
     assert!(taken < data.len());
-    assert_eq!(lan.members[1].network.counters().memory_throttled_writes, 1);
+    let mut refused = 1;
+    assert_eq!(
+        lan.members[1].network.counters().memory_throttled_writes,
+        refused
+    );
     assert!(memory.waiting(1));
     assert!(
         lan.members
@@ -785,8 +790,29 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
             .all(|m| m.network.counters().memory_pressure)
     );
     assert_eq!(memory.buffer_bytes(), charged(&lan));
+    // A wait has no price on what would feed it (c153): the writer's retry
+    // after vm_wait wakes it while the group has any room, and its write,
+    // which the application makes on each Writable, is refused again as
+    // long as the room is too small for it.
+    let mut retry = |lan: &mut Lan, taken: &mut usize| {
+        if drained(&mut lan.members[1].network).contains(&Event::Writable(ids[1])) {
+            match lan.members[1]
+                .network
+                .try_write(ids[1], &data[*taken..], WriteOptions::default())
+            {
+                Ok(receipt) => *taken += receipt.accepted,
+                Err(error) => assert!(matches!(error, Error::WouldBlock(_)), "{error:?}"),
+            }
+            assert!(*taken < data.len());
+            refused += 1;
+            assert_eq!(
+                lan.members[1].network.counters().memory_throttled_writes,
+                refused
+            );
+        }
+    };
     lan.step();
-    drained(&mut lan.members[1].network);
+    retry(&mut lan, &mut taken);
     signalled(&wake);
     // Member 0's connection goes: its storage returns to the group.
     lan.members[0].network.abort(ids[0]).unwrap();
@@ -800,7 +826,11 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
         // Its Closed event drained, the connection is released.
         drained(&mut lan.members[0].network);
         woken |= signalled(&wake);
+        if !woken {
+            retry(&mut lan, &mut taken);
+        }
     }
+    let refused = lan.members[1].network.counters().memory_throttled_writes;
     assert!(woken, "member 1's descriptor was written");
     assert!(!memory.waiting(1));
     // Member 1's drives report its writer's event pending until drained.
@@ -813,7 +843,10 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
         .try_write(ids[1], &data[taken..], WriteOptions::default())
         .unwrap();
     assert_eq!(receipt.accepted, data.len() - taken);
-    assert_eq!(lan.members[1].network.counters().memory_throttled_writes, 1);
+    assert_eq!(
+        lan.members[1].network.counters().memory_throttled_writes,
+        refused
+    );
     assert_eq!(memory.buffer_bytes(), charged(&lan));
 }
 

@@ -1125,13 +1125,13 @@ pub(crate) struct Connection {
     // Caller ticks retain sub-microsecond fractions across state transitions.
     transport_ticks: [u64; 3],
     send_backpressured: bool,
-    // The bytes a write's storage growth needed when the buffer budget or
-    // the allocator refused it, as Linux's tcp_sendmsg finds
-    // sk_wmem_schedule fail and waits in sk_stream_wait_memory. Until memory
-    // comes back (`memory_released`) or a later write's growth succeeds,
-    // writes take only what the allocated storage holds. Writability ignores
-    // it, as tcp_poll does (`stream_writable`).
-    send_memory_wanted: Option<usize>,
+    // Whether a write's storage growth was refused by the buffer budget or
+    // the allocator, as Linux's tcp_sendmsg finds sk_wmem_schedule fail and
+    // waits in sk_stream_wait_memory. Until memory comes back
+    // (`memory_released`) or a later write's growth succeeds, writes take
+    // only what the allocated storage holds. Writability ignores it, as
+    // tcp_poll does (`stream_writable`).
+    send_memory_waiting: bool,
     // Whether memory pressure applies to the send direction
     // (`ConnectionConfig::send_capacity_max`), and the floor it moderates
     // the send limit to.
@@ -1546,7 +1546,7 @@ impl Connection {
             last_data_received: now,
             transport_ticks: [0; 3],
             send_backpressured: false,
-            send_memory_wanted: None,
+            send_memory_waiting: false,
             send_tuned,
             send_min: send_sizes.min,
             send_max: send_sizes.max,
@@ -1951,7 +1951,7 @@ impl Connection {
         // Storage refused for the data leaves a plain SYN, as Linux's
         // tcp_send_syn_data falls back when it cannot allocate syn_data.
         if self.prepare_send_metadata(count, None, max_charge, None)? {
-            self.send_memory_wanted = None;
+            self.send_memory_waiting = false;
             self.send_backpressured = false;
             return Ok(0);
         }
@@ -5445,12 +5445,12 @@ impl Connection {
     }
 
     // What a write takes now: the admission room, and while its storage
-    // growth stays refused (`send_memory_wanted`) no more than the
+    // growth stays refused (`send_memory_waiting`) no more than the
     // allocated storage holds, as tcp_sendmsg copies into what
     // sk_wmem_schedule granted and then waits for memory.
     pub(crate) fn send_admission_room(&self, lowat: Option<u32>) -> usize {
         let room = self.admission_room(lowat, self.send_space_remaining());
-        if self.send_memory_wanted.is_some() {
+        if self.send_memory_waiting {
             room.min(self.allocated_send_room())
         } else {
             room
@@ -5498,7 +5498,6 @@ impl Connection {
     // again.
     pub(crate) fn reclaim_send_ring(&mut self) {
         self.send.release();
-        self.send_storage_reclaimed();
     }
 
     #[cfg(test)]
@@ -5516,22 +5515,6 @@ impl Connection {
     pub(crate) fn reclaim_ledgers(&mut self) {
         self.rack.release();
         self.scoreboard.release();
-        self.send_storage_reclaimed();
-    }
-
-    // The storage a refused writer's growth was priced against is gone:
-    // what waking it needs is now the growth that takes one more byte from
-    // what is left (as prepare_send_storage prices it), if that is less.
-    // Without this, a writer whose whole queue an ACK drained, freeing the
-    // ring it wanted to double, would wait for memory to double a ring it
-    // no longer has, and what its writes may take while it waits
-    // (send_admission_room) would stay zero.
-    fn send_storage_reclaimed(&mut self) {
-        if let Some(wanted) = self.send_memory_wanted {
-            let held = self.send.len() + self.allocated_send_room();
-            let next = self.send_growth_cost(held + 1).unwrap_or(wanted);
-            self.send_memory_wanted = Some(next.min(wanted));
-        }
     }
 
     // What an ACK's SACK splits are held to: the queued payload and
@@ -5643,18 +5626,14 @@ impl Connection {
     }
 
     pub(crate) fn send_memory_throttled(&self) -> bool {
-        self.send_memory_wanted.is_some()
-    }
-
-    pub(crate) fn send_memory_wanted(&self) -> Option<usize> {
-        self.send_memory_wanted
+        self.send_memory_waiting
     }
 
     // Memory came back to the buffer budget: the next write may grow the
     // storage again, and the connection is writable if `stream_writable`
     // holds (sk_stream_write_space).
     pub(crate) fn memory_released(&mut self) {
-        if self.send_memory_wanted.take().is_some() && self.stream_writable(None) {
+        if core::mem::take(&mut self.send_memory_waiting) && self.stream_writable(None) {
             self.send_backpressured = false;
             self.events.writable |=
                 !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
@@ -5745,9 +5724,9 @@ impl Connection {
         }
     }
 
-    // A write found its storage growth refused for `wanted` bytes.
-    pub(crate) fn throttle_send(&mut self, wanted: usize) {
-        self.send_memory_wanted = Some(wanted);
+    // A write found its storage growth refused.
+    pub(crate) fn throttle_send(&mut self) {
+        self.send_memory_waiting = true;
         self.send_backpressured = true;
     }
 
@@ -5960,11 +5939,7 @@ impl Connection {
             }
             part /= 2;
         }
-        // What waking it needs is the smallest growth that takes one more
-        // byte, not the whole write.
-        let held = self.send.len() + self.allocated_send_room();
-        let next = self.send_growth_cost(held + 1).unwrap_or(wanted);
-        self.throttle_send(next.min(wanted));
+        self.throttle_send();
         Ok(Some(wanted))
     }
 
@@ -6146,7 +6121,7 @@ impl Connection {
         }
         // A write the endpoint found short of memory takes what the storage
         // holds; it grows nothing here.
-        if self.send_memory_wanted.is_none() {
+        if !self.send_memory_waiting {
             self.prepare_send_metadata(input_len, lowat, usize::MAX, None)?;
         }
         let application_idle = !self.application_timer_needed();
