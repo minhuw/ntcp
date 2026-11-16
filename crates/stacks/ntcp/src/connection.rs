@@ -5448,6 +5448,7 @@ impl Connection {
     // again.
     pub(crate) fn reclaim_send_ring(&mut self) {
         self.send.release();
+        self.send_storage_reclaimed();
     }
 
     #[cfg(test)]
@@ -5465,6 +5466,22 @@ impl Connection {
     pub(crate) fn reclaim_ledgers(&mut self) {
         self.rack.release();
         self.scoreboard.release();
+        self.send_storage_reclaimed();
+    }
+
+    // The storage a refused writer's growth was priced against is gone:
+    // what waking it needs is now the growth that takes one more byte from
+    // what is left (as prepare_send_storage prices it), if that is less.
+    // Without this, a writer whose whole queue an ACK drained, freeing the
+    // ring it wanted to double, would wait for memory to double a ring it
+    // no longer has, and its allocated room, the bound on what it may take
+    // while it waits (send_space_remaining), would stay zero.
+    fn send_storage_reclaimed(&mut self) {
+        if let Some(wanted) = self.send_memory_wanted {
+            let held = self.send.len() + self.allocated_send_room();
+            let next = self.send_growth_cost(held + 1).unwrap_or(wanted);
+            self.send_memory_wanted = Some(next.min(wanted));
+        }
     }
 
     // What an ACK's SACK splits are held to: the queued payload and

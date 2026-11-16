@@ -9688,6 +9688,58 @@ mod memory_wait_tests {
         assert_eq!(progress.queued_end, progress.acknowledged);
         assert_eq!(ring(&a), crate::connection::SEND_RING_RESERVE);
     }
+    // A writer refused the growth of its own ring, whose queue the peer
+    // then acknowledges whole, freeing that ring, is woken by the return:
+    // the growth it waits for is now a page of ring, not the doubling of
+    // the ring it no longer holds, and it is writable, as Linux's
+    // sk_stream_write_space finds sk_stream_is_writeable once the ACK
+    // emptied sk_wmem_queued.
+    #[test]
+    fn a_refused_writer_whose_ring_an_ack_frees_is_woken() {
+        let (mut a, mut b, listener) = endpoints();
+        let (client, server) = connect(&mut a, &mut b, listener, 40000);
+        let ring = |a: &Endpoint| a.slot(client).unwrap().connection.send_ring_bytes();
+        a.set_send_buffer(client, 8192).unwrap();
+        let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        assert_eq!(a.write(client, &data[..3000]), Ok(3000));
+        assert_eq!(ring(&a), 2 * 4096);
+        writable(&mut a, client);
+        // The budget has no room for the ring to double.
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        let mut sent = 3000 + a.write(client, &data[3000..]).unwrap();
+        assert!(sent < data.len());
+        assert_eq!(a.memory_throttled_writes(), 1);
+        assert_eq!(a.send_admission_room(client, None), Ok(0));
+        let wanted = |a: &Endpoint| {
+            a.slot(client)
+                .unwrap()
+                .connection
+                .send_memory_wanted()
+                .unwrap()
+        };
+        let doubling = wanted(&a);
+        let mut read = Vec::new();
+        for now in 1..256 {
+            exchange(&mut a, &mut b, now);
+            let mut out = [0; 1024];
+            let len = b.read(server, &mut out).unwrap_or(0);
+            read.extend_from_slice(&out[..len]);
+            if read.len() == sent {
+                break;
+            }
+            // Nothing is freed while bytes are queued.
+            assert_eq!(ring(&a), 2 * 4096);
+        }
+        exchange(&mut a, &mut b, 300);
+        assert_eq!(read, data[..sent]);
+        // The ring went back to the budget, and with it the writer's wait.
+        assert_eq!(ring(&a), 0);
+        assert!(doubling > 2 * 4096, "{doubling}");
+        assert!(a.memory_waiters.is_empty());
+        assert!(writable(&mut a, client));
+        sent += a.write(client, &data[sent..]).unwrap();
+        assert!(sent > read.len());
+    }
 
     #[test]
     fn another_connections_release_wakes_a_waiting_writer() {
