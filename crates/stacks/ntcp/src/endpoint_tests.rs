@@ -2760,7 +2760,7 @@ fn time_wait_endpoint(
 
 // `b` closed first and is in TIME-WAIT, with `reuse_time_wait` as given.
 fn time_wait_endpoint_with(
-    mut cfg: EndpointConfig,
+    cfg: EndpointConfig,
     reuse: bool,
 ) -> (
     Endpoint,
@@ -2771,6 +2771,25 @@ fn time_wait_endpoint_with(
     u32,
 ) {
     let (local, remote) = addresses();
+    time_wait_endpoint_at(cfg, reuse, local, remote, b"")
+}
+
+// `time_wait_endpoint_with` between `local` and `remote`, where the peer
+// sent `unread` before its FIN and `b` has not read it.
+fn time_wait_endpoint_at(
+    mut cfg: EndpointConfig,
+    reuse: bool,
+    local: core::net::SocketAddr,
+    remote: core::net::SocketAddr,
+    unread: &[u8],
+) -> (
+    Endpoint,
+    ListenerId,
+    ConnectionId,
+    IpMetadata,
+    wire::Header,
+    u32,
+) {
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     cfg.reuse_time_wait = reuse;
     let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
@@ -2780,6 +2799,10 @@ fn time_wait_endpoint_with(
     let server = b.accept(listener).unwrap();
     b.shutdown(server).unwrap();
     pump(&mut a, &mut b, 2_000);
+    if !unread.is_empty() {
+        assert_eq!(a.write(client, unread), Ok(unread.len()));
+        pump(&mut a, &mut b, 2_500);
+    }
     a.shutdown(client).unwrap();
     let fin = packets(&mut a, 3_000);
     let peer_ts = wire::parse(fin[0].0, &fin[0].1)

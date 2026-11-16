@@ -52,13 +52,29 @@ struct Twins {
     ip: IpMetadata,
     h: wire::Header,
     ts: u32,
+    tuple: Tuple,
+    // The connection `held` keeps.
+    kept: ConnectionId,
 }
 
 const MARK: u32 = 0x5a5a;
 
 fn twins(cfg: &EndpointConfig, reuse: bool) -> Twins {
-    let (mut held, listener, kept, ip, h, ts) = time_wait_endpoint_with(cfg.clone(), reuse);
-    let (mut record, _, old, ..) = time_wait_endpoint_with(cfg.clone(), reuse);
+    let (local, remote) = addresses();
+    twins_at(cfg, reuse, local, remote, b"")
+}
+
+// `twins` between `local` and `remote`, `b` holding `unread` from the peer.
+fn twins_at(
+    cfg: &EndpointConfig,
+    reuse: bool,
+    local: core::net::SocketAddr,
+    remote: core::net::SocketAddr,
+    unread: &[u8],
+) -> Twins {
+    let (mut held, listener, kept, ip, h, ts) =
+        time_wait_endpoint_at(cfg.clone(), reuse, local, remote, unread);
+    let (mut record, _, old, ..) = time_wait_endpoint_at(cfg.clone(), reuse, local, remote, unread);
     held.set_mark(kept, MARK).unwrap();
     record.set_mark(old, MARK).unwrap();
     let charge = record.buffer_bytes();
@@ -75,6 +91,11 @@ fn twins(cfg: &EndpointConfig, reuse: bool) -> Twins {
         ip,
         h,
         ts,
+        tuple: Tuple {
+            local: remote,
+            remote: local,
+        },
+        kept,
     }
 }
 
@@ -108,9 +129,11 @@ impl Twins {
             self.record.time_wait_connections()
         );
         assert_eq!(
-            self.held.connect(now, tuple().local, tuple().remote).err(),
+            self.held
+                .connect(now, self.tuple.local, self.tuple.remote)
+                .err(),
             self.record
-                .connect(now, tuple().local, tuple().remote)
+                .connect(now, self.tuple.local, self.tuple.remote)
                 .err()
         );
     }
@@ -233,6 +256,66 @@ fn a_time_wait_record_answers_every_segment_as_its_connection() {
                     assert_eq!(twins.held.time_wait_connections(), 0);
                     assert_eq!(twins.record.time_wait_connections(), 0);
                 }
+            }
+        }
+    }
+}
+
+// The ACK of the peer's FIN offers the free receive space, and every ACK
+// of TIME-WAIT, the record's as the connection's, repeats that window: as
+// Linux's tcp_time_wait keeps tw_rcv_wnd = tcp_receive_window(tp) and
+// tcp_v4_timewait_ack / tcp_v6_timewait_ack send tw_rcv_wnd >>
+// tw_rcv_wscale. Unscaled and scaled, IPv4 and IPv6: a retransmitted FIN,
+// an out-of-window segment and a challenged SYN.
+#[test]
+fn a_time_wait_record_acks_with_the_window_its_connection_offered() {
+    use wire::{ACK, FIN, SYN};
+    let unread = [5; 100];
+    let v6 = (
+        "[2001:db8::1]:40000".parse().unwrap(),
+        "[2001:db8::2]:8080".parse().unwrap(),
+    );
+    for (local, remote) in [addresses(), v6] {
+        for (capacity, scaled) in [(1024, false), (1 << 20, true)] {
+            let mut cfg = config();
+            cfg.connection.receive_capacity = capacity;
+            let probe = twins_at(&cfg, false, local, remote, &unread);
+            let (rcv, snd, ts) = (probe.h.acknowledgment, probe.h.sequence, probe.ts);
+            let window = probe.h.window;
+            let info = probe.held.transport_info(probe.kept).unwrap();
+            assert_eq!(info.receive_window_scale != 0, scaled);
+            if scaled {
+                // The free space, at most rcv_ssthresh (Linux's
+                // __tcp_select_window), in units of the scale.
+                let offered = u32::from(window) << info.receive_window_scale;
+                assert!(offered != 0 && offered as usize <= capacity - unread.len());
+            } else {
+                // The free space, less the FIN's sequence number: the edge
+                // offered before the FIN stays (a window grown by less than
+                // the update threshold keeps its edge).
+                assert_eq!(usize::from(window), capacity - unread.len() - 1);
+            }
+            let fresh = Some(ts.wrapping_add(1));
+            let cases: [Case; 3] = [
+                (rcv - 1, snd, FIN | ACK, fresh, b""),
+                (rcv + 100, snd, ACK, fresh, b"late"),
+                (rcv + 100, 0, SYN, fresh, b""),
+            ];
+            for (seq, ack, flags, ts, payload) in cases {
+                let mut twins = twins_at(&cfg, false, local, remote, &unread);
+                let segment = twins.segment(seq, ack, flags, ts, payload);
+                let replies = twins.input(4_000, &segment);
+                assert_eq!(replies.len(), 1);
+                let reply = wire::parse(replies[0].0, &replies[0].1).unwrap().header;
+                assert_eq!(
+                    (
+                        reply.flags,
+                        reply.sequence,
+                        reply.acknowledgment,
+                        reply.window
+                    ),
+                    (ACK, snd, rcv, window)
+                );
             }
         }
     }

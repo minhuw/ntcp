@@ -2091,13 +2091,17 @@ impl Connection {
         if self.state != State::TimeWait || !self.output_idle() {
             return None;
         }
-        // The ACK of the peer's FIN has gone out, offering no window past it.
-        debug_assert_eq!(self.receive_window(), 0);
+        // The ACK of the peer's FIN has gone out. The record answers with
+        // the window that ACK offered, as Linux's tcp_time_wait keeps
+        // tw_rcv_wnd = tcp_receive_window(tp) and tcp_v4_timewait_ack /
+        // tcp_v6_timewait_ack send tw_rcv_wnd >> tw_rcv_wscale.
         debug_assert_eq!(self.last_ack_sent, self.receive.next());
+        let shift = if self.scaling { self.local_scale } else { 0 };
         Some(crate::time_wait::Record {
             tuple: self.scoped_tuple(),
             snd_nxt: self.snd_nxt,
             rcv_nxt: self.receive.next(),
+            window: (self.receive_window() >> shift).min(u32::from(u16::MAX)) as u16,
             ack_floor: self
                 .snd_una
                 .wrapping_add(0u32.wrapping_sub(self.max_snd_wnd)),
@@ -7267,7 +7271,15 @@ impl Connection {
             + u64::from(h.flags & SYN != 0)
             + u64::from(h.flags & FIN != 0);
         let next = self.receive.next();
-        let window = self.receive_window();
+        // TIME-WAIT accepts RCV.NXT only, whatever window its ACKs offer:
+        // Linux's tcp_timewait_state_process takes a bare ACK or RST at
+        // rcv_nxt and answers or drops everything else, as the TIME-WAIT
+        // record does (`time_wait::Record::input`).
+        let window = if self.state == State::TimeWait {
+            0
+        } else {
+            self.receive_window()
+        };
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.4
         //# A TCP receiver MUST process the RST and URG fields of all incoming segments,
         //# even when the receive window is zero (MUST-66).
@@ -9146,12 +9158,11 @@ impl Connection {
         if syn {
             return self.syn_window;
         }
-        if self.receive.eof() {
-            return 0;
-        }
+        // The peer's FIN closes no window: Linux's __tcp_select_window has
+        // no FIN case and keeps offering the free space.
         let shift = if self.scaling { self.local_scale } else { 0 };
         let unit = 1u32 << shift;
-        let backing = self.receive.right_edge().distance_from(self.receive.next());
+        let backing = self.receive.room();
         // Linux's __tcp_select_window: the free space, at most rcv_ssthresh
         // (u32::MAX for a fixed or locked direction).
         let quota = (self
@@ -11829,7 +11840,7 @@ impl Connection {
             //# greater than the window announced by the most recent <ACK>, if
             //# more than one segment has arrived since the application consumed
             //# any data in the receive buffer).
-            if edge.after(self.advertised_edge) || self.receive.eof() {
+            if edge.after(self.advertised_edge) {
                 self.advertised_edge = edge;
             }
         }

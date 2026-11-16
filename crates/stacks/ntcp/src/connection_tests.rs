@@ -12353,7 +12353,9 @@ fn coalesced_reads_preserve_ack_triggers_and_suppress_eof_updates() {
             let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
             assert_eq!(segment.header.flags & ACK, ACK);
             assert_eq!(segment.header.acknowledgment, b.receive.next().0);
-            assert_eq!(segment.header.window, if trigger == 3 { 0 } else { 64 });
+            // The FIN closes no window (Linux's __tcp_select_window has no
+            // FIN case): the read freed the whole ring either way.
+            assert_eq!(segment.header.window, 64);
             assert_eq!(
                 segment.payload,
                 if trigger == 2 { &b"reply"[..] } else { b"" }
@@ -12372,6 +12374,52 @@ fn coalesced_reads_preserve_ack_triggers_and_suppress_eof_updates() {
         packet(&mut b, 40);
         assert_eq!(b.read(&mut [0; 48]), Ok(48));
         assert_eq!(b.transmit(41, &mut [0; 64]), Ok(None));
+    }
+}
+
+// The ACK of data and FIN offers the right edge the same data alone would
+// get, from the free receive space: Linux's __tcp_select_window has no FIN
+// case. (The window is a byte smaller: the FIN takes a sequence number,
+// and a window grown by less than the update threshold keeps its edge.)
+// Reading after the FIN sends no window update, as Linux's
+// __tcp_cleanup_rbuf sends none once RCV_SHUTDOWN is set.
+#[test]
+fn ack_of_data_and_fin_offers_the_free_receive_space() {
+    for capacity in [4096, 1 << 20] {
+        let ack_of = |fin: u8| {
+            let (_, mut b) = pair(config(capacity, 1000), 100);
+            let next = b.receive.next();
+            let ack = b.snd_una;
+            inject(&mut b, 40, next, ack, ACK | PSH | fin, 20000, &[7; 1000]);
+            let now = if b.ack_pending {
+                40
+            } else {
+                let deadline = b.ack_deadline.unwrap();
+                b.timeout(deadline).unwrap();
+                deadline
+            };
+            let bytes = packet(&mut b, now);
+            let header = wire::parse(ip(reverse(tuple())), &bytes).unwrap().header;
+            assert_eq!(header.acknowledgment, b.receive.next().0);
+            let shift = if b.scaling { b.local_scale } else { 0 };
+            assert_eq!(shift != 0, capacity > 65535);
+            let edge = Seq(header.acknowledgment).wrapping_add(u32::from(header.window) << shift);
+            (b, header.window, edge, now)
+        };
+        let (_, _, open, _) = ack_of(0);
+        let (mut b, window, edge, now) = ack_of(FIN);
+        assert!(b.receive.eof());
+        assert_ne!(window, 0);
+        if b.local_scale == 0 {
+            assert_eq!(edge, open);
+            assert_eq!(usize::from(window), capacity - 1000 - 1);
+        } else {
+            // Within the scale unit both round to.
+            let gap = edge.distance_from(open).min(open.distance_from(edge));
+            assert!(gap < 1 << b.local_scale, "{gap}");
+        }
+        assert_eq!(b.read(&mut [0; 1000]), Ok(1000));
+        assert_eq!(b.transmit(now + 1, &mut [0; 64]), Ok(None));
     }
 }
 
@@ -14040,9 +14088,12 @@ fn rfc5961_reset_and_syn_state_matrix_drops_text_urgent_fin_and_ack() {
                         ),
                         before
                     );
+                    // TIME-WAIT takes RCV.NXT only, whatever window it
+                    // offers (Linux's tcp_timewait_state_process): an
+                    // inexact RST is dropped unanswered there.
                     assert_eq!(
                         a.ack_pending || a.challenge_ack_pending,
-                        control == SYN || offset == 1
+                        control == SYN || offset == 1 && state != State::TimeWait
                     );
                     if a.ack_pending || a.challenge_ack_pending {
                         let bytes = packet(&mut a, 50);

@@ -1,8 +1,8 @@
 //! TIME-WAIT without a connection. Once a connection in TIME-WAIT has no
 //! application owner, the Endpoint keeps only what TIME-WAIT still needs
-//! (Linux's inet_timewait_sock): the tuple, both sequence frontiers, the
-//! timestamp state, the challenge-ACK budget and the timer. The connection,
-//! its buffers and its slot are freed.
+//! (Linux's inet_timewait_sock): the tuple, both sequence frontiers, the last
+//! offered window, the timestamp state, the challenge-ACK budget and the timer.
+//! The connection, its buffers and its slot are freed.
 extern crate alloc;
 
 use alloc::{boxed::Box, vec::Vec};
@@ -26,6 +26,10 @@ pub(crate) struct Record {
     pub(crate) tuple: ScopedTuple,
     pub(crate) snd_nxt: Seq,
     pub(crate) rcv_nxt: Seq,
+    // The window field of the connection's last ACK, the ACK of the peer's
+    // FIN, which every ACK of the record repeats (Linux's tw_rcv_wnd >>
+    // tw_rcv_wscale).
+    pub(crate) window: u16,
     // SND.UNA - MAX.SND.WND, the oldest acceptable SEG.ACK (RFC 5961 5.2).
     pub(crate) ack_floor: Seq,
     pub(crate) timestamps: bool,
@@ -171,8 +175,16 @@ impl Record {
         let len = segment.payload.len() as u64
             + u64::from(h.flags & SYN != 0)
             + u64::from(h.flags & FIN != 0);
-        // RCV.WND is zero: the ACK of the peer's FIN, sent before the record
-        // was made, offered no window past it.
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-3.2
+        //= reason=TIME-WAIT acceptability is RCV.NXT only, as Linux's tcp_timewait_state_process takes only a bare ACK or RST at rcv_nxt, although its ACKs repeat the window last offered (tw_rcv_wnd): no data can follow the peer's FIN, so an inexact RST is dropped unanswered, as before that window was offered. Scoped departure for TIME-WAIT only; the held connection's TIME-WAIT and its record agree (time_wait_record matrix).
+        //# 3) If the RST bit is set and the sequence number does not exactly
+        //# match the next expected sequence value, yet is within the current
+        //# receive window (RCV.NXT < SEG.SEQ < RCV.NXT+RCV.WND), TCP MUST
+        //# send an acknowledgment (challenge ACK):
+        // Only RCV.NXT is acceptable, whatever window the ACKs offer: no
+        // data can follow the peer's FIN, and Linux's
+        // tcp_timewait_state_process takes only a bare ACK or RST at
+        // rcv_nxt.
         let next = self.rcv_nxt;
         let acceptable = if h.flags & RST != 0 {
             seq == next
@@ -195,7 +207,7 @@ impl Record {
         //# 2) If the RST bit is set and the sequence number exactly matches the
         //# next expected sequence number (RCV.NXT), then TCP MUST reset the
         //# connection.
-        // Without a window, only RCV.NXT is acceptable: no RST is challenged.
+        // Only RCV.NXT is acceptable: no RST is challenged.
         if h.flags & RST != 0 {
             return Input::Reset;
         }
@@ -240,9 +252,13 @@ impl Record {
         }
     }
 
-    // The pure ACK a TIME-WAIT connection sends: SND.NXT, RCV.NXT, a zero
-    // window (the peer's FIN ends the receive stream) and, when negotiated,
-    // TSval and TS.Recent. Returns the header and its options.
+    // The pure ACK a TIME-WAIT connection sends: SND.NXT, RCV.NXT, the
+    // window the connection last offered and, when negotiated, TSval and
+    // TS.Recent. Returns the header and its options.
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
+    //= reason=Every TIME-WAIT ACK repeats the window field of the ACK of the peer's FIN (Linux's tw_rcv_wnd >> tw_rcv_wscale), so the right edge stays where that ACK put it.
+    //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
+    //# edge to the left (SHLD-14).
     pub(crate) fn ack(&self, now: Instant, config: &ConnectionConfig) -> (Header, [u8; 12], usize) {
         let header = Header {
             source_port: self.tuple.tuple.local.port(),
@@ -250,7 +266,7 @@ impl Record {
             sequence: self.snd_nxt.0,
             acknowledgment: self.rcv_nxt.0,
             flags: ACK,
-            window: 0,
+            window: self.window,
             urgent_pointer: 0,
         };
         let mut options = [1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -768,6 +784,7 @@ mod tests {
             },
             snd_nxt: Seq(1),
             rcv_nxt: Seq(1),
+            window: 0,
             ack_floor: Seq(1),
             timestamps: false,
             timestamp_offset: 0,

@@ -1224,12 +1224,19 @@ impl ReceiveBuffer {
             .wrapping_add(u32::from(self.eof))
     }
 
+    #[cfg(test)]
     pub(crate) fn right_edge(&self) -> Seq {
         self.read_base.wrapping_add(self.data.len() as u32)
     }
 
     pub(crate) fn readable(&self) -> usize {
         self.contiguous_len
+    }
+
+    // The ring's room past next(): a FIN takes sequence space, not ring
+    // storage.
+    pub(crate) fn room(&self) -> u32 {
+        (self.data.len() - self.contiguous_len) as u32
     }
 
     // The sequence after the last byte held beyond a gap, if any: the end
