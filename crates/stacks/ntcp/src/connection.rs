@@ -11382,7 +11382,10 @@ impl Connection {
         // Fixed receive-report metadata is journaled along with sender state.
         // FIN/URG outputs retain the existing immutable reservation contract.
         // A reserved PTB repair charges nothing per byte before acceptance.
-        self.repair_undo = if reserve
+        // Cleared in place and captured into the field: most outputs keep
+        // none, and an empty one built aside would still be copied in whole.
+        self.repair_undo = None;
+        if reserve
             && retransmitted
             && !ptb_repair
             && !syn
@@ -11392,7 +11395,7 @@ impl Connection {
             && flags & (FIN | URG) == 0
             && self.prr.is_some_and(|p| p.timer_repair())
         {
-            RepairUndo::capture(self, seq, count)
+            RepairUndo::capture(self, seq, count);
         } else if self.local_refusals
             && reserve
             && fresh_data
@@ -11405,10 +11408,8 @@ impl Connection {
             && sack_option_len == 0
             && self.snd_wnd != 0
         {
-            RepairUndo::capture_fresh(self)
-        } else {
-            None
-        };
+            RepairUndo::capture_fresh(self);
+        }
         // A sequence-bearing control without payload (SYN, SYN-ACK, FIN)
         // keeps its selection-time state, so a held attempt whose next hop
         // never resolves can be withdrawn without a departure.

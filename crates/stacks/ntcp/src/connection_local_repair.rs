@@ -120,12 +120,15 @@ impl RepairUndo {
     pub(super) fn is_fresh(&self) -> bool {
         self.fresh.is_some()
     }
-    pub(super) fn capture(a: &Connection, start: Seq, count: usize) -> Option<Self> {
-        let rack = a.rack.retry_undo(start, start.wrapping_add(count as u32))?;
-        Some(Self::capture_state(a, Some(rack), None))
+    // Both captures store into `a.repair_undo` only when they keep one, so
+    // the common output without an undo copies nothing.
+    pub(super) fn capture(a: &mut Connection, start: Seq, count: usize) {
+        if let Some(rack) = a.rack.retry_undo(start, start.wrapping_add(count as u32)) {
+            a.repair_undo = Some(Self::capture_state(a, Some(rack), None));
+        }
     }
 
-    pub(super) fn capture_fresh(a: &Connection) -> Option<Self> {
+    pub(super) fn capture_fresh(a: &mut Connection) {
         if a.flight() != 0
             || !a.rack.empty_valid()
             || a.prr.is_some()
@@ -140,9 +143,9 @@ impl RepairUndo {
             || a.fast_open_retry.is_some()
             || a.pmtud.as_ref().is_some_and(|p| p.probe.is_some())
         {
-            return None;
+            return;
         }
-        Some(Self::capture_state(a, None, Some(FreshState::capture(a))))
+        a.repair_undo = Some(Self::capture_state(a, None, Some(FreshState::capture(a))));
     }
 
     fn capture_state(
