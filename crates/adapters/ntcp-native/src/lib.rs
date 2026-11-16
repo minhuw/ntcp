@@ -1651,6 +1651,11 @@ impl<P: PacketIo> Network<P> {
     /// it found ready and asks again before it reports them, as Linux's
     /// level-triggered epoll does, can drop one when it is no longer ready:
     /// its next change is an event. Asking changes nothing else.
+    ///
+    /// `writable` is Linux's tcp_poll EPOLLOUT test, which does not ask
+    /// whether memory to store a write is there: a connection whose write
+    /// the buffer budget refuses (`WouldBlock(SendBuffer)`) can be reported
+    /// writable, and its Writable comes once memory comes back.
     pub fn readiness(&mut self, id: ConnId) -> Result<Readiness> {
         self.running()?;
         let c = self.conn(id)?;
@@ -1673,11 +1678,7 @@ impl<P: PacketIo> Network<P> {
             || self.endpoint.readable_bytes(core).unwrap_or(0) != 0
             || self.endpoint.terminal_readable_bytes(core).unwrap_or(0) != 0;
         let open = matches!(state, State::Established | State::CloseWait);
-        let writable = open
-            && self
-                .endpoint
-                .check_write_admission(core, None, TxTimestampRequest::default())
-                .is_ok_and(|n| n != 0);
+        let writable = open && writable(&self.endpoint, core, TxTimestampRequest::default());
         let c = self.conn_mut(id)?;
         if !readable {
             c.read_waiting = true;
@@ -1810,8 +1811,8 @@ impl<P: PacketIo> Network<P> {
     /// copy). Empty slices are skipped; no slices or only empty ones take
     /// nothing (`accepted` 0, no PUSH), as `try_write` of nothing. Errors
     /// are `try_write`'s, given only when nothing was taken: a refusal for
-    /// room is `WouldBlock` (the connection becomes Writable when it has
-    /// room); once some bytes are taken, a later refusal or error ends the
+    /// room is `WouldBlock` (the connection becomes Writable as `Writable`
+    /// tells); once some bytes are taken, a later refusal or error ends the
     /// write with them, and the next call reports it, as sendmsg returns
     /// what it copied. No TX timestamps are requested. One write call is
     /// this and one `push(id, now)`, which sends it as Linux's sendmsg does.
@@ -2297,10 +2298,7 @@ impl<P: PacketIo> Network<P> {
                         .config
                         .tx_timestamp_phases
                         .saturating_sub(c.trace_count)
-                && self
-                    .endpoint
-                    .check_write_admission(c.core, None, request)
-                    .is_ok_and(|n| n != 0)
+                && write_owed(&self.endpoint, c.core, request)
             {
                 c.write_waiting = None;
                 return Some(Event::Writable(id));
@@ -2445,10 +2443,7 @@ impl<P: PacketIo> Network<P> {
                             .config
                             .tx_timestamp_phases
                             .saturating_sub(c.trace_count)
-                    && self
-                        .endpoint
-                        .check_write_admission(c.core, None, request)
-                        .is_ok_and(|n| n != 0)
+                    && write_owed(&self.endpoint, c.core, request)
             })
     }
     fn stage_timestamp(&mut self) -> bool {
@@ -2503,4 +2498,29 @@ impl<P: PacketIo> Network<P> {
         self.stamped.push(id.slot);
         Ok(())
     }
+}
+
+// Whether connection `core` is writable for a write with `request`: one
+// would be admitted, and the core finds it writable as Linux's tcp_poll
+// reports EPOLLOUT (`Endpoint::stream_writable`): free send space of at
+// least half the send usage. A write is admitted while usage is below the
+// send space, so after a refusal the connection becomes writable only once
+// ACKs have freed a third of it; whether memory to store the write is
+// there is not asked.
+fn writable(endpoint: &Endpoint, core: ntcp::ConnectionId, request: TxTimestampRequest) -> bool {
+    endpoint
+        .check_write_admission(core, None, request)
+        .is_ok_and(|n| n != 0)
+        && endpoint.stream_writable(core, None) == Ok(true)
+}
+
+// Whether a writer armed for Writable is owed it: `writable`, and a write
+// would take bytes now. One the buffer budget refused waits for memory to
+// come back, whose wake raises the core's writable event; telling it
+// before would only bring the same WouldBlock.
+fn write_owed(endpoint: &Endpoint, core: ntcp::ConnectionId, request: TxTimestampRequest) -> bool {
+    writable(endpoint, core, request)
+        && endpoint
+            .send_admission_room(core, None)
+            .is_ok_and(|n| n != 0)
 }

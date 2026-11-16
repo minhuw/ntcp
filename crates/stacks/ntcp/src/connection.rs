@@ -1129,8 +1129,8 @@ pub(crate) struct Connection {
     // the allocator refused it, as Linux's tcp_sendmsg finds
     // sk_wmem_schedule fail and waits in sk_stream_wait_memory. Until memory
     // comes back (`memory_released`) or a later write's growth succeeds,
-    // writes take only what the allocated storage holds, and the connection
-    // is not writable beyond it.
+    // writes take only what the allocated storage holds. Writability ignores
+    // it, as tcp_poll does (`stream_writable`).
     send_memory_wanted: Option<usize>,
     // Whether memory pressure applies to the send direction
     // (`ConnectionConfig::send_capacity_max`), and the floor it moderates
@@ -1768,7 +1768,7 @@ impl Connection {
         self.config.send_capacity = send;
         self.send_tuned = false;
         self.send_expand_pending = false;
-        if self.send_space_remaining() != 0 {
+        if self.stream_writable(None) {
             self.send_backpressured = false;
         }
         self.refresh_writable();
@@ -1834,12 +1834,13 @@ impl Connection {
         Ok(())
     }
 
-    // A setter's writability: room in an open send direction.
+    // A setter's writability: an open send direction that is
+    // `stream_writable`.
     fn refresh_writable(&mut self) {
         self.events.writable = !self.shutdown
             && !self.read_closed
             && matches!(self.state, State::Established | State::CloseWait)
-            && self.send_space_remaining() != 0;
+            && self.stream_writable(None);
     }
 
     pub(crate) fn into_receive(self: Box<Self>) -> ReceiveBuffer {
@@ -4379,10 +4380,10 @@ impl Connection {
             return;
         }
         let decreased = effective < self.mss;
-        let blocked = self.send_space_remaining() == 0;
+        let blocked = !self.stream_writable(None);
         self.mss = effective;
         // A new segment size moves C; reopened room is writable as after an ACK.
-        if blocked && self.send_space_remaining() != 0 {
+        if blocked && self.stream_writable(None) {
             self.send_backpressured = false;
             self.events.writable |=
                 !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
@@ -4996,7 +4997,7 @@ impl Connection {
         }
         self.syn_pending = false;
         self.events.connected = true;
-        self.events.writable = !self.shutdown && self.send_space_remaining() != 0;
+        self.events.writable = !self.shutdown && self.stream_writable(None);
         self.events.readable =
             !self.read_closed && (self.receive.readable() != 0 || self.receive.eof());
         self.events.pushed |= self.receive.take_push();
@@ -5420,18 +5421,6 @@ impl Connection {
         self.check_admission(lowat, request, self.send_space_remaining())
     }
 
-    // As check_write_admission, but for a write that tries its storage
-    // growth again, as each tcp_sendmsg call retries sk_wmem_schedule: the
-    // room a write would take with memory to grow.
-    pub(crate) fn check_write_retry(
-        &self,
-        lowat: Option<u32>,
-        request: TxTimestampRequest,
-    ) -> Result<usize, Error> {
-        let space = self.send_space().saturating_sub(self.send_usage());
-        self.check_admission(lowat, request, space)
-    }
-
     fn check_admission(
         &self,
         lowat: Option<u32>,
@@ -5455,8 +5444,17 @@ impl Connection {
         }
     }
 
+    // What a write takes now: the admission room, and while its storage
+    // growth stays refused (`send_memory_wanted`) no more than the
+    // allocated storage holds, as tcp_sendmsg copies into what
+    // sk_wmem_schedule granted and then waits for memory.
     pub(crate) fn send_admission_room(&self, lowat: Option<u32>) -> usize {
-        self.admission_room(lowat, self.send_space_remaining())
+        let room = self.admission_room(lowat, self.send_space_remaining());
+        if self.send_memory_wanted.is_some() {
+            room.min(self.allocated_send_room())
+        } else {
+            room
+        }
     }
 
     // The admission room with `space` of send space left.
@@ -5526,8 +5524,8 @@ impl Connection {
     // what is left (as prepare_send_storage prices it), if that is less.
     // Without this, a writer whose whole queue an ACK drained, freeing the
     // ring it wanted to double, would wait for memory to double a ring it
-    // no longer has, and its allocated room, the bound on what it may take
-    // while it waits (send_space_remaining), would stay zero.
+    // no longer has, and what its writes may take while it waits
+    // (send_admission_room) would stay zero.
     fn send_storage_reclaimed(&mut self) {
         if let Some(wanted) = self.send_memory_wanted {
             let held = self.send.len() + self.allocated_send_room();
@@ -5653,10 +5651,10 @@ impl Connection {
     }
 
     // Memory came back to the buffer budget: the next write may grow the
-    // storage again, and the connection is writable if it has room
-    // (sk_stream_write_space).
+    // storage again, and the connection is writable if `stream_writable`
+    // holds (sk_stream_write_space).
     pub(crate) fn memory_released(&mut self) {
-        if self.send_memory_wanted.take().is_some() && self.send_space_remaining() != 0 {
+        if self.send_memory_wanted.take().is_some() && self.stream_writable(None) {
             self.send_backpressured = false;
             self.events.writable |=
                 !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
@@ -5740,7 +5738,7 @@ impl Connection {
             return;
         }
         self.sndbuf_expand();
-        if self.send_space_remaining() != 0 {
+        if self.stream_writable(None) {
             self.send_backpressured = false;
             self.events.writable |=
                 !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
@@ -5829,16 +5827,32 @@ impl Connection {
     }
 
     // Bytes admitted above a smaller new C stay queued; room reopens only
-    // once ordinary ACK progress drains below it.
-    // While a write's storage growth stays refused, only what the allocated
-    // storage holds: Linux's sk_stream_memory_free.
+    // once ordinary ACK progress drains below it. Room is what Linux's
+    // sk_stream_memory_free asks for (sk_wmem_queued < sk_sndbuf): it does
+    // not ask whether memory to store more is there.
+    #[inline]
     fn send_space_remaining(&self) -> usize {
-        let room = self.send_space().saturating_sub(self.send_usage());
-        if self.send_memory_wanted.is_some() {
-            room.min(self.allocated_send_room())
-        } else {
-            room
-        }
+        self.send_space().saturating_sub(self.send_usage())
+    }
+
+    // Linux's __sk_stream_is_writeable(sk, 1), which tcp_poll reports as
+    // EPOLLOUT and sk_stream_write_space wakes a writer on, with send usage
+    // as sk_wmem_queued and the send space C as sk_sndbuf: free space of at
+    // least half the usage (sk_stream_wspace >= sk_stream_min_wspace),
+    // usage below C, and with a notsent low-water mark `lowat`, fewer than
+    // half of it unsent (__sk_stream_memory_free, tcp_stream_memory_free
+    // with wake = 1; u32::MAX is none, Linux's default). Memory is not
+    // asked: a write whose storage growth is refused finds WouldBlock and
+    // waits for memory to come back (`memory_released`).
+    #[inline]
+    pub(crate) fn stream_writable(&self, lowat: Option<u32>) -> bool {
+        let usage = self.send_usage();
+        let space = self.send_space();
+        usage < space
+            && space - usage >= usage / 2
+            && lowat
+                .filter(|&lowat| lowat != u32::MAX)
+                .is_none_or(|lowat| (self.notsent_bytes() as u64) << 1 < u64::from(lowat))
     }
 
     // Fresh payload a managed connection may newly transmit: C less the
@@ -5876,9 +5890,10 @@ impl Connection {
     // Growth the budget or the allocator refuses fails no write: as Linux's
     // tcp_sendmsg copies what fits and then waits for memory
     // (sk_wmem_schedule, sk_stream_wait_memory), the write takes what the
-    // allocated storage holds, as a partial write or WouldBlock, and the
-    // connection is not writable beyond it until memory comes back. Returns
-    // whether growth was refused.
+    // allocated storage holds, as a partial write or WouldBlock, and later
+    // writes take no more than that until memory comes back or their own
+    // growth succeeds. Writability does not change (`stream_writable`).
+    // Returns whether growth was refused.
     pub(crate) fn prepare_send_metadata(
         &mut self,
         bytes: usize,
@@ -5915,8 +5930,7 @@ impl Connection {
         }
         // What the write would take with memory to grow: a refused write
         // tries again.
-        let space = self.send_space().saturating_sub(self.send_usage());
-        let accepted = bytes.min(self.admission_room(lowat, space));
+        let accepted = bytes.min(self.admission_room(lowat, self.send_space_remaining()));
         if accepted == 0 {
             return Ok(None);
         }
@@ -5947,8 +5961,7 @@ impl Connection {
             part /= 2;
         }
         // What waking it needs is the smallest growth that takes one more
-        // byte, not the whole write: as sk_stream_memory_free, any room lets
-        // the writer make progress.
+        // byte, not the whole write.
         let held = self.send.len() + self.allocated_send_room();
         let next = self.send_growth_cost(held + 1).unwrap_or(wanted);
         self.throttle_send(next.min(wanted));
@@ -6232,7 +6245,7 @@ impl Connection {
         if self.snd_up.is_some_and(|up| up.after(end)) {
             self.snd_up = (retained != 0).then_some(end);
         }
-        if discarded != 0 && self.send_space_remaining() != 0 {
+        if discarded != 0 && self.stream_writable(None) {
             self.send_backpressured = false;
             self.events.writable = true;
         }
@@ -8496,9 +8509,6 @@ impl Connection {
             // lets the endpoint raise a tuned limit (`expand_send`).
             self.send_expand_pending |= self.send_tuned && self.send_backpressured;
             self.refresh_work |= self.send_expand_pending;
-            if self.send_space_remaining() != 0 {
-                self.send_backpressured = false;
-            }
             self.send_base = self.send_base.wrapping_add(bytes);
             self.acknowledged = self.acknowledged.saturating_add(bytes as u64);
             self.events.acknowledged = Some(self.acknowledged);
@@ -8512,8 +8522,11 @@ impl Connection {
                 self.now,
                 TxTimestampClock::CallerTicks(self.config.timebase),
             );
-            if !self.shutdown && self.send_space_remaining() != 0 {
-                self.events.writable = true;
+            // sk_stream_write_space: SOCK_NOSPACE clears, and the writer is
+            // told, once the space the ACK freed makes it writable.
+            if self.stream_writable(None) {
+                self.send_backpressured = false;
+                self.events.writable |= !self.shutdown;
             }
         }
         self.snd_una = ack;

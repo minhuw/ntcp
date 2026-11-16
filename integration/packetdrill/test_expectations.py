@@ -487,21 +487,26 @@ class AccountingExpectations(unittest.TestCase):
         self.assertIn('getsockopt(4, SOL_TCP, TCP_NOTSENT_LOWAT, [0], [4]) = 0', text)
         self.assertNotIn('setsockopt(4, SOL_TCP, TCP_NOTSENT_LOWAT', text)
         self.assertIn('write(4, ..., 59000) = 8000', text)
-        self.assertIn('write(4, ..., 59000) = 2000', text)
+        self.assertIn('write(4, ..., 59000) = 4000', text)
         self.assertNotIn('= -1 EAGAIN', text)
         self.assertNotIn('epoll', text)
-        wait1 = '+0...0.020 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1'
+        timed = '+0...0.025 poll([{fd=4, events=POLLOUT, revents=0}], 1, 25) = 0'
+        wait1 = '+.005...0.015 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1'
         wait2 = '+0...0.010 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1'
+        self.assertIn(timed, text)
         self.assertIn(wait1, text)
         self.assertIn(wait2, text)
-        during_first = text[text.index(wait1):text.index(wait2)]
-        self.assertLess(during_first.index('ack 1 win 0'), during_first.index('ack 1 win 2000'))
-        self.assertLess(during_first.index('ack 1 win 2000'), during_first.index('ack 2001 win 2000'))
-        self.assertEqual(text.count('events=POLLOUT, revents=0}], 1, 0) = 0'), 2)
+        # The timed blocking poll spans the duplicate ACK, the reopen and
+        # ACK2001, none of which makes the socket writable.
+        during_timed = text[text.index(timed):text.index(wait1)]
+        self.assertLess(during_timed.index('ack 1 win 0'), during_timed.index('ack 1 win 2000'))
+        self.assertLess(during_timed.index('ack 1 win 2000'), during_timed.index('ack 2001 win 2000'))
+        self.assertIn('ack 4001 win 2000', text[text.index(wait1):text.index(wait2)])
+        self.assertEqual(text.count('events=POLLOUT, revents=0}], 1, 0) = 0'), 3)
         level = 'poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1'
         self.assertGreaterEqual(text.count(level), 6)
         # ACKs may only follow actual contiguous emitted ranges, including
-        # both the full initial payload ring and the reclaimed2000-byte fill.
+        # both the full initial payload ring and the reclaimed4000-byte fill.
         lines = text.splitlines()
         frontier = 1
         for line in lines:
@@ -514,8 +519,8 @@ class AccountingExpectations(unittest.TestCase):
             incoming = re.search(r'< \. 1:1\(0\) ack (\d+) win', line)
             if incoming:
                 self.assertLessEqual(int(incoming.group(1)), frontier)
-        self.assertEqual(frontier, 10001)
-        self.assertIn('ack 10001 win 2000', text)
+        self.assertEqual(frontier, 12001)
+        self.assertIn('ack 12001 win 2000', text)
         self.assertFalse(changed['upstream_setup_supported'])
         self.assertEqual(changed['upstream_blocked_reasons'], audit['blocked_reasons'])
         altered = copy.deepcopy(self.manifest)

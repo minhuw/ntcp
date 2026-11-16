@@ -4912,6 +4912,8 @@ impl Endpoint {
 
     /// Check byte and timestamp admission before consuming an external source.
     /// The caller must not mutate the endpoint between this check and its write.
+    /// The room is what a write takes if its storage can grow; a write whose
+    /// growth the buffer budget refuses takes what the storage holds.
     pub fn check_write_admission(
         &self,
         id: ConnectionId,
@@ -4922,6 +4924,26 @@ impl Endpoint {
             .slot(id)?
             .connection
             .check_write_admission(lowat, request)?)
+    }
+
+    /// Whether connection `id` is writable as Linux's tcp_poll reports
+    /// EPOLLOUT, `__sk_stream_is_writeable(sk, 1)`, with the send usage
+    /// (`TransportInfo::send_used`) as sk_wmem_queued and the send space
+    /// (`TransportInfo::send_space`) as sk_sndbuf: free space of at least
+    /// half the usage, usage below the space and, for a notsent low-water
+    /// mark `lowat` (TCP_NOTSENT_LOWAT; None or u32::MAX for none), fewer
+    /// than `lowat / 2` bytes unsent. Writes are admitted up to the space,
+    /// and up to `lowat` unsent, beyond what this reports. Whether memory to
+    /// store more is there is not asked: a write whose storage growth the
+    /// buffer budget refuses finds WouldBlock, and the connection's next
+    /// event after memory comes back lets it try again. The connection's
+    /// state is not asked either.
+    pub fn stream_writable(
+        &self,
+        id: ConnectionId,
+        lowat: Option<u32>,
+    ) -> Result<bool, EndpointError> {
+        Ok(self.slot(id)?.connection.stream_writable(lowat))
     }
 
     /// Prepare bookkeeping for at most `capacity` bytes before consuming an
@@ -4938,7 +4960,7 @@ impl Endpoint {
         let room = self
             .slot(id)?
             .connection
-            .check_write_retry(lowat, request)?;
+            .check_write_admission(lowat, request)?;
         let count = capacity.min(room);
         self.prepare_write_metadata(id, count, lowat, Some(request))?;
         // Storage refused for memory admits what the allocated storage holds.
@@ -5984,9 +6006,12 @@ impl Endpoint {
     /// (WouldBlock), because the buffer budget (`max_buffer_bytes`) or the
     /// allocator refused their send storage, not because the send buffer
     /// was full: where Linux's tcp_sendmsg finds sk_wmem_schedule fail and
-    /// waits in sk_stream_wait_memory, which has no MIB counter. The
-    /// connection is then not writable until memory comes back to the
-    /// budget: a connection's storage released, reclaimed or shrunk.
+    /// waits in sk_stream_wait_memory, which has no MIB counter. Its writes
+    /// then take no more than its storage holds until memory comes back to
+    /// the budget (a connection's storage released, reclaimed or shrunk),
+    /// which raises its writable event if it is `stream_writable`, or a
+    /// write's own growth succeeds; whether it is `stream_writable` does
+    /// not depend on memory.
     pub fn memory_throttled_writes(&self) -> u64 {
         self.memory_throttled_writes
     }
@@ -9516,7 +9541,8 @@ mod timestamp_default_control_tests {
 
 // A write whose storage growth the buffer budget refuses waits for memory as
 // Linux's tcp_sendmsg does in sk_stream_wait_memory: it takes what fits, then
-// would block, and the connection is writable again once memory comes back.
+// would block, and the connection is woken once memory comes back. Whether
+// it is writable does not ask for memory, as tcp_poll does not.
 #[cfg(test)]
 mod memory_wait_tests {
     use super::*;

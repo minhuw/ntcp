@@ -92,7 +92,7 @@
       "source_sha256": "9b19fb287c49efbeecf90f5a2a75eedbb1bc3ce3b91772b0c7c4b684bdbdcd24",
       "input_generated_sha256": "9b19fb287c49efbeecf90f5a2a75eedbb1bc3ce3b91772b0c7c4b684bdbdcd24",
       "fixture": "ntcp-expectations/epoll/epoll_out_edge.pkt",
-      "fixture_sha256": "743b1cf78dfa1352039b510ea03d88394a6c35a1bd54826631496aecde0c2647",
+      "fixture_sha256": "c33c3f72e4ff0f7a2fc5017a0ebb38aace502460513388c502450affa36f7ff7",
       "native_setup": {
         "kind": "explicit-native-socket-options",
         "linux_setup_reproduced": false,
@@ -115,7 +115,7 @@
           }
         ]
       },
-      "rationale": "Exercise native payload-space and LOWAT readiness through real EPOLLET after positive partial writes. Linux skb allocation overshoot and write-space hysteresis are separate host policies.",
+      "rationale": "Exercise native payload-space and LOWAT readiness through real EPOLLET after positive partial writes. Readiness follows Linux's __sk_stream_is_writeable on payload (free space of at least half the queued payload); Linux skb allocation overshoot is a separate host policy.",
       "changes": [
         {
           "field": "Linux tcp_wmem setup",
@@ -144,8 +144,8 @@
         {
           "field": "writable wakeup timeline",
           "upstream": "Linux skb memory-wakeup threshold",
-          "ntcp": "first2000-byte cumulative progress",
-          "derivation": "Native OUT requires payload room and2*notsent<effectiveLOWAT."
+          "ntcp": "first cumulative progress that leaves free space of at least half the queued payload (ACK 4001 and ACK 12001 of 8000 queued)",
+          "derivation": "Native OUT requires free payload space >= queued/2 (Linux's sk_stream_min_wspace, with payload as sk_wmem_queued and the8000-byte payload limit as sk_sndbuf) and2*notsent<effectiveLOWAT."
         },
         {
           "field": "third-cycle polling",
@@ -173,7 +173,7 @@
       "source_sha256": "dfef6226aa011c2ddc8676d8a448ff3ff6f7668e06edde4f6469011ff0fca15b",
       "input_generated_sha256": "dfef6226aa011c2ddc8676d8a448ff3ff6f7668e06edde4f6469011ff0fca15b",
       "fixture": "ntcp-expectations/epoll/epoll_out_edge_default_notsent_lowat.pkt",
-      "fixture_sha256": "88e8ab215c52f2950977ea6ee340ddfea1baf7f29168d1eef71f90e335fc71d3",
+      "fixture_sha256": "08e39fba662acce77bd736d31c0c6058a3789ef9b14dd9c9e6e1b3d70ca4eb03",
       "native_setup": {
         "kind": "explicit-native-socket-options",
         "linux_setup_reproduced": false,
@@ -196,7 +196,7 @@
           }
         ]
       },
-      "rationale": "Exercise native payload-space and LOWAT readiness through real EPOLLET after positive partial writes. Linux skb allocation overshoot and write-space hysteresis are separate host policies.",
+      "rationale": "Exercise native payload-space and LOWAT readiness through real EPOLLET after positive partial writes. Readiness follows Linux's __sk_stream_is_writeable on payload (free space of at least half the queued payload); Linux skb allocation overshoot is a separate host policy.",
       "changes": [
         {
           "field": "Linux tcp_wmem setup",
@@ -225,8 +225,8 @@
         {
           "field": "writable wakeup timeline",
           "upstream": "Linux skb memory-wakeup threshold",
-          "ntcp": "first2000-byte cumulative progress",
-          "derivation": "Native OUT requires payload room and2*notsent<effectiveLOWAT."
+          "ntcp": "first cumulative progress that leaves free space of at least half the queued payload (ACK 4001 and ACK 12001 of 8000 queued)",
+          "derivation": "Native OUT requires free payload space >= queued/2 (Linux's sk_stream_min_wspace, with payload as sk_wmem_queued and the8000-byte payload limit as sk_sndbuf) and2*notsent<effectiveLOWAT."
         },
         {
           "field": "third-cycle polling",
@@ -335,7 +335,7 @@
       "source_sha256": "b96dc3e7a6bc4d4f7369895120c77503cb94c18f18bccc4e9e8b5ee15903ac87",
       "input_generated_sha256": "b96dc3e7a6bc4d4f7369895120c77503cb94c18f18bccc4e9e8b5ee15903ac87",
       "fixture": "ntcp-expectations/notsent_lowat/notsent-lowat-default.pkt",
-      "fixture_sha256": "d8f40a70274ae89abb94cb738bae4d7fd6381ca04b79ce58961230167b81b9e8",
+      "fixture_sha256": "88efffb0a8a8729af4008f5226020a4284e67f352dbd93f7f12b453e91b5e9c2",
       "native_setup": {
         "kind": "explicit-native-socket-options",
         "linux_setup_reproduced": false,
@@ -359,7 +359,7 @@
           }
         ]
       },
-      "rationale": "Exercise a real blocking poll after a positive partial write, with native payload-space readiness and default LOWAT inheritance. Linux skb allocation overshoot and write-space hysteresis do not define native admission or notification thresholds.",
+      "rationale": "Exercise a real blocking poll after a positive partial write, with native payload-space readiness and default LOWAT inheritance. Readiness follows Linux's __sk_stream_is_writeable on payload (free space of at least half the queued payload); Linux skb allocation overshoot does not define native admission.",
       "changes": [
         {
           "field": "Linux default buffer and TSO setup",
@@ -382,13 +382,13 @@
         {
           "field": "blocking poll completion and ACKs",
           "upstream": "Linux poll becomes writable after cumulativeACK17001",
-          "ntcp": "first poll finishes20ms after invocation onACK2001; duplicateACK at5ms and reopen at10ms do not complete it",
-          "derivation": "Only real cumulative progress frees payload space. Each ACK follows a checked contiguous transmitted2000-byte range; original poll timeout1000ms and ordinary timing tolerance remain."
+          "ntcp": "a25ms blocking poll spanning the duplicateACK at5ms, the reopen at10ms and ACK2001 at20ms times out with no event; a second blocking poll finishes10ms after invocation onACK4001",
+          "derivation": "Only real cumulative progress frees payload space, and POLLOUT needs free space of at least half the queued payload (sk_stream_min_wspace): ACK2001 leaves2000 free of6000 queued, ACK4001 4000 of4000. Each blocking wait spans one wake: packetdrill times relative events from the previous event's actual time, so a wait spanning several transmitted ranges accumulates their capture latency. Each ACK follows a checked contiguous transmitted2000-byte range; ordinary timing tolerance remains."
         },
         {
           "field": "level readiness and second fill/drain cycle",
           "upstream": "one blocking poll",
-          "ntcp": "repeated ready polls; second59000-byte request returns2000, second blocked poll completes10ms later onACK4001; full data drain toACK10001",
+          "ntcp": "repeated ready polls; second59000-byte request returns4000; ACK6001 leaves it not ready; a blocked poll completes10ms later onACK8001; full data drain toACK12001",
           "derivation": "Refill exactly the reclaimed room. Verify poll reports persistent current level and can block again after refill, independent of epoll edge generations."
         }
       ],
@@ -398,7 +398,7 @@
         "Both writes return a positive prefix smaller than59000, without any application-visible EAGAIN call.",
         "Blocked poll cannot return on a duplicateACK or a window-only update; cumulative data ACK restores writable capacity.",
         "Repeated ready queries remain ready, and a refilled buffer removes POLLOUT until new cumulative progress.",
-        "Every ACK covers explicitly checked transmitted data; all10000 accepted bytes are transmitted and acknowledged.",
+        "Every ACK covers explicitly checked transmitted data; all12000 accepted bytes are transmitted and acknowledged.",
         "Production buffer policy, LOWAT/readiness code, congestion/recovery, pacing and packetdrill tolerances stay unchanged."
       ]
     },

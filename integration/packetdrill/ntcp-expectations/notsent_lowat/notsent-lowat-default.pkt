@@ -18,25 +18,32 @@
 // Fill the8000-byte payload buffer with a positive partial write.
    +0 write(4, ..., 59000) = 8000
    +0 poll([{fd=4, events=POLLOUT, revents=0}], 1, 0) = 0
-// DuplicateACK and window reopen free no payload space. Only data ACK wakes poll.
-   +0...0.020 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1
+// DuplicateACK, window reopen and ACK2001 do not wake a blocked poll: POLLOUT
+// needs free space of at least half the queued payload (sk_stream_min_wspace),
+// and ACK2001 frees2000 of6000 queued. The poll times out after25ms.
+   +0...0.025 poll([{fd=4, events=POLLOUT, revents=0}], 1, 25) = 0
  +.005 < . 1:1(0) ack 1 win 0
  +.005 < . 1:1(0) ack 1 win 2000
    +0 > P. 1:2001(2000) ack 1
  +.010 < . 1:1(0) ack 2001 win 2000
    +0 > P. 2001:4001(2000) ack 1
-   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
-   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
-// Refill the real2000-byte room and require a second blocked-to-writable cycle.
-   +0 write(4, ..., 59000) = 2000
-   +0 poll([{fd=4, events=POLLOUT, revents=0}], 1, 0) = 0
-   +0...0.010 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1
+// ACK4001 frees4000 of4000 queued and wakes a blocked poll.
+ +.005...0.015 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1
  +.010 < . 1:1(0) ack 4001 win 2000
    +0 > P. 4001:6001(2000) ack 1
    +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
+// Refill the real4000-byte room and require a second blocked-to-writable cycle.
+   +0 write(4, ..., 59000) = 4000
+   +0 poll([{fd=4, events=POLLOUT, revents=0}], 1, 0) = 0
  +.010 < . 1:1(0) ack 6001 win 2000
    +0 > P. 6001:8001(2000) ack 1
+   +0 poll([{fd=4, events=POLLOUT, revents=0}], 1, 0) = 0
+   +0...0.010 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 1000) = 1
  +.010 < . 1:1(0) ack 8001 win 2000
    +0 > P. 8001:10001(2000) ack 1
+   +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1
  +.010 < . 1:1(0) ack 10001 win 2000
+   +0 > P. 10001:12001(2000) ack 1
+ +.010 < . 1:1(0) ack 12001 win 2000
    +0 poll([{fd=4, events=POLLOUT, revents=POLLOUT}], 1, 0) = 1

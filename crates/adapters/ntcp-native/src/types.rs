@@ -222,6 +222,16 @@ pub enum Event {
     /// data is unread, as Linux wakes a socket for each segment it queues:
     /// at most once per connection per drain.
     Readable(ConnId),
+    /// A write refused with `WouldBlock`, or a `Network::readiness` that
+    /// found the connection not writable, is followed by writability, as
+    /// Linux's sk_stream_write_space wakes a socket once
+    /// `__sk_stream_is_writeable` holds: free send space of at least half
+    /// the send usage (`TransportInfo::send_space` less `send_used` at least
+    /// `send_used / 2`). Writes are admitted up to the send space, so after a
+    /// full send buffer ACKs free a third of it first. Memory is not asked:
+    /// a write whose storage the buffer budget refuses gets
+    /// `WouldBlock(SendBuffer)`, and Writable follows once memory comes
+    /// back to the budget.
     Writable(ConnId),
     Closed {
         connection: ConnId,

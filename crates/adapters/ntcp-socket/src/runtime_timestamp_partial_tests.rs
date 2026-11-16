@@ -257,7 +257,8 @@ fn timestamp_partial_native_accounting_fixture_keeps_all_phases() {
 }
 
 // Writable readiness follows the rounded admission ceiling C, not the
-// SO_SNDBUF capacity B that getsockopt keeps reporting.
+// SO_SNDBUF capacity B that getsockopt keeps reporting, as sk_sndbuf in
+// __sk_stream_is_writeable: free space of at least half the usage.
 #[test]
 fn writable_readiness_agrees_with_rounded_admission() {
     let mut f = fixture();
@@ -276,12 +277,13 @@ fn writable_readiness_agrees_with_rounded_admission() {
     assert_eq!(room(&f), 0);
     assert!(!writable(&mut f));
     assert_eq!(send(&mut f), Err(EAGAIN));
-    // A partial ACK drains below C and reopens both together. The 24-byte
+    // A partial ACK drains below C and reopens admission. The 24-byte
     // segment the window cut keeps an entry beyond the full-size segments
-    // the queued bytes need, which send usage charges.
+    // the queued bytes need, which send usage charges. The free space is
+    // less than half the usage: not writable (sk_stream_min_wspace).
     ack(&mut f, 20000, 988);
     assert_eq!(room(&f), 988 - ENTRY_BYTES);
-    assert!(writable(&mut f));
+    assert!(!writable(&mut f));
     assert_eq!(send(&mut f).unwrap() as usize, 988 - ENTRY_BYTES);
     assert!(!writable(&mut f));
     // A live resize keeps reporting B and moves C with it.

@@ -2,7 +2,8 @@
 // A 100ms handshake RTT separates staged ACKs from initial loss-probe timing.
 // Common upstream profile; explicit native payload capacity = 2*4000.
 // Peer scale zero makes each 2000-byte window exactly two 1000-byte MSS.
-// The native wakeup checks payload space and, for LOWAT4000, notsent<2000.
+// EPOLLOUT needs free payload space of at least half the queued payload
+// (Linux's sk_stream_min_wspace) and, for LOWAT4000, notsent<2000.
     0 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
    +0 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
    +0 bind(3, ..., ...) = 0
@@ -31,10 +32,10 @@
    +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
  +.01 < . 1:1(0) ack 2001 win 2000
    +0 > P. 2001:4001(2000) ack 1
-   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
    +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
  +.01 < . 1:1(0) ack 4001 win 2000
    +0 > P. 4001:6001(2000) ack 1
+   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
    +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
  +.01 < . 1:1(0) ack 6001 win 2000
    +0 > P. 6001:8001(2000) ack 1
@@ -48,10 +49,10 @@
    +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
  +.01 < . 1:1(0) ack 10001 win 2000
    +0 > P. 10001:12001(2000) ack 1
-   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
    +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
  +.01 < . 1:1(0) ack 12001 win 2000
    +0 > P. 12001:14001(2000) ack 1
+   +0 epoll_wait(5, {events=EPOLLOUT, fd=4}, 1, 0) = 1
    +0 epoll_wait(5, {events=0, ptr=0}, 1, 0) = 0
  +.01 < . 1:1(0) ack 14001 win 2000
    +0 > P. 14001:16001(2000) ack 1

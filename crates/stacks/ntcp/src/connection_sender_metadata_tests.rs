@@ -408,7 +408,7 @@ fn one_byte_writes_stop_at_the_send_limit_by_usage() {
     assert!(a.rack.capacity() < crate::rack::SplitBound::entries(limit) / 4);
     assert!(metadata_bytes(&a) < 64 * 1024);
     assert_eq!(
-        a.check_write_retry(None, TxTimestampRequest::default()),
+        a.check_write_admission(None, TxTimestampRequest::default()),
         Err(Error::WouldBlock)
     );
     // The peer's ACK frees the room: writable again, and the next write's

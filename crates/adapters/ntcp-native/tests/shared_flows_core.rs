@@ -951,8 +951,11 @@ fn a_waiting_writer_whose_own_write_finds_returned_memory_is_writable() {
     assert!(taken < data.len());
     assert!(memory.waiting(1));
     lan.step();
-    drained(&mut lan.members[1].network);
-    assert!(!lan.members[1].network.readiness(ids[1]).unwrap().writable);
+    // No Writable while the group has no room for the write; readiness
+    // reports it writable, as Linux's tcp_poll asks no memory (c153). The
+    // refused write armed its Writable.
+    assert!(!drained(&mut lan.members[1].network).contains(&Event::Writable(ids[1])));
+    assert!(lan.members[1].network.readiness(ids[1]).unwrap().writable);
     // Member 0 goes; member 1 has not driven since.
     drop(lan.members.remove(0));
     assert!(memory.waiting(1));

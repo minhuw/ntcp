@@ -222,7 +222,9 @@ fn pmtu_changes_move_c_and_keep_admitted_data_above_it() {
     // A smaller segment leaves less unused space: C grows to 2 * 860.
     set_link_mtu(&mut a, &mut service, 900);
     assert_eq!((a.mss, a.send_space()), (860, 1720));
-    assert!(a.take_events().writable);
+    // 260 octets free is less than half the 1460 queued: a write takes
+    // them, but the connection is not writable (__sk_stream_is_writeable).
+    assert!(!a.take_events().writable);
     assert_eq!(a.write(&[2; 5000]).unwrap(), 260);
     // Back at 1500, C = 1460 is below the 1720 admitted bytes: they stay.
     set_link_mtu(&mut a, &mut service, 1500);
@@ -259,7 +261,8 @@ fn pmtu_decrease_below_queue_reopens_on_partial_ack() {
     deliver(&mut a, &mut b, 10);
     deliver(&mut b, &mut a, 11);
     assert_eq!(a.send.len(), 3420);
-    assert!(a.take_events().writable);
+    // 420 octets free is less than half the 3420 queued: not writable.
+    assert!(!a.take_events().writable);
     assert_eq!(a.send_admission_room(None), 420);
     assert_eq!(a.write(&[2; 9000]).unwrap(), 420);
 }
@@ -279,7 +282,8 @@ fn resize_with_unchanged_mss_recomputes_c_and_reports_b() {
     a.set_buffer_capacities(6000, 65536, usize::MAX).unwrap();
     let info = a.transport_info();
     assert_eq!((info.send_capacity, info.send_space), (6000, 5840));
-    assert!(a.take_events().writable);
+    // 1460 octets free is less than half the 4380 queued: not writable.
+    assert!(!a.take_events().writable);
     // Shared payload takes the same admission as copied bytes.
     let shared = crate::Payload::from_vec(vec![3; 9000]);
     a.prepare_shared_storage(&shared, usize::MAX, usize::MAX)

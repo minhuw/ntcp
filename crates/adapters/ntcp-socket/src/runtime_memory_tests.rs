@@ -455,7 +455,9 @@ fn packet_ptb_validation_precedes_bounded_queue_admission() {
 
 // PMTU feedback re-rounds the send space C of an unchanged SO_SNDBUF (B):
 // a smaller C keeps the bytes already admitted above it, a larger one
-// reopens writable readiness with a new edge; getsockopt keeps B.
+// reopens admission; getsockopt keeps B. Writable readiness needs free
+// space of at least half the usage (__sk_stream_is_writeable), which no
+// C within this B gives these bytes: no EPOLLOUT edge.
 #[test]
 fn packet_ptb_rerounds_send_space_readiness_and_edges() {
     let (mut a, _, clients, _) = ptb_pair(1);
@@ -506,8 +508,8 @@ fn packet_ptb_rerounds_send_space_readiness_and_edges() {
         (1100, 4400, 4380)
     );
     let reopened = ready(&mut a);
-    assert_ne!(reopened.value & EPOLLOUT, 0);
-    assert!(socket_options::edge_changed(
+    assert_eq!(reopened.value & EPOLLOUT, 0);
+    assert!(!socket_options::edge_changed(
         EPOLLOUT as u32,
         Some(blocked.readiness_generations),
         reopened.readiness_generations,

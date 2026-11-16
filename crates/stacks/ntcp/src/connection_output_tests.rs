@@ -2375,6 +2375,81 @@ fn eor_sack_rescue_selects_final_record_not_a_clipped_prefix() {
     );
 }
 
+// sk_stream_write_space wakes a writer, and tcp_poll reports EPOLLOUT, only
+// once the free send space is at least half the usage (sk_stream_wspace >=
+// sk_stream_min_wspace in __sk_stream_is_writeable): an ACK that leaves less
+// lets a write in but raises no writable event, and SOCK_NOSPACE
+// (send_backpressured) stays set for the next ACK.
+#[test]
+fn writable_needs_free_space_of_half_the_usage() {
+    let (mut a, _) = pair(config(3000, 1000), 100);
+    a.take_events();
+    assert_eq!(a.write(&[1; 4000]), Ok(3000));
+    assert!(!a.stream_writable(None));
+    for _ in 0..3 {
+        packet(&mut a, 40);
+    }
+    let next = a.receive.next();
+    let ack = a.send_base.wrapping_add(999);
+    inject(&mut a, 50, next, ack, ACK, 32768, &[]);
+    // 999 octets free, 2001 queued.
+    assert_eq!(a.send_admission_room(None), 999);
+    assert!(!a.stream_writable(None));
+    assert!(!a.take_events().writable);
+    assert!(a.send_backpressured);
+    let ack = a.send_base.wrapping_add(1);
+    inject(&mut a, 51, next, ack, ACK, 32768, &[]);
+    // 1000 free, 2000 queued.
+    assert!(a.stream_writable(None));
+    assert!(a.take_events().writable);
+    assert!(!a.send_backpressured);
+    assert_eq!(a.write(&[2; 1500]), Ok(1000));
+}
+
+// tcp_poll asks tcp_stream_memory_free with wake = 1: writable while fewer
+// than half of TCP_NOTSENT_LOWAT octets are unsent ((notsent << 1) <
+// lowat), while writes are admitted up to the mark. Between half the mark
+// and the mark a write still takes bytes, but the connection is not
+// writable; sending unsent bytes, not an ACK, makes it writable again. A
+// mark of zero is never writable, and None or u32::MAX is no mark. The
+// send space rule applies besides.
+#[test]
+fn notsent_lowat_writability_is_half_the_mark() {
+    let (mut a, _) = pair(config(32768, 1000), 100);
+    a.set_cork(true);
+    assert!(a.stream_writable(Some(4000)));
+    assert!(!a.stream_writable(Some(0)));
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(&[1; 1999], true, false, Some(4000)),
+        Ok(1999)
+    );
+    assert!(a.stream_writable(Some(4000)));
+    assert!(!a.stream_writable(Some(3998)));
+    assert_eq!(
+        a.write_with_options_and_notsent_lowat(&[1; 1], true, false, Some(4000)),
+        Ok(1)
+    );
+    assert_eq!(a.transport_info().notsent_bytes, 2000);
+    assert!(!a.stream_writable(Some(4000)));
+    assert!(a.stream_writable(Some(4001)));
+    assert!(a.stream_writable(None) && a.stream_writable(Some(u32::MAX)));
+    assert_eq!(a.send_admission_room(Some(4000)), 2000);
+    // One segment leaves: 1000 unsent.
+    a.set_cork(false);
+    packet(&mut a, 40);
+    assert_eq!(a.transport_info().notsent_bytes, 1000);
+    assert!(a.stream_writable(Some(4000)));
+    assert!(!a.stream_writable(Some(2000)));
+    // With the mark met, the send space still decides: 21845 of 32768
+    // octets queued leaves 10923, at least half; one more does not.
+    let more = 21845 - a.send.len();
+    assert_eq!(a.write_with_options(&vec![2; more], true, false), Ok(more));
+    assert!(a.stream_writable(None));
+    assert_eq!(a.write_with_options(&[2], true, false), Ok(1));
+    assert!(!a.stream_writable(None));
+    assert!(!a.stream_writable(Some(u32::MAX)));
+}
+
 #[test]
 fn lowat_byte_admission_transmission_ack_resize_flush_and_wrap() {
     for iss in [0, u32::MAX - 1999] {

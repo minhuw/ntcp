@@ -45,10 +45,20 @@ const FLUSH: WorkBudget = WorkBudget::new(0, 64, 0, 0);
 // `headroom`, with memory pressure beginning at the cap: a send limit
 // expanded with cwnd grows until the cap itself refuses its ring.
 fn network(address: IpAddr, wire: Wire, opens: usize, headroom: usize) -> Network<Wire> {
+    let cap = base(address).buffer_budget(opens, &wire).unwrap() + headroom;
+    capped(address, wire, cap)
+}
+
+fn base(address: IpAddr) -> NetworkConfig {
     let mut config = NetworkConfig::new(address, 1500);
     config.tcp.max_connections = CONNECTIONS;
     config.tcp.connection.timebase.units_per_second = 1_000_000_000;
-    let cap = config.buffer_budget(opens, &wire).unwrap() + headroom;
+    config
+}
+
+// The same with a buffer cap of `cap` bytes.
+fn capped(address: IpAddr, wire: Wire, cap: usize) -> Network<Wire> {
+    let mut config = base(address);
     config.tcp.max_buffer_bytes = cap;
     config.tcp.buffer_pressure_bytes = Some(cap);
     config.tcp.buffer_low_bytes = Some(cap - 1);
@@ -139,4 +149,114 @@ fn a_writer_refused_memory_is_writable_again_once_the_peer_reads() {
     }
     assert_eq!(received, data);
     assert!(refused > 0, "no write was refused for memory");
+}
+
+// A connection is writable by Linux's rule while the budget refuses its
+// send storage: tcp_poll reports EPOLLOUT by __sk_stream_is_writeable,
+// which asks sk_wmem_queued and sk_sndbuf, not memory. Its write takes what
+// fits and the next one is refused (WouldBlock, throttled writes), no
+// Writable comes while memory stays short, and the return of another
+// connection's storage, once the peer has read that connection's data,
+// raises Writable; the next write then takes bytes.
+#[test]
+fn a_writable_connection_refused_memory_is_woken_by_a_return_and_writes() {
+    let (server_ip, client_ip): (IpAddr, IpAddr) =
+        ("198.18.0.1".parse().unwrap(), "198.18.0.2".parse().unwrap());
+    let data: Vec<u8> = (0..1 << 16).map(|i: u32| (i * 7 % 251) as u8).collect();
+    // The charge once `bulk` filled its send buffer, unacknowledged, with
+    // room to spare; then a cap 64 KiB above it, which `bulk`'s growth
+    // peaks fit and the waiter's 64 KiB ring does not.
+    let run = |cap: Option<usize>| -> usize {
+        let (near, far) = wires();
+        let mut server = match cap {
+            Some(cap) => capped(server_ip, near, cap),
+            None => network(server_ip, near, CONNECTIONS, CONNECTIONS * 70 * 65536),
+        };
+        let mut client = network(client_ip, far, CONNECTIONS, CONNECTIONS * 70 * 65536);
+        let listener = server.listen(7000, 4).unwrap();
+        let now = Cell::new(0u64);
+        let drive = |network: &mut Network<Wire>, budget| {
+            now.set(now.get() + 20_000);
+            network.drive(now.get(), budget).unwrap();
+            let mut events = Vec::new();
+            let mut out = [Event::NetworkStopped; 8];
+            loop {
+                let report = network.drain_events(&mut out);
+                events.extend_from_slice(&out[..report.written]);
+                if !report.more {
+                    return events;
+                }
+            }
+        };
+        let dialers: Vec<_> = (0..2)
+            .map(|_| client.connect(SocketAddr::new(server_ip, 7000)).unwrap())
+            .collect();
+        let mut accepted = Vec::new();
+        while accepted.len() < 2 {
+            drive(&mut server, BUDGET);
+            drive(&mut client, BUDGET);
+            match server.accept(listener) {
+                Ok(id) => accepted.push(id),
+                Err(error) => assert!(error.is_would_block(), "{error:?}"),
+            }
+        }
+        let (bulk, waiter) = (accepted[0], accepted[1]);
+        // A fixed send limit, as SO_SNDBUF sets: pressure does not moderate
+        // it to what the waiter queued.
+        server.set_send_buffer(waiter, 65536).unwrap();
+        // The client reads nothing yet: `bulk`'s data stays queued.
+        let mut sent = 0;
+        while let Ok(receipt) = server.try_write(bulk, &data[sent..], WriteOptions::default()) {
+            sent += receipt.accepted;
+            drive(&mut server, FLUSH);
+        }
+        assert!(sent > 0);
+        assert_eq!(server.counters().memory_throttled_writes, 0);
+        let charge = server.counters().buffer_bytes;
+        if cap.is_none() {
+            return charge;
+        }
+        drive(&mut server, BUDGET);
+        let taken = server
+            .try_write(waiter, &data, WriteOptions::default())
+            .unwrap()
+            .accepted;
+        assert!(taken > 0 && taken < data.len(), "{taken}");
+        assert_eq!(server.counters().memory_throttled_writes, 1);
+        let error = server
+            .try_write(waiter, &data[taken..], WriteOptions::default())
+            .unwrap_err();
+        assert!(error.is_would_block(), "{error:?}");
+        assert_eq!(server.counters().memory_throttled_writes, 2);
+        // Writable by Linux's rule, but no Writable while memory is short.
+        assert!(server.readiness(waiter).unwrap().writable);
+        assert!(!drive(&mut server, BUDGET).contains(&Event::Writable(waiter)));
+        // The client reads; its ACKs drain `bulk`, whose freed storage
+        // wakes the waiter.
+        let mut buffer = vec![0u8; 65536];
+        let (mut received, mut woken) = (0, false);
+        for _ in 0..10_000 {
+            woken |= drive(&mut server, BUDGET).contains(&Event::Writable(waiter));
+            drive(&mut client, BUDGET);
+            while let Ok(ReadOutcome::Data { len, .. }) = client.try_read(dialers[0], &mut buffer) {
+                received += len;
+            }
+            if woken && received == sent {
+                break;
+            }
+        }
+        assert_eq!(received, sent);
+        assert!(
+            woken,
+            "no Writable after the return: {:?}",
+            server.counters()
+        );
+        let receipt = server
+            .try_write(waiter, &data[taken..], WriteOptions::default())
+            .unwrap();
+        assert!(receipt.accepted > 0);
+        charge
+    };
+    let charge = run(None);
+    assert_eq!(run(Some(charge + 65536)), charge);
 }

@@ -1585,10 +1585,13 @@ fn transport_info_sndbuf_requires_application_backpressure_and_send_starvation()
     let partial = a.send_base.wrapping_add(3);
     inject(&mut a, 20_200, next, partial, ACK, 64, &[]);
     assert_eq!(a.transport_info_at(40_200).sndbuf_limited_us, 20_000);
-    // An exactly satisfied write is application-limited, not NOSPACE.
+    // The ACK left 3 octets free, less than half the 13 queued, so NOSPACE
+    // stays (sk_stream_write_space clears SOCK_NOSPACE only once
+    // __sk_stream_is_writeable holds): once a write fills the room and is
+    // sent, the starvation counts again.
     assert_eq!(a.write(&[2; 3]), Ok(3));
     packet(&mut a, 20_200);
-    assert_eq!(a.transport_info_at(40_200).sndbuf_limited_us, 20_000);
+    assert_eq!(a.transport_info_at(40_200).sndbuf_limited_us, 40_000);
     let end = a.snd_nxt;
     inject(&mut a, 40_200, next, end, ACK, 64, &[]);
     assert_eq!(a.transport_info_at(100_000).busy_time_us, 40_100);
@@ -16174,7 +16177,10 @@ fn flush_retains_advertised_urgency_and_push_after_partial_ack() {
     assert_eq!(a.snd_nxt, next);
     assert_eq!(a.snd_up, Some(urgent_end));
     assert_eq!(a.advertised_snd_up, Some(urgent_end));
-    assert!(a.take_events().writable);
+    // 2 of 16 octets free is less than half the 14 queued: not writable
+    // (__sk_stream_is_writeable), though a write would take them.
+    assert!(!a.take_events().writable);
+    assert_eq!(a.send_admission_room(None), 2);
     a.retx_pending = true;
     let bytes = packet(&mut a, 60);
     let segment = wire::parse(ip(tuple()), &bytes).unwrap();

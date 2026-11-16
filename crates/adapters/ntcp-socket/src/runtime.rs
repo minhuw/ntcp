@@ -13,7 +13,7 @@ mod ports;
 mod send;
 #[path = "runtime_timestamping.rs"]
 mod timestamps;
-use crate::socket_options::{Linger, effective_notsent_lowat, notsent_writable};
+use crate::socket_options::{Linger, effective_notsent_lowat};
 use crate::*;
 use ntcp::{
     AddressValidation, CloseReason, ConnectionId, Endpoint, EndpointConfig, EndpointError, Error,
@@ -2963,7 +2963,6 @@ impl Owner {
             }
             Handle::Connection(cid) => {
                 let state = self.endpoint.state(cid).map_err(engine)?;
-                let info = self.endpoint.transport_info(cid).map_err(engine)?;
                 let eof = s.peer_fin
                     || matches!(
                         state,
@@ -2990,17 +2989,17 @@ impl Owner {
                     || matches!(state, State::Closed | State::TimeWait)
                     || ((matches!(state, State::Established | State::CloseWait)
                         || state == State::SynReceived && s.connected)
-                        && info.send_used < info.send_space
-                        // Not while a write waits for memory beyond what its
-                        // storage holds (sk_stream_memory_free).
-                        && self.endpoint.send_admission_room(cid, None) != Ok(0)
-                        && notsent_writable(
-                            info.notsent_bytes,
-                            effective_notsent_lowat(
-                                s.notsent_lowat,
-                                self.socket_policy.notsent_lowat,
-                            ),
-                        ))
+                        // tcp_poll's __sk_stream_is_writeable(sk, 1).
+                        && self
+                            .endpoint
+                            .stream_writable(
+                                cid,
+                                Some(effective_notsent_lowat(
+                                    s.notsent_lowat,
+                                    self.socket_policy.notsent_lowat,
+                                )),
+                            )
+                            .map_err(engine)?)
                 {
                     bits |= EPOLLOUT;
                 }
