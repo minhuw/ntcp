@@ -91,6 +91,10 @@ impl<P: PacketIo> Network<P> {
     /// preempted owner stops receiving and acknowledging until it runs again
     /// (for example an application timer thread that wakes once per request).
     ///
+    /// Output a write queues leaves in its `push`, Linux's tcp_push at the
+    /// end of sendmsg, or in the next drive; every other output (timers,
+    /// ACKs of input, other connections') leaves in drives.
+    ///
     /// A drive with `budget.receive` 0 receives nothing
     /// (`WorkBudget::receive`): run between a `try_read` and the next
     /// `drain_events`, it adds no arrival to what the read left.
@@ -159,6 +163,185 @@ impl<P: PacketIo> Network<P> {
         }
         report.events_pending = self.events_pending();
         Ok(report)
+    }
+    /// Linux's tcp_push for connection `id` alone, at `now`: its output is
+    /// selected and handed to the backend until it has nothing selectable
+    /// (nothing queued, or what is queued held by the windows, Nagle or
+    /// pacing), a frame waits for backend room, its frame waits for its
+    /// next hop's resolution, or `PUSH_FRAMES` frames went out
+    /// (`PushReport::more`). What one write left past a TSO aggregate, the
+    /// rest of a reservation and the segments of an aggregate the backend
+    /// refused all leave in the same push. Call it where Linux's sendmsg
+    /// ends: after the writes of one application write (one
+    /// `try_write_vectored`, or the `try_write`s of one iovec), and after
+    /// `set_nodelay(true)` and `shutdown_write`, which Linux pushes inside
+    /// the call. What is written and not pushed is sent by the next drive.
+    ///
+    /// Everything else stays with `drive`: timers (one due now runs in the
+    /// next drive, as Linux runs a timer that fired during sendmsg at
+    /// release_sock), input, other connections' output and stateless
+    /// replies, ARP timers and replies, closes, reclaim and event
+    /// collection. A push that finds any frame waiting for backend room
+    /// sends nothing (`tx_blocked`): the next drive retries those first, as
+    /// a qdisc queues a new skb behind older ones. A connection whose
+    /// output is reserved (its own frame waiting for room or for its next
+    /// hop) gets nothing sent either, with `tx_blocked`; the drive that
+    /// ends the reservation sends what its calls released meanwhile. The
+    /// first frame to an unresolved next hop starts its resolution here:
+    /// the frame is held, and the request leaves in this push.
+    ///
+    /// A push can arm a retransmission or pacing timer, so its
+    /// `next_deadline` is the network's, as `drive` reports it. An
+    /// embedding that sleeps until a deadline sleeps no later than the
+    /// earliest of its last drive's and its pushes' since, and drives first
+    /// when a push reports `more_work`.
+    ///
+    /// Errors as `drive`'s: `Stopped`, nothing done; `TimeWentBackwards`,
+    /// nothing done and the network runs on; `InvalidHandle` for a
+    /// connection released, closed or aborted, nothing done; any other
+    /// stops the network first.
+    pub fn push(&mut self, id: ConnId, now: Instant) -> Result<PushReport> {
+        self.running()?;
+        let c = self.conn(id)?;
+        if c.close_requested || c.abort_requested || c.released {
+            return Err(Error::InvalidHandle);
+        }
+        let core = c.core;
+        match self.advance_time(now) {
+            Ok(()) => {}
+            Err(error @ Error::Tcp(EndpointError::Connection(ntcp::Error::AmbiguousTimeJump))) => {
+                return Err(self.stop_with_cause(error));
+            }
+            Err(error) => return Err(error),
+        }
+        let mut report = DriveReport::default();
+        let result = self.push_inner(core, now, &mut report);
+        self.wake_members_for_memory();
+        self.counters.transmitted += report.transmitted as u64;
+        let more = match result {
+            Ok(more) => more,
+            Err(Error::Backend(error)) => return Err(self.stop_with_error(error)),
+            Err(other) => {
+                if cfg!(debug_assertions) {
+                    panic!("push: broken invariant: {other}");
+                }
+                return Err(self.stop_with_cause(other));
+            }
+        };
+        Ok(PushReport {
+            transmitted: report.transmitted,
+            tx_blocked: report.tx_blocked || self.tx_pending != 0,
+            more,
+            more_work: more || self.tx_pending != 0,
+            next_deadline: self.next_deadline(),
+        })
+    }
+    // The push's transmit loop for `core`; true when it ended at the frame
+    // limit with the connection's output still selectable.
+    fn push_inner(
+        &mut self,
+        core: ntcp::ConnectionId,
+        now: Instant,
+        report: &mut DriveReport,
+    ) -> Result<bool> {
+        // The shared neighbor table's mapping epoch, which egress resolution
+        // checks its front cache against.
+        if let Some(member) = super::shared::member(&mut self.host) {
+            member.begin();
+        }
+        // A path change an earlier drive queued reaches the connection
+        // before its selection, as in the drive.
+        if self.host.output_changes_pending() {
+            let changes = self.host.service_changes(&mut self.endpoint, now)?;
+            if let Some(error) = changes.first_error {
+                return Err(error.into());
+            }
+        }
+        let held = self.tx_held;
+        let mut frames = 0;
+        let mut more = false;
+        // Frames waiting for backend room go first, in the drive.
+        while self.tx_pending == 0 {
+            if frames == PUSH_FRAMES {
+                more = self.endpoint.output_selectable(core);
+                break;
+            }
+            // No frame waits for room, so every slot is free but those
+            // held for their next hop.
+            let index = if self.tx_held == 0 {
+                self.tx_cursor
+            } else {
+                match (0..self.tx.len()).find(|&i| self.tx[i].pending.is_none()) {
+                    Some(index) => index,
+                    None => break,
+                }
+            };
+            frames += 1;
+            let mut tx = std::mem::take(&mut self.tx);
+            let slot = &mut tx[index];
+            let result = self.push_slot(slot, core, report);
+            let waiting = slot.pending.as_ref().map(|p| p.held);
+            self.tx = tx;
+            if let Some(held) = waiting {
+                occupy(&mut self.tx_frames, index);
+                if held {
+                    self.tx_held += 1;
+                } else {
+                    self.tx_pending += 1;
+                }
+            }
+            if result? || waiting.is_some() {
+                break;
+            }
+        }
+        // The request for a next hop the push began resolving.
+        if self.tx_held != held {
+            if self.shared_neighbors {
+                self.shared_output(now, PUSH_FRAMES, false, report)?;
+            } else if !self.control.is_empty() {
+                self.control_output(now, PUSH_FRAMES, report)?;
+            }
+        }
+        Ok(more)
+    }
+    // One frame of `core`'s output polled into empty `slot` and tried, and
+    // the segments polled again, one at a time, of an aggregate the backend
+    // refused; true when the connection had nothing to select.
+    fn push_slot(
+        &mut self,
+        slot: &mut TxSlot,
+        core: ntcp::ConnectionId,
+        report: &mut DriveReport,
+    ) -> Result<bool> {
+        if self.fill(slot, Some(core), false, report)?.is_some() {
+            return Ok(true);
+        }
+        loop {
+            match self.send(slot, report)? {
+                Some(owner) => {
+                    if self.fill(slot, Some(owner), true, report)?.is_some() {
+                        return Ok(true);
+                    }
+                }
+                None => return Ok(false),
+            }
+        }
+    }
+    // The earliest instant the network has work: the endpoint's timers,
+    // reassembly expiry and, on a resolving link, its neighbor timers.
+    fn next_deadline(&self) -> Option<Instant> {
+        let deadline = self
+            .endpoint
+            .next_deadline()
+            .into_iter()
+            .chain(self.host.next_reassembly_deadline())
+            .min();
+        if !self.control.is_empty()
+            && let Some(at) = self.host.next_neighbor_deadline()
+        {
+            return Some(deadline.map_or(at, |d| d.min(at)));
+        }
+        deadline
     }
     // Whether drain_events would give anything now: its queues, and the
     // endpoint's events it collects first. When it would not, no live
@@ -448,17 +631,7 @@ impl<P: PacketIo> Network<P> {
         self.collect_core_events();
         self.maintain_connections()?;
         self.host.collect(&self.endpoint)?;
-        report.next_deadline = self
-            .endpoint
-            .next_deadline()
-            .into_iter()
-            .chain(self.host.next_reassembly_deadline())
-            .min();
-        if !self.control.is_empty()
-            && let Some(at) = self.host.next_neighbor_deadline()
-        {
-            report.next_deadline = Some(report.next_deadline.map_or(at, |d| d.min(at)));
-        }
+        report.next_deadline = self.next_deadline();
         self.check_live();
         debug_assert_eq!(
             self.tx_pending,
@@ -1138,7 +1311,7 @@ impl<P: PacketIo> Network<P> {
     // more work, and the next connection may have a packet.
     fn transmit_slot(&mut self, slot: &mut TxSlot, report: &mut DriveReport) -> Result<bool> {
         if slot.pending.is_none()
-            && let Some(idle) = self.fill(slot, None, report)?
+            && let Some(idle) = self.fill(slot, None, false, report)?
         {
             return Ok(idle);
         }
@@ -1147,7 +1320,7 @@ impl<P: PacketIo> Network<P> {
                 // The backend refused the aggregate, which the endpoint
                 // took back: its first segment goes out alone, in this turn.
                 Some(owner) => {
-                    if let Some(idle) = self.fill(slot, Some(owner), report)? {
+                    if let Some(idle) = self.fill(slot, Some(owner), true, report)? {
                         return Ok(idle);
                     }
                 }
@@ -1157,11 +1330,14 @@ impl<P: PacketIo> Network<P> {
     }
     // Polls the endpoint's next packet into empty `slot`, or that of
     // `owner`'s reservation; Some ends the slot's turn, Some(true) when the
-    // endpoint has nothing left to offer.
+    // endpoint has nothing left to offer. `scalar`: the packet goes out
+    // alone, never prepared as an aggregate (a re-poll after the backend
+    // refused one).
     fn fill(
         &mut self,
         slot: &mut TxSlot,
         owner: Option<ntcp::ConnectionId>,
+        scalar: bool,
         report: &mut DriveReport,
     ) -> Result<Option<bool>> {
         let offset = self.config.link.offset();
@@ -1245,7 +1421,7 @@ impl<P: PacketIo> Network<P> {
                 ip_len,
                 held: false,
                 group: None,
-                scalar: owner.is_some(),
+                scalar,
             });
         }
         Ok(None)

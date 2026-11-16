@@ -283,6 +283,33 @@ impl WorkBudget {
     }
 }
 
+/// The frames one `Network::push` hands to the backend at most, counted as
+/// `WorkBudget::transmit` counts them (an aggregate is one): a push that
+/// reaches it with output left reports `PushReport::more`.
+pub const PUSH_FRAMES: usize = 64;
+
+/// What a `Network::push` did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PushReport {
+    /// Wire segments the backend took, an aggregate's counted one by one,
+    /// as `DriveReport::transmitted` counts them.
+    pub transmitted: usize,
+    /// A frame waits for backend room: this connection's, or another's
+    /// that kept the push from sending (`Network::push`); or the
+    /// connection's output was reserved. The next drive retries it.
+    pub tx_blocked: bool,
+    /// The push ended at `PUSH_FRAMES` with the connection's output still
+    /// selectable: push again, or drive.
+    pub more: bool,
+    /// Drive before sleeping, as for `DriveReport::more_work`: `more`, or a
+    /// frame waiting for backend room.
+    pub more_work: bool,
+    /// The network's next deadline, as `DriveReport::next_deadline`, which
+    /// the push may have moved earlier (a retransmission or pacing timer
+    /// it armed).
+    pub next_deadline: Option<Instant>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DriveReport {
     pub received: usize,

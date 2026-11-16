@@ -1706,6 +1706,9 @@ impl<P: PacketIo> Network<P> {
             _ => Err(Error::ConnectionClosed(self.endpoint.close_reason(c.core)?)),
         }
     }
+    /// Queues `data` on connection `id`, PUSH on its last byte; it is sent
+    /// by the next `push(id, now)`, where Linux's sendmsg ends, or else by
+    /// the next drive.
     pub fn try_write(
         &mut self,
         id: ConnId,
@@ -1780,7 +1783,8 @@ impl<P: PacketIo> Network<P> {
     /// room is `WouldBlock` (the connection becomes Writable when it has
     /// room); once some bytes are taken, a later refusal or error ends the
     /// write with them, and the next call reports it, as sendmsg returns
-    /// what it copied. No TX timestamps are requested.
+    /// what it copied. No TX timestamps are requested. One write call is
+    /// this and one `push(id, now)`, which sends it as Linux's sendmsg does.
     pub fn try_write_vectored(
         &mut self,
         id: ConnId,
@@ -1995,6 +1999,9 @@ impl<P: PacketIo> Network<P> {
             },
         })
     }
+    /// Turns Nagle's algorithm off (`enabled`) or on for connection `id`.
+    /// Linux's setsockopt(TCP_NODELAY) on also pushes what Nagle held: here
+    /// `push(id, now)` after it does, or else the next drive.
     pub fn set_nodelay(&mut self, id: ConnId, enabled: bool) -> Result<()> {
         self.running()?;
         self.endpoint.set_nagle(self.conn(id)?.core, !enabled)?;
@@ -2110,6 +2117,9 @@ impl<P: PacketIo> Network<P> {
             .endpoint
             .listener_buffer_capacities(self.open_listener_core(listener)?)?)
     }
+    /// Queues the FIN of connection `id` after its data. Linux's
+    /// shutdown(SHUT_WR) sends it inside the call: here `push(id, now)`
+    /// after it does, or else the next drive.
     pub fn shutdown_write(&mut self, id: ConnId) -> Result<()> {
         self.running()?;
         let c = self.conn(id)?;

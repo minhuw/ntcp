@@ -274,6 +274,43 @@ fn stations_resolve_each_other_and_exchange_data_both_ways() {
     );
 }
 
+// A push whose frame goes to an unresolved next hop holds the frame and
+// sends the request at once, as Linux's neigh_resolve_output probes from
+// inside the send; its deadline is the resolution's. While the frame is
+// held, a push sends nothing; the drive that takes in the reply sends it.
+#[test]
+fn a_push_to_an_unresolved_next_hop_holds_its_frame_and_asks() {
+    let mut a = Station::new(config(IP_A, MAC_A, None));
+    let mut b = Station::new(config(IP_B, MAC_B, None));
+    let listener = b.network.listen(80, 2).unwrap();
+    let client = a.network.connect(SocketAddr::new(IP_B.into(), 80)).unwrap();
+    let report = a.network.push(client, 10).unwrap();
+    let sent = a.sent();
+    assert_eq!(
+        arps(&sent),
+        [(ntcp_ethernet::BROADCAST, request((MAC_A, IP_A), IP_B))]
+    );
+    assert_eq!(sent.len(), 1);
+    assert_eq!(report.transmitted, 1);
+    assert!(!report.more_work && !report.tx_blocked);
+    assert_eq!(report.next_deadline, Some(10 + SECOND));
+    // The held frame keeps the connection's output reserved.
+    let report = a.network.push(client, 20).unwrap();
+    assert_eq!(report.transmitted, 0);
+    assert!(report.tx_blocked && !report.more_work);
+    assert!(a.sent().is_empty());
+    b.deliver(&sent);
+    b.drive(30);
+    a.deliver(&b.sent());
+    a.drive(40);
+    let syn = a.sent();
+    assert_eq!(ipv4(&syn).len(), 1);
+    assert_eq!(syn[0][..6], MAC_B);
+    b.deliver(&syn);
+    let mut now = 40;
+    established(&mut a, &mut b, &mut now, listener);
+}
+
 #[test]
 fn a_silent_peer_fails_resolution_and_the_syn_is_never_sent() {
     let mut a = Station::new(config(IP_A, MAC_A, None));

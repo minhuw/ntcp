@@ -1,6 +1,6 @@
 // Network::try_write_vectored: one send of several slices, PUSH only at the
-// end of the bytes taken, and what a transmit-only (flush) drive sends of
-// pushed writes. Two IPv4 Networks over an in-memory IP wire whose sender
+// end of the bytes taken, and what a transmit-only (flush) drive or a push
+// sends of pushed writes. Two IPv4 Networks over an in-memory IP wire whose sender
 // side segments TCP aggregates (TSO), PSH and FIN on the last segment.
 use ntcp_io::{
     PacketIo, PacketLayer, TcpSegmentationCapabilities, TcpSegmentationError,
@@ -225,6 +225,13 @@ impl Pair {
         self.server.drive(self.now, FLUSH).unwrap();
         self.sent.borrow_mut().drain(..).collect()
     }
+    // One push of the server's connection; what it submitted.
+    fn push(&mut self) -> Vec<Sent> {
+        self.now += 10;
+        let report = self.server.push(self.id, self.now).unwrap();
+        assert!(!report.more && !report.tx_blocked);
+        self.sent.borrow_mut().drain(..).collect()
+    }
     // The client takes what reached it; its bytes.
     fn read(&mut self) -> Vec<u8> {
         self.now += 10;
@@ -257,6 +264,28 @@ fn pushed_writes_leave_whole_in_their_flush_drive() {
         pair.flush(),
         [Sent::Scalar(1448, true), Sent::Aggregate(2, 2672, true)]
     );
+    assert_eq!(pair.server.transport_info(id).unwrap().notsent_bytes, 0);
+    assert_eq!(pair.read().len(), 4120);
+}
+
+#[test]
+fn pushed_writes_leave_whole_in_their_push() {
+    // The same PDU sent by a push after its writes (Linux's tcp_push at
+    // the end of sendmsg): the same frames as the flush drive's, and a
+    // second push finds nothing.
+    let mut pair = Pair::new();
+    let id = pair.id;
+    for len in [24, 4096] {
+        let written = pair
+            .server
+            .try_write(id, &vec![9; len], WriteOptions::default());
+        assert_eq!(written.unwrap().accepted, len);
+    }
+    assert_eq!(
+        pair.push(),
+        [Sent::Scalar(1448, true), Sent::Aggregate(2, 2672, true)]
+    );
+    assert_eq!(pair.push(), []);
     assert_eq!(pair.server.transport_info(id).unwrap().notsent_bytes, 0);
     assert_eq!(pair.read().len(), 4120);
 }
