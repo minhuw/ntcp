@@ -2273,6 +2273,40 @@ fn eor_cork_flush_does_not_bypass_cwnd_or_prr_credit_and_tlp_respects_boundary()
     assert_eq!(segment.payload, &[2; 300]); // Probe also cannot cross EOR.
 }
 
+// A blocked writer pushes what it queued (finish_send with force), which
+// lifts Nagle but not sender SWS: the piece the window clips off a longer
+// queue waits for a full segment, as Linux's tcp_snd_wnd_test holds it
+// under TCP_NAGLE_PUSH. Sent anyway, it split the next segment into 999 +
+// 1 bytes, and the extra entry's send usage kept a blocked write short.
+#[test]
+fn pushed_queue_holds_window_clipped_short_segment() {
+    let (mut a, _) = pair(config(8000, 1000), 100);
+    let next = a.receive.next();
+    let base = a.snd_una;
+    let window = (2000u32 >> a.peer_scale) as u16;
+    inject(&mut a, 40, next, base, ACK, window, &[]);
+    a.write(&[1; 5000]).unwrap();
+    let end = a.acknowledged + a.send.len() as u64;
+    a.finish_send(end, false, false, true);
+    assert_eq!(outputs(&mut a, 50, base), [(0, 1000), (1000, 1000)]);
+    // 999 bytes of window: SWS holds them while 3000 bytes are queued.
+    inject(&mut a, 60, next, base.wrapping_add(999), ACK, window, &[]);
+    assert_eq!(outputs(&mut a, 60, base), []);
+    inject(&mut a, 70, next, base.wrapping_add(1000), ACK, window, &[]);
+    assert_eq!(outputs(&mut a, 70, base), [(2000, 1000)]);
+    // A pushed short segment that takes all queued data still leaves.
+    let (mut a, _) = pair(config(8000, 1000), 100);
+    let next = a.receive.next();
+    let base = a.snd_una;
+    inject(&mut a, 40, next, base, ACK, window, &[]);
+    a.write(&[1; 2999]).unwrap();
+    let end = a.acknowledged + a.send.len() as u64;
+    a.finish_send(end, false, false, true);
+    assert_eq!(outputs(&mut a, 50, base), [(0, 1000), (1000, 1000)]);
+    inject(&mut a, 60, next, base.wrapping_add(999), ACK, window, &[]);
+    assert_eq!(outputs(&mut a, 60, base), [(2000, 999)]);
+}
+
 #[test]
 fn cork_timestamp_credit_does_not_make_partial_payload_a_full_mss() {
     let (mut a, _) = pair(

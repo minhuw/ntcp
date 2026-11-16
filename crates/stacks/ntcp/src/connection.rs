@@ -10773,8 +10773,13 @@ impl Connection {
                 } else {
                     record
                 };
-                let sws = !flushing
-                    && !descriptor_limited
+                // A push (flush credit) does not lift it: RFC 9293 sends a
+                // pushed short segment early only when it takes all queued
+                // data (count == largest) or on the override timeout, and
+                // Linux's tcp_snd_wnd_test holds the window-clipped piece of
+                // a larger skb whatever the push (TCP_NAGLE_PUSH lifts only
+                // Nagle). A blocked write pushes on every wait.
+                let sws = !descriptor_limited
                     && !self.sws_override
                     && count < largest
                     && count < (self.max_snd_wnd / 2) as usize;
