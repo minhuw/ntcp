@@ -20,6 +20,14 @@ fn client() -> (Endpoint, ActiveOpenOptions) {
     (a, options)
 }
 
+// SYN data without a cached server MSS, as Linux's tcp_send_syn_data: the
+// MSS `client` offers (Linux's advmss, 1460), bounded by the path (IPv6
+// without discovery: the 1280-byte minimum MTU, 1280 - 40 - 20), less the
+// whole option space.
+fn cold(v6: bool) -> usize {
+    if v6 { 1220 - 40 } else { 1460 - 40 }
+}
+
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
 //= type=test
 //= reason=Cold SYN admission uses a conservative 536-byte ceiling in both families before option, configuration, path and storage limits; true peer defaults remain 536/1220 and validated learned MSS remains usable.
@@ -50,7 +58,7 @@ fn supplied_cookie_cold_limits_options_and_real_mss_learning() {
                     Some(cookie),
                 )
                 .unwrap();
-            assert_eq!(n, 496);
+            assert_eq!(n, cold(v6));
             assert!(!a.transport_info(id).unwrap().syn_data_acked);
             let syn = packet(&mut a, 0);
             let decoded = wire::parse(syn.0, &syn.1).unwrap();
@@ -137,7 +145,7 @@ fn cold_admission_modes_complete_stream_and_use_learned_mss() {
                     }
                 };
                 let (id, n) = open(&mut a, 0, local).unwrap();
-                assert_eq!(n, if mode == 0 { 0 } else { 496 });
+                assert_eq!(n, if mode == 0 { 0 } else { cold(v6) });
                 let syn = emit(&mut a, 0, id, reserved);
                 let parsed = wire::parse(syn.0, &syn.1).unwrap();
                 assert_eq!(parsed.payload, &data[..n]);
@@ -232,7 +240,7 @@ fn absent_synack_mss_keeps_cookie_supplied_and_protected_admission_cold() {
                 if reserved {
                     a.enable_output_reservations().unwrap();
                 }
-                let data: Vec<u8> = (0..1600).map(|i| (i % 251) as u8).collect();
+                let data: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
                 for round in 0..3 {
                     let now = round * 4_000_000;
                     let (local, _) = addresses(v6, 49800 + round as u16);
@@ -261,7 +269,7 @@ fn absent_synack_mss_keeps_cookie_supplied_and_protected_admission_cold() {
                         if mode == 0 && round == 0 {
                             0
                         } else if round < 2 {
-                            496
+                            cold(v6)
                         } else {
                             900
                         }
@@ -618,7 +626,7 @@ fn actual_server_cookie_can_be_transferred_to_a_cold_client_context() {
                 Some(obtained),
             )
             .unwrap();
-        assert_eq!(accepted, 496);
+        assert_eq!(accepted, cold(v6));
         let syn = packet(&mut a, 0);
         assert_eq!(
             wire::parse(syn.0, &syn.1).unwrap().options.fast_open,

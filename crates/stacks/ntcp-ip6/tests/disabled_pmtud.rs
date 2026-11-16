@@ -555,11 +555,10 @@ fn disabled_ipv6_fast_open_cold_warm_supplied_protected_and_rejected() {
                 .unwrap();
                 // A rejected cookie suppresses subsequent early attempts at that
                 // service; use the existing explicit cache clear for the next case.
-                let expected = if attempt == 0 {
-                    usize::from(limit.min(1240)) - 60 // Validated learned MSS, path limited.
-                } else {
-                    496 // Cold admission after explicit cache clear, including IPv6.
-                };
+                // Validated learned MSS 4096 or, after the explicit cache
+                // clear, the offered MSS 4096 (Linux's advmss): either way
+                // path limited, less the whole option space.
+                let expected = usize::from(limit.min(1240)) - 60;
                 assert_eq!(n, expected);
                 let syn = poll(&mut a, id, now, mode, bound).unwrap();
                 assert_eq!(syn.tcp().header.flags & SYN, SYN);
@@ -569,7 +568,7 @@ fn disabled_ipv6_fast_open_cold_warm_supplied_protected_and_rejected() {
                 assert_eq!(syn.tcp().options.fast_open.is_none(), attempt == 3);
                 if attempt == 2 {
                     assert_eq!(syn.tcp().raw_options.len(), 40);
-                    assert_eq!(syn.bytes.len(), 596); // Full options plus conservative cold data.
+                    assert_eq!(syn.bytes.len(), 100 + n); // Full options plus path-limited data.
                 }
                 if let Some(token) = syn.token {
                     assert!(a.reject_unsubmitted(token).unwrap());

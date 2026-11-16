@@ -360,7 +360,10 @@ fn first_syn_and_hidden_synack_use_outgoing_path_before_construction_both_famili
                         &mut a.0,
                     )
                     .unwrap();
-                assert!(admitted <= 536);
+                // SYN data fills the outgoing path less the IP and TCP
+                // headers and the whole option space (Linux's
+                // tcp_send_syn_data), as the path is known before construction.
+                assert_eq!(admitted as u32, mtu - if v6 { 40 } else { 20 } - 20 - 40);
                 id
             } else {
                 a.1.connect_with_path_provider(0, local, remote, options(&cfg, 24), &mut a.0)

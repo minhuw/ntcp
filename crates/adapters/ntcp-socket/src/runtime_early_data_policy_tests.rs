@@ -177,8 +177,10 @@ fn native_server_cookie_staging_is_peer_scoped_and_does_not_enable_calls() {
             );
             continue;
         }
+        // Without a cached MSS all 1000 bytes fit the offered MSS less the
+        // option space (1420), as Linux's tcp_send_syn_data sizes SYN data.
         if selection == 0 {
-            assert_eq!(result.unwrap().value, 496);
+            assert_eq!(result.unwrap().value, 1000);
         } else {
             assert_eq!(result.unwrap_err(), EINPROGRESS);
         }
@@ -191,7 +193,7 @@ fn native_server_cookie_staging_is_peer_scoped_and_does_not_enable_calls() {
             .unwrap();
         let syn = wire::parse(tx.ip, &bytes[..tx.len]).unwrap();
         assert_eq!(syn.options.fast_open, Some(FastOpenCookie::request()));
-        assert_eq!(syn.payload.len(), if selection == 0 { 496 } else { 0 });
+        assert_eq!(syn.payload.len(), if selection == 0 { 1000 } else { 0 });
         assert_eq!(
             owner
                 .execute(fd, Op::SetFastOpenServerCookie(None))
@@ -280,7 +282,7 @@ fn native_client_policy_is_exact_peer_scoped_and_explicit_credentials_win() {
         }
         let early = matches!(mode, 0 | 2 | 4);
         if early {
-            assert_eq!(result.unwrap().value, 496);
+            assert_eq!(result.unwrap().value, 1000);
         } else {
             assert_eq!(result.unwrap_err(), EINPROGRESS);
         }
@@ -292,7 +294,7 @@ fn native_client_policy_is_exact_peer_scoped_and_explicit_credentials_win() {
             .packet
             .unwrap();
         let syn = wire::parse(tx.ip, &out[..tx.len]).unwrap();
-        assert_eq!(syn.payload.len(), if early { 496 } else { 0 });
+        assert_eq!(syn.payload.len(), if early { 1000 } else { 0 });
         assert_eq!(syn.options.fast_open.is_none(), matches!(mode, 0 | 2));
         assert_eq!(
             owner
@@ -340,7 +342,7 @@ fn client_default_mode_changes_leave_deferred_admission_intact() {
             .execute(fd, Op::Send(vec![(data.as_ptr() as usize, data.len())], 0))
             .unwrap()
             .value,
-        496
+        1000
     );
     let mut out = [0; 2048];
     let tx = owner
@@ -350,7 +352,7 @@ fn client_default_mode_changes_leave_deferred_admission_intact() {
         .packet
         .unwrap();
     let syn = wire::parse(tx.ip, &out[..tx.len]).unwrap();
-    assert_eq!(syn.payload.len(), 496);
+    assert_eq!(syn.payload.len(), 1000);
     assert!(syn.options.fast_open.is_none());
     let next = owner.execute(0, Op::New(SOCK_NONBLOCK)).unwrap().value as u64;
     assert_eq!(

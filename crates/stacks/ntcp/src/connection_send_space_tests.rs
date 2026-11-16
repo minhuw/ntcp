@@ -320,7 +320,14 @@ fn fast_open_peer_mss_installation_sets_c_before_admission() {
             .unwrap();
         assert!(early != 0);
         assert_eq!(a.send_space(), 1200 / q * q);
-        assert_eq!(early + a.write(&[2; 2000]).unwrap(), 1200 / q * q);
+        // Without a cached MSS the SYN data is sized for the MSS offered
+        // (Linux's advmss) and may take all of C.
+        let rest = match a.write(&[2; 2000]) {
+            Ok(n) => n,
+            Err(Error::WouldBlock) => 0,
+            Err(e) => panic!("{e:?}"),
+        };
+        assert_eq!(early + rest, 1200 / q * q);
     }
 }
 

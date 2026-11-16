@@ -658,7 +658,8 @@ fn managed_native_public_rust_fast_open_helper_and_fd_alias_use_production_attac
         assert!(eth.payload.len() <= 1100);
         let tcp = ntcp::wire::parse(ip.ip, ip.payload).unwrap();
         assert_eq!(tcp.header.flags & ntcp::wire::SYN, ntcp::wire::SYN);
-        assert!(!tcp.payload.is_empty() && tcp.payload.len() <= 536);
+        // SYN data fits the 1100-byte path less the whole option space.
+        assert!(!tcp.payload.is_empty() && tcp.payload.len() <= 1100 - 20 - 20 - 40);
         drop(wire);
         assert_eq!(crate::close(alias), 0);
     }

@@ -61,7 +61,11 @@ fn explicit_client_policy_separates_wire_option_and_cold_mss() {
                         )
                     }
                     .unwrap();
-                    let bound = usize::from(user_mss.unwrap_or(536)).saturating_sub(40);
+                    // Without a cached MSS, the MSS this end offers (Linux's
+                    // advmss), bounded by the path (IPv6 without discovery:
+                    // 1280 - 40 - 20), less the whole option space.
+                    let bound = usize::from(user_mss.unwrap_or(if v6 { 1220 } else { 1460 }))
+                        .saturating_sub(40);
                     assert_eq!(n, if mode == 0 { 0 } else { bytes.min(bound) });
                     let syn = packet(&mut a, 0);
                     let syn = wire::parse(syn.0, &syn.1).unwrap();
@@ -74,12 +78,60 @@ fn explicit_client_policy_separates_wire_option_and_cold_mss() {
     }
 }
 
+// Linux's tcp_send_syn_data sizes SYN data for the cached server MSS or, with
+// none, for its own advmss (the MSS it offers: route MTU, TCP_MAXSEG and the
+// route's advmss), bounded by the path, less MAX_TCP_OPTION_SPACE.
+#[test]
+fn cold_syn_data_fits_the_offered_mss_less_the_option_space() {
+    for v6 in [false, true] {
+        for (advertised, expected) in [(None, if v6 { 1180 } else { 1420 }), (Some(800), 760)] {
+            let mut a = Endpoint::new(
+                EndpointConfig {
+                    max_connections: 16,
+                    connection: ConnectionConfig {
+                        mss: 1460,
+                        timestamps: false,
+                        send_capacity: 8192,
+                        receive_capacity: 8192,
+                        send_ip_payload_limit: if v6 { 1500 } else { 1480 },
+                        advertised_mss: advertised,
+                        ..ConnectionConfig::default()
+                    },
+                    ..EndpointConfig::default()
+                },
+                [1; 32],
+                0,
+                |_| true,
+            )
+            .unwrap();
+            a.enable_fast_open().unwrap();
+            let (local, remote) = addresses(v6, 40000);
+            let (_, n) = a
+                .connect_fast_open_with_policy(
+                    0,
+                    local,
+                    remote,
+                    &[7; 4000],
+                    options(None),
+                    FastOpenClientPolicy::ApplicationProtected,
+                )
+                .unwrap();
+            assert_eq!(n, expected);
+            let syn = packet(&mut a, 0);
+            let syn = wire::parse(syn.0, &syn.1).unwrap();
+            assert_eq!(syn.payload, &[7; 4000][..n]);
+            // The offer itself; IPv6 without discovery sends within 1280 bytes.
+            assert_eq!(syn.options.mss, Some(advertised.unwrap_or(1460)));
+        }
+    }
+}
+
 #[test]
 fn optionless_handshake_learns_mss_without_unsolicited_credentials() {
     for v6 in [false, true] {
         let mut a = client(v6);
         let (_, remote) = addresses(v6, 40000);
-        for (index, mss, expected) in [(0, 940, 496), (1, 1460, 900), (2, 1460, 1000)] {
+        for (index, mss, expected) in [(0, 940, 1000), (1, 1460, 900), (2, 1460, 1000)] {
             let (local, _) = addresses(v6, 40000 + index);
             let (id, n) = a
                 .connect_fast_open_with_policy(

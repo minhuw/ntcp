@@ -2435,7 +2435,13 @@ fn server_cookie_blocking_iov_and_deferred_calls_retain_tail_until_handshake() {
         };
         assert!(!a.service(&mut request));
         let syn = tfo_capture(&mut a);
-        assert_eq!(segment(&syn).payload, &first[..496]);
+        // Without a cached MSS the SYN carries the offered MSS less the
+        // whole option space (Linux's tcp_send_syn_data): 1420 bytes,
+        // across both iovecs.
+        let all = [first, second].concat();
+        let early = segment(&syn).payload.len();
+        assert_eq!(early, 1460 - 40);
+        assert_eq!(segment(&syn).payload, &all[..early]);
         assert_eq!(
             segment(&syn).options.fast_open,
             Some(FastOpenCookie::request())
@@ -2448,7 +2454,7 @@ fn server_cookie_blocking_iov_and_deferred_calls_retain_tail_until_handshake() {
             .value as u64;
         assert_eq!(
             b.execute(server, Op::Read(BYTES)).unwrap().bytes,
-            first[..496]
+            all[..early]
         );
         exchange(&mut a, &mut b);
         assert!(a.service(&mut request));
@@ -2456,7 +2462,7 @@ fn server_cookie_blocking_iov_and_deferred_calls_retain_tail_until_handshake() {
         exchange(&mut a, &mut b);
         assert_eq!(
             b.execute(server, Op::Read(BYTES)).unwrap().bytes,
-            [first[496..].to_vec(), second].concat()
+            all[early..]
         );
     }
 }

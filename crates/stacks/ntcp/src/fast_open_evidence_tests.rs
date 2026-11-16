@@ -1958,9 +1958,10 @@ fn spurious_synacks_cannot_revert_parallel_cookie_mss_or_extend_lifetimes() {
                     Some(FastOpenCookie::new(&[2; 8]).unwrap()),
                 )
                 .unwrap();
-            // Expired peer MSS restores conservative cold admission, rather
-            // than keeping the newer or any spurious MSS alive.
-            assert_eq!(n, 496);
+            // Expired peer MSS restores cold admission (the MSS this end
+            // offers, Linux's advmss: all 1000 bytes), rather than keeping
+            // the newer 940 (900 bytes) or any spurious MSS alive.
+            assert_eq!(n, 1000);
         }
     }
 }

@@ -1894,9 +1894,6 @@ impl Connection {
     // A supplied cookie is a credential obtained from this server, including
     // an explicitly agreed zero cookie for a protected RFC7413 section7.3 service.
     // It is still serialized as a Fast Open option; no omitted-option bypass.
-    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
-    //= reason=Cold SYN admission uses a conservative 536-byte ceiling in both families before option, configuration, path and storage limits; true peer defaults remain 536/1220 and validated learned MSS remains usable.
-    //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
     pub(crate) fn prepare_fast_open_with_server_cookie(
         &mut self,
         cookie: wire::FastOpenCookie,
@@ -1929,11 +1926,14 @@ impl Connection {
         } else {
             1220
         });
-        // Unknown peer/path capacity calls for conservative cold SYN admission
-        // in both families. Keep the actual peer MSS defaults above independent.
-        let admission_mss = peer_mss.unwrap_or(536);
-        // Reserve the entire option budget, including cookies up to 16 bytes.
-        // A changed path may clip the SYN further; all accepted bytes remain queued.
+        // SYN data fits the cached peer MSS or, without one, the MSS this
+        // end offers, as Linux's tcp_send_syn_data clamps it (mss_clamp =
+        // advmss unless tcp_fastopen_cache_get has an MSS). The actual peer
+        // MSS defaults above stay for a SYN-ACK without the option.
+        let admission_mss = peer_mss.unwrap_or(self.receive_mss_offer);
+        // Reserve the entire option budget (MAX_TCP_OPTION_SPACE), including
+        // cookies up to 16 bytes. A changed path may clip the SYN further;
+        // all accepted bytes remain queued.
         let limit = usize::from(
             admission_mss
                 .min(self.config.mss)
@@ -10247,14 +10247,15 @@ impl Connection {
                     || self.fast_open_client_policy
                         == crate::FastOpenClientPolicy::ApplicationProtected)
             {
+                // fast_open_initial already fits the MSS SYN data was
+                // admitted for, less the whole option budget.
                 let limit = self
                     .fast_open_initial
                     .min(packet_mss)
                     .min(timestamp_credit.saturating_sub(1) as usize)
                     .min(
                         usize::from(
-                            self.peer_mss
-                                .min(self.send_mss_limit)
+                            self.send_mss_limit
                                 .min(self.config.user_mss.unwrap_or(u16::MAX)),
                         )
                         .saturating_sub(option_len),

@@ -241,6 +241,13 @@ fn native_pump(a: &mut Owner, b: &mut Owner, reserved: bool) {
     }
 }
 
+// SYN data without a cached server MSS, as Linux's tcp_send_syn_data: the
+// offered MSS 1460 (Linux's advmss), bounded by the path (IPv6 without
+// discovery: the 1280-byte minimum MTU), less the whole option space.
+fn cold(v6: bool) -> i32 {
+    if v6 { 1280 - 40 - 20 - 40 } else { 1460 - 40 }
+}
+
 //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
 //= type=test
 //= reason=The cookie-required branch serializes the selected server cookie and limits SYN data to validated learned MSS or a conservative cold 536 bytes in both families before the full option reserve and other bounds. Explicit ApplicationProtected uses section 7.3 authorization separately. Erratum 8015 remains Held for Document Update and is not needed for this bound.
@@ -303,7 +310,7 @@ fn native_cold_admission_is_independent_of_family_and_learns_real_mss() {
                         let expected = if mode == 0 {
                             0
                         } else if attempt == 0 {
-                            496
+                            cold(v6)
                         } else {
                             900
                         };
@@ -406,7 +413,7 @@ fn native_cookie_without_advertised_mss_keeps_all_authorization_modes_cold() {
                         let expected = if cold_request {
                             0
                         } else if attempt < 2 {
-                            496
+                            cold(v6)
                         } else {
                             900
                         };
