@@ -50,8 +50,8 @@ drop_reasons! {
     DevHdr = "DEV_HDR",
     /// The frame's link-layer destination is not this port.
     OtherHost = "OTHERHOST",
-    /// Neither IPv4, IPv6 nor ARP, or an IP version this port does not
-    /// receive.
+    /// Neither IPv4, IPv6 nor ARP, or an IPv4 packet on a port that does
+    /// not receive IPv4.
     UnhandledProto = "UNHANDLED_PROTO",
     /// Shorter than its headers.
     PktTooSmall = "PKT_TOO_SMALL",
@@ -86,6 +86,10 @@ drop_reasons! {
     IpInvalidDest = "IP_INVALID_DEST",
     /// A protocol this host does not process.
     IpNoproto = "IP_NOPROTO",
+    /// An IPv6 packet on a port that does not receive IPv6, refused before
+    /// any of its headers is processed (Linux's ip6_rcv_core on a device
+    /// with disable_ipv6).
+    Ipv6Disabled = "IPV6DISABLED",
     /// An IPv6 extension header refused or unsupported.
     Ipv6BadExthdr = "IPV6_BAD_EXTHDR",
     /// A source-routed packet that policy refuses (Linux discards one

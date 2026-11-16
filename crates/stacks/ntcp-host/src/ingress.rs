@@ -571,10 +571,11 @@ impl Host {
                 // before reassembly (RFC 1122 section 3.2.1.8). The header
                 // checksum is verified here, once for each arriving packet
                 // (RFC 1122 section 3.2.1.2, cited at ntcp_ip::ipv4_bounds).
-                let source_routes = capabilities.ipv4.source_routes();
-                let packet =
-                    ntcp_ip::parse_fragment(frame, source_routes.ok_or(Error::Unsupported)?)
-                        .inspect_err(|&error| self.count_header_error(frame, error))?;
+                let Some(source_routes) = capabilities.ipv4.source_routes() else {
+                    return Err(self.version_refused(now, frame, DropReason::UnhandledProto));
+                };
+                let packet = ntcp_ip::parse_fragment(frame, source_routes)
+                    .inspect_err(|&error| self.count_header_error(frame, error))?;
                 if packet.fragmentation.is_complete() {
                     return Ok(Received::Datagram(whole));
                 }
@@ -595,6 +596,7 @@ impl Host {
             6 if capabilities.ipv6 == crate::Ipv6Receive::Extensions => {
                 return self.receive_extensions(context, now, frame, link_multicast, out);
             }
+            6 => return Err(self.version_refused(now, frame, DropReason::Ipv6Disabled)),
             _ => return Err(Error::Unsupported),
         };
         let local = self.local_in_context(context, piece.destination)?;
@@ -699,6 +701,20 @@ impl Host {
     }
 
     // An arriving IPv4 packet refused with `error` (`ipv4_header_errors`).
+    // A packet of an IP version the port does not receive, refused by its
+    // version alone, before any of its headers (an ICMP message's
+    // included) is looked at: Linux's ip6_rcv_core drops an IPv6 packet on
+    // a device with disable_ipv6 first thing (IPV6DISABLED). Recorded here,
+    // so the caller does not classify it by its upper layer.
+    #[cold]
+    #[inline(never)]
+    fn version_refused(&mut self, now: Instant, frame: &[u8], reason: DropReason) -> Error {
+        self.drops.record_error(reason, now, frame.len(), || {
+            ntcp::DropSubject::of_ip_packet(frame)
+        });
+        Error::Unsupported
+    }
+
     pub(crate) fn count_header_error(&mut self, frame: &[u8], error: ntcp_ip::Error) {
         self.ipv4_header_errors += u64::from(ntcp_ip::header_error(frame, error));
     }

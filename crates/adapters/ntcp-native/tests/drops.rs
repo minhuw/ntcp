@@ -54,7 +54,10 @@ struct Station {
 }
 impl Station {
     fn new(layer: PacketLayer) -> Self {
-        let mut config = NetworkConfig::new(IpAddr::V4(Ipv4Addr::from(LOCAL)), 1500);
+        Self::at(layer, IpAddr::V4(Ipv4Addr::from(LOCAL)))
+    }
+    fn at(layer: PacketLayer, local: IpAddr) -> Self {
+        let mut config = NetworkConfig::new(local, 1500);
         config.tcp.max_connections = 4;
         config.tcp.max_listeners = 1;
         if layer == PacketLayer::Ethernet {
@@ -235,6 +238,38 @@ fn icmp_messages_acted_on_by_nothing() {
     let sum = checksum(&portless);
     portless[2..4].copy_from_slice(&sum.to_be_bytes());
     assert_eq!(s.ip(ipv4(1, &portless)), [DropReason::IcmpInvalid]);
+}
+
+// The Router Solicitation a kernel sent into a fresh TUN (xylem c68):
+// fe80::456a:e4b4:a953:75a3 to ff02::2, hop limit 255, checksum valid.
+const ROUTER_SOLICITATION: [u8; 48] = [
+    0x60, 0, 0, 0, 0, 8, 58, 0xff, 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x45, 0x6a, 0xe4, 0xb4, 0xa9,
+    0x53, 0x75, 0xa3, 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x85, 0, 0x34, 0x21,
+    0, 0, 0, 0,
+];
+
+// A packet of a family the port does not receive is refused by its version
+// before its upper layer is looked at: an ICMPv6 Router Solicitation on an
+// IPv4 port is IPV6DISABLED (Linux's ip6_rcv_core with disable_ipv6), not
+// an invalid ICMP message, and an ICMPv4 message on an IPv6 port is
+// UNHANDLED_PROTO. On an IPv6 port the solicitation to the all-routers group
+// this host never joins is dropped by destination as Linux's ip6_mc_input
+// drops it, and no ICMP processing sees it.
+#[test]
+fn a_family_the_port_does_not_receive() {
+    let mut s = Station::new(PacketLayer::Ip);
+    assert_eq!(
+        s.ip(ROUTER_SOLICITATION.to_vec()),
+        [DropReason::Ipv6Disabled]
+    );
+    for local in ["2001:db8::2", "fe80::2"] {
+        let mut s = Station::at(PacketLayer::Ip, local.parse().unwrap());
+        assert_eq!(s.ip(ipv4(1, &icmp((3, 1)))), [DropReason::UnhandledProto]);
+        assert_eq!(
+            s.ip(ROUTER_SOLICITATION.to_vec()),
+            [DropReason::IpInaddrerrors]
+        );
+    }
 }
 
 #[test]
