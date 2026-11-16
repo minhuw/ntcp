@@ -4,7 +4,7 @@
 // (TSO), refuse them, have no TX room, or lose segments.
 use ntcp_io::{
     PacketIo, PacketLayer, TcpSegmentationCapabilities, TcpSegmentationError,
-    TcpSegmentationRequest, TxOutcome,
+    TcpSegmentationRequest, TxCompletion, TxOutcome,
 };
 use ntcp_native::*;
 use std::{
@@ -38,6 +38,10 @@ struct Shared {
     aggregates: Rc<Cell<usize>>,
     // A loss generator's state; 0 loses nothing.
     loss: Rc<Cell<u64>>,
+    // How the device completes frames, and, for a Counter device, how many
+    // submissions it has completed.
+    completion: Rc<Cell<TxCompletion>>,
+    completed: Rc<Cell<u64>>,
 }
 
 struct Wire {
@@ -87,6 +91,12 @@ impl PacketIo for Wire {
     }
     fn tcp_segmentation_capabilities(&self) -> Option<TcpSegmentationCapabilities> {
         self.tso
+    }
+    fn tx_completion(&self) -> TxCompletion {
+        self.shared.completion.get()
+    }
+    fn tx_submissions_completed(&self) -> u64 {
+        self.shared.completed.get()
     }
     fn transmit_segmented(
         &mut self,
@@ -210,8 +220,20 @@ impl Net {
     }
     // Both sides' configurations changed by `configure`.
     fn configured(segmentation: bool, configure: impl Fn(&mut NetworkConfig)) -> Self {
+        Self::build(segmentation, TxCompletion::Synchronous, configure)
+    }
+    // The server's device completing frames as `completion` says.
+    fn completing(segmentation: bool, completion: TxCompletion) -> Self {
+        Self::build(segmentation, completion, |_| {})
+    }
+    fn build(
+        segmentation: bool,
+        completion: TxCompletion,
+        configure: impl Fn(&mut NetworkConfig),
+    ) -> Self {
         let (a, b) = (Queue::default(), Queue::default());
         let wire = Shared::default();
+        wire.completion.set(completion);
         let network = |address: Ipv4Addr, incoming: &Queue, outgoing: &Queue, server: bool| {
             let mut config = NetworkConfig::new(IpAddr::V4(address), 1500);
             config.tcp.max_connections = 8;
@@ -714,4 +736,170 @@ fn a_push_refuses_as_a_drive_does() {
     assert_eq!(net.push(a).transmitted, 1);
     net.server.stop();
     assert!(matches!(net.push_result(a), Err(Error::Stopped)));
+}
+
+// An NVMe/TCP read's C2H data PDU, then its response, each its own write
+// call and push, on a DPDK-like device (NextPoll): the data frame is in
+// the device until the next drive, so the response's push holds it
+// (Linux's tcp_should_autocork), reporting work due now. Later pushes
+// before the drive add to the hold, which counts once. The drive sends
+// what was held as one segment, whatever the device's state.
+#[test]
+fn autocorking_holds_small_writes_while_a_data_frame_is_in_the_device() {
+    let mut net = Net::completing(true, TxCompletion::NextPoll);
+    let id = net.connect(true);
+    let before = net.server.counters();
+    net.write(id, 24 + 4096);
+    let report = net.push(id);
+    assert_eq!(report.transmitted, 3);
+    net.write(id, 24);
+    let report = net.push(id);
+    assert_eq!(report.transmitted, 0);
+    assert!(report.more_work && !report.more && !report.tx_blocked);
+    assert_eq!(report.next_deadline, Some(net.now));
+    net.write(id, 24);
+    let report = net.push(id);
+    assert_eq!(report.transmitted, 0);
+    assert!(report.more_work);
+    let counters = net.server.counters();
+    assert_eq!(counters.autocorked - before.autocorked, 1);
+    assert_eq!(lengths(&net.sent()), [1448, 1448, 1224]);
+    net.now += 10;
+    let drive = net.server.drive(net.now, FLUSH).unwrap();
+    assert_eq!(drive.transmitted, 1);
+    assert_eq!(lengths(&net.sent()), [48]);
+    // That frame is in the device now: the next small write holds again,
+    // a new hold.
+    net.write(id, 24);
+    assert_eq!(net.push(id).transmitted, 0);
+    let counters = net.server.counters();
+    assert_eq!(counters.autocorked - before.autocorked, 2);
+    // Segments the backend took, none retransmitted.
+    assert_eq!(counters.out_segments - before.out_segments, 4);
+    assert_eq!(net.read(id).len(), 4120 + 72);
+}
+
+// A device that completes frames as it takes them (TUN, AF_PACKET,
+// in-memory wires) never holds; nor does a NextPoll one with
+// tcp.autocorking off.
+#[test]
+fn autocorking_never_holds_on_a_synchronous_device_or_when_off() {
+    let off = Net::build(true, TxCompletion::NextPoll, |config| {
+        config.tcp.autocorking = false;
+    });
+    for mut net in [Net::completing(true, TxCompletion::Synchronous), off] {
+        let id = net.connect(true);
+        net.write(id, 4120);
+        assert_eq!(net.push(id).transmitted, 3);
+        for _ in 0..3 {
+            net.write(id, 24);
+            let report = net.push(id);
+            assert_eq!(report.transmitted, 1);
+            assert!(!report.more_work);
+        }
+        assert_eq!(net.server.counters().autocorked, 0);
+    }
+}
+
+// What autocorking leaves alone: a write as large as the size goal (one
+// MSS without TSO), nothing in flight, the push after TCP_NODELAY is set,
+// and the push after shutdown_write, whose FIN Linux sends at once.
+#[test]
+fn autocorking_leaves_large_writes_idle_connections_nodelay_and_fin() {
+    let mut net = Net::completing(false, TxCompletion::NextPoll);
+    let id = net.connect(true);
+    // Nothing in flight, nothing in the device.
+    net.write(id, 100);
+    assert_eq!(net.push(id).transmitted, 1);
+    // In the device, but a full segment waits.
+    net.write(id, 1448);
+    assert_eq!(net.push(id).transmitted, 1);
+    net.write(id, 100);
+    assert_eq!(net.push(id).transmitted, 0);
+    net.server.set_nodelay(id, true).unwrap();
+    assert_eq!(net.push(id).transmitted, 1);
+    net.write(id, 100);
+    assert_eq!(net.push(id).transmitted, 0);
+    net.server.shutdown_write(id).unwrap();
+    let sent_fin = net.push(id);
+    assert_eq!(sent_fin.transmitted, 1);
+    let sent = net.sent();
+    let last = sent.last().unwrap();
+    assert_eq!((payload_len(last), flags(last) & 0x01), (100, 0x01));
+    assert_eq!(net.read(id).len(), 1748);
+}
+
+// A Counter device (AF_XDP's completion ring) tells the completion of
+// each submission: a push holds only while the connection's last data
+// frame is not completed, and the next drive sends what it held even then.
+#[test]
+fn autocorking_follows_a_counter_devices_completions() {
+    let mut net = Net::completing(false, TxCompletion::Counter);
+    let id = net.connect(true);
+    let completed = net.wire.completed.clone();
+    completed.set(u64::MAX);
+    net.write(id, 100);
+    assert_eq!(net.push(id).transmitted, 1);
+    // Everything completed: no hold.
+    net.write(id, 100);
+    assert_eq!(net.push(id).transmitted, 1);
+    // Its frame not completed: held.
+    completed.set(0);
+    net.write(id, 100);
+    let report = net.push(id);
+    assert_eq!(report.transmitted, 0);
+    assert!(report.more_work);
+    // The drive sends it, completions or not.
+    net.now += 10;
+    net.server.drive(net.now, FLUSH).unwrap();
+    assert_eq!(lengths(&net.sent()), [100, 100, 100]);
+    assert_eq!(net.server.counters().autocorked, 1);
+    assert_eq!(net.read(id).len(), 300);
+}
+
+// The randomized push/flush-drive script on a NextPoll device: autocorking
+// changes the segmentation, never the bytes delivered.
+#[test]
+fn autocorked_pushes_deliver_every_byte() {
+    for seed in 1..=4u64 {
+        let mut net = Net::completing(seed % 2 == 0, TxCompletion::NextPoll);
+        let id = net.connect(true);
+        let (_, peer) = net.connections[0];
+        let mut rng = seed;
+        let mut next = move |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let (mut written, mut read) = (Vec::new(), Vec::new());
+        let mut buf = [0; 65536];
+        for round in 0..400 {
+            if next(3) != 0 {
+                let len = [1, 24, 100, 1448, 4120][next(5) as usize];
+                let bytes: Vec<u8> = (0..len).map(|n| (n + round) as u8).collect();
+                if let Ok(receipt) = net.server.try_write(id, &bytes, WriteOptions::default()) {
+                    written.extend_from_slice(&bytes[..receipt.accepted]);
+                }
+                let report = net.push(id);
+                if report.more_work {
+                    net.now += 10;
+                    net.server.drive(net.now, FLUSH).unwrap();
+                }
+            } else {
+                net.step();
+                while let Ok(ReadOutcome::Data { len, .. }) = net.client.try_read(peer, &mut buf) {
+                    read.extend_from_slice(&buf[..len]);
+                }
+            }
+        }
+        for _ in 0..200 {
+            net.step();
+            while let Ok(ReadOutcome::Data { len, .. }) = net.client.try_read(peer, &mut buf) {
+                read.extend_from_slice(&buf[..len]);
+            }
+        }
+        assert!(read == written, "seed {seed}");
+        assert!(net.server.counters().autocorked > 0, "seed {seed}");
+    }
 }

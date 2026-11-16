@@ -301,12 +301,13 @@ pub struct PushReport {
     /// The push ended at `PUSH_FRAMES` with the connection's output still
     /// selectable: push again, or drive.
     pub more: bool,
-    /// Drive before sleeping, as for `DriveReport::more_work`: `more`, or a
-    /// frame waiting for backend room.
+    /// Drive before sleeping, as for `DriveReport::more_work`: `more`, a
+    /// frame waiting for backend room, or output autocorking held, which
+    /// the next drive sends (`Network::push`).
     pub more_work: bool,
     /// The network's next deadline, as `DriveReport::next_deadline`, which
     /// the push may have moved earlier (a retransmission or pacing timer
-    /// it armed).
+    /// it armed); `now` when autocorking held output.
     pub next_deadline: Option<Instant>,
 }
 
@@ -513,4 +514,18 @@ pub struct Counters {
     pub rx_nombuf: u64,
     pub rx_missed: u64,
     pub tx_nombuf: u64,
+    // Pushes that held a connection's output (`Network::push`,
+    // autocorking), once per hold: a push that starts a hold on a
+    // connection not already held counts; the hold ends when a data frame
+    // of the connection is submitted. Linux's TCPAutoCorking.
+    pub autocorked: u64,
+    // TCP segments the backend took that carried no retransmitted sequence
+    // space: new data, SYN, FIN, pure ACKs and window updates, and
+    // stateless replies (RST, challenge and TIME-WAIT ACKs), an aggregate's
+    // counted one by one. Linux's Tcp OutSegs, which counts a segment when
+    // it is new data or carries no sequence space, and the RSTs and ACKs
+    // its control socket sends; retransmissions are
+    // retransmitted_segments. autocorked / out_segments over a window is
+    // comparable with Linux's TCPAutoCorking / OutSegs.
+    pub out_segments: u64,
 }

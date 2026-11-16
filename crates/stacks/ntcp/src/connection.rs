@@ -4816,6 +4816,35 @@ impl Connection {
         self.snd_nxt.distance_from(self.snd_una)
     }
 
+    // Endpoint::should_autocork's test of this connection.
+    pub(crate) fn should_autocork(&self, gso_max_bytes: usize, gso_max_segments: usize) -> bool {
+        let unsent = self.notsent_bytes();
+        unsent != 0
+            && self.flight() != 0
+            && !self.shutdown
+            && !self.send.ends_record()
+            && unsent < self.size_goal(gso_max_bytes, gso_max_segments)
+    }
+
+    // Linux's tcp_xmit_size_goal: the device's largest aggregate, bounded
+    // to half the largest window the peer offered (tcp_bound_to_half_wnd),
+    // in whole segments of the current MSS (tcp_current_mss, net of
+    // timestamps), at least one.
+    fn size_goal(&self, gso_max_bytes: usize, gso_max_segments: usize) -> usize {
+        let mss = self
+            .mss
+            .saturating_sub(if self.timestamps { 12 } else { 0 })
+            .max(1);
+        let window = self.max_snd_wnd as usize;
+        let cutoff = if window > 536 { window / 2 } else { window };
+        let goal = if cutoff != 0 {
+            gso_max_bytes.min(cutoff)
+        } else {
+            gso_max_bytes
+        };
+        ((goal / mss).min(gso_max_segments) * mss).max(mss)
+    }
+
     // Linux tcp_minshall_check: a short segment sent is not yet wholly
     // acknowledged. It implies data in flight (tcp_nagle_check's
     // packets_out), and SND.UNA never passes SND.NXT.

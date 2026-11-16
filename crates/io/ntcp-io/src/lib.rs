@@ -219,6 +219,26 @@ pub struct DeviceCounters {
     pub tx_nombuf: u64,
 }
 
+/// When a backend's device is done with a frame it submitted, for
+/// autocorking: Linux's tcp_push holds a small write while an earlier data
+/// skb of the socket is still in the qdisc or device (sk_wmem_alloc, freed
+/// at TX completion). Completion only decides whether a push holds; the
+/// next drive sends whatever a push held, whatever the completion state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TxCompletion {
+    /// Done when `transmit` returns: the frame was copied out (TUN,
+    /// AF_PACKET, in-memory wires). Never holds.
+    #[default]
+    Synchronous,
+    /// Learned only when the owner polls the device again: a frame
+    /// submitted before a drive counts as completed at that drive (DPDK,
+    /// whose PMD frees transmitted mbufs only in later bursts).
+    NextPoll,
+    /// Completions counted in submission order (`tx_submissions_completed`),
+    /// as a completion ring reports them (AF_XDP).
+    Counter,
+}
+
 // Enabled adapter paths, not a guarantee that every packet has metadata.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TimestampCapabilities {
@@ -318,6 +338,18 @@ pub trait PacketIo {
     // (DPDK rte_eth_stats_get, which mlx5 serves with a system call).
     fn device_counters(&self) -> DeviceCounters {
         DeviceCounters::default()
+    }
+
+    // How the device completes what this backend submits (`TxCompletion`).
+    fn tx_completion(&self) -> TxCompletion {
+        TxCompletion::Synchronous
+    }
+    // A `TxCompletion::Counter` backend: how many of its submissions (each
+    // transmit call that returned Submitted, an aggregate one) the device
+    // has completed, oldest first. Read on the push path: a load, no device
+    // access.
+    fn tx_submissions_completed(&self) -> u64 {
+        0
     }
 
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>>;

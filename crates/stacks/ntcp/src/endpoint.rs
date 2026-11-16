@@ -125,6 +125,10 @@ pub struct EndpointConfig {
     pub buffer_low_bytes: Option<usize>,
     pub hop_limit: u8,
     pub dscp: u8,
+    // Linux's tcp_autocorking: an embedding's push of a small write may
+    // hold it while an earlier data frame of the connection is still in
+    // the device (`Endpoint::should_autocork`). On by default, as in Linux.
+    pub autocorking: bool,
     pub connection: ConnectionConfig,
     // The geometry of the owner's timer wheel (`TimerWheel`): how finely it
     // keeps timers, and how far ahead it reaches. Every timer the
@@ -311,6 +315,7 @@ impl Default for EndpointConfig {
             buffer_low_bytes: None,
             hop_limit: 64,
             dscp: 0,
+            autocorking: true,
             connection: ConnectionConfig::default(),
             timer_wheel: crate::TimerWheel::Internet,
         }
@@ -6660,6 +6665,33 @@ impl Endpoint {
     /// attempts is outstanding, or, without a reservation, its entry in the
     /// ready queue. Its selection may still find nothing to send (Nagle,
     /// the windows, pacing). A lookup, not a pass over the queue.
+    /// Linux's tcp_should_autocork, its TCP half: whether a push
+    /// (tcp_push) of connection `id` should leave its output for later,
+    /// asked by an embedding that knows an earlier data frame of the
+    /// connection is still in its device (Linux's sk_wmem_alloc test, the
+    /// half TCP cannot see). True when autocorking is on
+    /// (`EndpointConfig::autocorking`), data is in flight (the retransmit
+    /// queue is not empty), unsent data waits and is less than the size
+    /// goal (the write queue's tail is shorter than it), its last byte
+    /// ends no record (tcp_skb_can_collapse_to) and no FIN is queued
+    /// (tcp_send_fin pushes without autocorking). The size goal is
+    /// tcp_xmit_size_goal's: the largest aggregate the device segments
+    /// (`gso_max_bytes` of payload, `gso_max_segments`; 0 for a device
+    /// that segments nothing) in whole segments of the current MSS, at most
+    /// half the largest window the peer offered, at least one MSS.
+    pub fn should_autocork(
+        &self,
+        id: ConnectionId,
+        gso_max_bytes: usize,
+        gso_max_segments: usize,
+    ) -> Result<bool, EndpointError> {
+        Ok(self.config.autocorking
+            && self
+                .slot(id)?
+                .connection
+                .should_autocork(gso_max_bytes, gso_max_segments))
+    }
+
     pub fn output_selectable(&self, id: ConnectionId) -> bool {
         if self.generations.get(id.slot) != Some(&id.generation) {
             return false;

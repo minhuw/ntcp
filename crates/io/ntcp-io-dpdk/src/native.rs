@@ -520,6 +520,13 @@ impl PacketIo for Dpdk {
         }
     }
 
+    // The PMD frees a copied mbuf only in a later rte_eth_tx_burst (mlx5
+    // asks for a completion every 32 packets), so no per-frame completion
+    // is known: a frame counts as in the device until the owner's next
+    // drive (TxCompletion::NextPoll).
+    fn tx_completion(&self) -> ntcp_io::TxCompletion {
+        ntcp_io::TxCompletion::NextPoll
+    }
     // Only what this adapter counts: the port's receive counters belong to
     // the host that owns the port (HostedQueue reads them).
     fn device_counters(&self) -> DeviceCounters {

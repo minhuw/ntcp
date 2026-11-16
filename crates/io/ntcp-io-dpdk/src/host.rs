@@ -1173,6 +1173,9 @@ impl PacketIo for HostedQueue {
     fn device_counters(&self) -> DeviceCounters {
         HostedQueue::device_counters(self)
     }
+    fn tx_completion(&self) -> ntcp_io::TxCompletion {
+        self.io.tx_completion()
+    }
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
         self.io.receive(out)
     }

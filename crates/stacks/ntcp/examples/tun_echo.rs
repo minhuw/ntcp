@@ -2352,6 +2352,9 @@ mod linux {
             //# Generally, an application SHOULD NOT change the Diffserv field value
             //# during the course of a connection (SHLD-23).
             dscp: 0,
+            // Its TUN backend completes every frame as it takes it: nothing
+            // is ever held.
+            autocorking: EndpointConfig::default().autocorking,
             ipv4_options_enabled,
             error_reports: true,
             reuse_time_wait: false,

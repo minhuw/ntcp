@@ -7444,3 +7444,65 @@ fn randomized_exchanges_cross_check_refresh_fast_path() {
     }
     assert!(expirations > 100, "{expirations}");
 }
+
+// Endpoint::should_autocork follows Linux's tcp_should_autocork: unsent
+// data below the size goal (tcp_xmit_size_goal: the device's aggregate in
+// whole segments, at most half the largest window offered, at least one
+// MSS) behind data in flight, its tail ending no record, no FIN queued.
+#[test]
+fn should_autocork_follows_tcp_should_autocork() {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    b.accept(listener).unwrap();
+    let cork = |a: &Endpoint, gso: (usize, usize)| a.should_autocork(client, gso.0, gso.1).unwrap();
+    // Nothing unsent.
+    assert!(!cork(&a, (0, 0)));
+    // Nothing in flight.
+    assert_eq!(a.write(client, &[1; 10]).unwrap(), 10);
+    assert!(!cork(&a, (0, 0)));
+    let sent = packets(&mut a, 0);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(a.write(client, &[2; 10]).unwrap(), 10);
+    assert!(cork(&a, (0, 0)));
+    assert!(cork(&a, (65_000, 64)));
+    // 600 bytes unsent: above one MSS (64), and above half the peer's
+    // 1024-byte window, which bounds a 64 KiB aggregate's goal to 512.
+    assert_eq!(a.write(client, &[3; 590]).unwrap(), 590);
+    assert!(!cork(&a, (0, 0)));
+    assert!(!cork(&a, (65_000, 64)));
+    deliver(&mut b, 0, sent);
+    pump(&mut a, &mut b, 0);
+    assert!(!cork(&a, (65_000, 64)));
+    // A record's end at the tail; then data after it.
+    assert_eq!(a.write(client, &[4; 10]).unwrap(), 10);
+    packets(&mut a, 0);
+    let request = TxTimestampRequest::default();
+    let written = a.write_with_timestamp(client, &[5; 5], false, true, None, request);
+    assert_eq!(written.unwrap(), 5);
+    assert!(!cork(&a, (0, 0)));
+    assert_eq!(a.write(client, &[6; 5]).unwrap(), 5);
+    assert!(cork(&a, (0, 0)));
+    // A FIN queued.
+    a.shutdown(client).unwrap();
+    assert!(!cork(&a, (0, 0)));
+}
+
+// tcp.autocorking off: never.
+#[test]
+fn should_autocork_is_off_without_autocorking() {
+    let (local, remote) = addresses();
+    let config = EndpointConfig {
+        autocorking: false,
+        ..config()
+    };
+    let mut a = Endpoint::new(config, [1; 32], 0, test_policy).unwrap();
+    let mut b = Endpoint::new(self::config(), [2; 32], 0, test_policy).unwrap();
+    let listener = b.listen(remote, 4).unwrap();
+    let client = a.connect(0, local, remote).unwrap();
+    pump(&mut a, &mut b, 0);
+    b.accept(listener).unwrap();
+    assert_eq!(a.write(client, &[1; 10]).unwrap(), 10);
+    packets(&mut a, 0);
+    assert_eq!(a.write(client, &[2; 10]).unwrap(), 10);
+    assert!(!a.should_autocork(client, 0, 0).unwrap());
+}

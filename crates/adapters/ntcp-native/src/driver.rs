@@ -24,6 +24,9 @@ pub(super) struct PendingFrame {
     // Polled again after the backend refused its aggregate: sent a segment
     // at a time.
     scalar: bool,
+    // The segment carries payload: once submitted it is in the device for
+    // autocorking (`Network::push`).
+    data: bool,
 }
 pub(super) struct TxSlot {
     pub bytes: Vec<u8>,
@@ -116,6 +119,9 @@ impl<P: PacketIo> Network<P> {
     ///   wrap (`Tcp(Connection(AmbiguousTimeJump))`); otherwise a broken
     ///   invariant of the stack, which debug builds assert.
     pub fn drive(&mut self, now: Instant, budget: WorkBudget) -> Result<DriveReport> {
+        // A NextPoll device has completed what was submitted before this
+        // drive (autocorking, `Network::push`).
+        self.tx_epoch += 1;
         // The drive's look at the inbox of a member of shared flows begins
         // before anything that can fail: every handoff from here on wakes
         // the member again, whatever becomes of this drive, so a drive that
@@ -190,6 +196,21 @@ impl<P: PacketIo> Network<P> {
     /// first frame to an unresolved next hop starts its resolution here:
     /// the frame is held, and the request leaves in this push.
     ///
+    /// Autocorking (Linux's tcp_should_autocork, `tcp.autocorking`, on by
+    /// default): on a backend whose device completes frames later
+    /// (`PacketIo::tx_completion` NextPoll or Counter), a push holds the
+    /// connection's output while a data frame it submitted earlier is still
+    /// in the device, data is in flight, and what waits unsent is less than
+    /// the size goal, the device's largest aggregate (`Endpoint::
+    /// should_autocork`). The held output stays queued and the next drive
+    /// sends it, together with what later writes add, whatever the device's
+    /// completion state: so a push that holds sends nothing and reports
+    /// `more_work` with `next_deadline` now, and the caller drives before
+    /// it sleeps. The first push after `set_nodelay(true)` does not hold,
+    /// as Linux pushes inside setsockopt(TCP_NODELAY), nor does one after
+    /// `shutdown_write`, whose FIN Linux pushes at once.
+    /// `Counters::autocorked` counts holds.
+    ///
     /// A push can arm a retransmission or pacing timer, so its
     /// `next_deadline` is the network's, as `drive` reports it. An
     /// embedding that sleeps until a deadline sleeps no later than the
@@ -215,7 +236,11 @@ impl<P: PacketIo> Network<P> {
             Err(error) => return Err(error),
         }
         let mut report = DriveReport::default();
-        let result = self.push_inner(core, now, &mut report);
+        let result = match self.autocork(id, core, now) {
+            Ok(Some(held)) => return Ok(held),
+            Ok(None) => self.push_inner(core, now, &mut report),
+            Err(error) => Err(error),
+        };
         self.wake_members_for_memory();
         self.counters.transmitted += report.transmitted as u64;
         let more = match result {
@@ -235,6 +260,89 @@ impl<P: PacketIo> Network<P> {
             more_work: more || self.tx_pending != 0,
             next_deadline: self.next_deadline(),
         })
+    }
+    // Where the backend's transmission stands, for a frame submitted now
+    // (`Connection::tx_mark`): the drive epoch for a NextPoll device, the
+    // submissions so far, this one's included, for a Counter one.
+    fn tx_position(&self) -> u64 {
+        match self.tx_completion {
+            ntcp_io::TxCompletion::Counter => self.tx_submitted,
+            _ => self.tx_epoch,
+        }
+    }
+    // A data frame of `owner` was submitted: it is in the device until the
+    // device completes it.
+    fn mark_in_device(&mut self, owner: ntcp::ConnectionId) {
+        if self.tx_completion == ntcp_io::TxCompletion::Synchronous {
+            return;
+        }
+        let position = self.tx_position();
+        if let Some(slot) = self.connection_slot(owner)
+            && let Some(c) = self.connections[slot].value.as_mut()
+        {
+            c.tx_mark = position;
+            c.nodelay_push = false;
+        }
+    }
+    // A push of `id` held by autocorking, Linux's tcp_should_autocork: the
+    // device still has a data frame of the connection (its sk_wmem_alloc
+    // test), and TCP's half holds (`Endpoint::should_autocork`). The hold
+    // counts once, until the connection's next data frame is submitted.
+    fn autocork(
+        &mut self,
+        id: ConnId,
+        core: ntcp::ConnectionId,
+        now: Instant,
+    ) -> Result<Option<PushReport>> {
+        let completion = self.tx_completion;
+        if completion == ntcp_io::TxCompletion::Synchronous {
+            return Ok(None);
+        }
+        let c = self.conn_mut(id)?;
+        let nodelay = std::mem::take(&mut c.nodelay_push);
+        let mark = c.tx_mark & !HELD;
+        let in_device = match completion {
+            ntcp_io::TxCompletion::Counter => mark > self.io.tx_submissions_completed(),
+            _ => mark == self.tx_epoch,
+        };
+        if nodelay || !in_device {
+            return Ok(None);
+        }
+        // tcp_xmit_size_goal's GSO size: the aggregate, less the headers
+        // (Linux's sk_gso_max_size less MAX_TCP_HEADER).
+        let (gso_bytes, gso_segments) = match self.segmentation {
+            Some(capabilities) => {
+                let ip = if self.config.local_address.is_ipv4() {
+                    20
+                } else {
+                    40
+                };
+                let headers = self.config.link.offset() + ip + 60;
+                (
+                    self.aggregate.len().saturating_sub(headers),
+                    capabilities.max_segments,
+                )
+            }
+            None => (0, 0),
+        };
+        if !self
+            .endpoint
+            .should_autocork(core, gso_bytes, gso_segments)?
+        {
+            return Ok(None);
+        }
+        let c = self.conn_mut(id)?;
+        if c.tx_mark & HELD == 0 {
+            c.tx_mark |= HELD;
+            self.counters.autocorked += 1;
+        }
+        Ok(Some(PushReport {
+            transmitted: 0,
+            tx_blocked: self.tx_pending != 0,
+            more: false,
+            more_work: true,
+            next_deadline: Some(now),
+        }))
     }
     // The push's transmit loop for `core`; true when it ended at the frame
     // limit with the connection's output still selectable.
@@ -719,6 +827,7 @@ impl<P: PacketIo> Network<P> {
             io,
             control,
             counters,
+            tx_submitted,
             ..
         } = self;
         let Some(member) = super::shared::member(host) else {
@@ -747,6 +856,7 @@ impl<P: PacketIo> Network<P> {
         });
         report.transmitted += sent;
         counters.arp_sent += sent as u64;
+        *tx_submitted += sent as u64;
         if blocked {
             report.tx_blocked = true;
             counters.backend_backpressure += 1;
@@ -842,6 +952,7 @@ impl<P: PacketIo> Network<P> {
                 BackendOutcome::Submitted => {
                     report.transmitted += 1;
                     self.counters.arp_sent += 1;
+                    self.tx_submitted += 1;
                 }
                 BackendOutcome::WouldBlock => {
                     report.tx_blocked = true;
@@ -1383,6 +1494,8 @@ impl<P: PacketIo> Network<P> {
             let Some(packet) = poll.packet else {
                 return Ok(Some(owner.is_none() && !more_work));
             };
+            // Read before the IP header is written around the segment.
+            let data = packet.len > usize::from(out[12] >> 4) * 4;
             let attempt = attempt.ok_or(Error::InvalidHandle)?;
             let ip_len = if packet.ip.source.is_ipv4() {
                 ntcp_ip::encode(&mut slot.bytes[offset..], packet, 0)
@@ -1422,6 +1535,7 @@ impl<P: PacketIo> Network<P> {
                 held: false,
                 group: None,
                 scalar,
+                data,
             });
         }
         Ok(None)
@@ -1552,8 +1666,14 @@ impl<P: PacketIo> Network<P> {
         );
         match result {
             Ok(Submission::Submitted) => {
+                let (owner, data) = (pending.owner, pending.data);
                 slot.pending = None;
                 report.transmitted += 1;
+                self.tcp_segments += 1;
+                self.tx_submitted += 1;
+                if data && let Some(owner) = owner {
+                    self.mark_in_device(owner);
+                }
             }
             Ok(Submission::Blocked(ticket) | Submission::Rejected(ticket)) => {
                 pending.ticket = Some(ticket);
@@ -1706,6 +1826,9 @@ impl<P: PacketIo> Network<P> {
                 slot.pending = None;
                 report.transmitted += segments;
                 self.counters.segmented += 1;
+                self.tcp_segments += segments as u64;
+                self.tx_submitted += 1;
+                self.mark_in_device(owner);
             }
             Ok(Submission::Blocked(_) | Submission::Rejected(_)) => {
                 pending.ticket = Some(ticket);

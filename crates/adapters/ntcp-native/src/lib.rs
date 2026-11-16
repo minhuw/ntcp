@@ -53,7 +53,18 @@ struct Connection {
     // Linux wakes a socket for every segment it queues (sk_data_ready).
     arrived: bool,
     write_waiting: Option<TxTimestampRequest>,
+    // Autocorking (`Network::push`): the transmit position
+    // (`Network::tx_position`) of the connection's last data frame
+    // submitted, with `HELD` set once a push held its output since, so the
+    // hold counts once (Linux's TSQ_THROTTLED).
+    tx_mark: u64,
+    // TCP_NODELAY was turned on since the connection's last data frame
+    // left: its next push sends without autocorking, as Linux's
+    // __tcp_sock_set_nodelay pushes.
+    nodelay_push: bool,
 }
+// `Connection::tx_mark`'s bit for a hold already counted.
+const HELD: u64 = 1 << 63;
 // The events a refresh raises from the core's state.
 struct Raised {
     connected: bool,
@@ -188,6 +199,15 @@ pub struct Network<P: PacketIo> {
     held_flows: Vec<Option<(ntcp::ConnectionId, flows::Held)>>,
     holding: usize,
     tx_cursor: usize,
+    // How the backend completes frames (`PacketIo::tx_completion`), for
+    // autocorking, and where its transmission stands: drives begun
+    // (NextPoll) and frames submitted (Counter).
+    tx_completion: ntcp_io::TxCompletion,
+    tx_epoch: u64,
+    tx_submitted: u64,
+    // TCP segments submitted, an aggregate's counted one by one: with the
+    // retransmitted ones taken out, Linux's OutSegs.
+    tcp_segments: u64,
     // The backend's TCP segmentation, when reservations are sized for it
     // (`NetworkConfig::gso`), and the frame of the aggregate being
     // submitted, built again for every call.
@@ -829,6 +849,7 @@ impl<P: PacketIo> Network<P> {
             gso,
         )?;
         let segmentation = gso.and(io.tcp_segmentation_capabilities());
+        let tx_completion = io.tx_completion();
         // The largest frame an aggregate fills: the backend's, within the
         // largest IP packet of the local family.
         let aggregate = match segmentation {
@@ -947,6 +968,10 @@ impl<P: PacketIo> Network<P> {
             held_flows,
             holding: 0,
             tx_cursor: 0,
+            tx_completion,
+            tx_epoch: 1,
+            tx_submitted: 0,
+            tcp_segments: 0,
             segmentation,
             aggregate,
             control,
@@ -1049,6 +1074,9 @@ impl<P: PacketIo> Network<P> {
             memory_refused_opens: memory.memory_refused_opens + self.counters.memory_refused_opens,
             memory_refused_growths: memory.memory_refused_growths,
             ledger_split_refusals: memory.ledger_split_refusals,
+            out_segments: self
+                .tcp_segments
+                .saturating_sub(loss.retransmitted_segments),
             rx_nombuf: device.rx_nombuf,
             rx_missed: device.rx_missed,
             tx_nombuf: device.tx_nombuf,
@@ -1281,6 +1309,8 @@ impl<P: PacketIo> Network<P> {
             read_waiting: true,
             arrived: false,
             write_waiting: None,
+            tx_mark: 0,
+            nodelay_push: false,
         });
         let taken = self.free_connections.pop();
         debug_assert_eq!(taken, Some(slot));
@@ -2005,6 +2035,9 @@ impl<P: PacketIo> Network<P> {
     pub fn set_nodelay(&mut self, id: ConnId, enabled: bool) -> Result<()> {
         self.running()?;
         self.endpoint.set_nagle(self.conn(id)?.core, !enabled)?;
+        if enabled {
+            self.conn_mut(id)?.nodelay_push = true;
+        }
         Ok(())
     }
     // The core connection of `id` for a buffer setter or getter: refused,

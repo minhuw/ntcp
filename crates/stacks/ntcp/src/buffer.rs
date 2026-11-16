@@ -346,6 +346,12 @@ impl SendBuffer {
         }
     }
 
+    // Whether the last queued byte carries EOR: the queue's tail ends a
+    // record, and nothing written later joins it.
+    pub(crate) fn ends_record(&self) -> bool {
+        self.len() != 0 && self.record_ends_after(self.len() - 1)
+    }
+
     // Whether a byte at or past `offset` carries EOR.
     fn record_ends_after(&self, offset: usize) -> bool {
         self.eor_offset().is_some_and(|last| last >= offset)

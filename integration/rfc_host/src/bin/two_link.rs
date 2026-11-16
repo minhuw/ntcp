@@ -528,6 +528,8 @@ fn config(local: IpAddr, small_mtu: u32) -> EndpointConfig {
         buffer_low_bytes: None,
         hop_limit: 64,
         dscp: 0,
+        // No push here: nothing asks.
+        autocorking: false,
         ipv4_options_enabled: false,
         error_reports: true,
         reuse_time_wait: false,
