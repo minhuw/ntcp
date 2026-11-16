@@ -2028,7 +2028,7 @@ fn fast_open_pending_writer_setter_reservation_and_generation_barriers() {
     }
     a.set_fast_open_write_pending(replacement, true).unwrap();
     a.set_fast_open_write_pending(replacement, false).unwrap();
-    // A suppressed Fast Open call has no wire option: context comes from its writer.
+    // A plain connect has no wire option: context comes from its writer.
     let fallback = a
         .connect(1, "192.0.2.1:40001".parse().unwrap(), remote)
         .unwrap();

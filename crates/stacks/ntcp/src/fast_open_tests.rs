@@ -23,7 +23,10 @@ fn addresses(v6: bool, port: u16) -> (SocketAddr, SocketAddr) {
     )
 }
 fn endpoint(key: u8, v6: bool) -> Endpoint {
-    let config = EndpointConfig {
+    Endpoint::new(config(v6), [key; 32], 0, |_| true).unwrap()
+}
+fn config(v6: bool) -> EndpointConfig {
+    EndpointConfig {
         max_connections: 16,
         max_listeners: 2,
         connection: ConnectionConfig {
@@ -34,8 +37,7 @@ fn endpoint(key: u8, v6: bool) -> Endpoint {
             ..ConnectionConfig::default()
         },
         ..EndpointConfig::default()
-    };
-    Endpoint::new(config, [key; 32], 0, |_| true).unwrap()
+    }
 }
 fn packet(endpoint: &mut Endpoint, now: u64) -> (IpMetadata, Vec<u8>) {
     for _ in 0..32 {
@@ -312,23 +314,28 @@ fn rfc7413_cookie_request_length_and_both_timeout_fallbacks() {
     }
 }
 
-//= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
-//= type=test
-//= reason=Verified erratum 5373 excludes the source port; subsequent requests change that port and remain suppressed. Only ICMP errors are cached as negative responses (duvet/rfc7413-todos.toml).
-//# For any negative responses, the client SHOULD disable Fast Open on the specific path (the source and
-//# destination IP addresses and ports) at least temporarily. Since TFO is enabled on a per-service-port
-//# basis, but cookies are independent of service ports, the client's cache should include remote port
-//# numbers, too.
-// An ICMP error suppresses the service; a SYN-ACK leaving the SYN data
-// unacknowledged and a SYN timeout do not, as in Linux 6.12.
+// No negative response the client sees about a Fast Open SYN disables Fast
+// Open for the next connection to the service, as in Linux 6.12: a SYN-ACK
+// leaving the SYN data unacknowledged (tcp_rcv_fastopen_synack retransmits
+// it), an ICMP error or Packet Too Big (tcp_v4_err and tcp_v6_err never touch
+// the Fast Open cache) and a SYN timeout (tcp_write_timeout records nothing
+// per destination). The next connect sends the cookie and data in its SYN.
 #[test]
-fn rfc7413_icmp_keeps_cookie_and_suppresses_service() {
+fn rfc7413_negative_responses_keep_cookie_and_fast_open() {
     for v6 in [false, true] {
-        for cause in 0..3 {
-            let (mut a, _, _) = warm(v6);
+        // An IPv6 Packet Too Big below 1280 is invalid, and this SYN is
+        // smaller than that.
+        for cause in 0..if v6 { 5 } else { 6 } {
+            let mut client = config(v6);
+            client.connection.pmtud = Some(PmtudConfig::new(1500));
+            let client = Endpoint::new(client, [1; 32], 0, |_| true).unwrap();
+            let (mut a, _, _) = warm_pair(v6, client, endpoint(2, v6));
             let (local, remote) = addresses(v6, 40001);
-            let (id, accepted) = a.connect_fast_open(100, local, remote, b"hello").unwrap();
-            assert_eq!(accepted, 5);
+            let tuple = Tuple { local, remote };
+            // Large enough that an IPv4 Packet Too Big at the 68-octet floor
+            // can name the SYN.
+            let (id, accepted) = a.connect_fast_open(100, local, remote, &[42; 200]).unwrap();
+            assert_eq!(accepted, 200);
             let syn = packet(&mut a, 100);
             let sequence = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
             let failed_at = match cause {
@@ -341,19 +348,16 @@ fn rfc7413_icmp_keeps_cookie_and_suppresses_service() {
                     assert_eq!(a.acknowledged(id).unwrap(), 0);
                     110
                 }
-                1 => {
-                    assert!(
-                        a.network_error(
-                            110,
-                            Tuple { local, remote },
-                            sequence,
-                            NetworkError::SoftUnreachable
-                        )
-                        .unwrap()
-                    );
+                1..=3 => {
+                    let error = [
+                        NetworkError::SoftUnreachable,
+                        NetworkError::HardUnreachable,
+                        NetworkError::TimeExceeded,
+                    ][cause - 1];
+                    assert!(a.network_error(110, tuple, sequence, error).unwrap());
                     110
                 }
-                _ => {
+                4 => {
                     let deadline = a.next_deadline().unwrap();
                     a.on_timeout(deadline, 64).unwrap();
                     let retry = packet(&mut a, deadline);
@@ -362,41 +366,40 @@ fn rfc7413_icmp_keeps_cookie_and_suppresses_service() {
                     assert!(retry.payload.is_empty());
                     deadline
                 }
+                _ => {
+                    let size = syn.1.len() as u32 + 20;
+                    assert!(a.pmtu_feedback(110, tuple, sequence, size, 20, 68).unwrap());
+                    // The dropped SYN is repaired by a regular SYN.
+                    let retry = packet(&mut a, 110);
+                    let retry = wire::parse(retry.0, &retry.1).unwrap();
+                    assert_eq!(retry.header.sequence, sequence);
+                    assert!(retry.options.fast_open.is_none());
+                    assert!(retry.payload.is_empty());
+                    110
+                }
             };
-            let suppressed = cause == 1;
             assert!(
                 a.has_fast_open_cookie(failed_at, local.ip(), remote.ip())
                     .unwrap()
             );
-            assert_eq!(
-                a.can_defer_fast_open(failed_at, local.ip(), remote)
-                    .unwrap(),
-                !suppressed
-            );
-            let other_service = SocketAddr::new(remote.ip(), remote.port() + 1);
             assert!(
-                a.can_defer_fast_open(failed_at, local.ip(), other_service)
+                a.can_defer_fast_open(failed_at, local.ip(), remote)
                     .unwrap()
             );
             let (next_local, _) = addresses(v6, 40002);
             let (_, accepted) = a
-                .connect_fast_open(failed_at, next_local, remote, b"retry")
+                .connect_fast_open(failed_at, next_local, remote, &[43; 200])
                 .unwrap();
-            if !suppressed {
-                assert_eq!(accepted, 5);
-                continue;
+            assert_eq!(accepted, 200);
+            let next = packet(&mut a, failed_at);
+            let next = wire::parse(next.0, &next.1).unwrap();
+            assert_eq!(next.header.flags & wire::SYN, wire::SYN);
+            let cookie = next.options.fast_open.unwrap();
+            assert_eq!(cookie.as_bytes().len(), 8);
+            if cause == 0 {
+                assert_eq!(cookie, wire::FastOpenCookie::new(&[9; 8]).unwrap());
             }
-            assert_eq!(accepted, 0); // Verified erratum 5373: source port is not a cache key.
-            let retry = packet(&mut a, failed_at);
-            let retry = wire::parse(retry.0, &retry.1).unwrap();
-            assert!(retry.options.fast_open.is_none());
-            assert!(retry.payload.is_empty());
-            let expires = failed_at + crate::fast_open::NEGATIVE_LIFETIME_US;
-            assert!(
-                !a.can_defer_fast_open(expires - 1, local.ip(), remote)
-                    .unwrap()
-            );
-            assert!(a.can_defer_fast_open(expires, local.ip(), remote).unwrap());
+            assert_eq!(next.payload, &[43; 200]);
         }
     }
 }
@@ -1023,8 +1026,7 @@ fn fast_open_cache_enable_budget_exact_fit_and_idempotence() {
     let charge = FastOpen::allocation_bytes();
     assert_eq!(
         charge,
-        64 * (core::mem::size_of::<crate::fast_open::CachedPeer>()
-            + core::mem::size_of::<crate::fast_open::NegativeService>())
+        64 * core::mem::size_of::<crate::fast_open::CachedPeer>()
     );
     let (local, remote) = addresses(false, 40001);
     for budget in [0, charge - 1, charge] {
@@ -1072,7 +1074,7 @@ fn fast_open_cache_allocation_failure_does_not_publish_or_charge() {
     };
     let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
     let (local, remote) = addresses(false, 40001);
-    for failure in 0..2 {
+    for failure in 0..1 {
         assert_eq!(
             crate::allocation_tests::fail_after(failure, || a.enable_fast_open()),
             Err(EndpointError::Connection(Error::NoMemory))
@@ -1966,110 +1968,6 @@ fn fast_open_syn_only_ack_keeps_next_service_attempt() {
     assert_eq!(syn.payload, b"retry");
 }
 
-#[test]
-fn fast_open_negative_endpoint_clock_expiry_and_repeated_errors() {
-    for units in [1_000_000, 1_000_000_000] {
-        for v6 in [false, true] {
-            let mut cfg = EndpointConfig::default();
-            cfg.connection.timebase.units_per_second = units;
-            let cooldown = cfg
-                .connection
-                .timebase
-                .ticks_from_us(crate::fast_open::NEGATIVE_LIFETIME_US);
-            let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
-            a.enable_fast_open().unwrap();
-            let (local, remote) = addresses(v6, 40000);
-            a.connect_fast_open(0, local, remote, &[]).unwrap();
-            let syn = packet(&mut a, 0);
-            deliver(&mut a, 1, &cache_reply(&syn, 536, Some(&[7; 8])));
-            packet(&mut a, 1);
-            let (local, _) = addresses(v6, 40001);
-            let (id, _) = a.connect_fast_open(2, local, remote, b"hello").unwrap();
-            let syn = packet(&mut a, 2);
-            let seq = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
-            let tuple = Tuple { local, remote };
-            assert!(
-                !a.network_error(3, tuple, seq.wrapping_sub(1), NetworkError::SoftUnreachable)
-                    .unwrap()
-            );
-            assert!(a.can_defer_fast_open(3, local.ip(), remote).unwrap());
-            assert!(
-                a.network_error(10, tuple, seq, NetworkError::SoftUnreachable)
-                    .unwrap()
-            );
-            assert!(!a.can_defer_fast_open(10, local.ip(), remote).unwrap());
-            assert!(
-                a.network_error(20, tuple, seq, NetworkError::TimeExceeded)
-                    .unwrap()
-            );
-            // Valid replacement learning must not remove the independent negative entry.
-            deliver(&mut a, 30, &cache_reply(&syn, 940, Some(&[9; 8])));
-            packet(&mut a, 30);
-            assert!(a.has_fast_open_cookie(30, local.ip(), remote.ip()).unwrap());
-            assert!(!a.can_defer_fast_open(30, local.ip(), remote).unwrap());
-            let other_port = SocketAddr::new(remote.ip(), remote.port() + 1);
-            assert!(a.can_defer_fast_open(30, local.ip(), other_port).unwrap());
-            let (other_local, _) = addresses(v6, 40002);
-            let (_, n) = a
-                .connect_fast_open(31, other_local, other_port, b"hello")
-                .unwrap();
-            assert_eq!(n, 5);
-            let other_syn = packet(&mut a, 31);
-            assert!(
-                wire::parse(other_syn.0, &other_syn.1)
-                    .unwrap()
-                    .options
-                    .fast_open
-                    .is_some()
-            );
-            // A suppressed attempt neither stores initial bytes nor refreshes cooldown.
-            let (other_local, _) = addresses(v6, 40003);
-            let (ordinary, n) = a
-                .connect_fast_open(32, other_local, remote, b"hello")
-                .unwrap();
-            assert_eq!(n, 0);
-            assert_eq!(a.transport_info(ordinary).unwrap().send_used, 0);
-            let ordinary_syn = packet(&mut a, 32);
-            let parsed = wire::parse(ordinary_syn.0, &ordinary_syn.1).unwrap();
-            assert!(parsed.options.fast_open.is_none());
-            assert!(
-                a.network_error(
-                    33,
-                    Tuple {
-                        local: other_local,
-                        remote
-                    },
-                    parsed.header.sequence,
-                    NetworkError::HardUnreachable
-                )
-                .unwrap()
-            );
-            a.release(ordinary).unwrap();
-            assert_eq!(a.abort(ordinary), Err(EndpointError::InvalidHandle));
-            assert!(
-                !a.can_defer_fast_open(10 + cooldown - 1, local.ip(), remote)
-                    .unwrap()
-            );
-            assert!(
-                a.can_defer_fast_open(10 + cooldown, local.ip(), remote)
-                    .unwrap()
-            );
-            let (local, _) = addresses(v6, 40004);
-            let (_, n) = a
-                .connect_fast_open(10 + cooldown, local, remote, b"again")
-                .unwrap();
-            assert_eq!(n, 5);
-            let syn = packet(&mut a, 10 + cooldown);
-            assert_eq!(
-                wire::parse(syn.0, &syn.1).unwrap().options.fast_open,
-                Some(wire::FastOpenCookie::new(&[9; 8]).unwrap())
-            );
-            assert!(a.can_defer_fast_open(9, local.ip(), remote).is_err());
-            assert_eq!(a.state(id).unwrap(), State::Established);
-        }
-    }
-}
-
 // Neither the unsubmitted attempt nor the accepted retry's timeout disables
 // Fast Open (Linux 6.12 records no per-destination SYN loss).
 #[test]
@@ -2316,7 +2214,7 @@ fn clear_client_cache_preserves_reserved_open_server_keys_and_live_connection() 
 }
 
 #[test]
-fn clear_client_cache_explicitly_discards_service_failure_and_does_not_enable_service() {
+fn clear_client_cache_discards_cookies_and_does_not_enable_service() {
     for v6 in [false, true] {
         let mut cold = endpoint(1, v6);
         let bytes = cold.buffer_bytes();
@@ -2326,25 +2224,15 @@ fn clear_client_cache_explicitly_discards_service_failure_and_does_not_enable_se
         let (local, remote) = addresses(v6, 40001);
         a.connect_fast_open(100, local, remote, b"probe").unwrap();
         let syn = packet(&mut a, 100);
-        let seq = wire::parse(syn.0, &syn.1).unwrap().header.sequence;
-        assert!(
-            a.network_error(
-                110,
-                Tuple { local, remote },
-                seq,
-                NetworkError::SoftUnreachable
-            )
-            .unwrap()
-        );
-        assert!(!a.can_defer_fast_open(110, local.ip(), remote).unwrap());
+        assert!(a.can_defer_fast_open(110, local.ip(), remote).unwrap());
         a.clear_fast_open_client_cache();
         assert!(
             !a.has_fast_open_cookie(110, local.ip(), remote.ip())
                 .unwrap()
         );
+        assert!(!a.can_defer_fast_open(110, local.ip(), remote).unwrap());
         // The live attempt retains its transport state and can learn a new
-        // credential; explicit invalidation, not successful ACK processing,
-        // is what removed the previously cached service failure.
+        // credential.
         deliver(&mut a, 120, &cache_reply(&syn, 940, Some(&[9; 8])));
         assert!(a.can_defer_fast_open(120, local.ip(), remote).unwrap());
     }

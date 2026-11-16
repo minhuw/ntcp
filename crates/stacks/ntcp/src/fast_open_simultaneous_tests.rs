@@ -749,8 +749,8 @@ fn simultaneous_first_response_departure_and_genuine_rto_provenance() {
         deliver(&mut p.b, 100, &ra);
         p.complete(ids, 100, vec![], vec![]);
 
-        // An actually transmitted request trains cooldown on its first RTO,
-        // but does not suppress the independent first local response cookie.
+        // An actually transmitted request's first RTO does not suppress the
+        // independent first local response cookie.
         let mut p = Peers::new(false, false, reserved, false);
         let ids = p.open(100, true, true);
         let sa = packet(&mut p.a, 100, reserved);
@@ -1550,7 +1550,7 @@ fn simultaneous_original_reservation_and_failed_encode_cannot_admit() {
 }
 
 #[test]
-fn simultaneous_response_only_timeout_cannot_train_client_cooldown() {
+fn simultaneous_response_only_timeout_keeps_client_fast_open() {
     let mut p = Peers::new(false, false, true, false);
     let ids = p.open(100, true, true);
     let sb = packet(&mut p.b, 100, true);

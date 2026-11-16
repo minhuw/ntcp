@@ -553,8 +553,8 @@ fn disabled_ipv6_fast_open_cold_warm_supplied_protected_and_rejected() {
                     ),
                 }
                 .unwrap();
-                // A rejected cookie suppresses subsequent early attempts at that
-                // service; use the existing explicit cache clear for the next case.
+                // Each case starts cold: the explicit cache clear below drops
+                // the cookie and MSS this one learned.
                 // Validated learned MSS 4096 or, after the explicit cache
                 // clear, the offered MSS 4096 (Linux's advmss): either way
                 // path limited, less the whole option space.

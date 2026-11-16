@@ -280,10 +280,11 @@ fn cookie_request_fallback_trace_keeps_fast_open_and_stream_progress() {
 }
 
 #[test]
-// An ICMP error about the request is a negative response that suppresses the
-// service; repeated SYN timeouts and giving up at the retry limit are not
-// (Linux 6.12 records SYN loss per destination for netlink only).
-fn cookie_request_icmp_suppresses_and_timeouts_do_not() {
+// Neither an ICMP error about the request nor repeated SYN timeouts nor
+// giving up at the retry limit disables Fast Open for the service: Linux
+// 6.12's tcp_v4_err/tcp_v6_err never touch the Fast Open cache, and it
+// records SYN loss per destination for netlink only.
+fn cookie_request_icmp_and_timeouts_keep_fast_open() {
     for v6 in [false, true] {
         for scale in [1, 1000] {
             for reserved in [false, true] {
@@ -368,15 +369,13 @@ fn cookie_request_icmp_suppresses_and_timeouts_do_not() {
                         assert_eq!(a.state(id).unwrap(), State::Established);
                         emit(&mut a, now + scale, id, reserved);
                     }
-                    let suppressed = cause == 1 || cause == 3;
                     assert!(
                         a.has_fast_open_cookie(now + 3 * scale, local.ip(), remote.ip())
                             .unwrap()
                     );
-                    assert_eq!(
+                    assert!(
                         a.can_defer_fast_open(now + 3 * scale, local.ip(), remote)
-                            .unwrap(),
-                        !suppressed
+                            .unwrap()
                     );
                     let (next_local, _) = addresses(v6, 40002);
                     let (next, accepted) = a
@@ -384,10 +383,10 @@ fn cookie_request_icmp_suppresses_and_timeouts_do_not() {
                         .unwrap();
                     // The learned MSS 1240 less the option space, path bound.
                     let learned = if v6 { 1180 } else { 1200 };
-                    assert_eq!(accepted, if suppressed { 0 } else { learned });
+                    assert_eq!(accepted, learned);
                     let next = emit(&mut a, now + 3 * scale, next, reserved);
                     let next = wire::parse(next.0, &next.1).unwrap();
-                    assert_eq!(next.options.fast_open.is_none(), suppressed);
+                    assert!(next.options.fast_open.is_some());
                     assert_eq!(next.payload.len(), accepted);
                 }
             }

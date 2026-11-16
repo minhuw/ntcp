@@ -2562,13 +2562,6 @@ impl Endpoint {
             .ticks_from_us(crate::fast_open::LIFETIME_US)
     }
 
-    fn fast_open_negative_lifetime(&self) -> u64 {
-        self.config
-            .connection
-            .timebase
-            .ticks_from_us(crate::fast_open::NEGATIVE_LIFETIME_US)
-    }
-
     /// Opt this listener into replay-tolerant early delivery; zero disables it.
     pub fn set_listener_fast_open(
         &mut self,
@@ -2609,7 +2602,7 @@ impl Endpoint {
     }
 
     /// A supplied cookie must have been obtained from this target server.
-    /// This checks eligibility only; it does not enable TFO or clear failures.
+    /// This checks eligibility only; it does not enable TFO.
     pub fn can_defer_fast_open_with_server_cookie(
         &self,
         now: Instant,
@@ -2618,16 +2611,11 @@ impl Endpoint {
         cookie: Option<wire::FastOpenCookie>,
     ) -> Result<bool, EndpointError> {
         self.check_clock(now)?;
-        Ok(
-            (cookie.is_some() || self.has_fast_open_cookie(now, local, remote.ip())?)
-                && self.fast_open.as_ref().is_some_and(|service| {
-                    !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote, None)
-                }),
-        )
+        Ok(self.fast_open.is_some()
+            && (cookie.is_some() || self.has_fast_open_cookie(now, local, remote.ip())?))
     }
 
     /// Check a protected-service agreement independently of cookie possession.
-    /// Negative-response suppression remains authoritative for either policy.
     pub fn can_defer_fast_open_with_policy(
         &self,
         now: Instant,
@@ -2636,18 +2624,16 @@ impl Endpoint {
         policy: crate::FastOpenClientPolicy,
     ) -> Result<bool, EndpointError> {
         self.check_clock(now)?;
-        Ok((policy == crate::FastOpenClientPolicy::ApplicationProtected
-            || self.has_fast_open_cookie(now, local, remote.ip())?)
-            && self.fast_open.as_ref().is_some_and(|service| {
-                !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote, None)
-            }))
+        Ok(self.fast_open.is_some()
+            && (policy == crate::FastOpenClientPolicy::ApplicationProtected
+                || self.has_fast_open_cookie(now, local, remote.ip())?))
     }
 
     /// Deferral eligibility for a peer whose tuple has `zone` (Some exactly
     /// when an address is IPv6 link-local): a supplied `cookie` as
     /// [`Self::can_defer_fast_open_with_server_cookie`], otherwise `policy`
     /// as [`Self::can_defer_fast_open_with_policy`], with that zone's cookie
-    /// cache and suppression.
+    /// cache.
     pub fn can_defer_scoped_fast_open(
         &self,
         now: Instant,
@@ -2660,10 +2646,9 @@ impl Endpoint {
         self.check_clock(now)?;
         let lifetime = self.fast_open_lifetime();
         Ok(self.fast_open.as_ref().is_some_and(|service| {
-            (cookie.is_some()
+            cookie.is_some()
                 || policy == crate::FastOpenClientPolicy::ApplicationProtected
-                || service.get_in(now, lifetime, local, remote.ip(), zone).is_some())
-                && !service.suppressed(now, self.fast_open_negative_lifetime(), local, remote, zone)
+                || service.get_in(now, lifetime, local, remote.ip(), zone).is_some()
         }))
     }
 
@@ -2810,8 +2795,6 @@ impl Endpoint {
             self.active_admission(now, self.scoped(tuple), &options, receive_authority, true);
         self.admit_open(admission)?;
         let service = self.fast_open.as_ref().ok_or(Error::InvalidState)?;
-        let suppressed =
-            service.suppressed(now, self.fast_open_negative_lifetime(), local.ip(), remote, zone);
         let cached = service.get_in(now, self.fast_open_lifetime(), local.ip(), remote.ip(), zone);
         let peer_mss =
             service.peer_mss(now, self.fast_open_lifetime(), local.ip(), remote.ip(), zone);
@@ -2831,9 +2814,7 @@ impl Endpoint {
         let budget = self
             .buffer_room()
             .saturating_add(connection.buffer_charge());
-        let accepted = match if suppressed {
-            Ok(0)
-        } else if let Some(cookie) = cookie {
+        let accepted = match if let Some(cookie) = cookie {
             connection.prepare_fast_open_with_server_cookie(cookie, peer_mss, initial, budget)
         } else if policy == crate::FastOpenClientPolicy::ApplicationProtected {
             connection.prepare_fast_open_without_cookie(peer_mss, initial, budget)
@@ -3461,7 +3442,6 @@ impl Endpoint {
         assert_eq!(slot.time_wait, state == State::TimeWait);
         assert_eq!(connection.loss_events, crate::LossCounters::default());
         assert_eq!(connection.split_refusals(), 0);
-        assert!(!connection.fast_open_negative);
         assert!(connection.fast_open_learned.is_none());
         assert!(!connection.fast_open_peer_reset);
         assert!(slot.fast_open_owner.is_none());
@@ -3549,13 +3529,6 @@ impl Endpoint {
             self.loss_counters
                 .add(core::mem::take(&mut slot.connection.loss_events));
             self.ledger_split_refusals += slot.connection.take_split_refusals();
-            if core::mem::take(&mut slot.connection.fast_open_negative)
-                && let Some(service) = self.fast_open.as_mut()
-            {
-                let scoped = slot.connection.scoped_tuple();
-                let tuple = scoped.tuple;
-                service.fail(self.now, tuple.local.ip(), tuple.remote, scoped.zone);
-            }
             if let Some((cookie, mss)) = slot.connection.fast_open_learned.take()
                 && let Some(service) = self.fast_open.as_mut()
             {

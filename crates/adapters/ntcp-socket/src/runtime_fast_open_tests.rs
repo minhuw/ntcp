@@ -2041,8 +2041,12 @@ fn syncnt_blocking_fast_open_and_deferred_timeout_retains_snapshot() {
     }
 }
 
+// An ICMP error about one Fast Open SYN leaves Fast Open on for the service
+// (Linux's tcp_v4_err/tcp_v6_err never touch the Fast Open cache):
+// MSG_FASTOPEN, a TCP_FASTOPEN_CONNECT connect and an already deferred
+// connect all send the cookie and the data in the next SYN.
 #[test]
-fn fast_open_negative_suppresses_msg_deferred_query_and_already_deferred_write() {
+fn fast_open_icmp_keeps_msg_deferred_query_and_already_deferred_write() {
     for mode in 0..3 {
         let (mut a, mut b, listener) = tfo_setup(true);
         let remote = "192.0.2.2:8080".parse().unwrap();
@@ -2077,45 +2081,46 @@ fn fast_open_negative_suppresses_msg_deferred_query_and_already_deferred_write()
                 .unwrap()
         );
         assert!(
-            !a.endpoint
+            a.endpoint
                 .can_defer_fast_open(a.now(), tuple.local.ip(), remote)
                 .unwrap()
         );
-        let result = if mode == 1 {
-            a.execute(client, Op::Connect(remote))
-        } else {
-            a.execute(
+        if mode == 1 {
+            a.execute(client, Op::Connect(remote)).unwrap();
+            tfo_no_output(&mut a);
+        }
+        let sent = a
+            .execute(
                 client,
                 tfo_send(b"hello", if mode == 0 { MSG_FASTOPEN } else { 0 }),
             )
-        };
-        assert_eq!(result.unwrap_err(), EINPROGRESS);
-        assert!(a.sockets[&client].deferred_peer.is_none());
+            .unwrap()
+            .value;
+        assert_eq!(sent, 5);
         let syn = tfo_capture(&mut a);
-        assert!(segment(&syn).options.fast_open.is_none());
-        assert!(segment(&syn).payload.is_empty());
-        assert_eq!(
-            a.endpoint
-                .transport_info(cid(&a, client))
+        assert_ne!(segment(&syn).header.flags & ntcp::wire::SYN, 0);
+        assert!(
+            !segment(&syn)
+                .options
+                .fast_open
                 .unwrap()
-                .send_used,
-            0
+                .as_bytes()
+                .is_empty()
         );
+        assert_eq!(segment(&syn).payload, b"hello");
         tfo_deliver(&mut b, syn);
         exchange(&mut a, &mut b);
         let server = b
             .execute(listener, Op::Accept(SOCK_NONBLOCK))
             .unwrap()
             .value as u64;
-        assert_eq!(a.execute(client, tfo_send(b"hello", 0)).unwrap().value, 5);
-        exchange(&mut a, &mut b);
         assert_eq!(b.execute(server, Op::Read(5)).unwrap().bytes, b"hello");
     }
 }
 
 #[test]
-fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
-    for (timeout, suppress) in [(false, false), (true, false), (false, true), (true, true)] {
+fn fast_open_reset_cookie_reuse_after_icmp_blocking_send() {
+    for (timeout, icmp) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut a, mut b, listener) = tfo_setup(true);
         let failing = new(&mut a, SOCK_NONBLOCK);
         assert_eq!(
@@ -2133,7 +2138,7 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
         let reset = tfo_capture(&mut b);
         assert_ne!(segment(&reset).header.flags & ntcp::wire::RST, 0);
         let failed_tuple = a.endpoint.tuple(cid(&a, failing)).unwrap();
-        if suppress {
+        if icmp {
             assert!(
                 a.endpoint
                     .network_error(
@@ -2159,11 +2164,10 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
                 .has_fast_open_cookie(a.now(), a.local, remote.ip())
                 .unwrap()
         );
-        assert_eq!(
+        assert!(
             a.endpoint
                 .can_defer_fast_open(a.now(), a.local, remote)
-                .unwrap(),
-            !suppress
+                .unwrap()
         );
         let listener = tfo_listener(&mut b);
         let client = new(&mut a, 0);
@@ -2190,8 +2194,8 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
             failed_tuple.local.port()
         );
         let initial = segment(&syn).payload.len();
-        assert_eq!(initial > 0, !suppress);
-        assert_eq!(segment(&syn).options.fast_open.is_some(), !suppress);
+        assert!(initial > 0);
+        assert!(segment(&syn).options.fast_open.is_some());
         assert_eq!(request.send.as_ref().unwrap().accepted, initial);
         assert_eq!(
             a.endpoint.transport_info(connection).unwrap().send_used,
@@ -2245,9 +2249,6 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
                 .execute(listener, Op::Accept(SOCK_NONBLOCK))
                 .unwrap()
                 .value as u64;
-            if initial == 0 {
-                assert_eq!(b.execute(server, Op::Read(BYTES)).unwrap_err(), EAGAIN);
-            }
             assert!(a.service(&mut request));
             assert_eq!(rx.try_recv().unwrap().unwrap().value, payload.len() as i32);
             exchange(&mut a, &mut b);
@@ -2259,13 +2260,13 @@ fn fast_open_reset_cookie_reuse_and_independent_suppression_blocking_send() {
                 EISCONN
             );
         }
-        // Only the ICMP error suppresses the service; the SYN timeouts and
-        // giving up do not (Linux 6.12 records no per-destination SYN loss).
-        assert_eq!(
+        // Neither the ICMP error nor the SYN timeouts and giving up disable
+        // Fast Open (Linux 6.12 records no per-destination SYN loss and its
+        // tcp_v4_err/tcp_v6_err never touch the Fast Open cache).
+        assert!(
             a.endpoint
                 .can_defer_fast_open(a.now(), a.local, remote)
-                .unwrap(),
-            !suppress
+                .unwrap()
         );
     }
 }

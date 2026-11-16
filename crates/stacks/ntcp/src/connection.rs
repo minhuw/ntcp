@@ -893,8 +893,6 @@ pub(crate) struct Connection {
     // Physical option provenance is independent of early-send authorization.
     fast_open_option_sent: bool,
     fast_open_initial: usize,
-    fast_open_attempt: bool,
-    pub(crate) fast_open_negative: bool,
     // Physical SYN acceptance, separate from attempted/queued Fast Open data.
     syn_payload_sent: usize,
     syn_data_acked: bool,
@@ -1377,8 +1375,6 @@ impl Connection {
             fast_open_client_policy: crate::FastOpenClientPolicy::RequireCookie,
             fast_open_option_sent: false,
             fast_open_initial: 0,
-            fast_open_attempt: false,
-            fast_open_negative: false,
             syn_payload_sent: 0,
             syn_data_acked: false,
             syn_data_fully_acked: false,
@@ -3009,17 +3005,6 @@ impl Connection {
         self.handshake_retransmission_limit
     }
 
-    // ICMP errors about a physically transmitted request train the service
-    // cooldown once. A SYN timeout or a SYN-ACK that leaves the SYN data
-    // unacknowledged does not: Linux 6.12 never disables Fast Open for a
-    // destination on SYN loss (see duvet/rfc7413-todos.toml).
-    fn report_fast_open_failure(&mut self) {
-        if self.handshake_pending() && core::mem::take(&mut self.fast_open_attempt) {
-            self.fast_open_negative = true;
-            self.refresh_work = true;
-        }
-    }
-
     fn record_syn_departure(&mut self, timestamp: Option<u32>) {
         if !self.passive_open
             && let Some(value) = timestamp
@@ -3087,7 +3072,6 @@ impl Connection {
         //# Since these Unreachable messages indicate soft error conditions, a
         //# TCP implementation MUST NOT abort the connection (MUST-56), and it
         //# SHOULD make the information available to the application (SHLD-25).
-        self.report_fast_open_failure();
         self.events.network_error = Some(error);
         if let Some(p) = &mut self.pmtud {
             p.network_error();
@@ -3499,7 +3483,6 @@ impl Connection {
         });
         if d.syn {
             if finished {
-                self.fast_open_attempt |= d.fast_open && !self.syn_committed;
                 self.fast_open_option_sent |= d.fast_open_option;
                 self.fast_open_response_committed |= d.simultaneous_response;
                 self.record_syn_departure(d.syn_timestamp);
@@ -4174,7 +4157,6 @@ impl Connection {
                 self.resolve_probe_response();
             }
             crate::PmtuFeedback::Deferred | crate::PmtuFeedback::Decreased { .. } => {
-                self.report_fast_open_failure();
                 // Budget only: the exact quoted range below is the repair,
                 // not a head retry from SND.UNA.
                 self.refresh_path_mss_with(false);
@@ -4186,7 +4168,6 @@ impl Connection {
         // stream bytes, only a never-retransmitted SYN is eligible: a minimal
         // quote cannot name the copy, so duplicates never amplify retries.
         if self.quote_covers_syn(span.0, span.1) && self.committed_syn_retransmissions == 0 {
-            self.report_fast_open_failure();
             self.syn_pending = true;
         }
         self.note_ptb_drop(span.0, span.1);
@@ -4947,7 +4928,6 @@ impl Connection {
             .config
             .receive_capacity
             .min(10 * usize::from(self.advertised_payload_mss()));
-        self.fast_open_attempt = false;
         if self.deferred_tfo_push {
             self.deferred_tfo_push = false;
             let end = self.iss.wrapping_add(1 + self.fast_open_initial as u32);
@@ -5540,7 +5520,6 @@ impl Connection {
         self.send_expand_pending
             || self.loss_events != crate::LossCounters::default()
             || self.rack.split_refusals != 0
-            || self.fast_open_negative
             || self.fast_open_learned.is_some()
             || self.fast_open_peer_reset
             || self.iw_setup_loss
@@ -11499,13 +11478,6 @@ impl Connection {
             stream: count != 0 && !keepalive,
             syn,
             syn_timestamp: timestamp.map(|(value, _)| value),
-            fast_open: syn
-                && !response_syn
-                && !self.passive_open
-                && (fast_open_option.is_some()
-                    || self.fast_open_client_policy
-                        == crate::FastOpenClientPolicy::ApplicationProtected
-                        && count != 0),
             fast_open_option: syn
                 && !response_syn
                 && fast_open_option.is_some()
@@ -11855,13 +11827,6 @@ impl Connection {
         //# 2. Advance to SYN-SENT state and update SND.NXT to include the data accordingly.
         let length = count as u32 + u32::from(flags & SYN != 0) + u32::from(flags & FIN != 0);
         if syn && !reserve {
-            self.fast_open_attempt |= !response_syn
-                && !self.passive_open
-                && !self.syn_committed
-                && (fast_open_option.is_some()
-                    || self.fast_open_client_policy
-                        == crate::FastOpenClientPolicy::ApplicationProtected
-                        && count != 0);
             self.fast_open_option_sent |=
                 !response_syn && fast_open_option.is_some() && !self.passive_open;
             self.fast_open_response_committed |= response_syn;

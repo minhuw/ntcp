@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::net::{IpAddr, SocketAddr};
+use core::net::IpAddr;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -25,8 +25,7 @@ pub enum FastOpenClientPolicy {
     #[default]
     RequireCookie,
     /// The target service has independently agreed to protected early data.
-    /// Omit the FO option; SYN data admission and negative-response caching
-    /// are the same as with a cookie.
+    /// Omit the FO option; SYN data admission is the same as with a cookie.
     ApplicationProtected,
 }
 
@@ -673,7 +672,6 @@ impl ServerCookieContext {
 }
 
 const CAPACITY: usize = 64;
-pub(crate) const NEGATIVE_LIFETIME_US: u64 = 60_000_000;
 pub(crate) const LIFETIME_US: u64 = 3_600_000_000;
 
 #[derive(Clone, Copy)]
@@ -694,24 +692,14 @@ pub(crate) struct CachedPeer {
     learned: Instant,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct NegativeService {
-    local: IpAddr,
-    remote: SocketAddr,
-    zone: Option<LinkId>,
-    failed: Instant,
-}
-
 pub(crate) struct FastOpen {
     entries: Vec<CachedPeer>,
     next: usize,
-    negative: Vec<NegativeService>,
-    negative_next: usize,
 }
 
 impl FastOpen {
     pub const fn allocation_bytes() -> usize {
-        CAPACITY * (core::mem::size_of::<CachedPeer>() + core::mem::size_of::<NegativeService>())
+        CAPACITY * core::mem::size_of::<CachedPeer>()
     }
 
     pub fn new() -> Result<Self, Error> {
@@ -719,67 +707,12 @@ impl FastOpen {
         entries
             .try_reserve_exact(CAPACITY)
             .map_err(|_| Error::NoMemory)?;
-        let mut negative = Vec::new();
-        negative
-            .try_reserve_exact(CAPACITY)
-            .map_err(|_| Error::NoMemory)?;
-        Ok(Self {
-            entries,
-            next: 0,
-            negative,
-            negative_next: 0,
-        })
+        Ok(Self { entries, next: 0 })
     }
 
     pub fn clear_client_cache(&mut self) {
         self.entries.clear();
         self.next = 0;
-        self.negative.clear();
-        self.negative_next = 0;
-    }
-
-    //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3.1
-    //= reason=Verified erratum 5373 removes the source port from this published path definition. Suppression is keyed by source IP and destination IP/port.
-    //# For any negative responses, the client SHOULD disable Fast Open on the specific path (the source and
-    //# destination IP addresses and ports) at least temporarily. Since TFO is enabled on a per-service-port
-    //# basis, but cookies are independent of service ports, the client's cache should include remote port
-    //# numbers, too.
-    pub fn suppressed(
-        &self,
-        now: Instant,
-        lifetime: u64,
-        local: IpAddr,
-        remote: SocketAddr,
-        zone: Option<LinkId>,
-    ) -> bool {
-        self.negative.iter().any(|e| {
-            e.local == local
-                && e.remote == remote
-                && e.zone == zone
-                && now >= e.failed
-                && now - e.failed < lifetime
-        })
-    }
-
-    pub fn fail(&mut self, now: Instant, local: IpAddr, remote: SocketAddr, zone: Option<LinkId>) {
-        let entry = NegativeService {
-            local,
-            remote,
-            zone,
-            failed: now,
-        };
-        if let Some(old) = self
-            .negative
-            .iter_mut()
-            .find(|e| e.local == local && e.remote == remote && e.zone == zone)
-        {
-            *old = entry;
-        } else if self.negative.len() < CAPACITY {
-            self.negative.push(entry);
-        } else {
-            self.negative[self.negative_next] = entry;
-            self.negative_next = (self.negative_next + 1) % CAPACITY;
-        }
     }
 
     #[cfg(test)]
@@ -1102,19 +1035,17 @@ mod tests {
     }
 
     // A link-local address pair on one link and the same pair on another
-    // (or unscoped) are different peers: neither the cookie, the MSS
-    // observation nor the negative entry of one is visible to the other.
+    // (or unscoped) are different peers: neither the cookie nor the MSS
+    // observation of one is visible to the other.
     #[test]
     fn client_cache_entries_are_scoped_by_zone() {
         let local = "fe80::1".parse().unwrap();
         let remote: IpAddr = "fe80::2".parse().unwrap();
-        let service = SocketAddr::new(remote, 80);
         let [first, second, recycled] = crate::fast_open_policy_tests::zones();
         let cookie = FastOpenCookie::new(&[5; 8]).unwrap();
         let mut cache = FastOpen::new().unwrap();
         cache.update_mss(1, local, remote, Some(first), 940);
         cache.learn_in(2, local, remote, Some(second), cookie, None);
-        cache.fail(3, local, service, Some(first));
         assert_eq!(
             cache.peer_mss(3, 100, local, remote, Some(first)),
             Some(940)
@@ -1122,11 +1053,9 @@ mod tests {
         assert!(cache.get_in(3, 100, local, remote, Some(first)).is_none());
         for zone in [Some(second), Some(recycled), None] {
             assert_eq!(cache.peer_mss(3, 100, local, remote, zone), None);
-            assert!(!cache.suppressed(3, 100, local, service, zone));
         }
         let entry = cache.get_in(3, 100, local, remote, Some(second)).unwrap();
         assert_eq!((entry.cookie, entry.mss), (cookie, None));
-        assert!(cache.suppressed(3, 100, local, service, Some(first)));
         for zone in [Some(first), Some(recycled), None] {
             assert!(cache.get_in(3, 100, local, remote, zone).is_none());
         }
@@ -1251,56 +1180,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod negative_tests {
-    use super::*;
-
-    #[test]
-    fn negative_capacity_lifetime_isolation_and_independent_cookie_age() {
-        for units in [1_000_000, 1_000_000_000] {
-            let lifetime = crate::CallerTimebase {
-                units_per_second: units,
-                ..Default::default()
-            }
-            .ticks_from_us(NEGATIVE_LIFETIME_US);
-            let local = "192.0.2.1".parse().unwrap();
-            let other = "192.0.2.3".parse().unwrap();
-            let remote: SocketAddr = "192.0.2.2:80".parse().unwrap();
-            let mut cache = FastOpen::new().unwrap();
-            let cookie = FastOpenCookie::new(&[1; 8]).unwrap();
-            cache.learn(1, local, remote.ip(), cookie, Some(536));
-            cache.fail(10, local, remote, None);
-            for now in [9, 10, 10 + lifetime - 1, 10 + lifetime] {
-                assert_eq!(
-                    cache.suppressed(now, lifetime, local, remote, None),
-                    (10..10 + lifetime).contains(&now)
-                );
-            }
-            assert!(!cache.suppressed(10, lifetime, other, remote, None));
-            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(other, 80), None));
-            assert!(!cache.suppressed(10, lifetime, local, SocketAddr::new(remote.ip(), 81), None));
-            assert_eq!(cache.entries[0].credential.unwrap().1, 1);
-            assert_eq!(cache.entries[0].mss, Some((536, 1)));
-            cache.learn(11, local, remote.ip(), cookie, Some(940));
-            assert!(cache.suppressed(11, lifetime, local, remote, None));
-            cache.fail(20, local, remote, None);
-            assert_eq!(cache.negative.len(), 1);
-            assert!(cache.suppressed(10 + lifetime, lifetime, local, remote, None));
-            assert!(!cache.suppressed(20 + lifetime, lifetime, local, remote, None));
-            crate::allocation_tests::fail_after(0, || {
-                for port in 81..=145 {
-                    cache.fail(20, local, SocketAddr::new(remote.ip(), port), None);
-                }
-            });
-            assert_eq!(cache.negative.len(), CAPACITY);
-            assert_eq!(cache.negative.capacity(), CAPACITY);
-            assert!(!cache.suppressed(20, lifetime, local, remote, None));
-            assert_eq!(cache.entries[0].credential.unwrap().1, 11);
-            assert_eq!(cache.entries[0].mss, Some((940, 11)));
-        }
-    }
-}
-
-#[cfg(test)]
 mod cache_management_tests {
     use super::*;
 
@@ -1312,24 +1191,18 @@ mod cache_management_tests {
         for n in 1..=65 {
             let remote = IpAddr::from([198, 51, 100, n]);
             cache.learn(0, local, remote, cookie, Some(536));
-            cache.fail(0, local, SocketAddr::new(remote, 80), None);
         }
-        let capacities = (cache.entries.capacity(), cache.negative.capacity());
-        assert_eq!((cache.next, cache.negative_next), (1, 1));
+        let capacity = cache.entries.capacity();
+        assert_eq!(cache.next, 1);
         crate::allocation_tests::fail_after(0, || {
             cache.clear_client_cache();
             cache.clear_client_cache();
-            assert!(cache.entries.is_empty() && cache.negative.is_empty());
-            assert_eq!((cache.next, cache.negative_next), (0, 0));
-            assert_eq!(
-                (cache.entries.capacity(), cache.negative.capacity()),
-                capacities
-            );
+            assert!(cache.entries.is_empty());
+            assert_eq!(cache.next, 0);
+            assert_eq!(cache.entries.capacity(), capacity);
             let remote = IpAddr::from([203, 0, 113, 1]);
             cache.learn(10, local, remote, cookie, Some(940));
-            cache.fail(10, local, SocketAddr::new(remote, 80), None);
             assert_eq!(cache.get(10, 100, local, remote).unwrap().mss, Some(940));
-            assert!(cache.suppressed(10, 100, local, SocketAddr::new(remote, 80), None));
             assert!(
                 cache
                     .get(10, 100, local, IpAddr::from([198, 51, 100, 65]))

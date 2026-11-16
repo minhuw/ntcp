@@ -351,11 +351,11 @@ fn partial_synack_rtt_repair_and_next_service_admission() {
     }
 }
 
-// A partial SYN-ACK neither clears an earlier ICMP error's suppression nor
-// creates one after a SYN timeout (Linux 6.12 records no SYN loss for the
-// destination).
+// After an ICMP error or a SYN timeout, a partial SYN-ACK gets the rest of
+// the SYN data repaired and Fast Open stays on for the service (Linux 6.12
+// caches neither).
 #[test]
-fn partial_synack_preserves_prior_icmp_suppression() {
+fn partial_synack_after_icmp_or_timeout_keeps_fast_open() {
     for v6 in [false, true] {
         for reserved in [false, true] {
             for timed_out in [false, true] {
@@ -386,10 +386,9 @@ fn partial_synack_preserves_prior_icmp_suppression() {
                     );
                     110
                 };
-                assert_eq!(
+                assert!(
                     a.can_defer_fast_open(failure_at, local.ip(), remote)
-                        .unwrap(),
-                    timed_out
+                        .unwrap()
                 );
                 let replied_at = failure_at + 100;
                 deliver(&mut a, replied_at, &response(&syn, 3));
@@ -401,24 +400,22 @@ fn partial_synack_preserves_prior_icmp_suppression() {
                     a.has_fast_open_cookie(replied_at, local.ip(), remote.ip())
                         .unwrap()
                 );
-                assert_eq!(
+                assert!(
                     a.can_defer_fast_open(replied_at, local.ip(), remote)
-                        .unwrap(),
-                    timed_out
+                        .unwrap()
                 );
                 let (next_local, _) = addresses(v6, 40002);
                 let (next, accepted) = a
                     .connect_fast_open(replied_at + 1, next_local, remote, &[0x66; 12])
                     .unwrap();
-                assert_eq!(accepted, if timed_out { 12 } else { 0 });
+                assert_eq!(accepted, 12);
                 let next = emit(&mut a, replied_at + 1, next, reserved);
-                assert_eq!(
+                assert!(
                     wire::parse(next.0, &next.1)
                         .unwrap()
                         .options
                         .fast_open
-                        .is_none(),
-                    !timed_out
+                        .is_some()
                 );
             }
         }

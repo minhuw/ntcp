@@ -531,7 +531,7 @@ UPSTREAM_OPTION_AUDIT['mtu_probe/basic-v4.pkt'] = {
 
 
 UPSTREAM_OPTION_AUDIT['fastopen/client/cookie-less-sendto.pkt'] = {
-    'application-protected-tfo-client': 'Exact tcp_fastopen=5 explicitly selects option-omitted active-open data for protected services; retain cold SYN-data admission (offered MSS less the option space), actual SYN accounting and ICMP negative-response evidence.',
+    'application-protected-tfo-client': 'Exact tcp_fastopen=5 explicitly selects option-omitted active-open data for protected services; retain cold SYN-data admission (offered MSS less the option space) and actual SYN accounting.',
     'no-timestamps': 'Exact initial setup disables timestamps throughout the source.',
     'budget224m': 'Five sequential connections retain charged active and closing pools; use the existing bounded seven-connection budget without changing per-socket accounting.',
 }

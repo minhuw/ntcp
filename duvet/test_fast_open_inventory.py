@@ -279,7 +279,7 @@ class FastOpenInventory(unittest.TestCase):
         groups = {
             "wire": ["option-layout", "minimum-nonempty-cookie", "unaligned-cookie", "ignore-invalid-and-nonsyn"],
             "cookies": ["mac-address", "mac-secret", "mac-cost", "mac-expiration", "is-cookie-valid", "cookie-cache-pair", "mss-cache"],
-            "negative": ["negative-scope", "request-timeout-fallback"],
+            "negative": ["request-timeout-fallback"],
             "client": ["send-syn", "option-space-fallback", "send-state-sequence", "client-cache-update", "client-ack", "client-established", "first-ack-all-repair"],
             "server": ["server-disabled", "server-limit", "server-invalid", "server-notify-pending", "server-synack-ack", "server-synreceived", "server-iw", "synack-timeout", "server-final-ack", "reset-monitor"],
             "api": ["api-implicit-connect", "api-blocking", "api-nonblock-hit", "api-nonblock-miss", "api-connect-errno", "api-passive-enable", "api-threshold-cookie", "api-early-accept"],
@@ -302,12 +302,15 @@ class FastOpenInventory(unittest.TestCase):
         for id in ("replay-app", "app-reuse", "farm-key", "nat-timestamp-cookie", "aes-example",
                    "cross-connection-cc-disable", "synack-payload-delay", "api-active-option-alternative"):
             self.assertEqual(rows[id]["status"], "exception")
-        # User decision (c167): the client caches neither SYN timeouts nor
-        # unacknowledged SYN data, as Linux 6.12; only ICMP evidence remains.
-        for id in ("negative-cache", "negative-causes", "request-retry-period",
+        # User decisions (c167, c171): the client caches no negative response
+        # (SYN timeouts, unacknowledged SYN data, ICMP errors or Packet Too
+        # Big), as Linux 6.12.
+        for id in ("negative-cache", "negative-causes", "negative-scope", "request-retry-period",
                    "lost-syn-heuristic", "middlebox-negative"):
             self.assertEqual(rows[id]["status"], "exception")
             self.assertIn("7268586baa53", rows[id]["reason"])
+            self.assertIn("tcp_v4_err", rows[id]["reason"])
+            self.assertNotIn("evidence", rows[id])
         self.assertIn("crates/adapters/ntcp-socket/", rows["api-early-accept"]["evidence"][0])
 
     def test_t2_closures_keep_canonical_source_and_test_reasons(self):
@@ -499,12 +502,16 @@ class FastOpenInventory(unittest.TestCase):
         self.assertEqual(review["verified"], [4238, 4239, 5373, 8013, 8016])
         self.assertEqual(review["held_for_document_update"], [8014, 8015, 8017])
         self.assertEqual(review["rejected"], [6239])
-        for id, erratum in (("option-layout", 4238), ("length-erratum", 4239), ("negative-scope", 5373)):
+        for id, erratum in (("option-layout", 4238), ("length-erratum", 4239)):
             row = rows[id]
             self.assertEqual(row["status"], "covered")
             self.assertEqual(row["errata"], [erratum])
             self.assertIn("Verified erratum", row["interpretation"])
             self.assertTrue(row["evidence"])
+        # No negative-path cache is kept (c171); the erratum stays recorded.
+        self.assertEqual(rows["negative-scope"]["status"], "exception")
+        self.assertEqual(rows["negative-scope"]["errata"], [5373])
+        self.assertIn("Verified erratum 5373", rows["negative-scope"]["interpretation"])
         self.assertIn("Length field of 0", rows["length-erratum"]["quote"])
         self.assertIn("Length 2", rows["length-erratum"]["interpretation"])
         self.assertIn("range 6 to 18", rows["option-layout"]["quote"])

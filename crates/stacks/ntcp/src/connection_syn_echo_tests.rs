@@ -71,7 +71,6 @@ fn syn_echo_invalid_does_not_commit_peer_state_and_valid_retry_delivers_once() {
                     assert_eq!(a.sample, sample);
                     assert!(!a.handshake_complete());
                     assert!(!a.events_pending());
-                    assert!(!a.fast_open_negative);
                     assert!(a.fast_open_learned.is_none());
                     let reset_bytes = packet(&mut a, 20_000);
                     let reset = wire::parse(ip(tuple()), &reset_bytes).unwrap();
@@ -95,7 +94,6 @@ fn syn_echo_invalid_does_not_commit_peer_state_and_valid_retry_delivers_once() {
                     assert_eq!(a.receive.readable(), 2);
                     assert_eq!(a.receive.next(), Seq(903));
                     assert_eq!(a.acknowledged, if tfo { 7 } else { 0 });
-                    assert!(!a.fast_open_negative);
                 }
             }
         }
@@ -145,9 +143,6 @@ fn syn_echo_original_and_retransmitted_bounds_are_inclusive_through_wrap() {
                 );
                 assert_eq!(a.state(), State::Established);
                 assert_eq!(a.receive.readable(), 5);
-                // Neither the RTO nor the SYN-ACK that leaves the SYN data
-                // unacknowledged is held against the service (Linux 6.12).
-                assert!(!a.fast_open_negative);
             }
         }
     }
