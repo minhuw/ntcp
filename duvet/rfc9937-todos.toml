@@ -11,7 +11,7 @@ prr_out = 0                   // Total bytes sent in recovery
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc9937#section-6.1"
-reason = "Deliberate Linux-compatible deviation: RecoverFS is the same quantity in packets, the transmission units neither cumulatively acknowledged nor SACKed (Linux packets_out - sacked_out) after the entering ACK, plus the packets that ACK delivered. Linux divides by prior_cwnd, in packets; ntcp keeps this RFC's flight-based RecoverFS and only changes its unit. The ssthresh it is compared with is the byte target rounded up to whole SMSS packets."
+reason = "Deliberate deviation in unit only: RecoverFS is the same quantity in packets, as Linux counts PRR in packets, the transmission units neither cumulatively acknowledged nor SACKed (Linux packets_out - sacked_out) after the entering ACK, plus the packets that ACK delivered. The divisor itself follows this RFC, not Linux: Linux divides by prior_cwnd, while ntcp keeps this RFC's flight-based RecoverFS, consistent with RFC 5681's ssthresh, which is computed from FlightSize, so PRR scales down the flight the target was taken from. The ssthresh it is compared with is the byte target rounded up to whole SMSS packets."
 quote = '''
 RecoverFS = SND.NXT - SND.UNA
 // Bytes SACKed before entering recovery will not be
