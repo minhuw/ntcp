@@ -53,8 +53,11 @@ fn input_rx(
     )
     .unwrap();
     let segment = wire::parse(metadata, &bytes[..size]).unwrap();
-    crate::allocation_tests::fail_after(0, || to.input_with_timestamps(now, 0, &segment, stamps))
-        .unwrap();
+    // RX timestamp metadata never allocates on input; the payload's frame
+    // does (n0bw stage 1: received data is held as heap frames).
+    let metadata = to.rx_timestamps.storage_bytes();
+    to.input_with_timestamps(now, 0, &segment, stamps).unwrap();
+    assert_eq!(to.rx_timestamps.storage_bytes(), metadata);
 }
 
 #[test]

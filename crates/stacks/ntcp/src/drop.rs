@@ -182,6 +182,10 @@ drop_reasons! {
     TcpOldData = "TCP_OLD_DATA",
     /// Out-of-order text wholly held already.
     TcpOfoMerge = "TCP_OFOMERGE",
+    /// Text the receive queue could not take for memory: the allocator
+    /// refused its frame (Linux's SKB_DROP_REASON_PROTO_MEM, which TCP
+    /// uses for every receive memory refusal).
+    ProtoMem = "PROTO_MEM",
     /// New text after the application closed the receive side: the
     /// connection is reset.
     TcpAbortOnData = "TCP_ABORT_ON_DATA",

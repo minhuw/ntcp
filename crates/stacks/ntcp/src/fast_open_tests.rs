@@ -938,7 +938,7 @@ fn fast_open_explicit_capacity_admission_failure_preserves_tuple_and_budget() {
 }
 
 #[test]
-fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
+fn fast_open_explicit_capacity_allocation_rollback_restores_the_budget() {
     use crate::allocation_tests::fail_after;
     let (local, remote) = addresses(false, 40001);
     for preallocate in [0, 1] {
@@ -950,7 +950,7 @@ fn fast_open_explicit_capacity_allocation_rollback_preserves_receive_pool() {
             cfg.connection.mss = 536;
             cfg.preallocate_connections = preallocate;
             // Preserve the exact connection allowance, plus the optional cache.
-            cfg.max_buffer_bytes = crate::connection::Connection::open_bytes(257, 536).unwrap()
+            cfg.max_buffer_bytes = crate::connection::Connection::open_bytes(536).unwrap()
                 + crate::fast_open::FastOpen::allocation_bytes();
             let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
             a.enable_fast_open().unwrap();
@@ -1096,9 +1096,9 @@ fn fast_open_cache_allocation_failure_does_not_publish_or_charge() {
 }
 
 #[test]
-fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
+fn fast_open_cache_charge_constrains_subsequent_admission() {
     let cache = crate::fast_open::FastOpen::allocation_bytes();
-    let connection = crate::connection::Connection::open_bytes(257, 536).unwrap();
+    let connection = crate::connection::Connection::open_bytes(536).unwrap();
     let (local, remote) = addresses(false, 40001);
     for preallocate in [0, 1] {
         for budget in [connection + cache - 1, connection + cache] {
@@ -1109,20 +1109,10 @@ fn fast_open_cache_charge_constrains_subsequent_admission_with_pool_credit() {
             cfg.preallocate_connections = preallocate;
             cfg.max_buffer_bytes = budget;
             let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
-            assert_eq!(a.buffer_bytes(), preallocate * connection);
-            if preallocate == 1 && budget < connection + cache {
-                assert_eq!(
-                    a.enable_fast_open(),
-                    Err(EndpointError::Connection(Error::NoMemory))
-                );
-                assert_eq!(a.buffer_bytes(), connection);
-                // The failed optional reservation did not spend pooled credit.
-                a.connect(0, local, remote).unwrap();
-                assert_eq!(a.buffer_bytes(), connection);
-                continue;
-            }
+            // preallocate_connections reserves nothing (n0bw stage 1, Q4).
+            assert_eq!(a.buffer_bytes(), 0);
             a.enable_fast_open().unwrap();
-            assert_eq!(a.buffer_bytes(), preallocate * connection + cache);
+            assert_eq!(a.buffer_bytes(), cache);
             let result =
                 a.connect_fast_open_with_buffer_capacities(0, local, remote, b"miss", 64, 257);
             if budget < connection + cache {

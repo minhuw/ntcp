@@ -156,7 +156,7 @@ class PmtudInventory(unittest.TestCase):
         self.assertEqual(disabled["quote"],
                          "Nodes not implementing Path MTU Discovery must use the IPv6 minimum link MTU defined in [RFC8200] as the maximum packet size. In most cases, this will result in the use of smaller packets than necessary, because most paths have a PMTU greater than the IPv6 minimum link MTU. A node sending packets much smaller than the Path MTU allows is wasting network resources and probably getting suboptimal throughput.")
         self.assertEqual(disabled["evidence"], [
-            "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive_path(",
+            "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_path(",
             "crates/stacks/ntcp-ip6/tests/disabled_pmtud.rs::fn disabled_ipv6_codec_peer_boundaries_options_loss_and_output_modes()",
         ])
         # The creation profile is not the path control: the owner's flag on

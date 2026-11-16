@@ -1150,9 +1150,17 @@ fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_p
             .register_fast_open_key(0, FastOpenServerKey::HmacSha256([7; 32]), lease)
             .unwrap();
         let budget = probe.buffer_bytes();
+        // The pooled connections preallocate_connections reserved in the
+        // budget let connections open while the registry could not grow.
+        // It reserves nothing since n0bw stage 1 (Q4): each registry
+        // operation below that must be refused meets a budget with no room
+        // left (`pin`), and each connection gets room for its own (`unpin`).
+        let pin = |server: &mut Endpoint| server.set_max_buffer_bytes(server.buffer_bytes());
+        let unpin = |server: &mut Endpoint| server.set_max_buffer_bytes(usize::MAX);
         let mut server = Endpoint::new(
             EndpointConfig {
-                max_buffer_bytes: budget,
+                max_buffer_bytes: budget
+                    + 16 * crate::connection::Connection::open_bytes(1460).unwrap(),
                 ..config
             },
             [2; 32],
@@ -1172,12 +1180,16 @@ fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_p
             .unwrap();
         let (_, cookie) = learn(&mut server, listener, v6, 0, 40000);
         let usage = server.fast_open_key_registry_usage();
+        pin(&mut server);
         assert_eq!(
             server.try_set_fast_open_hmac_key([8; 32]),
             Err(Error::NoMemory.into())
         );
+        unpin(&mut server);
         lifecycle_open(&mut server, listener, v6, 49, 40001, cookie, true);
+        pin(&mut server);
         server.set_fast_open_hmac_key([8; 32]);
+        unpin(&mut server);
         assert_eq!(server.fast_open_cookie_error(), Some(Error::NoMemory));
         assert_eq!(server.fast_open_hmac_key_error(), Some(Error::NoMemory));
         assert_eq!(
@@ -1204,13 +1216,14 @@ fn bounded_registry_legacy_failure_blocks_explicit_listeners_and_preserves_tcp_p
             .unwrap();
         lifecycle_open(&mut server, listener, v6, 50, 40004, default_cookie, true);
         assert_eq!(server.fast_open_key_registry_usage(), usage);
-        assert!(server.buffer_bytes() <= budget);
         // A failed void policy replacement blocks inherited listeners too.
         #[cfg(feature = "tfo-linux-cookie")]
         {
+            pin(&mut server);
             server.set_fast_open_cookie_policy(FastOpenCookiePolicy::LinuxSipHash24(
                 LinuxSipHash24Key::new([9; 16]),
             ));
+            unpin(&mut server);
             assert_eq!(server.fast_open_cookie_error(), Some(Error::NoMemory));
             assert_eq!(
                 lifecycle_open(&mut server, listener, v6, 51, 40005, default_cookie, false),

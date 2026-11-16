@@ -79,12 +79,10 @@ pub struct MemoryCounters {
     /// children dropped for it, which also count in `listen_drops`. Linux
     /// has no MIB for this.
     pub memory_refused_opens: u64,
-    /// Storage growths refused by the cap, by memory pressure or by the
-    /// allocator: at write (send ring and ledgers, shared spans), at read
-    /// or before a segment is built (the receive ring's growth to back the
-    /// window to offer) and in `set_receive_buffer`. Linux's
-    /// __sk_mem_raise_allocated
-    /// suppressing an allocation, which no MIB counts.
+    /// Send storage growths refused by the cap, by memory pressure or by
+    /// the allocator at write (send ring and ledgers, shared spans). Linux's
+    /// __sk_mem_raise_allocated suppressing an allocation, which no MIB
+    /// counts. Received data, charged as it is held, counts none.
     pub memory_refused_growths: u64,
     /// SACK splits of a RACK ledger entry refused: once send usage passed
     /// twice the send limit plus 128 KiB (Linux's tcp_fragment counting

@@ -100,7 +100,10 @@ fn address(side: u8) -> IpAddr {
 
 fn side(n: u8, incoming: &Queue, outgoing: &Queue) -> (Network<Wire>, Wire) {
     side_with(n, incoming, outgoing, |config, wire| {
-        config.tcp.max_buffer_bytes = config.buffer_budget(4, wire).unwrap();
+        // `buffer_budget` is a floor that leaves no room to write or
+        // receive; until n0bw stage 1 the receive rings of connections not
+        // yet open left some.
+        config.tcp.max_buffer_bytes = config.buffer_budget(4, wire).unwrap() + (1 << 20);
     })
 }
 
@@ -464,7 +467,7 @@ fn a_syn_after_a_reset_on_close_reaches_the_listener() {
 // The 32 MiB receive maximum sets the window scale both SYNs offer, 10 as
 // Linux's tcp_select_initial_window derives it from tcp_rmem[2], while the
 // SYN window is the 64 KiB initial size, at most 65535. A reader that keeps
-// up with a bulk sender then grows its ring at read (DRS, Linux's
+// up with a bulk sender then grows its window at read (DRS, Linux's
 // tcp_rcv_space_adjust), and its ACKs advertise more than 64 KiB, while the
 // sender's limit rises with its congestion window past the 64 KiB start
 // (tcp_sndbuf_expand), so it holds more than 64 KiB written and unread.
@@ -494,7 +497,7 @@ fn the_buffers_start_at_64_kib_with_window_scale_10_and_grow() {
     }
     let opened = server.counters().buffer_bytes;
     let mut out = vec![0; 1 << 16];
-    let (mut read, mut written, mut deepest) = (0, 0, 0);
+    let (mut read, mut written, mut deepest, mut held) = (0, 0, 0, 0);
     let data = [5; 1 << 14];
     let mut widest = 0;
     let mut seen = server_wire.sent.borrow().len();
@@ -507,6 +510,7 @@ fn the_buffers_start_at_64_kib_with_window_scale_10_and_grow() {
         }
         deepest = deepest.max(written - read);
         step(&mut now, &mut client, &mut server);
+        held = held.max(server.counters().buffer_bytes);
         while let Ok(ReadOutcome::Data { len, .. }) = server.try_read(accepted, &mut out) {
             read += len;
         }
@@ -526,8 +530,8 @@ fn the_buffers_start_at_64_kib_with_window_scale_10_and_grow() {
         deepest > 65536,
         "at most {deepest} bytes written and unread"
     );
-    // The grown ring is charged, 1.375 bytes per byte.
-    assert!(server.counters().buffer_bytes > opened);
+    // The data the server held before each read was charged.
+    assert!(held > opened, "{held} {opened}");
 }
 
 // After an exchange a connection holds no more send storage than a page of

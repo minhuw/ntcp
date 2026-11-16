@@ -489,45 +489,40 @@ fn getters_report_live_sizes() {
     ));
 }
 
-// A size whose memory the budget cannot give is refused with NoMemory, as
-// Linux's ENOMEM, and changes nothing: a receive size that would grow the
-// ring past the cap, and an open whose locked receive ring does not fit
-// (refused at admission, taking no slot or port).
+// A receive size is a limit, as SO_RCVBUF is (Linux sets sk_rcvbuf and
+// charges nothing until data is queued): one the budget could never hold
+// is set, and an open locked at it is admitted on its open charge alone.
+// Received data is charged as it is held (n0bw stage 1); the receive ring
+// such a size once grew, and its NoMemory refusal, went with it.
 #[test]
-fn a_size_the_budget_refuses_is_no_memory() {
+fn a_receive_size_past_the_budget_is_a_limit() {
     let mut pair = Pair::with(|config, wire| {
         config.tcp.max_buffer_bytes = config.buffer_budget(4, wire).unwrap();
     });
     let id = pair.client.connect(pair.peer()).unwrap();
     pair.accept();
     let charged = pair.client.counters().buffer_bytes;
-    assert!(matches!(
-        pair.client.set_receive_buffer(id, 32 << 20),
-        Err(Error::NoMemory)
-    ));
+    pair.client.set_receive_buffer(id, 32 << 20).unwrap();
     assert_eq!(
         pair.client.buffer_capacities(id).unwrap(),
-        (INITIAL, INITIAL)
+        (INITIAL, 32 << 20)
     );
     assert_eq!(pair.client.counters().buffer_bytes, charged);
     let refused = pair.client.counters().memory_refused_opens;
-    assert!(matches!(
-        pair.client.connect_with(
+    let other = pair
+        .client
+        .connect_with(
             pair.peer(),
             ConnectOptions {
                 local_port: Some(40000),
                 receive_buffer: Some(32 << 20),
                 ..ConnectOptions::default()
-            }
-        ),
-        Err(Error::NoMemory)
-    ));
-    assert_eq!(pair.client.counters().memory_refused_opens, refused + 1);
-    assert_eq!(pair.client.counters().buffer_bytes, charged);
-    // The port and the slot are still free.
-    let other = pair.client.connect_from(pair.peer(), Some(40000)).unwrap();
+            },
+        )
+        .unwrap();
+    assert_eq!(pair.client.counters().memory_refused_opens, refused);
     assert_eq!(
         pair.client.buffer_capacities(other).unwrap(),
-        (INITIAL, INITIAL)
+        (INITIAL, 32 << 20)
     );
 }

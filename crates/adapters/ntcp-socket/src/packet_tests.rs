@@ -941,8 +941,12 @@ fn upstream_receive64k_changes_only_receive_capacity() {
     assert_eq!(format!("{current:?}"), format!("{old:?}"));
 }
 
+// The upstream profile's preallocation reserves nothing since n0bw stage 1
+// (Q4): each connection is charged its open charge, not its 8 MiB window,
+// so its 128 slots, not the 32 MiB budget, bound the opens; and the
+// preallocation is still validated against the budget.
 #[test]
-fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
+fn window8_preallocation_reserves_nothing_and_slots_bound_admission() {
     let config =
         crate::packet_profile::config(upstream_packet_tests("no-timestamps,immediate-ack"));
     assert_eq!(config.max_buffer_bytes, 32 * 1024 * 1024);
@@ -950,37 +954,27 @@ fn window8_preallocation_is_charged_once_and_preserves_admission_limit() {
     assert_eq!(config.max_listeners, 128);
     assert_eq!(config.max_control_packets, 128);
     let mut endpoint = Endpoint::new(config.clone(), [42; 32], 0, |_| true).unwrap();
-    let reserved = endpoint.buffer_bytes();
-    assert!(reserved >= 8 * 1024 * 1024);
-    assert!(reserved <= config.max_buffer_bytes);
+    assert_eq!(endpoint.buffer_bytes(), 0);
     let remote = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 8080);
     endpoint
         .connect(0, SocketAddr::new(local().into(), 40000), remote)
         .unwrap();
-    assert_eq!(endpoint.buffer_bytes(), reserved);
-    // With the pool consumed, later connections use ordinary admission, each
-    // charged its open charge (the 8 MiB receive ring, 1.375 bytes a byte),
-    // until the next does not fit the unchanged 32 MiB budget.
-    endpoint
-        .connect(0, SocketAddr::new(local().into(), 40001), remote)
-        .unwrap();
-    let charge = endpoint.buffer_bytes() - reserved;
-    assert!(charge >= 8 * 1024 * 1024 * 11 / 8);
-    let mut port = 40002;
-    while endpoint.buffer_bytes() + charge <= config.max_buffer_bytes {
+    let charge = endpoint.buffer_bytes();
+    assert!(charge > 0 && charge < 65535);
+    for port in 40001..40128 {
         endpoint
             .connect(0, SocketAddr::new(local().into(), port), remote)
             .unwrap();
-        port += 1;
     }
-    let charged = endpoint.buffer_bytes();
+    assert_eq!(endpoint.buffer_bytes(), 128 * charge);
     assert_eq!(
-        endpoint.connect(0, SocketAddr::new(local().into(), port), remote),
-        Err(EndpointError::Connection(ntcp::Error::NoMemory))
+        endpoint.connect(0, SocketAddr::new(local().into(), 40128), remote),
+        Err(EndpointError::LimitReached)
     );
-    assert_eq!(endpoint.buffer_bytes(), charged);
+    assert_eq!(endpoint.buffer_bytes(), 128 * charge);
+    let open = config.connection_charge(0, 0).unwrap();
     let mut insufficient = config;
-    insufficient.max_buffer_bytes = reserved - 1;
+    insufficient.max_buffer_bytes = insufficient.preallocate_connections * open - 1;
     assert!(matches!(
         Endpoint::new(insufficient, [42; 32], 0, |_| true),
         Err(EndpointError::LimitReached)
@@ -1040,7 +1034,7 @@ fn explicit_budget128_allows_200000_sndbuf_growth() {
 }
 
 #[test]
-fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
+fn profiles_charge_the_open_charge_whatever_the_receive_capacity_and_enforce_the_cap() {
     for (name, receive_capacity) in [
         ("baseline", 65535),
         ("upstream,no-timestamps,immediate-ack", 8 * 1024 * 1024),
@@ -1074,14 +1068,11 @@ fn profiles_charge_actual_receive_capacity_and_enforce_aggregate_cap() {
                 .receive_capacity,
             receive_capacity
         );
-        // A connection is charged its open charge: at least its receive ring
-        // (payload, presence/PUSH and report maps); no send ring before its
-        // first write.
+        // A connection is charged its open charge: no send ring before its
+        // first write, and received data only as it is held (the receive
+        // ring that window once allocated went in n0bw stage 1).
         let per_connection = owner.inner.endpoint.buffer_bytes() - reservation_bytes;
-        assert!(
-            per_connection
-                >= receive_capacity + receive_capacity.div_ceil(4) + receive_capacity.div_ceil(8)
-        );
+        assert!(per_connection > 0 && per_connection < 65535);
         let max_bytes = 32 * 1024 * 1024;
         let count = LIMIT.min((max_bytes - reservation_bytes) / per_connection);
         for i in 1..count {

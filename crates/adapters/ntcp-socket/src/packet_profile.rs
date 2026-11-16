@@ -270,7 +270,8 @@ pub(crate) fn config(profile: Profile) -> EndpointConfig {
             32
         } * 1024
             * 1024;
-        // First-touch storage before timed events, still charged to the bounded budget.
+        // Validated against the budget, but reserves nothing since n0bw
+        // stage 1 (the receive rings it pooled went).
         config.preallocate_connections = if o.prealloc4 {
             4
         } else if o.prealloc3 {
@@ -748,42 +749,54 @@ mod setup_profile_tests {
         let result = profile("upstream,linux-cookie,local=192.0.2.1");
         assert_eq!(result.is_ok(), cfg!(feature = "tfo-linux-cookie"));
     }
+    // prealloc3 sets preallocate_connections, which reserves nothing since
+    // n0bw stage 1 (Q4): each connection is charged its open charge as it
+    // opens, and the budget admits as many as it holds beside the cache, or
+    // the slots do, whichever binds first. (Sized for the worst-case charge
+    // with the receive ring, it held seven, the corpus maximum.)
     #[test]
-    fn fast_open_budget_admits_retained_connections_by_their_open_charge() {
+    fn fast_open_budget_admits_connections_by_their_open_charge() {
         let config = config(selected(",budget224m,prealloc3"));
         assert_eq!(config.preallocate_connections, 3);
-        let preallocate = config.preallocate_connections;
         let budget = config.max_buffer_bytes;
+        let slots = config.max_connections;
         let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
-        let reserved = endpoint.buffer_bytes();
-        let charge = reserved / preallocate;
+        assert_eq!(endpoint.buffer_bytes(), 0);
         endpoint.enable_fast_open().unwrap();
-        let cache_charge = endpoint.buffer_bytes() - reserved;
-        // Each connection is charged its open charge, the pooled ones too;
-        // the budget admits as many as it holds beside the cache. (Sized
-        // for the worst-case charge, it held seven, the corpus maximum.)
-        let admitted = (budget - cache_charge) / charge;
-        assert!(admitted >= 7);
+        let cache_charge = endpoint.buffer_bytes();
         let remote = "192.0.2.2:8080".parse().unwrap();
-        for index in 0..admitted as u16 {
-            let local = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
-            let (_, accepted) = endpoint.connect_fast_open(0, local, remote, &[]).unwrap();
+        let local = |index: u16| SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
+        endpoint
+            .connect_fast_open(0, local(0), remote, &[])
+            .unwrap();
+        let charge = endpoint.buffer_bytes() - cache_charge;
+        let admitted = ((budget - cache_charge) / charge).min(slots);
+        assert!(admitted >= 7);
+        for index in 1..admitted as u16 {
+            let (_, accepted) = endpoint
+                .connect_fast_open(0, local(index), remote, &[])
+                .unwrap();
             assert_eq!(accepted, 0);
             assert_eq!(
                 endpoint.buffer_bytes(),
-                (usize::from(index) + 1).max(preallocate) * charge + cache_charge
+                (usize::from(index) + 1) * charge + cache_charge
             );
         }
-        let next = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + admitted as u16);
         assert_eq!(
-            endpoint.connect_fast_open(0, next, remote, &[]),
-            Err(ntcp::EndpointError::Connection(ntcp::Error::NoMemory))
+            endpoint.connect_fast_open(0, local(admitted as u16), remote, &[]),
+            Err(if admitted == slots {
+                ntcp::EndpointError::LimitReached
+            } else {
+                ntcp::EndpointError::Connection(ntcp::Error::NoMemory)
+            })
         );
         assert_eq!(endpoint.buffer_bytes(), admitted * charge + cache_charge);
     }
 
+    // Whatever preallocate_connections says, nothing is reserved: each of
+    // three opens adds its open charge once.
     #[test]
-    fn fast_open_three_retained_opens_transfer_reserved_charges_once() {
+    fn fast_open_three_opens_each_add_their_open_charge() {
         for preallocate in [
             1,
             2,
@@ -792,20 +805,22 @@ mod setup_profile_tests {
             let mut config = config(selected(",budget224m,prealloc3"));
             config.preallocate_connections = preallocate;
             let mut endpoint = ntcp::Endpoint::new(config, [42; 32], 0, |_| true).unwrap();
-            let reserved = endpoint.buffer_bytes();
-            let charge = reserved / preallocate;
+            assert_eq!(endpoint.buffer_bytes(), 0);
             endpoint.enable_fast_open().unwrap();
             let initial = endpoint.buffer_bytes();
+            let mut charge = 0;
             for index in 0..3 {
                 let local = SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 40000 + index);
                 endpoint
                     .connect_fast_open(0, local, "192.0.2.2:8080".parse().unwrap(), &[])
                     .unwrap();
-                // Transfer each reserve once; only opens beyond the reserve
-                // count need newly charged storage.
+                if index == 0 {
+                    charge = endpoint.buffer_bytes() - initial;
+                    assert!(charge > 0);
+                }
                 assert_eq!(
                     endpoint.buffer_bytes(),
-                    initial + (usize::from(index) + 1).saturating_sub(preallocate) * charge
+                    initial + (usize::from(index) + 1) * charge
                 );
             }
         }

@@ -813,7 +813,6 @@ fn staged_syn_and_early_response_do_not_initialize_stream_ack_history() {
                 0,
                 &syn,
                 authenticated,
-                &mut None,
                 RxTimestamps::default(),
                 RxPacketTimestamps::default(),
             )

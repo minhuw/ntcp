@@ -612,7 +612,6 @@ fn handshake_icmp_quotes_follow_linux() {
                 10,
                 &syn,
                 early,
-                &mut None,
                 RxTimestamps::default(),
                 RxPacketTimestamps::default(),
             )

@@ -93,12 +93,11 @@ fn managed_pair_with_peer(
     };
     configure(&mut cfg);
     let (service, prepared, route) = authority(tuple, cfg.timebase);
-    let mut a = *Connection::active_with_receive_path(
+    let mut a = *Connection::active_with_path(
         tuple,
         cfg.clone(),
         u32::MAX - 1000,
         0,
-        &mut None,
         Some(prepared),
         crate::ReceiveIpCapability::new(ContextId::new(101), tuple.local.is_ipv6(), 1500),
         None,
@@ -468,12 +467,11 @@ fn managed_disabled_discovery_keeps_byte_window_and_real_retry_on_budget_growth(
         .set_link_mtu(prepared.snapshot.key().link(), 1100)
         .unwrap();
     prepared.snapshot = service.snapshot(prepared.client).unwrap();
-    let mut a = Connection::active_with_receive_path(
+    let mut a = Connection::active_with_path(
         tuple,
         cfg.clone(),
         100,
         0,
-        &mut None,
         Some(prepared),
         crate::ReceiveIpCapability::new(ContextId::new(101), tuple.local.is_ipv6(), 1100),
         None,

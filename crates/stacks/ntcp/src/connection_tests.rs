@@ -1647,8 +1647,12 @@ fn transport_info_sampling_is_read_only_and_preserves_fractional_caller_ticks() 
     assert_eq!(a.transport_info_at(u64::MAX).last_data_recv_ms, u32::MAX);
 }
 
+// A receive size is a limit, as SO_RCVBUF is: a larger one allocates
+// nothing, so neither the budget nor the allocator can refuse it (the
+// receive ring it once grew went in n0bw stage 1), and before the SYN it
+// sets the offer and the scale.
 #[test]
-fn resize_peak_is_checked_before_allocation_and_leaves_syn_offer_unchanged() {
+fn receive_resize_allocates_nothing_and_sets_the_syn_offer() {
     let cfg = ConnectionConfig {
         send_capacity: 1024,
         receive_capacity: 1,
@@ -1656,38 +1660,18 @@ fn resize_peak_is_checked_before_allocation_and_leaves_syn_offer_unchanged() {
         ..ConnectionConfig::default()
     };
     let mut connection = Connection::active(tuple(), cfg, 100, 0).unwrap();
-    // A larger send limit allocates nothing; a receive ring is staged.
-    assert_eq!(
-        crate::allocation_tests::fail_after(0, || {
-            connection.set_buffer_capacities(2048, 1, connection.buffer_charge())
-        }),
-        Ok(())
-    );
-    connection
-        .set_buffer_capacities(1024, 1, usize::MAX)
-        .unwrap();
-    let max_charge = connection.resize_peak_charge(2048).unwrap() - 1;
+    let charge = connection.buffer_charge();
     let (result, allocation_failed) = crate::allocation_tests::fail_after(0, || {
-        let result = connection.set_buffer_capacities(1024, 2048, max_charge);
-        // The failure injection remains armed: admission made no allocation.
+        let result = connection.set_buffer_capacities(1024, 262144, 0);
+        // The failure injection remains armed: the setter made no allocation.
         (result, SendBuffer::new(1).is_err())
     });
-    assert_eq!(result, Err(Error::NoMemory));
+    assert_eq!(result, Ok(()));
     assert!(allocation_failed);
-    assert_eq!(connection.buffer_capacities(), (1024, 1));
-    assert_eq!(connection.syn_window, 1);
-    assert_eq!(connection.local_scale, 0);
-    for allocation in 0..3 {
-        assert_eq!(
-            crate::allocation_tests::fail_after(allocation, || {
-                connection.set_buffer_capacities(1024, 262144, usize::MAX)
-            }),
-            Err(Error::NoMemory)
-        );
-        assert_eq!(connection.buffer_capacities(), (1024, 1));
-        assert_eq!(connection.syn_window, 1);
-        assert_eq!(connection.local_scale, 0);
-    }
+    assert_eq!(connection.buffer_charge(), charge);
+    assert_eq!(connection.buffer_capacities(), (1024, 262144));
+    assert_eq!(connection.syn_window, 65535);
+    assert_eq!(connection.local_scale, 3);
 }
 
 #[test]
@@ -1811,22 +1795,13 @@ fn live_buffer_resize_is_atomic_and_preserves_recovery_and_window_promises() {
         ],
     );
     let before_sack = a.scoreboard.ranges().to_vec();
-    // Only the receive ring grows, in place, its payload and bitmaps one by
-    // one: the send ring grows at the next write. Whichever allocation
-    // fails, the sizes and state are as they were.
-    let mut allocation = 0;
-    while let Err(error) = crate::allocation_tests::fail_after(allocation, || {
-        a.set_buffer_capacities(256, 256, usize::MAX)
-    }) {
-        assert_eq!(error, Error::NoMemory);
-        assert_eq!(a.buffer_capacities(), (128, 128));
-        assert_eq!(a.send.len(), 26);
-        assert_eq!(alloc::format!("{:?}", a.rack), before_rack);
-        assert_eq!(a.scoreboard.ranges(), &before_sack);
-        allocation += 1;
-        assert!(allocation <= 3);
-    }
-    assert!(allocation >= 1);
+    // Neither size allocates: the send ring grows at the next write, and
+    // received data is held as it arrives (the receive ring this grew went
+    // in n0bw stage 1). So no allocation failure can refuse it.
+    crate::allocation_tests::fail_after(0, || a.set_buffer_capacities(256, 256, usize::MAX))
+        .unwrap();
+    assert_eq!(a.buffer_capacities(), (256, 256));
+    assert_eq!(a.send.len(), 26);
     assert_eq!(a.scoreboard.ranges(), &before_sack);
     assert_eq!(alloc::format!("{:?}", a.rack), before_rack);
     a.set_buffer_capacities(4, 4, usize::MAX).unwrap();
@@ -1881,12 +1856,13 @@ fn resizing_scaled_receive_credit_keeps_negotiated_scale_and_old_edge() {
     a.write(b"abcdefghijklmnopqrstuvwxyz").unwrap();
     deliver(&mut a, &mut b, 40);
     let edge = b.advertised_edge;
+    let clamp = b.config.receive_capacity;
     b.set_buffer_capacities(1024, 4, usize::MAX).unwrap();
     b.immediate_ack();
     let shrunk = packet(&mut b, 50);
     let shrunk = wire::parse(ip(b.tuple()), &shrunk).unwrap();
     assert_eq!(b.advertised_edge, edge);
-    assert!(b.receive.right_edge().at_or_after(b.advertised_edge));
+    assert!(window_bound(&b, clamp).at_or_after(b.advertised_edge));
     assert_eq!(b.local_scale, 2);
     assert!(u32::from(shrunk.header.window) << 2 <= b.receive_window());
     let mut out = [0; 32];
@@ -1898,7 +1874,7 @@ fn resizing_scaled_receive_credit_keeps_negotiated_scale_and_old_edge() {
     let grown = wire::parse(ip(b.tuple()), &grown).unwrap();
     assert_eq!(grown.header.window, u16::MAX);
     assert!(b.advertised_edge.after(edge));
-    assert!(b.receive.right_edge().at_or_after(b.advertised_edge));
+    assert!(window_bound(&b, b.config.receive_capacity).at_or_after(b.advertised_edge));
 }
 
 // Exact physical-time traces in both caller units, independently of wire TS units.
@@ -11641,7 +11617,7 @@ fn peek_does_not_release_credit_or_schedule_ack_and_respects_shutdown() {
     deliver(&mut a, &mut b, 40);
     let used = b.receive_used;
     let read = b.received_read;
-    let edge = b.receive.right_edge();
+    let edge = window_bound(&b, b.config.receive_capacity);
     let ack = b.ack_pending;
     let mut out = [0; 8];
     for _ in 0..2 {
@@ -11649,7 +11625,7 @@ fn peek_does_not_release_credit_or_schedule_ack_and_respects_shutdown() {
         assert_eq!(&out[..3], b"abc");
         assert_eq!(b.receive_used, used);
         assert_eq!(b.received_read, read);
-        assert_eq!(b.receive.right_edge(), edge);
+        assert_eq!(window_bound(&b, b.config.receive_capacity), edge);
         assert_eq!(b.ack_pending, ack);
     }
     assert_eq!(b.read(&mut out), Ok(3));
@@ -12132,7 +12108,7 @@ fn invalid_configuration_and_unscaled_peer_defaults() {
 //# drastically beyond the requirements of the connection.
 fn scaled_window_rounding_never_overruns_storage_or_revokes_old_credit() {
     let (mut a, mut b) = pair(config(65536, 1460), 100);
-    let backing = b.receive.right_edge();
+    let backing = window_bound(&b, b.config.receive_capacity);
     for step in 0..32 {
         let now = 40 + step * 10;
         a.write(b"x").unwrap();
@@ -12242,7 +12218,7 @@ fn read_credit_scaled_waits_for_encodable_sws_credit() {
         let credit = if mss == 1000 { 1024 } else { 1536 };
         assert_eq!(encoded_edge.distance_from(promised), credit);
         assert_eq!(b.advertised_edge, encoded_edge);
-        assert!(b.receive.right_edge().at_or_after(encoded_edge));
+        assert!(window_bound(&b, b.config.receive_capacity).at_or_after(encoded_edge));
         assert_eq!(b.transmit(44, &mut [0; 64]), Ok(None));
     }
 }
@@ -12297,7 +12273,7 @@ fn coalesced_read_credit_is_bounded_and_commits_only_on_output() {
             assert_eq!(u32::from(segment.header.window) << b.local_scale, 2 * old);
             assert_eq!(edge.distance_from(promised), old);
             assert_eq!(b.advertised_edge, edge);
-            assert!(b.receive.right_edge().at_or_after(edge));
+            assert!(window_bound(&b, b.config.receive_capacity).at_or_after(edge));
             assert_eq!(b.transmit(45, &mut [0; 64]), Ok(None));
 
             // Continued incoming traffic carries one-MSS read credit on
@@ -12313,7 +12289,7 @@ fn coalesced_read_credit_is_bounded_and_commits_only_on_output() {
             assert!(b.ack_pending);
             packet(&mut b, 47);
             assert!(b.advertised_edge.after(promised));
-            assert!(b.receive.right_edge().at_or_after(b.advertised_edge));
+            assert!(window_bound(&b, b.config.receive_capacity).at_or_after(b.advertised_edge));
             assert_eq!(b.read(&mut vec![0; count]), Ok(count));
         }
     }
@@ -12503,7 +12479,7 @@ fn coalesced_read_credit_unscaled_large_mss_buffer_drain() {
             assert_eq!(segment.header.window, u16::MAX);
             assert!(segment.payload.is_empty());
             assert_eq!(b.advertised_edge.distance_from(promised), 40000);
-            assert!(b.receive.right_edge().at_or_after(b.advertised_edge));
+            assert!(window_bound(&b, b.config.receive_capacity).at_or_after(b.advertised_edge));
             assert_eq!(b.transmit(42, &mut [0; 64]), Ok(None));
         }
     }
@@ -12544,7 +12520,7 @@ fn coalesced_read_credit_reopens_scaled_zero_with_retained_promise() {
     let segment = wire::parse(ip(reverse(tuple())), &bytes).unwrap();
     assert_ne!(segment.header.window, 0);
     assert!(b.advertised_edge.after(promised));
-    assert!(b.receive.right_edge().at_or_after(b.advertised_edge));
+    assert!(window_bound(&b, b.config.receive_capacity).at_or_after(b.advertised_edge));
 }
 
 #[test]
@@ -14050,7 +14026,7 @@ fn rfc5961_reset_and_syn_state_matrix_drops_text_urgent_fin_and_ack() {
                 packet(&mut a, 40);
                 a.state = state;
                 // Exercise receive wrap as well as send wrap.
-                a.receive = ReceiveBuffer::new(Seq(u32::MAX), 64).unwrap();
+                a.receive = RxQueue::new(Seq(u32::MAX));
                 a.advertised_edge = Seq(63);
                 let next = a.receive.next();
                 let high = a.snd_nxt;
@@ -16949,7 +16925,7 @@ fn dsack_latest_checked_arrival_supersedes_pending_report() {
             assert_eq!(b.receive.sack_blocks(3)[0], Some(duplicate));
             let next = b.receive.next();
             let ack = b.snd_una;
-            let edge = b.receive.right_edge();
+            let edge = window_bound(&b, b.config.receive_capacity);
             match newer {
                 None => {}
                 Some(0) => timestamp_input(&mut b, 4_000, next, ack, ACK, Some((4, 0)), b""),
@@ -20445,4 +20421,16 @@ fn update_time_processes_each_instant_once() {
     a.update_time(boundary + 1).unwrap();
     assert_eq!((a.sample, a.last_timestamp_sent_at), (None, None));
     assert_eq!(a.update_time(boundary), Err(Error::TimeWentBackwards));
+}
+
+// The right edge the window rule may offer: `clamp` bytes past the read
+// point. The receive ring that once backed every offered edge, and whose
+// right edge the tests compared with it, went in n0bw stage 1; in these
+// fixed-size connections the ring's right edge was this bound.
+fn window_bound(b: &Connection, clamp: usize) -> Seq {
+    let held = b.receive.readable() as u32 + u32::from(b.receive.eof());
+    b.receive
+        .next()
+        .wrapping_add(held.wrapping_neg())
+        .wrapping_add(clamp as u32)
 }

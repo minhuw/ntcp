@@ -297,13 +297,8 @@ impl Fixture {
                 .reset_debt,
             0
         );
-        assert_eq!(
-            self.endpoint.receive_pool.len(),
-            self.endpoint
-                .config
-                .preallocate_connections
-                .saturating_sub(self.population)
-        );
+        // The receive pool this checked went in n0bw stage 1 (Q4):
+        // preallocate_connections reserves nothing, and `pooled` only sets it.
     }
     fn complete(&mut self, syn: &Packet, reply: Header, data: &[u8]) {
         let ack = packet(

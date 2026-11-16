@@ -38,7 +38,7 @@
       "reason": "Shared active/passive construction caps only the disabled IPv6 send IP-payload budget at the minimum link MTU minus the supported base header, preserving smaller caller limits, receive capability and configured storage. Actual codec/peer tests cover boundary-sized scalar, reserved, shared and coalesced output, options, RTO repair, Fast Open, live MSS updates and TIME-WAIT reopening; enabled discovery retains larger packets and validated growth. Smaller packets can cost throughput; discovery defaults are unchanged.",
       "target": "https://www.rfc-editor.org/rfc/rfc8201#section-1",
       "evidence": [
-        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_receive_path(",
+        "crates/stacks/ntcp/src/connection.rs::    pub(crate) fn active_with_path(",
         "crates/stacks/ntcp-ip6/tests/disabled_pmtud.rs::fn disabled_ipv6_codec_peer_boundaries_options_loss_and_output_modes()"
       ]
     },

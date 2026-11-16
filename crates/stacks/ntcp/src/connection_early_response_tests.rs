@@ -47,7 +47,6 @@ fn opening(
         0,
         &syn,
         auth,
-        &mut None,
         RxTimestamps::default(),
         RxPacketTimestamps::default(),
     )
@@ -1348,7 +1347,6 @@ fn inventory_tfo_server_early_policy_and_pre_handshake_payload_cap() {
                     0,
                     &syn,
                     true,
-                    &mut None,
                     RxTimestamps::default(),
                     RxPacketTimestamps::default(),
                 )

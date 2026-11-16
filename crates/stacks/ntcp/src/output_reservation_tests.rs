@@ -113,6 +113,10 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
     );
     let progress = a.send_progress(id).unwrap();
     let mut accepted_packets = 0;
+    // Only the sender's repair runs without allocations: the receiver holds
+    // what arrives in heap frames (n0bw stage 1), so the accepted packets
+    // reach it after, from storage reserved here.
+    let mut delivered = Vec::with_capacity(30);
     crate::allocation_tests::fail_after(0, || {
         a.set_endpoint_first_hop_mtu(3, 100).unwrap();
         assert!(a.reject_unsubmitted(attempt).unwrap());
@@ -136,7 +140,7 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
                 assert!(a.reject_unsubmitted(token).unwrap());
                 assert!(!a.accept_transmit(a.now, token).unwrap());
             } else {
-                b.input(3, p.ip, &bytes[..p.len]).unwrap();
+                delivered.push((p.ip, bytes, p.len));
                 assert!(a.accept_transmit(a.now, token).unwrap());
                 assert!(!a.accept_transmit(a.now, token).unwrap());
                 total += count;
@@ -147,6 +151,9 @@ fn reserved_data_fin_partial_acceptance_and_mutation_barrier() {
         }
         assert_eq!(total, 300);
     });
+    for (ip, packet, len) in &delivered {
+        b.input(3, *ip, &packet[..*len]).unwrap();
+    }
     assert_eq!(a.send_progress(id).unwrap(), progress);
     assert_eq!(b.readable_bytes(peer).unwrap(), 300);
     assert!(a.poll_transmit(3, &mut bytes, 16).unwrap().packet.is_none());

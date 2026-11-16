@@ -8,7 +8,7 @@ pub(super) struct RepairUndo {
     rack: Option<crate::rack::RetryUndo>,
     fresh: Option<FreshState>,
     mss: usize,
-    receive: crate::buffer::ReceiveOutputUndo,
+    receive: crate::rx_queue::RxOutputUndo,
     congestion: Congestion,
     prr: Option<Prr>,
     sack_recovery: Option<SackRecovery>,
@@ -403,7 +403,9 @@ impl Connection {
     }
 
     fn restore_selection(&mut self, undo: RepairUndo) {
-        self.receive.restore_output(undo.receive);
+        // A report anchor put back may take a map node: charged at the
+        // next refresh.
+        self.refresh_work |= self.receive.restore_output(undo.receive);
         self.congestion = undo.congestion;
         self.prr = undo.prr;
         self.sack_recovery = undo.sack_recovery;

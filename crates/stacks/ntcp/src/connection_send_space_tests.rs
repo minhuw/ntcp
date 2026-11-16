@@ -303,12 +303,11 @@ fn fast_open_peer_mss_installation_sets_c_before_admission() {
         };
         let tuple = tuple();
         let (_service, prepared, _) = authority(tuple, cfg.timebase);
-        let mut a = Connection::active_with_receive_path(
+        let mut a = Connection::active_with_path(
             tuple,
             cfg,
             100,
             0,
-            &mut None,
             Some(prepared),
             crate::ReceiveIpCapability::new(ContextId::new(101), false, 1500),
             None,
@@ -739,12 +738,11 @@ fn fast_open_syn_data_stays_within_c() {
         };
         let tuple = tuple();
         let (_service, prepared, _) = authority(tuple, cfg.timebase);
-        let mut a = Connection::active_with_receive_path(
+        let mut a = Connection::active_with_path(
             tuple,
             cfg,
             100,
             0,
-            &mut None,
             Some(prepared),
             crate::ReceiveIpCapability::new(ContextId::new(101), false, 1500),
             None,

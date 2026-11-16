@@ -15,7 +15,22 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::mem::size_of;
 use ntcp_buffer::RxFrame;
 
-use crate::{buffer::ReceiveOutcome, seq::Seq};
+use crate::seq::Seq;
+
+#[derive(Debug)]
+pub(crate) struct ReceiveOutcome {
+    pub new_bytes: usize,
+    pub sack_overflow: bool,
+    // next() changed, including consumption of FIN.
+    pub advanced: bool,
+    // FIN became contiguous during this insertion, not merely accepted.
+    pub fin: bool,
+    // Nonempty segment starts away from the previous next(), even if rejected.
+    pub out_of_order: bool,
+    // The allocator refused the memory to hold the new text: nothing of the
+    // segment was taken, and the queue is as it was.
+    pub refused: bool,
+}
 
 // Accepted payload: borrowed from the segment, copied into a heap frame
 // (truesize = length) for the part the queue keeps, or a frame the queue
@@ -26,24 +41,39 @@ pub(crate) enum RxPayload<'a> {
 }
 
 impl RxPayload<'_> {
-    fn len(&self) -> usize {
+    fn bytes(&self) -> &[u8] {
         match self {
-            Self::Borrowed(bytes) => bytes.len(),
-            Self::Owned(frame) => frame.len(),
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(frame) => frame,
         }
     }
 
-    // The frame holding bytes `from..to` of the payload.
-    fn into_frame(self, from: usize, to: usize) -> RxFrame {
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    // The frame holding bytes `from..to` of the payload: a borrowed
+    // payload is copied into a heap frame of that length, whose allocation
+    // may be refused.
+    fn into_frame(self, from: usize, to: usize) -> Result<RxFrame, ()> {
         match self {
-            Self::Borrowed(bytes) => RxFrame::copy_from_slice(&bytes[from..to]),
+            Self::Borrowed(bytes) => heap_copy(&bytes[from..to]),
             Self::Owned(mut frame) => {
                 frame.truncate(to);
                 frame.advance(from);
-                frame
+                Ok(frame)
             }
         }
     }
+}
+
+// A heap frame holding a copy of `bytes`, allocated to their length, or
+// none if the allocator refuses it.
+pub(crate) fn heap_copy(bytes: &[u8]) -> Result<RxFrame, ()> {
+    let mut copy = alloc::vec::Vec::new();
+    copy.try_reserve_exact(bytes.len()).map_err(|_| ())?;
+    copy.extend_from_slice(bytes);
+    Ok(RxFrame::from_vec(copy))
 }
 
 // An entry beyond a gap: its frame, and whether a PUSH mark lies in it.
@@ -225,15 +255,20 @@ impl RxQueue {
 
     // Only the initial SYN prefix can be staged. No presence/reporting
     // state is published until validated establishment; next() remains
-    // IRS+1 throughout.
-    pub(crate) fn defer_syn(&mut self, frame: RxFrame, fin: bool, push: bool) {
+    // IRS+1 throughout. The deque slot promotion needs is taken now, so
+    // that establishment never allocates; a refusal stages nothing.
+    pub(crate) fn defer_syn(&mut self, frame: RxFrame, fin: bool, push: bool) -> Result<(), ()> {
         assert!(!self.has_data() && self.fin_sequence.is_none() && self.deferred_syn.is_none());
         let len = frame.len();
+        if len != 0 {
+            self.inorder.try_reserve(1).map_err(|_| ())?;
+        }
         let frame = (len != 0).then_some(frame);
         if let Some(frame) = &frame {
             self.hold(frame);
         }
         self.deferred_syn = Some((frame, len, fin, push));
+        Ok(())
     }
 
     pub(crate) fn promote_syn(&mut self) -> Option<usize> {
@@ -310,7 +345,7 @@ impl RxQueue {
         Some(self.seq(end))
     }
 
-    fn occupied(&self) -> usize {
+    pub(crate) fn occupied(&self) -> usize {
         self.readable + self.ofo_bytes
     }
 
@@ -370,6 +405,9 @@ impl RxQueue {
         // Nothing is held beyond a gap, so data at or above the frontier
         // duplicates nothing: as Linux tcp_data_queue sets a D-SACK only
         // below rcv_nxt or over its out-of-order queue.
+        if self.runs.is_empty() {
+            return;
+        }
         let edge = self.read + self.readable as u64;
         let from = edge + start as u64;
         if let Some((left, right)) = self.run_from(from) {
@@ -520,15 +558,15 @@ impl RxQueue {
 
     // Output consumes at most one pending anchor. Reservation ownership
     // excludes input/read mutation, so restoring it and the fixed report
-    // metadata is exact.
-    pub(crate) fn restore_output(&mut self, undo: RxOutputUndo) {
+    // metadata is exact. Whether an anchor was put back (storage may have
+    // changed).
+    pub(crate) fn restore_output(&mut self, undo: RxOutputUndo) -> bool {
         self.reported = undo.reported;
         self.dsack = undo.dsack;
         self.report_debt = undo.report_debt;
         self.pending_first = undo.pending_first;
-        if let Some(anchor) = undo.anchor {
-            self.anchors.insert(anchor);
-        }
+        undo.anchor
+            .is_some_and(|anchor| self.anchors.insert(anchor))
     }
 
     // Called only after a SACK-bearing packet has been successfully encoded.
@@ -571,16 +609,23 @@ impl RxQueue {
         self.pending_first.or(self.latest)
     }
 
-    pub(crate) fn commit_report(&mut self) {
+    // Whether an anchor was taken (storage may have changed).
+    pub(crate) fn commit_report(&mut self) -> bool {
         self.report_debt = self.report_debt.saturating_sub(1);
-        if let Some(anchor) = self.report_anchor()
-            && let Some(offset) = self.offset(anchor)
-            && self.anchors.remove(&offset)
-            && self.pending_first == Some(anchor)
-        {
+        let Some(anchor) = self.report_anchor() else {
+            return false;
+        };
+        let Some(offset) = self.offset(anchor) else {
+            return false;
+        };
+        if !self.anchors.remove(&offset) {
+            return false;
+        }
+        if self.pending_first == Some(anchor) {
             self.pending_first = self.find_pending(offset + 1);
         }
         self.shed();
+        true
     }
 
     // The first anchor at or after `offset`, while anything is held and a
@@ -682,11 +727,39 @@ impl RxQueue {
         self.ofo_bytes -= len;
     }
 
-    // Holds stream bytes [from, to), bytes `skip..` of `payload`, which start and end at gaps beyond the in-order
-    // edge: every entry between them is replaced by the new frame, which
-    // takes its PUSH mark, as Linux's tcp_data_queue_ofo replaces the skbs
-    // a new one covers (merge_right). Bytes held twice keep the new copy.
-    fn hold_run(&mut self, payload: RxPayload<'_>, skip: usize, from: u64, to: u64) {
+    // The new bytes of stream bytes [from, to): from the first one no run
+    // holds to the end of the last, if any.
+    fn new_span(&self, from: u64, to: u64) -> Option<(u64, u64)> {
+        let first = self.run_at(from).map_or(from, |(_, end)| end);
+        if first >= to {
+            return None;
+        }
+        let last = self.run_at(to - 1).map_or(to, |(start, _)| start);
+        Some((first, last))
+    }
+
+    // A heap frame of `span`, the arrival's bytes from stream offset
+    // `from`, over which the entries it covers are copied: as Linux's
+    // tcp_data_queue_ofo (merge_right) one entry replaces those a new
+    // arrival covers, and a byte held twice keeps its first copy, as
+    // RFC 9293 processes only the new parts of a segment, so that the bytes
+    // read are those whose arrival the receive metadata (RX timestamps)
+    // records. A rare path: a retransmission covering held data.
+    fn merged_frame(&self, span: &[u8], from: u64) -> Result<RxFrame, ()> {
+        let mut bytes = alloc::vec::Vec::new();
+        bytes.try_reserve_exact(span.len()).map_err(|_| ())?;
+        bytes.extend_from_slice(span);
+        for (&start, seg) in self.ofo.range(from..from + span.len() as u64) {
+            let at = (start - from) as usize;
+            bytes[at..at + seg.frame.len()].copy_from_slice(&seg.frame);
+        }
+        Ok(RxFrame::from_vec(bytes))
+    }
+
+    // Holds `frame`, stream bytes [from, to), which start and end at gaps
+    // beyond the in-order edge: every entry between them is replaced by the
+    // new frame, which takes its PUSH mark (`merged_frame`).
+    fn hold_run(&mut self, frame: RxFrame, from: u64, to: u64) {
         let mut push = false;
         while let Some((&start, _)) = self.ofo.range(from..to).next() {
             let seg = self.ofo.remove(&start).unwrap();
@@ -696,7 +769,7 @@ impl RxQueue {
         while let Some((&start, _)) = self.runs.range(from..to).next() {
             self.runs.remove(&start);
         }
-        let frame = payload.into_frame(skip, skip + (to - from) as usize);
+        debug_assert_eq!(frame.len() as u64, to - from);
         self.hold(&frame);
         self.ofo.insert(from, OfoSeg { frame, push });
         let mut start = from;
@@ -737,6 +810,7 @@ impl RxQueue {
             advanced: false,
             fin: false,
             out_of_order: (len != 0 || fin) && sequence != previous_next,
+            refused: false,
         };
         if self.eof || (len == 0 && !fin) {
             return outcome;
@@ -751,9 +825,17 @@ impl RxQueue {
         // byte is new and extends the in-order data, with no reporting
         // anchor and PUSH taken at once. A FIN on it follows every held
         // byte, so it is kept when it lies within the limit and none is
-        // kept yet, as below.
+        // kept yet, as below. Its frame and deque slot are taken first: a
+        // refusal leaves the queue as it was.
         if len != 0 && !outcome.out_of_order && !had_holes && contiguous + len <= data_limit {
-            let frame = payload.into_frame(0, len);
+            let Ok(frame) = payload.into_frame(0, len) else {
+                outcome.refused = true;
+                return outcome;
+            };
+            if self.inorder.try_reserve(1).is_err() {
+                outcome.refused = true;
+                return outcome;
+            }
             self.hold(&frame);
             self.inorder.push_back(frame);
             let end = contiguous + len;
@@ -789,6 +871,39 @@ impl RxQueue {
             )
         };
         let lo = lo.max(contiguous as u64);
+        // The frame holding the new bytes, and the deque slots a promotion
+        // they cause needs, are taken before anything changes: a refusal
+        // leaves the queue as it was. BTreeMap nodes are allocated
+        // infallibly (n0bw D8).
+        let span = if lo < hi {
+            self.new_span(self.read + lo, self.read + hi)
+        } else {
+            None
+        };
+        let mut frame = None;
+        if let Some((from, to)) = span {
+            let skip = (from - self.read).wrapping_sub(skew) as usize;
+            let edge = self.read + contiguous as u64;
+            let promoted = if from == edge {
+                let end = self.runs.get(&to).copied().unwrap_or(to);
+                1 + self.ofo.range(to..end).count()
+            } else {
+                0
+            };
+            let len = (to - from) as usize;
+            let built = if self.ofo.range(from..to).next().is_some() {
+                self.merged_frame(&payload.bytes()[skip..skip + len], from)
+            } else {
+                payload.into_frame(skip, skip + len)
+            };
+            match built {
+                Ok(held) if self.inorder.try_reserve(promoted).is_ok() => frame = Some(held),
+                _ => {
+                    outcome.refused = true;
+                    return outcome;
+                }
+            }
+        }
         let mut new_anchor = None;
         // The first and past the last new byte, as stream offsets.
         let mut stored: Option<(u64, u64)> = None;
@@ -813,10 +928,10 @@ impl RxQueue {
             }
             gap(at, to, &mut accepted);
         }
-        if let Some((from, to)) = stored {
+        debug_assert_eq!(stored, span);
+        if let (Some((from, to)), Some(frame)) = (stored, frame) {
             new_anchor = Some(self.seq(from));
-            let skip = (from - self.read).wrapping_sub(skew) as usize;
-            self.hold_run(payload, skip, from, to);
+            self.hold_run(frame, from, to);
             self.ofo_bytes += outcome.new_bytes;
         }
 
@@ -896,12 +1011,12 @@ impl RxQueue {
     }
 }
 
-#[cfg(test)]
+#[cfg(debug_assertions)]
 impl RxQueue {
     // A full recount of every running total and structural invariant:
     // entries apart and in order, runs the maximal unions of the entries
-    // beyond a gap, anchors on held bytes.
-    pub(crate) fn assert_invariants(&self) {
+    // beyond a gap, anchors on held bytes. Linear: debug builds only.
+    pub(crate) fn debug_check(&self) {
         let (mut frames, mut entries) = (0, 0);
         let mut readable = 0;
         for frame in &self.inorder {
@@ -967,7 +1082,7 @@ mod tests {
             Self::new(start)
         }
         fn defer_syn(&mut self, frame: RxFrame, fin: bool, push: bool) {
-            RxQueue::defer_syn(self, frame, fin, push)
+            RxQueue::defer_syn(self, frame, fin, push).unwrap()
         }
         fn promote_syn(&mut self) -> Option<usize> {
             RxQueue::promote_syn(self)
@@ -1024,10 +1139,10 @@ mod tests {
             RxQueue::commit_sack(self, first)
         }
         fn commit_report(&mut self) {
-            RxQueue::commit_report(self)
+            RxQueue::commit_report(self);
         }
         fn restore_output(&mut self, undo: RxOutputUndo) {
-            RxQueue::restore_output(self, undo)
+            RxQueue::restore_output(self, undo);
         }
         fn take_push(&mut self) -> bool {
             RxQueue::take_push(self)
@@ -1097,7 +1212,7 @@ mod tests {
                 .collect()
         }
         fn check(&self) {
-            self.assert_invariants();
+            self.debug_check();
         }
     }
 
@@ -1149,7 +1264,7 @@ mod tests {
         }
         fn defer_syn(&mut self, frame: RxFrame, fin: bool, push: bool) {
             let frame = self.adopt(frame);
-            self.with(|q| q.defer_syn(frame, fin, push))
+            self.with(|q| q.defer_syn(frame, fin, push)).unwrap()
         }
         fn promote_syn(&mut self) -> Option<usize> {
             self.with(|q| q.promote_syn())
@@ -1222,10 +1337,10 @@ mod tests {
             self.with(|q| q.commit_sack(first))
         }
         fn commit_report(&mut self) {
-            self.with(|q| q.commit_report())
+            self.with(|q| q.commit_report());
         }
         fn restore_output(&mut self, undo: RxOutputUndo) {
-            self.with(|q| q.restore_output(undo))
+            self.with(|q| q.restore_output(undo));
         }
         fn take_push(&mut self) -> bool {
             self.queue.take_push()
@@ -1259,7 +1374,7 @@ mod tests {
         }
         fn check(&self) {
             let queue = &self.queue;
-            queue.assert_invariants();
+            queue.debug_check();
             let live = usize::try_from(self.live).unwrap();
             // Frames are allocated at their truesize, the deque at its
             // capacity: the maps' share is what is left, within its bound.
@@ -1379,45 +1494,45 @@ mod tests {
         assert!(queue.take_push());
     }
 
-    // Overlapping arrivals with different bytes: unlike the per-byte ring,
-    // which keeps the first copy of every byte, a frame covering held
-    // entries replaces them (Linux tcp_data_queue_ofo's merge_right), and
-    // only a frame inside one entry, or the parts of one that overlap its
-    // neighbours, are dropped.
+    // Overlapping arrivals with different bytes: a frame covering held
+    // entries replaces them with one entry (Linux tcp_data_queue_ofo's
+    // merge_right), whose held bytes keep their first copy, as the per-byte
+    // ring kept them; a frame inside one entry, or the parts of one that
+    // overlap its neighbours, are dropped. A covering frame owned by the
+    // queue is copied into a heap frame of the span.
     #[test]
-    fn a_frame_covering_held_entries_replaces_them() {
+    fn a_frame_covering_held_entries_replaces_them_keeping_their_bytes() {
         let start = Seq(0);
         let limit = Seq(1000);
         let mut queue = RxQueue::new(start);
-        let insert = |queue: &mut RxQueue, at: u32, bytes: &[u8]| {
+        let insert = |queue: &mut RxQueue, at: u32, payload: RxPayload<'_>| {
             queue
-                .insert(
-                    Seq(at),
-                    RxPayload::Borrowed(bytes),
-                    false,
-                    false,
-                    limit,
-                    |_, _| {},
-                )
+                .insert(Seq(at), payload, false, false, limit, |_, _| {})
                 .new_bytes
         };
-        assert_eq!(insert(&mut queue, 10, b"ab"), 2);
-        assert_eq!(insert(&mut queue, 13, b"c"), 1);
-        assert_eq!(insert(&mut queue, 8, b"XXXXXXX"), 4);
+        assert_eq!(insert(&mut queue, 10, RxPayload::Borrowed(b"ab")), 2);
+        assert_eq!(insert(&mut queue, 13, RxPayload::Borrowed(b"c")), 1);
+        let owned = heap_frame(b"XXXXXXX", 2297);
+        assert_eq!(insert(&mut queue, 8, RxPayload::Owned(owned)), 4);
         assert_eq!(queue.ofo.len(), 1);
-        assert_eq!(&queue.ofo[&8].frame[..], b"XXXXXXX");
+        assert_eq!(&queue.ofo[&8].frame[..], b"XXabXcX");
+        assert_eq!(queue.ofo[&8].frame.truesize(), 7);
         // Inside one entry: dropped.
-        assert_eq!(insert(&mut queue, 10, b"Z"), 0);
+        assert_eq!(insert(&mut queue, 10, RxPayload::Borrowed(b"Z")), 0);
         // Overlapping its neighbours: trimmed to the new bytes.
-        assert_eq!(insert(&mut queue, 13, b"QQQQ"), 2);
-        assert_eq!(insert(&mut queue, 5, b"PPPP"), 3);
+        assert_eq!(insert(&mut queue, 13, RxPayload::Borrowed(b"QQQQ")), 2);
+        assert_eq!(insert(&mut queue, 5, RxPayload::Borrowed(b"PPPP")), 3);
         let stream: Vec<u8> = queue
             .ofo
             .values()
             .flat_map(|seg| seg.frame.to_vec())
             .collect();
-        assert_eq!(stream, b"PPPXXXXXXXQQ");
+        assert_eq!(stream, b"PPPXXabXcXQQ");
         assert_eq!(queue.runs.iter().collect::<Vec<_>>(), [(&5, &17)]);
-        queue.assert_invariants();
+        queue.debug_check();
     }
 }
+
+#[cfg(test)]
+#[path = "rx_queue_tests.rs"]
+mod ring_tests;

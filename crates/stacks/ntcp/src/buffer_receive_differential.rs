@@ -1,18 +1,17 @@
 // The receive queue's differential harness: one operation trait, the
 // per-byte ring of b0d2988 (receive_reference) as the oracle, and random
 // operation sequences whose every observable is compared after each step.
+// RxQueue runs it (rx_queue.rs tests); until stage 1 C3 the receive ring
+// did too.
 //
-// Payload bytes are a function of their stream offset, so a queue that
-// resolves overlapping arrivals differently (which copy of a byte it keeps)
-// still holds the same bytes. A queue's limit is the oracle's right edge,
-// passed to every insertion; the oracle's growth raises it.
+// Payload bytes are a function of their stream offset, except in a quarter
+// of the arrivals, whose bytes are random: a byte held twice must keep its
+// first copy, as the oracle does. A queue's limit is the oracle's right
+// edge, passed to every insertion; the oracle's growth raises it.
 extern crate std;
 
-use super::{
-    ReceiveBuffer, ReceiveOutcome, ReceiveOutputUndo,
-    receive_reference::ReferenceReceiveBuffer as Reference,
-};
-use crate::seq::Seq;
+use super::receive_reference::{ReceiveOutputUndo, ReferenceReceiveBuffer as Reference};
+use crate::{rx_queue::ReceiveOutcome, seq::Seq};
 use alloc::vec::Vec;
 use ntcp_buffer::RxFrame;
 
@@ -106,123 +105,6 @@ fn ring_runs(
             (left..right).any(&push),
         ));
         offset = right;
-    }
-}
-
-impl ReceiveQueue for ReceiveBuffer {
-    type Undo = ReceiveOutputUndo;
-    fn create(start: Seq, capacity: usize) -> Self {
-        Self::new(start, capacity).unwrap()
-    }
-    fn defer_syn(&mut self, frame: RxFrame, fin: bool, push: bool) {
-        ReceiveBuffer::defer_syn(self, &frame, fin, push)
-    }
-    fn promote_syn(&mut self) -> Option<usize> {
-        ReceiveBuffer::promote_syn(self)
-    }
-    fn insert(
-        &mut self,
-        sequence: Seq,
-        frame: RxFrame,
-        fin: bool,
-        push: bool,
-        limit: Seq,
-        accepted: &mut dyn FnMut(usize, usize),
-    ) -> ReceiveOutcome {
-        assert_eq!(limit, self.right_edge());
-        self.insert_observed(sequence, &frame, fin, push, accepted)
-    }
-    fn record_duplicate(&mut self, sequence: Seq, len: usize) {
-        ReceiveBuffer::record_duplicate(self, sequence, len)
-    }
-    fn read(&mut self, out: &mut [u8]) -> usize {
-        ReceiveBuffer::read(self, out)
-    }
-    fn peek(&self, out: &mut [u8]) -> usize {
-        ReceiveBuffer::peek(self, out)
-    }
-    fn sack_blocks(&self, max_blocks: usize) -> [Option<(u32, u32)>; 4] {
-        ReceiveBuffer::sack_blocks(self, max_blocks)
-    }
-    fn output_undo(&self) -> ReceiveOutputUndo {
-        ReceiveBuffer::output_undo(self)
-    }
-    fn commit_sack(&mut self, first: (u32, u32)) {
-        ReceiveBuffer::commit_sack(self, first)
-    }
-    fn commit_report(&mut self) {
-        ReceiveBuffer::commit_report(self)
-    }
-    fn restore_output(&mut self, undo: ReceiveOutputUndo) {
-        ReceiveBuffer::restore_output(self, undo)
-    }
-    fn take_push(&mut self) -> bool {
-        ReceiveBuffer::take_push(self)
-    }
-    fn clear(&mut self) {
-        ReceiveBuffer::clear(self)
-    }
-    fn reset_start(&mut self, start: Seq) -> Result<(), ()> {
-        ReceiveBuffer::reset_start(self, start)
-    }
-    fn clear_dsack(&mut self) {
-        ReceiveBuffer::clear_dsack(self)
-    }
-    fn grow(&mut self, capacity: usize) -> Result<(), ()> {
-        ReceiveBuffer::grow(self, capacity)
-    }
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            next: self.next(),
-            readable: self.readable(),
-            eof: self.eof(),
-            has_data: self.has_data(),
-            out_of_order_end: self.out_of_order_end(),
-            has_sack_blocks: self.has_sack_blocks(),
-            dsack_pending: self.dsack_pending(),
-            has_pending_report: self.has_pending_report(),
-            read_base: self.read_base,
-            occupied: self.occupied,
-            fin_sequence: self.fin_sequence,
-            latest: self.latest,
-            reported: self.reported,
-            report_debt: self.report_debt,
-            pending_first: self.pending_first,
-            dsack: self.dsack,
-            pushed: self.pushed,
-            deferred_syn: self.deferred_syn,
-        }
-    }
-    fn byte_at(&self, seq: Seq) -> Option<u8> {
-        let offset = seq.distance_from(self.read_base) as usize;
-        if offset >= self.capacity() {
-            return None;
-        }
-        let index = self.index(offset);
-        // A held slot holds an initialized byte.
-        self.holds(index)
-            .then(|| unsafe { self.data[index].assume_init() })
-    }
-    fn pending(&self, seq: Seq) -> bool {
-        ReceiveBuffer::pending(self, seq)
-    }
-    fn block_at(&self, seq: Seq) -> Option<(Seq, Seq)> {
-        ReceiveBuffer::block_at(self, seq)
-    }
-    fn runs(&self) -> Vec<(Seq, Seq, bool)> {
-        ring_runs(
-            self.read_base,
-            self.contiguous_len,
-            self.capacity(),
-            |offset, present| self.find_presence(offset, present),
-            |offset| self.is_push(self.index(offset)),
-        )
-    }
-    fn check(&self) {
-        // The prefix keeps no PUSH marks.
-        for offset in 0..self.contiguous_len {
-            assert!(!self.is_push(self.index(offset)));
-        }
     }
 }
 
@@ -509,7 +391,11 @@ pub(crate) fn run<Q: ReceiveQueue>(rounds: usize, steps: usize, seed: u32) -> Co
                         // In order.
                         _ => (next, rng.below(capacity.min(300) + 1)),
                     };
-                    let payload = bytes(epoch, base, &r, sequence, len);
+                    let payload = if rng.below(4) == 0 {
+                        (0..len).map(|_| rng.below(256) as u8).collect()
+                    } else {
+                        bytes(epoch, base, &r, sequence, len)
+                    };
                     let push = rng.below(3) == 0;
                     if rng.below(2) == 0 {
                         q.record_duplicate(sequence, len);
@@ -622,21 +508,4 @@ pub(crate) fn assert_covered(coverage: &Coverage) {
             && coverage.wrapped > 10,
         "{coverage:?}"
     );
-}
-
-#[test]
-fn ring_matches_the_per_byte_reference_on_stream_consistent_input() {
-    let coverage = run::<ReceiveBuffer>(200, 120, 0x7f4a_7c15);
-    std::eprintln!("{coverage:?}");
-    assert_eq!(coverage.steps, 24_000);
-    assert_covered(&coverage);
-}
-
-// Soak: run once per commit in a release build with debug assertions
-// (`--profile packetdrill`).
-#[test]
-#[ignore]
-fn ring_matches_the_per_byte_reference_soak() {
-    let coverage = run::<ReceiveBuffer>(2000, 120, 0x2545_f491);
-    std::eprintln!("{coverage:?}");
 }

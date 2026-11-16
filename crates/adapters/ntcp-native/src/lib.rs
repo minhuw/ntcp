@@ -1486,8 +1486,7 @@ impl<P: PacketIo> Network<P> {
         };
         let local = SocketAddr::new(self.config.local_address, port);
         let mut transport = ntcp::ActiveOpenOptions::from(&self.config.tcp.connection);
-        // Open with the rings at the locked sizes, the receive ring charged
-        // at admission, rather than growing them once open.
+        // Open with the locked sizes, rather than setting them once open.
         transport.send_capacity = send_buffer.unwrap_or(transport.send_capacity);
         transport.receive_capacity = receive_buffer.unwrap_or(transport.receive_capacity);
         let options = ntcp::ManagedOpenOptions {

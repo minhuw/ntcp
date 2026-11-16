@@ -84,15 +84,17 @@ impl NetworkConfig {
     /// once: its output reservations, one per connection slot and one for
     /// stateless replies, each holding the TCP packet of one IP packet of
     /// the MTU, and each connection's charge at open
-    /// (`EndpointConfig::connection_charge`), its receive ring, scratch
-    /// segment, first ledger entries and timestamp records. None if it
-    /// overflows. `buffer_budget(0, io)` is the reservations alone.
+    /// (`EndpointConfig::connection_charge`), its scratch segment, first
+    /// ledger entries and timestamp records. None if it overflows.
+    /// `buffer_budget(0, io)` is the reservations alone.
     ///
     /// It is a floor for the cap, not a cap to use: it leaves no room to
-    /// write. A connection is charged what it allocates, so its first write
-    /// adds a send ring of 2 bytes per byte of `send_capacity`, and its RACK
-    /// and SACK ledgers grow with the bytes it holds queued (68 bytes per
-    /// byte until they are kept per segment). A write whose storage the cap
+    /// write or receive. A connection is charged what it allocates, so its
+    /// first write adds a send ring of 2 bytes per byte of `send_capacity`,
+    /// its RACK and SACK ledgers grow with the bytes it holds queued, and
+    /// the data it receives is charged, frame by frame, while it is held
+    /// unread or beyond a gap (a heap frame of its length plus its queue
+    /// slot), and returned as it is read. A write whose storage the cap
     /// refuses takes what the connection's storage holds and then waits for
     /// memory, as Linux's: a partial write or `Error::WouldBlock`, the
     /// connection writable again once memory comes back
@@ -101,10 +103,8 @@ impl NetworkConfig {
     /// `send_capacity_max`, its ring and ledgers growing at write; a
     /// receive limit rises at read with the bytes read per round trip up to
     /// `receive_capacity_max`, and its window with the full-size data
-    /// received (Linux's rcv_ssthresh), the ring growing at read or before
-    /// the next segment is sent, 1.375 bytes per byte of window offered; a
-    /// growth the cap or memory pressure refuses leaves the window as it is
-    /// (`Counters::memory_refused_growths`).
+    /// received (Linux's rcv_ssthresh), outside memory pressure; the window
+    /// is a limit, which allocates nothing.
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the

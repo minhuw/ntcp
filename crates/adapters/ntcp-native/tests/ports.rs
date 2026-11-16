@@ -84,7 +84,10 @@ fn built(
         outgoing: outgoing.clone(),
     };
     let connections = config.tcp.max_connections;
-    config.tcp.max_buffer_bytes = config.buffer_budget(connections, &wire).unwrap();
+    // `buffer_budget` is a floor that leaves no room to write or receive;
+    // until n0bw stage 1 the receive rings of connections not yet open left
+    // some.
+    config.tcp.max_buffer_bytes = config.buffer_budget(connections, &wire).unwrap() + (1 << 20);
     Network::new(config, wire, secret, 0).unwrap()
 }
 

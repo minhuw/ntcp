@@ -17,8 +17,9 @@ use crate::{
     RxPacketTimestamps, RxReadTimestamps, RxTimestampStatus, SendProgress, SourceRoute,
     TimestampRequest, TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource,
     TxTimestampStage, TxTimestampToken,
-    buffer::ReceiveBuffer,
-    connection::{Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple, State, Tuple},
+    connection::{
+        Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple, State, Tuple,
+    },
     rx_timestamp::RxTimestamps,
     schedule::{Deadlines, ReadyQueue},
     seq::Seq,
@@ -100,6 +101,9 @@ pub enum AddressValidation {
 #[derive(Clone, Debug)]
 pub struct EndpointConfig {
     pub max_connections: usize,
+    // Validated (at most max_connections, that many open charges within
+    // max_buffer_bytes) but reserves nothing: the receive rings it pooled
+    // went in n0bw stage 1. To be removed with the other breaking changes.
     pub preallocate_connections: usize,
     pub ipv4_options_enabled: bool,
     pub error_reports: bool,
@@ -196,7 +200,7 @@ impl EndpointConfig {
                 return Err(Error::InvalidArgument.into());
             }
         }
-        self.preallocation_bytes()?;
+        self.validate_preallocation()?;
         self.timer_wheel_geometry()?;
         Ok(())
     }
@@ -226,30 +230,27 @@ impl EndpointConfig {
     }
 
     /// The share of `max_buffer_bytes` one connection with the configured
-    /// buffers and MSS is charged at open, once its TX timestamp phases and
-    /// RX timestamp ranges are set to these capacities: what it allocates
-    /// before its first write, the receive ring (1.375 bytes per byte of
-    /// `receive_capacity`), its MSS-sized scratch segment and its sender
-    /// ledgers' first entries. A budget of N of these admits N connections
-    /// and no more: each is charged what it actually allocates, so its first
-    /// write adds a send ring of 2 bytes per byte of `send_capacity`, and its
-    /// RACK and SACK ledgers grow with the bytes it holds queued, 64 and 4
-    /// bytes per byte. None if it overflows.
+    /// MSS is charged at open, once its TX timestamp phases and RX timestamp
+    /// ranges are set to these capacities: what it allocates before its
+    /// first write, its MSS-sized scratch segment and its sender ledgers'
+    /// first entries. A budget of N of these admits N connections and no
+    /// more: each is charged what it actually allocates, so its first write
+    /// adds a send ring of 2 bytes per byte of `send_capacity`, its RACK
+    /// and SACK ledgers grow with the bytes it holds queued, and the data it
+    /// receives is charged while it is held, frame by frame, until it is
+    /// read. None if it overflows.
     pub fn connection_charge(
         &self,
         tx_timestamp_phases: usize,
         rx_timestamp_ranges: usize,
     ) -> Option<usize> {
-        Connection::open_bytes(
-            self.connection.receive_capacity,
-            usize::from(self.connection.mss),
-        )?
-        .checked_add(crate::tx_timestamp::TxTimestamps::allocation_bytes(
-            tx_timestamp_phases,
-        )?)?
-        .checked_add(crate::rx_timestamp::RxTimestamps::allocation_bytes(
-            rx_timestamp_ranges,
-        )?)
+        Connection::open_bytes(usize::from(self.connection.mss))?
+            .checked_add(crate::tx_timestamp::TxTimestamps::allocation_bytes(
+                tx_timestamp_phases,
+            )?)?
+            .checked_add(crate::rx_timestamp::RxTimestamps::allocation_bytes(
+                rx_timestamp_ranges,
+            )?)
     }
 
     /// The share of `max_buffer_bytes` taken by `count` output reservations
@@ -274,25 +275,20 @@ impl EndpointConfig {
             .checked_mul(count)
     }
 
-    fn preallocation_bytes(&self) -> Result<(usize, usize), EndpointError> {
-        // A pooled connection is a receive ring at the initial size. It is
-        // charged the open charge of the connection that will take it, the
-        // ring plus that connection's scratch segment and first ledger
-        // entries, so a budget that holds the pool admits its connections.
-        let per_connection_bytes = Connection::open_bytes(
-            self.connection.receive_capacity,
-            usize::from(self.connection.mss),
-        )
-        .ok_or(EndpointError::LimitReached)?;
+    // `preallocate_connections` reserves nothing since the receive ring it
+    // pooled went (n0bw); it is still validated as it was, within
+    // max_connections and with that many open charges within the budget.
+    fn validate_preallocation(&self) -> Result<(), EndpointError> {
+        let per_connection_bytes = Connection::open_bytes(usize::from(self.connection.mss))
+            .ok_or(EndpointError::LimitReached)?;
         if self.preallocate_connections > self.max_connections {
             return Err(EndpointError::LimitReached);
         }
-        let buffer_bytes = self
-            .preallocate_connections
+        self.preallocate_connections
             .checked_mul(per_connection_bytes)
             .filter(|&bytes| bytes <= self.max_buffer_bytes)
             .ok_or(EndpointError::LimitReached)?;
-        Ok((per_connection_bytes, buffer_bytes))
+        Ok(())
     }
 }
 
@@ -783,8 +779,6 @@ pub struct Endpoint {
     control_turn: bool,
     // The bytes charged against max_buffer_bytes and the pressure state.
     budget: crate::memory::Budget,
-    per_connection_bytes: usize,
-    receive_pool: Vec<ReceiveBuffer>,
     // ponytail: conservative FIFO loss retention until eviction; add path-qualified
     // aging only when measured deployment behavior warrants it.
     setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
@@ -901,16 +895,8 @@ impl Endpoint {
         let event_capacity = count
             .checked_add(listeners_count)
             .ok_or(EndpointError::LimitReached)?;
-        let (per_connection_bytes, buffer_bytes) = config.preallocation_bytes()?;
-        let mut budget = crate::memory::Budget::new();
-        budget.raise(buffer_bytes, now, config.buffer_memory());
-        let mut receive_pool = reserved_vec(config.preallocate_connections)?;
-        for _ in 0..config.preallocate_connections {
-            receive_pool.push(
-                ReceiveBuffer::new(Seq(0), config.connection.receive_capacity)
-                    .map_err(|_| Error::NoMemory)?,
-            );
-        }
+        config.validate_preallocation()?;
+        let budget = crate::memory::Budget::new();
         let mut slots = reserved_vec(count)?;
         slots.resize_with(count, || None);
         let mut generations = reserved_vec(count)?;
@@ -1022,8 +1008,6 @@ impl Endpoint {
             local_refusals: false,
             control_turn: true,
             budget,
-            per_connection_bytes,
-            receive_pool,
         })
     }
 
@@ -1608,21 +1592,7 @@ impl Endpoint {
     //# (MUST-46).
 
     // Scoped to the embedding policy's bound network; base invalid addresses cannot be allowed.
-    fn admission(&self, tuple: ScopedTuple) -> Result<(), EndpointError> {
-        self.admission_with_buffers(
-            tuple,
-            (
-                self.config.connection.send_capacity,
-                self.config.connection.receive_capacity,
-            ),
-        )
-    }
-
-    fn admission_with_buffers(
-        &self,
-        scoped: ScopedTuple,
-        capacities: (usize, usize),
-    ) -> Result<(), EndpointError> {
+    fn admission(&self, scoped: ScopedTuple) -> Result<(), EndpointError> {
         let tuple = scoped.tuple;
         if !self.admits_zone(scoped)
             || !supported_socket(tuple.local)
@@ -1639,7 +1609,7 @@ impl Endpoint {
         {
             return Err(EndpointError::InvalidAddress);
         }
-        self.resource_admission(scoped, capacities)
+        self.resource_admission(scoped)
     }
 
     // A zone is authority of this Endpoint's managed network context; a raw
@@ -1666,11 +1636,7 @@ impl Endpoint {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.1
     //= reason=Duplicate tuple admission fails without replacing the existing record; independent listener remains legal.
     //# Return "error: connection already exists".
-    fn resource_admission(
-        &self,
-        tuple: ScopedTuple,
-        capacities: (usize, usize),
-    ) -> Result<(), EndpointError> {
+    fn resource_admission(&self, tuple: ScopedTuple) -> Result<(), EndpointError> {
         if tuple.tuple.local.port() == 0 || tuple.tuple.remote.port() == 0 {
             return Err(EndpointError::InvalidAddress);
         }
@@ -1681,18 +1647,17 @@ impl Endpoint {
         //# If there is
         //# no room to create a new connection, return "error: insufficient
         //# resources".
-        self.room_for(capacities.1)
+        self.room_for()
     }
 
-    // Room for a connection with a `receive`-byte ring: a slot
-    // (LimitReached) and its charge at open within the budget (NoMemory).
-    fn room_for(&self, receive: usize) -> Result<(), EndpointError> {
+    // Room for a connection: a slot (LimitReached) and its charge at open
+    // within the budget (NoMemory).
+    fn room_for(&self) -> Result<(), EndpointError> {
         if self.free.is_empty() {
             return Err(EndpointError::LimitReached);
         }
-        let (_, credit) = self.pooled_receive_credit(receive);
-        if Connection::open_bytes(receive, usize::from(self.config.connection.mss))
-            .is_none_or(|charge| charge > self.buffer_room().saturating_add(credit))
+        if Connection::open_bytes(usize::from(self.config.connection.mss))
+            .is_none_or(|charge| charge > self.buffer_room())
         {
             return Err(Error::NoMemory.into());
         }
@@ -1736,19 +1701,6 @@ impl Endpoint {
             self.charge(new - old);
         } else if new < old {
             self.uncharge(old - new);
-        }
-    }
-
-    // Pooled receive storage a new connection would reuse, and the charge it
-    // returns to the budget: pooled storage is already in buffer_bytes.
-    fn pooled_receive_credit(&self, receive_capacity: usize) -> (Option<usize>, usize) {
-        match self
-            .receive_pool
-            .iter()
-            .position(|r| r.capacity() == receive_capacity)
-        {
-            Some(index) => (Some(index), self.per_connection_bytes),
-            None => (None, 0),
         }
     }
 
@@ -1877,24 +1829,33 @@ impl Endpoint {
             None => (None, None),
         };
         let initial_ip_header_len = if let Some(transaction) = self.factory_transaction {
-            if let (IpAddr::V4(source), IpAddr::V4(destination)) = (tuple.local.ip(), tuple.remote.ip()) {
-                Some(20 + transaction.request.ipv4_options.encode(source, destination, 0, &mut [0; 40])
-                    .map_err(|_| Error::InvalidArgument)?.1 as u16)
-            } else { Some(transaction.prepared.snapshot.ip_header_len() as u16) }
-        } else { None };
+            if let (IpAddr::V4(source), IpAddr::V4(destination)) =
+                (tuple.local.ip(), tuple.remote.ip())
+            {
+                Some(
+                    20 + transaction
+                        .request
+                        .ipv4_options
+                        .encode(source, destination, 0, &mut [0; 40])
+                        .map_err(|_| Error::InvalidArgument)?
+                        .1 as u16,
+                )
+            } else {
+                Some(transaction.prepared.snapshot.ip_header_len() as u16)
+            }
+        } else {
+            None
+        };
         let capacities = (options.send_capacity, options.receive_capacity);
-        let charge = Connection::open_bytes(capacities.1, usize::from(self.config.connection.mss))
+        let charge = Connection::open_bytes(usize::from(self.config.connection.mss))
             .ok_or(Error::NoMemory)?;
-        let (pool_index, credit) = self.pooled_receive_credit(capacities.1);
-        let available = self.buffer_room().saturating_add(credit);
+        let available = self.buffer_room();
         if charge
             .checked_add(RxTimestamps::allocation_bytes(rx_ranges).ok_or(Error::NoMemory)?)
             .is_none_or(|total| total > available)
         {
             return Err(Error::NoMemory);
         }
-        // Stage metadata before touching the receive pool; constructor failures
-        // drop it while returning pooled storage through the existing path.
         let mut rx_timestamps = RxTimestamps::default();
         rx_timestamps.resize(rx_ranges, available - charge)?;
         let scoped = self.scoped(tuple);
@@ -1939,9 +1900,12 @@ impl Endpoint {
         if let Some(path) = managed_path
             && let Some(pmtud) = &mut connection_config.pmtud
         {
-            pmtud.first_hop_mtu = path.snapshot.first_hop_mtu().min(if tuple.local.is_ipv4() { 65535 } else { 65575 });
+            pmtud.first_hop_mtu = path.snapshot.first_hop_mtu().min(if tuple.local.is_ipv4() {
+                65535
+            } else {
+                65575
+            });
         }
-        let mut receive = pool_index.map(|index| self.receive_pool.swap_remove(index));
         // Apply the same policy to ordinary passive opens and TIME-WAIT reuse.
         let mut fast_open_response = None;
         let mut early = false;
@@ -1980,40 +1944,33 @@ impl Endpoint {
         }
         let syn = filtered_syn.as_ref().or(syn);
         let mut result = match syn {
-            Some(syn) => Connection::passive_with_receive_path(
+            Some(syn) => Connection::passive_with_path(
                 tuple,
                 connection_config,
                 iss,
                 self.now,
                 syn,
                 early,
-                &mut receive,
                 rx_timestamps,
                 timestamps,
                 managed_path,
                 receive_capability,
                 initial_ip_header_len,
             ),
-            None => Connection::active_with_receive_path(
+            None => Connection::active_with_path(
                 tuple,
                 connection_config,
                 iss,
                 self.now,
-                &mut receive,
                 managed_path,
                 receive_capability,
                 initial_ip_header_len,
             ),
         };
-        if result.as_ref().is_ok_and(|connection| {
-            connection.buffer_charge() > self.buffer_room().saturating_add(credit)
-        }) {
-            let connection = result.unwrap();
-            if credit != 0 {
-                let mut storage = connection.into_receive();
-                storage.clear();
-                self.receive_pool.push(storage);
-            }
+        if result
+            .as_ref()
+            .is_ok_and(|connection| connection.buffer_charge() > self.buffer_room())
+        {
             return Err(Error::NoMemory);
         }
         if let Ok(connection) = &mut result {
@@ -2021,12 +1978,8 @@ impl Endpoint {
             connection.passive_fast_open(fast_open_response, early);
             connection.set_timestamp_offset(self.timestamp_offset(scoped));
         }
-        if let Some(receive) = receive {
-            self.receive_pool.push(receive);
-        }
         if let Ok(connection) = &result {
-            let charge = connection.buffer_charge();
-            self.recharge(credit, charge);
+            self.charge(connection.buffer_charge());
         }
         result
     }
@@ -2070,19 +2023,7 @@ impl Endpoint {
     }
 
     fn recycle_connection(&mut self, connection: Box<Connection>) {
-        let charge = connection.buffer_charge();
-        // A ring the pool keeps stays charged its open charge.
-        if self.receive_pool.len() < self.config.preallocate_connections
-            && connection.receive_allocation_capacity() == self.config.connection.receive_capacity
-            && self.per_connection_bytes <= self.buffer_room().saturating_add(charge)
-        {
-            let mut receive = connection.into_receive();
-            receive.clear();
-            self.receive_pool.push(receive);
-            self.recharge(charge, self.per_connection_bytes);
-        } else {
-            self.uncharge(charge);
-        }
+        self.uncharge(connection.buffer_charge());
     }
 
     // `replaces` names the TIME-WAIT incarnation, a connection the
@@ -2856,7 +2797,7 @@ impl Endpoint {
         if fast_open && self.fast_open.is_none() {
             return Err(Error::InvalidState.into());
         }
-        self.admission_with_buffers(tuple, (options.send_capacity, options.receive_capacity))
+        self.admission(tuple)
     }
 
     pub fn connect(
@@ -2954,10 +2895,9 @@ impl Endpoint {
 
     /// Sets the receive window of `id` to `bytes` and locks its receive
     /// direction, as SO_RCVBUF sets SOCK_RCVBUF_LOCK: DRS no longer grows
-    /// it. A larger size grows the receive ring now, refused with
-    /// `NoMemory` if its peak charge does not fit the budget; a smaller one
-    /// keeps the ring and never retracts the window offered. Before the SYN
-    /// leaves, it also sets the window scale. 0 < `bytes` ≤ 65535·2^14.
+    /// it. A limit: it allocates nothing, and a smaller size never retracts
+    /// the window offered. Before the SYN leaves, it also sets the window
+    /// scale. 0 < `bytes` ≤ 65535·2^14.
     pub fn set_receive_buffer(
         &mut self,
         id: ConnectionId,
@@ -2965,24 +2905,27 @@ impl Endpoint {
     ) -> Result<(), EndpointError> {
         self.reserved_call(id)?;
         Connection::validate_buffer_capacities(1, bytes)?;
-        let old = self.slot(id)?.connection.buffer_charge();
-        let max_charge = self.buffer_room().saturating_add(old);
-        let result = self
-            .slot_mut(id)?
-            .connection
-            .set_receive_buffer(bytes, max_charge);
-        self.memory_refused_growths += u64::from(result == Err(Error::NoMemory));
-        // Charged even when refused: a bitmap that grew before another
-        // failed keeps its storage.
-        let new = self.slot(id)?.connection.buffer_charge();
-        self.recharge(old, new);
-        result?;
+        self.slot_mut(id)?.connection.set_receive_buffer(bytes);
         self.refresh(id.slot);
         Ok(())
     }
 
-    // Shorthand for tests: both setters, receive first so that a refused
-    // growth changes nothing.
+    #[cfg(test)]
+    pub(crate) fn set_max_buffer_bytes(&mut self, bytes: usize) {
+        self.config.max_buffer_bytes = bytes;
+    }
+
+    // The heap the RX timestamp metadata of `id` holds.
+    #[cfg(test)]
+    pub(crate) fn rx_timestamp_storage(&self, id: ConnectionId) -> usize {
+        self.slot(id)
+            .unwrap()
+            .connection
+            .rx_timestamps
+            .storage_bytes()
+    }
+
+    // Shorthand for tests: both setters.
     #[cfg(test)]
     pub(crate) fn set_buffer_capacities(
         &mut self,
@@ -3011,19 +2954,18 @@ impl Endpoint {
     }
 
     /// `set_receive_buffer` for the connections `id` accepts from now on:
-    /// each opens with a ring and window of this size, locked, and takes
-    /// its window scale from it. Refused with `NoMemory` if one such
-    /// connection's open charge with the listener's RX timestamp capacity
-    /// exceeds the cap.
+    /// each opens with a window of this size, locked, and takes its window
+    /// scale from it. Refused with `NoMemory` if one such connection's open
+    /// charge with the listener's RX timestamp capacity exceeds the cap.
     pub fn set_listener_receive_buffer(
         &mut self,
         id: ListenerId,
         bytes: usize,
     ) -> Result<(), EndpointError> {
         let listener = self.listener(id)?;
-        let (send, rx_ranges) = (listener.buffer_capacities.0, listener.rx_timestamp_capacity);
+        let rx_ranges = listener.rx_timestamp_capacity;
         Connection::validate_buffer_capacities(1, bytes)?;
-        self.validate_listener_rx_capacity((send, bytes), rx_ranges)?;
+        self.validate_listener_rx_capacity(rx_ranges)?;
         let listener = self.listeners[id.slot].as_mut().unwrap();
         listener.buffer_capacities.1 = bytes;
         listener.buffer_locks.1 = true;
@@ -3043,16 +2985,12 @@ impl Endpoint {
         self.set_listener_send_buffer(id, send)
     }
 
-    fn validate_listener_rx_capacity(
-        &self,
-        capacities: (usize, usize),
-        ranges: usize,
-    ) -> Result<(), EndpointError> {
+    fn validate_listener_rx_capacity(&self, ranges: usize) -> Result<(), EndpointError> {
         if ranges == 0 {
             return Ok(());
         }
         let metadata = RxTimestamps::allocation_bytes(ranges).ok_or(Error::NoMemory)?;
-        let total = Connection::open_bytes(capacities.1, usize::from(self.config.connection.mss))
+        let total = Connection::open_bytes(usize::from(self.config.connection.mss))
             .and_then(|bytes| bytes.checked_add(metadata))
             .ok_or(Error::NoMemory)?;
         if total > self.memory().high {
@@ -3066,8 +3004,8 @@ impl Endpoint {
         id: ListenerId,
         ranges: usize,
     ) -> Result<(), EndpointError> {
-        let capacities = self.listener(id)?.buffer_capacities;
-        self.validate_listener_rx_capacity(capacities, ranges)?;
+        self.listener(id)?;
+        self.validate_listener_rx_capacity(ranges)?;
         self.listeners[id.slot]
             .as_mut()
             .unwrap()
@@ -3439,6 +3377,7 @@ impl Endpoint {
         let state = connection.state();
         assert!(!connection.send_expand_pending());
         assert!(!connection.ledgers_reclaimable() && !connection.send_ring_reclaimable());
+        assert!(connection.receive_charge_settled());
         assert_eq!(slot.time_wait, state == State::TimeWait);
         assert_eq!(connection.loss_events, crate::LossCounters::default());
         assert_eq!(connection.split_refusals(), 0);
@@ -3512,6 +3451,13 @@ impl Endpoint {
                 connection.reclaim_send_ring();
             }
             let new = connection.buffer_charge();
+            self.recharge(old, new);
+        }
+        // A change of the receive queue outside input and reads: a clear,
+        // or report anchors SACK output took or put back.
+        if let Some(slot) = self.slots[index].as_mut()
+            && let Some((old, new)) = slot.connection.settle_receive_charge()
+        {
             self.recharge(old, new);
         }
         if let Some(slot) = self.slots[index].as_mut() {
@@ -4103,6 +4049,16 @@ impl Endpoint {
                 }
                 self.drop_segment(reason, tuple, segment);
             }
+            // The data the input took into, or released from, the receive
+            // queue, as Linux charges an skb when it is queued.
+            if let Some((old, new)) = self.slots[index]
+                .as_mut()
+                .unwrap()
+                .connection
+                .settle_receive_charge()
+            {
+                self.recharge(old, new);
+            }
             self.refresh(index);
             return Ok(if held {
                 InputDisposition::Dropped
@@ -4379,22 +4335,19 @@ impl Endpoint {
             return Some(PassiveRefusal::AcceptQueue);
         }
         match target {
-            None => match self.resource_admission(tuple, record.buffer_capacities) {
+            None => match self.resource_admission(tuple) {
                 Ok(()) => None,
                 Err(EndpointError::LimitReached) => Some(PassiveRefusal::Resources),
                 Err(EndpointError::Connection(Error::NoMemory)) => Some(PassiveRefusal::Memory),
                 Err(_) => Some(PassiveRefusal::Invalid),
             },
-            Some(_) => self
-                .room_for(record.buffer_capacities.1)
-                .err()
-                .map(|error| {
-                    if error == Error::NoMemory.into() {
-                        PassiveRefusal::Memory
-                    } else {
-                        PassiveRefusal::Resources
-                    }
-                }),
+            Some(_) => self.room_for().err().map(|error| {
+                if error == Error::NoMemory.into() {
+                    PassiveRefusal::Memory
+                } else {
+                    PassiveRefusal::Resources
+                }
+            }),
         }
     }
 
@@ -4584,12 +4537,6 @@ impl Endpoint {
             connection.send_tuned() && !connection.send_below_min(),
             charge,
         )
-    }
-
-    // The same for a tuned receive ring's growth (DRS): Linux applies one
-    // rule to SK_MEM_RECV, with tcp_rmem[0] as the floor.
-    fn receive_growth_room(&self, connection: &Connection, charge: usize) -> usize {
-        self.growth_room(!connection.receive_below_min(), charge)
     }
 
     // What the hard cap leaves, and when `pressured`, Linux's limits past
@@ -5133,61 +5080,20 @@ impl Endpoint {
         self.reserved_call(id)?;
         let connection = &mut self.slot_mut(id)?.connection;
         let count = connection.read(out)?;
-        if connection.receive_tuned() {
-            if let Some(target) = connection.receive_space_adjust() {
-                connection.raise_receive_clamp(target);
-            }
-            if connection.receive_grow_pending() {
-                self.grow_receive(id.slot, true);
-            }
+        if connection.receive_tuned()
+            && let Some(target) = connection.receive_space_adjust()
+        {
+            connection.raise_receive_clamp(target);
+        }
+        // Frames read to their end go back to the budget, waking writers
+        // waiting for memory (sock_rfree).
+        if let Some((old, new)) = connection.settle_receive_charge() {
+            self.recharge(old, new);
         }
         self.refresh(id.slot);
         Ok(count)
     }
 
-    // The window the connection at `index` is to offer passed what its
-    // receive ring backs (`Connection::receive_ring_target`): grows the
-    // ring, before a read returns (`read`, which then offers the room if it
-    // is worth an update) or before the next segment is built. As Linux's
-    // __sk_mem_raise_allocated for SK_MEM_RECV, the growth's peak charge
-    // must fit the room `receive_growth_room` gives; a refused one is
-    // counted, enters pressure if it would have passed the threshold, and
-    // leaves the window as the ring backs it until the next DRS measure.
-    // Linux charges skbs as they arrive, within the window offered; input
-    // here never allocates, so the ring is grown before that window is
-    // offered.
-    #[cold]
-    #[inline(never)]
-    fn grow_receive(&mut self, index: usize, update: bool) {
-        let connection = &self.slots[index].as_ref().unwrap().connection;
-        let Some(target) = connection.receive_ring_target() else {
-            // Reads since made the room: settle the request.
-            let connection = &mut self.slots[index].as_mut().unwrap().connection;
-            connection.grow_receive_ring(0, true);
-            return;
-        };
-        let own = connection.buffer_charge();
-        let room = self.receive_growth_room(connection, own);
-        let growth = connection
-            .receive_growth_peak(target)
-            .map_or(usize::MAX, |peak| peak - own);
-        let connection = &mut self.slots[index].as_mut().unwrap().connection;
-        let grown = connection.grow_receive_ring(target, growth <= room);
-        // Charged even when refused: a bitmap that grew before another
-        // failed keeps its storage.
-        let charge = connection.buffer_charge();
-        if grown && update {
-            connection.receive_grown();
-        }
-        let before = self.budget.allocated();
-        self.recharge(own, charge);
-        if !grown {
-            self.memory_refused_growths += 1;
-            let memory = self.memory();
-            self.budget
-                .attempted(before.saturating_add(growth), self.now, memory);
-        }
-    }
     // Socket adapters may drain accepted bytes after CLOSED; the normal read
     // contract remains unchanged. Eligibility excludes unfinished handshakes
     // and discarded receive sides, and draining schedules no network output.
@@ -7958,14 +7864,6 @@ impl Endpoint {
             };
             self.output.remove(index);
             let connection = self.id(index);
-            if self.slots[index]
-                .as_ref()
-                .unwrap()
-                .connection
-                .receive_grow_pending()
-            {
-                self.grow_receive(index, false);
-            }
             let slot = self.slots[index].as_mut().unwrap();
             let tuple = slot.connection.tuple();
             let output = if let Some(parts) = shared.as_deref_mut() {
@@ -8264,8 +8162,12 @@ mod recovery_observation_tests {
         assert_eq!(endpoint.buffer_bytes(), prepared);
     }
 
+    // Both buffer setters are limits: neither allocates, so a budget with
+    // no room left takes either, and the charge does not move (the receive
+    // ring a larger receive size grew, with its staged peak, went in n0bw
+    // stage 1).
     #[test]
-    fn buffer_resize_admission_accounts_for_staged_peak() {
+    fn buffer_setters_allocate_nothing_within_a_full_budget() {
         for (send, receive) in [(2048, 1), (1024, 2048), (2048, 2048)] {
             let config = EndpointConfig {
                 preallocate_connections: 0,
@@ -8286,45 +8188,24 @@ mod recovery_observation_tests {
                 )
                 .unwrap();
             let old = endpoint.buffer_bytes();
-            let peak = endpoint
-                .slot(id)
-                .unwrap()
-                .connection
-                .resize_peak_charge(receive)
-                .unwrap();
-            // A send limit allocates nothing; a receive ring is staged
-            // beside the original.
-            assert_eq!(
-                peak - old,
-                ReceiveBuffer::allocation_bytes(receive).unwrap() * usize::from(receive > 1)
-            );
-            if receive > 1 {
-                // The final replacement fits, but its staging alongside the
-                // original does not.
-                endpoint.config.max_buffer_bytes = peak - 1;
-                assert_eq!(
-                    endpoint.set_buffer_capacities(id, send, receive),
-                    Err(Error::NoMemory.into())
-                );
-                assert_eq!(endpoint.buffer_capacities(id).unwrap(), (1024, 1));
-                assert_eq!(endpoint.buffer_bytes(), old);
-            }
-            endpoint.config.max_buffer_bytes = peak;
+            endpoint.config.max_buffer_bytes = old;
             endpoint.set_buffer_capacities(id, send, receive).unwrap();
             assert_eq!(endpoint.buffer_capacities(id).unwrap(), (send, receive));
+            assert_eq!(endpoint.buffer_bytes(), old);
             assert_eq!(
                 endpoint.buffer_bytes(),
                 endpoint.slot(id).unwrap().connection.buffer_charge()
             );
-            assert!(endpoint.buffer_bytes() < peak || receive == 1);
-            endpoint.config.max_buffer_bytes = endpoint.buffer_bytes();
             endpoint.set_buffer_capacities(id, 1, 1).unwrap();
-            assert_eq!(endpoint.buffer_bytes(), endpoint.config.max_buffer_bytes);
+            assert_eq!(endpoint.buffer_bytes(), old);
         }
     }
 
+    // preallocate_connections reserves nothing since the pooled receive
+    // rings went (n0bw stage 1, Q4): a connection is charged its open
+    // charge, a failed table insertion and a reclaim give it back.
     #[test]
-    fn receive_pool_transfers_charges_and_restores_failed_table_insertions() {
+    fn open_charge_returns_on_failed_table_insertion_and_reclaim() {
         for target in [0, 1] {
             let config = EndpointConfig {
                 max_connections: 1,
@@ -8343,25 +8224,24 @@ mod recovery_observation_tests {
                 remote: "192.0.2.2:8080".parse().unwrap(),
             };
             let mut endpoint = Endpoint::new(config, [1; 32], 0, |_| true).unwrap();
-            let charge = endpoint.per_connection_bytes;
-            assert_eq!(charge, Connection::open_bytes(17, 8).unwrap());
-            let pool_capacity = endpoint.receive_pool.capacity();
+            assert_eq!(endpoint.buffer_bytes(), 0);
+            let charge = Connection::open_bytes(8).unwrap();
             // A full bounded probe table can fail insertion after construction.
             let mut occupied = tuple;
             occupied.remote.set_port(occupied.remote.port() + 1);
-            endpoint.tuples.entries.fill(Entry::Occupied(ScopedTuple::unscoped(occupied), 0));
+            endpoint
+                .tuples
+                .entries
+                .fill(Entry::Occupied(ScopedTuple::unscoped(occupied), 0));
             let connection = endpoint.new_connection(tuple, 100, None).unwrap();
-            assert!(endpoint.receive_pool.is_empty());
             assert_eq!(endpoint.buffer_bytes(), charge);
             assert_eq!(
                 endpoint.insert(connection, None, None),
                 Err(EndpointError::LimitReached)
             );
-            assert_eq!(endpoint.receive_pool.len(), target);
-            assert_eq!(endpoint.buffer_bytes(), target * charge);
+            assert_eq!(endpoint.buffer_bytes(), 0);
             endpoint.tuples.entries.fill(Entry::Empty);
             let id = endpoint.connect(0, tuple.local, tuple.remote).unwrap();
-            assert!(endpoint.receive_pool.is_empty());
             assert_eq!(endpoint.buffer_bytes(), charge);
             let mut remote = tuple.remote;
             remote.set_port(remote.port() + 1);
@@ -8372,13 +8252,7 @@ mod recovery_observation_tests {
             endpoint.abort(id).unwrap();
             endpoint.release(id).unwrap();
             endpoint.poll_transmit(0, &mut [0; 128], 16).unwrap();
-            assert_eq!(endpoint.receive_pool.len(), target);
-            assert_eq!(endpoint.receive_pool.capacity(), pool_capacity);
-            assert_eq!(endpoint.buffer_bytes(), target * charge);
-            assert_eq!(
-                endpoint.buffer_bytes(),
-                (endpoint.slots.iter().flatten().count() + endpoint.receive_pool.len()) * charge
-            );
+            assert_eq!(endpoint.buffer_bytes(), 0);
         }
     }
 
@@ -8878,20 +8752,10 @@ mod recovery_observation_tests {
                 crate::TxTimestampOutcome::Cancelled
             );
         }
-        // Timestamp allocation also remains charged during ordinary buffer resize.
+        // Timestamp allocation also remains charged during ordinary buffer
+        // resize, which allocates nothing: a full budget takes it.
         let (send, receive) = endpoint.buffer_capacities(id).unwrap();
-        let peak = endpoint
-            .slot(id)
-            .unwrap()
-            .connection
-            .resize_peak_charge(receive * 2)
-            .unwrap();
-        endpoint.config.max_buffer_bytes = peak - 1;
-        assert_eq!(
-            endpoint.set_buffer_capacities(id, send * 2, receive * 2),
-            Err(Error::NoMemory.into())
-        );
-        endpoint.config.max_buffer_bytes = peak;
+        endpoint.config.max_buffer_bytes = endpoint.buffer_bytes();
         endpoint
             .set_buffer_capacities(id, send * 2, receive * 2)
             .unwrap();
@@ -8984,23 +8848,9 @@ mod recovery_observation_tests {
             endpoint.slot(id).unwrap().connection.rx_timestamps.at(2),
             timestamps
         );
+        // A resize allocates nothing: a full budget takes it.
         let (send, receive) = endpoint.buffer_capacities(id).unwrap();
-        let peak = endpoint
-            .slot(id)
-            .unwrap()
-            .connection
-            .resize_peak_charge(receive * 2)
-            .unwrap();
-        endpoint.config.max_buffer_bytes = peak - 1;
-        assert_eq!(
-            endpoint.set_buffer_capacities(id, send, receive * 2),
-            Err(Error::NoMemory.into())
-        );
-        assert_eq!(
-            endpoint.slot(id).unwrap().connection.rx_timestamps.at(2),
-            timestamps
-        );
-        endpoint.config.max_buffer_bytes = peak;
+        endpoint.config.max_buffer_bytes = endpoint.buffer_bytes();
         endpoint
             .set_buffer_capacities(id, send, receive * 2)
             .unwrap();
@@ -9092,14 +8942,32 @@ mod recovery_observation_tests {
             assert_eq!(endpoint.peek(child, &mut out), Ok(3));
             assert_eq!(&out[..3], b"abc");
         };
-        let base = Connection::open_bytes(17, 8).unwrap();
+        let base = Connection::open_bytes(8).unwrap();
         let metadata = RxTimestamps::allocation_bytes(2).unwrap();
+        // The SYN's 3 bytes, held as a frame from the child's construction,
+        // and the deque slot reserved for their promotion.
+        let syn_data = {
+            let mut deque = alloc::collections::VecDeque::<ntcp_buffer::RxFrame>::new();
+            deque.try_reserve(1).unwrap();
+            3 + deque.capacity() * core::mem::size_of::<ntcp_buffer::RxFrame>()
+        };
+        // The child's charge once established: its open charge, timestamps
+        // and the queue holding the SYN data.
+        let established = |endpoint: &Endpoint, child| {
+            base + metadata
+                + endpoint
+                    .slot(child)
+                    .unwrap()
+                    .connection
+                    .receive_queue()
+                    .storage()
+        };
         for preallocate in [0, 1] {
             let cfg = EndpointConfig {
                 max_connections: 2,
                 max_listeners: 1,
                 preallocate_connections: preallocate,
-                max_buffer_bytes: base + metadata,
+                max_buffer_bytes: base + metadata + syn_data,
                 connection: ConnectionConfig {
                     send_capacity: 17,
                     receive_capacity: 17,
@@ -9117,8 +8985,7 @@ mod recovery_observation_tests {
                 (endpoint, listener)
             };
             let clean = |endpoint: &Endpoint, listener: ListenerId| {
-                assert_eq!(endpoint.buffer_bytes(), preallocate * base);
-                assert_eq!(endpoint.receive_pool.len(), preallocate);
+                assert_eq!(endpoint.buffer_bytes(), 0);
                 assert_eq!(endpoint.free.len(), 2);
                 assert!(endpoint.slots.iter().all(Option::is_none));
                 let record = endpoint.listener(listener).unwrap();
@@ -9127,6 +8994,10 @@ mod recovery_observation_tests {
                 assert_eq!(endpoint.connection_id(tuple), None);
             };
             let (mut endpoint, listener) = make();
+            // A listener's capacity is checked against one open charge with
+            // its metadata: a cap holding two ranges refuses three. SYN data
+            // is charged as the child holds it.
+            endpoint.config.max_buffer_bytes = base + metadata;
             assert_eq!(
                 endpoint.set_listener_rx_timestamp_capacity(listener, usize::MAX),
                 Err(Error::NoMemory.into())
@@ -9135,13 +9006,10 @@ mod recovery_observation_tests {
                 endpoint.set_listener_rx_timestamp_capacity(listener, 3),
                 Err(Error::NoMemory.into())
             );
+            endpoint.config.max_buffer_bytes = base + metadata + syn_data;
             assert_eq!(endpoint.listener_rx_timestamp_capacity(listener), Ok(2));
-            assert_eq!(
-                endpoint.set_listener_buffer_capacities(listener, 17, 18),
-                Err(Error::NoMemory.into())
-            );
             assert_eq!(endpoint.listener_buffer_capacities(listener), Ok((17, 17)));
-            // Base storage fits, but metadata does not. Reject before taking the pool.
+            // Base storage fits, but metadata and SYN data do not.
             endpoint.config.max_buffer_bytes -= 1;
             assert_eq!(
                 endpoint.input_with_timestamps(1, ip, 0, Ipv4Options::default(), &syn[..n], stamps),
@@ -9164,8 +9032,7 @@ mod recovery_observation_tests {
                 Ok(InputDisposition::Processed)
             );
             let child = endpoint.connection_id(tuple).unwrap();
-            assert_eq!(endpoint.buffer_bytes(), base + metadata);
-            assert!(endpoint.receive_pool.is_empty());
+            assert_eq!(endpoint.buffer_bytes(), base + metadata + syn_data);
             assert_eq!(endpoint.rx_timestamp_status(child).unwrap().capacity, 2);
             assert_eq!(
                 endpoint.slot(child).unwrap().connection.rx_timestamps.at(0),
@@ -9195,7 +9062,7 @@ mod recovery_observation_tests {
                         stamps
                     );
                     establish(&mut endpoint, child);
-                    assert_eq!(endpoint.buffer_bytes(), base + metadata);
+                    assert_eq!(endpoint.buffer_bytes(), established(&endpoint, child));
                     succeeded = true;
                     break;
                 }
@@ -9623,6 +9490,20 @@ mod memory_wait_tests {
         a.slot(id).unwrap().connection.allocated_send_room()
     }
 
+    // Makes `a`'s end of `peer`'s connection hold `bytes` that `peer`, on
+    // `b`, sent and `a`'s application has not read. A connection's receive
+    // memory counts toward its share, as sk_rmem_alloc does in Linux's
+    // __sk_mem_raise_allocated: since a receive size allocates nothing
+    // (n0bw stage 1), this, not a large receive size, keeps a connection
+    // above its fair share.
+    fn hold_unread(a: &mut Endpoint, b: &mut Endpoint, peer: ConnectionId, bytes: usize) {
+        let mut left = bytes;
+        while left != 0 {
+            left -= b.write(peer, &alloc::vec![9; left.min(1024)]).unwrap_or(0);
+            exchange(a, b, 0);
+        }
+    }
+
     // More bytes than the ledgers the first write allocated hold entries
     // for.
     fn long_data() -> Vec<u8> {
@@ -10005,13 +9886,14 @@ mod memory_wait_tests {
         let mut a = Endpoint::new(tuned(), [1; 32], 0, |_| true).unwrap();
         let mut b = Endpoint::new(tuned(), [2; 32], 0, |_| true).unwrap();
         let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
-        // `big`'s large receive ring keeps it above its fair share.
+        // The data `big` holds unread keeps it above its fair share.
         let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
         let big = a
             .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
             .unwrap();
         exchange(&mut a, &mut b, 0);
-        b.accept(listener).unwrap();
+        let peer = b.accept(listener).unwrap();
+        hold_unread(&mut a, &mut b, peer, 4096);
         let (small, _) = connect(&mut a, &mut b, listener, 40001);
         assert_eq!(a.write(big, &[1; 200]), Ok(200));
         assert_eq!(a.write(small, &[2; 20]), Ok(20));
@@ -10070,13 +9952,14 @@ mod memory_wait_tests {
         let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
         let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
         let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
-        // The writer's large receive ring keeps it above its fair share.
+        // The data the writer holds unread keeps it above its fair share.
         let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
         let writer = a
             .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
             .unwrap();
         exchange(&mut a, &mut b, 0);
-        b.accept(listener).unwrap();
+        let peer = b.accept(listener).unwrap();
+        hold_unread(&mut a, &mut b, peer, 4096);
         let (first, _) = connect(&mut a, &mut b, listener, 40001);
         let (second, _) = connect(&mut a, &mut b, listener, 40002);
         let (_idle, _) = connect(&mut a, &mut b, listener, 40003);
@@ -10151,13 +10034,15 @@ mod memory_wait_tests {
             let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
             let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
             let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
-            // The client's large receive ring keeps it above its fair share.
+            // The data the client holds unread keeps it above its fair
+            // share.
             let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
             let client = a
                 .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
                 .unwrap();
             exchange(&mut a, &mut b, 0);
             let server = b.accept(listener).unwrap();
+            hold_unread(&mut a, &mut b, server, 4096);
             for port in 40001..40004 {
                 connect(&mut a, &mut b, listener, port);
             }
@@ -10245,8 +10130,8 @@ mod memory_wait_tests {
         assert_eq!(counters.buffer_bytes, base + 2001);
     }
 
-    // An active open, a SYN and a growth the budget refuses each count, the
-    // SYN in listen_drops too.
+    // An active open, a SYN and a send growth the budget refuses each
+    // count, the SYN in listen_drops too.
     #[test]
     fn memory_counters_count_refused_opens_and_growths() {
         let (mut a, mut b, listener) = endpoints();
@@ -10262,12 +10147,11 @@ mod memory_wait_tests {
         // The ledgers hold entries for `room` more bytes; more is refused.
         let room = held(&a, client);
         assert_eq!(a.write(client, &long_data()), Ok(room));
-        assert_eq!(
-            a.set_buffer_capacities(client, 1024, 4096),
-            Err(Error::NoMemory.into())
-        );
+        // A larger receive size allocates nothing, so it is not refused
+        // (the receive ring it grew went in n0bw stage 1).
+        assert_eq!(a.set_buffer_capacities(client, 1024, 4096), Ok(()));
         let counters = a.memory_counters();
-        assert_eq!(counters.memory_refused_growths, 2);
+        assert_eq!(counters.memory_refused_growths, 1);
         assert_eq!(counters.memory_throttled_writes, 1);
         // The server has room for none: its SYN is dropped.
         let mut c = Endpoint::new(config(), [3; 32], 0, |_| true).unwrap();
@@ -10396,7 +10280,7 @@ mod memory_wait_tests {
     #[test]
     fn shared_buffer_memory_returned_by_one_member_wakes_anothers_writer() {
         let (mut a, mut b, listener) = endpoints();
-        let (writer, _) = connect(&mut a, &mut b, listener, 40000);
+        let (writer, server) = connect(&mut a, &mut b, listener, 40000);
         assert_eq!(a.write(writer, &[1; 9]), Ok(9));
         writable(&mut a, writer);
         // Storage b will give back.
@@ -10425,6 +10309,8 @@ mod memory_wait_tests {
         assert!(!group.waiting(0));
         assert!(!a.poll_shared_memory());
         exchange(&mut a, &mut b, 1);
+        // The server reads what it received, which the group charged.
+        while b.read(server, &mut [0; 1024]).is_ok() {}
         assert!(writable(&mut a, writer));
         assert_eq!(a.write(writer, &data[room..]), Ok(data.len() - room));
     }
@@ -10518,13 +10404,15 @@ mod memory_wait_tests {
         let mut a = Endpoint::new(tuned(), [1; 32], 0, |_| true).unwrap();
         let mut b = Endpoint::new(tuned(), [2; 32], 0, |_| true).unwrap();
         let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
-        // `big`'s large receive ring keeps it above its fair share.
+        // The data `big` holds unread keeps it above its fair share.
         let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
         let big = a
             .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
             .unwrap();
         exchange(&mut a, &mut b, 0);
-        b.accept(listener).unwrap();
+        let peer = b.accept(listener).unwrap();
+        // Above a third of a cap that also holds `other`'s records.
+        hold_unread(&mut a, &mut b, peer, 16384);
         let (fixed, _) = connect(&mut a, &mut b, listener, 40001);
         let (other, _) = connect(&mut a, &mut b, listener, 40002);
         a.set_send_buffer(fixed, 1024).unwrap();
@@ -10661,10 +10549,13 @@ mod memory_wait_tests {
         exchange(&mut a, &mut b, 1);
         assert!(writable(&mut a, writer));
         assert_eq!(a.write(writer, &data[room..]), Ok(data.len() - room));
-        // b's owner number is free again; dropped, b leaves as it did.
+        // b's owner number is free again; dropped, b leaves as it did. It
+        // rejoins with all it charges, the data its server holds unread
+        // included.
         let before = group.buffer_bytes();
+        let rejoining = b.buffer_bytes();
         b.share_buffer_memory(&group, 1).unwrap();
-        assert_eq!(group.buffer_bytes(), before + base_b + 600);
+        assert_eq!(group.buffer_bytes(), before + rejoining);
         assert_eq!(group.connections(), 2);
         assert!(!a.poll_shared_memory());
         drop(b);
@@ -10699,13 +10590,14 @@ mod memory_wait_tests {
         let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
         let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
         let listener = b.listen(REMOTE.parse().unwrap(), 4).unwrap();
-        // The writer's large receive ring keeps it above its fair share.
+        // The data the writer holds unread keeps it above its fair share.
         let local = SocketAddr::new("192.0.2.1".parse().unwrap(), 40000);
         let writer = a
             .connect_with_buffer_capacities(0, local, REMOTE.parse().unwrap(), 1024, 65536)
             .unwrap();
         exchange(&mut a, &mut b, 0);
-        b.accept(listener).unwrap();
+        let peer = b.accept(listener).unwrap();
+        hold_unread(&mut a, &mut b, peer, 4096);
         let (_, idle) = connect(&mut a, &mut b, listener, 40001);
         assert_eq!(a.write(writer, &[1; 9]), Ok(9));
         drain(&mut a, 1);

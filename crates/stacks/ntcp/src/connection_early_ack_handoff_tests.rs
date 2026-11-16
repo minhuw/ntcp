@@ -75,7 +75,6 @@ fn response(cfg: ConnectionConfig, iss: u32, pending: bool, fin: bool) -> Connec
         0,
         &syn,
         true,
-        &mut None,
         RxTimestamps::default(),
         RxPacketTimestamps::default(),
     )
@@ -303,7 +302,6 @@ fn early_ack_handoff_fin_data_and_empty_control_are_separate() {
             0,
             &syn,
             true,
-            &mut None,
             RxTimestamps::default(),
             RxPacketTimestamps::default(),
         )

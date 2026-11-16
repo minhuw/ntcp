@@ -191,14 +191,19 @@ fn prepared_write_output_ack_and_reuse_need_no_more_allocations() {
     a.prepare_send_metadata(64, None, usize::MAX, None).unwrap();
     let retained = metadata_bytes(&a);
     let mut bytes = [0; 256];
-    crate::allocation_tests::fail_after(0, || {
+    // Only the sender's calls run without allocations: the receiver holds
+    // the data in a heap frame (n0bw stage 1).
+    let n = crate::allocation_tests::fail_after(0, || {
         assert_eq!(a.write(&[7; 64]), Ok(64));
-        let n = a.transmit(40, &mut bytes).unwrap().unwrap();
-        let segment = wire::parse(ip(a.tuple()), &bytes[..n]).unwrap();
-        b.input(40, &segment).unwrap();
-        b.timeout(300_040).unwrap();
-        let n = b.transmit(300_040, &mut bytes).unwrap().unwrap();
-        let ack = wire::parse(ip(b.tuple()), &bytes[..n]).unwrap();
+        a.transmit(40, &mut bytes).unwrap().unwrap()
+    });
+    let segment = wire::parse(ip(a.tuple()), &bytes[..n]).unwrap();
+    b.input(40, &segment).unwrap();
+    b.timeout(300_040).unwrap();
+    let mut ack = [0; 256];
+    let n = b.transmit(300_040, &mut ack).unwrap().unwrap();
+    crate::allocation_tests::fail_after(0, || {
+        let ack = wire::parse(ip(b.tuple()), &ack[..n]).unwrap();
         a.input(300_040, &ack).unwrap();
         assert_eq!(a.send.len(), 0);
         assert_eq!(a.write(&[8; 64]), Ok(64));

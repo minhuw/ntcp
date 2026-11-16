@@ -3,6 +3,9 @@
 // randomized equivalence test runs it in lockstep with ReceiveBuffer.
 #![allow(dead_code)]
 use super::*;
+use crate::{rx_queue::ReceiveOutcome, seq::Seq};
+use alloc::alloc::{Layout, alloc_zeroed};
+use core::mem::MaybeUninit;
 
 #[derive(Debug)]
 pub(crate) struct ReferenceReceiveBuffer {
@@ -968,6 +971,7 @@ impl ReferenceReceiveBuffer {
             advanced: false,
             fin: false,
             out_of_order: (!payload.is_empty() || fin) && sequence != previous_next,
+            refused: false,
         };
         if self.eof || (payload.is_empty() && !fin) {
             return outcome;
@@ -1128,5 +1132,267 @@ impl ReferenceReceiveBuffer {
             }
         }
         outcome
+    }
+}
+
+// The ring's representation, kept with the reference alone since the
+// receive ring itself went (n0bw stage 1).
+
+// `len` zeroed elements, allocated as zeroed memory: their pages are not
+// touched until used.
+//
+// SAFETY: the all-zero bit pattern must be a valid `T`.
+unsafe fn zeroed_vec<T>(len: usize) -> Result<Vec<T>, ()> {
+    let layout = Layout::array::<T>(len).map_err(|_| ())?;
+    if layout.size() == 0 {
+        return Ok(Vec::new());
+    }
+    let pointer = unsafe { alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err(());
+    }
+    // Zeroed elements are valid (caller); the allocation uses Vec's exact layout.
+    Ok(unsafe { Vec::from_raw_parts(pointer.cast(), len, len) })
+}
+
+// The presence bits of the 32 slots of one metadata word.
+const PRESENT_BITS: u64 = 0x5555_5555_5555_5555;
+
+// One bit per chunk of 32 receive slots (one metadata word), summarized
+// upwards 64 bits per word, so that the next or previous chunk of interest
+// is found in one step per level whatever the distance, as Linux finds the
+// out-of-order queue's next skb in its rbtree rather than by walking the
+// window. A chunk bit is stored as `interest ^ flip`: a summary of chunks
+// holding a byte keeps flip 0, one of chunks missing a byte keeps it set,
+// so that zeroed storage is the empty ring's state for both. A word's bit at
+// the next level up is set exactly when the word has an interesting bit.
+#[derive(Debug)]
+pub(crate) struct ChunkSummary {
+    // Level k occupies words[levels[k]..levels[k + 1]]; level 0 holds the
+    // chunk bits and the last level a single word, kept in `top` rather
+    // than allocated, so a ring of up to 64 chunks allocates nothing here.
+    words: Vec<u64>,
+    top: u64,
+    levels: [usize; 8],
+    depth: usize,
+    flip: u64,
+}
+
+impl ChunkSummary {
+    // The heap bytes `new(chunks, _)` allocates: every word but the top.
+    fn allocation_bytes(chunks: usize) -> usize {
+        let (mut len, mut total) = (chunks.div_ceil(64).max(1), 0);
+        loop {
+            total += len;
+            if len == 1 {
+                break;
+            }
+            len = len.div_ceil(64);
+        }
+        (total - 1) * core::mem::size_of::<u64>()
+    }
+
+    fn new(chunks: usize, flip: bool) -> Result<Self, ()> {
+        let mut levels = [0; 8];
+        let (mut depth, mut len, mut total) = (0, chunks.div_ceil(64).max(1), 0);
+        loop {
+            levels[depth] = total;
+            total += len;
+            depth += 1;
+            if len == 1 {
+                break;
+            }
+            len = len.div_ceil(64);
+        }
+        levels[depth] = total;
+        Ok(Self {
+            // SAFETY: zero is a valid u64.
+            words: unsafe { zeroed_vec(total - 1)? },
+            top: 0,
+            levels,
+            depth,
+            flip: if flip { !0 } else { 0 },
+        })
+    }
+
+    fn storage_bytes(&self) -> usize {
+        self.words.capacity() * core::mem::size_of::<u64>()
+    }
+
+    fn clear(&mut self) {
+        self.words.fill(0);
+        self.top = 0;
+    }
+
+    // Word `at` of the levels as stored, the last one being `top`.
+    fn raw(&self, at: usize) -> u64 {
+        *self.words.get(at).unwrap_or(&self.top)
+    }
+
+    fn set_raw(&mut self, at: usize, value: u64) {
+        *self.words.get_mut(at).unwrap_or(&mut self.top) = value;
+    }
+
+    // The interesting bits of word `word` of level `level`, or none past the
+    // level's end (a summary bit of a word that does not exist).
+    fn interest(&self, level: usize, word: usize) -> u64 {
+        let at = self.levels[level] + word;
+        if at < self.levels[level + 1] {
+            self.raw(at) ^ self.flip
+        } else {
+            0
+        }
+    }
+
+    fn mark(&mut self, chunk: usize, interesting: bool) {
+        self.mark_level(0, chunk, interesting);
+    }
+
+    // `mark` for every chunk of `chunks`, a word at a time.
+    fn mark_run(&mut self, chunks: core::ops::Range<usize>, interesting: bool) {
+        let mut chunk = chunks.start;
+        while chunk < chunks.end {
+            let word = chunk / 64;
+            let end = chunks.end.min((word + 1) * 64);
+            let bits = (!0 >> (64 - (end - chunk))) << (chunk % 64);
+            let at = self.levels[0] + word;
+            let old = self.raw(at) ^ self.flip;
+            let new = if interesting { old | bits } else { old & !bits };
+            self.set_raw(at, new ^ self.flip);
+            if (old != 0) != (new != 0) {
+                self.mark_level(1, word, new != 0);
+            }
+            chunk = end;
+        }
+    }
+
+    // Sets bit `index` of level `level` and the summary bits above it.
+    fn mark_level(&mut self, level: usize, mut index: usize, mut interesting: bool) {
+        for level in level..self.depth {
+            let at = self.levels[level] + index / 64;
+            let bit = 1 << (index % 64);
+            let old = self.raw(at) ^ self.flip;
+            let new = if interesting { old | bit } else { old & !bit };
+            if new == old {
+                return;
+            }
+            self.set_raw(at, new ^ self.flip);
+            if (old != 0) == (new != 0) {
+                return;
+            }
+            interesting = new != 0;
+            index /= 64;
+        }
+    }
+
+    // The first interesting chunk at or after `chunk`. A chunk past the end
+    // of the ring may be returned; callers bound the result.
+    fn next(&self, chunk: usize) -> Option<usize> {
+        let (mut level, mut index) = (0, chunk);
+        loop {
+            let bits = self.interest(level, index / 64) & (!0 << (index % 64));
+            if bits != 0 {
+                index = index / 64 * 64 + bits.trailing_zeros() as usize;
+                break;
+            }
+            if level + 1 == self.depth {
+                return None;
+            }
+            level += 1;
+            index = index / 64 + 1;
+        }
+        while level > 0 {
+            level -= 1;
+            let bits = self.interest(level, index);
+            if bits == 0 {
+                return None;
+            }
+            index = index * 64 + bits.trailing_zeros() as usize;
+        }
+        Some(index)
+    }
+
+    // The last interesting chunk at or before `chunk`, a chunk of the ring.
+    fn previous(&self, chunk: usize) -> Option<usize> {
+        let (mut level, mut index) = (0, chunk);
+        loop {
+            let bits = self.interest(level, index / 64) & (!0 >> (63 - index % 64));
+            if bits != 0 {
+                index = index / 64 * 64 + 63 - bits.leading_zeros() as usize;
+                break;
+            }
+            if index < 64 || level + 1 == self.depth {
+                return None;
+            }
+            level += 1;
+            index = index / 64 - 1;
+        }
+        while level > 0 {
+            level -= 1;
+            index = index * 64 + 63 - self.interest(level, index).leading_zeros() as usize;
+        }
+        Some(index)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReceiveOutputUndo {
+    reported: [Option<Seq>; 4],
+    dsack: Option<(Seq, Seq)>,
+    report_debt: usize,
+    pending_first: Option<Seq>,
+    pending_byte: Option<(usize, u8)>,
+}
+
+// The `width`-bit field of `slot` in a bitmap of 8 / `width` slots per byte.
+fn field(map: &[u8], width: usize, slot: usize) -> u8 {
+    let per_byte = 8 / width;
+    (map[slot / per_byte] >> (width * (slot % per_byte))) & ((1 << width) - 1)
+}
+
+fn set_field(map: &mut [u8], width: usize, slot: usize, value: u8) {
+    let per_byte = 8 / width;
+    let shift = width * (slot % per_byte);
+    let byte = &mut map[slot / per_byte];
+    *byte = (*byte & !(((1 << width) - 1) << shift)) | (value << shift);
+}
+
+// Moves the fields of slots [from, from + count) up to [to, to + count),
+// to > from, overlapping as memmove may, then clears the source slots left
+// behind. A distance of whole bytes moves the inner bytes as bytes.
+fn move_fields(map: &mut [u8], width: usize, from: usize, to: usize, count: usize) {
+    let per_byte = 8 / width;
+    let distance = to - from;
+    let end = from + count;
+    // Highest slot first, so no source is overwritten before it moves.
+    let mut slot = end;
+    if distance.is_multiple_of(per_byte) {
+        while slot > from && !slot.is_multiple_of(per_byte) {
+            slot -= 1;
+            set_field(map, width, slot + distance, field(map, width, slot));
+        }
+        let first = from.next_multiple_of(per_byte);
+        if slot > first {
+            map.copy_within(
+                first / per_byte..slot / per_byte,
+                (first + distance) / per_byte,
+            );
+            slot = first;
+        }
+    }
+    while slot > from {
+        slot -= 1;
+        set_field(map, width, slot + distance, field(map, width, slot));
+    }
+    let cleared = from..end.min(to);
+    let mut slot = cleared.start;
+    while slot < cleared.end && !slot.is_multiple_of(per_byte) {
+        set_field(map, width, slot, 0);
+        slot += 1;
+    }
+    let whole = cleared.end.saturating_sub(slot) / per_byte * per_byte;
+    map[slot / per_byte..(slot + whole) / per_byte].fill(0);
+    for slot in slot + whole..cleared.end {
+        set_field(map, width, slot, 0);
     }
 }

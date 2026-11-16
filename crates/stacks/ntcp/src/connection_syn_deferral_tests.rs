@@ -66,7 +66,6 @@ fn ordinary_syn_deferral_window_controls_overlap_time_and_output_matrix() {
                                     10,
                                     &initial,
                                     false,
-                                    &mut None,
                                     metadata,
                                     stamps(111),
                                 )
@@ -125,10 +124,12 @@ fn ordinary_syn_deferral_window_controls_overlap_time_and_output_matrix() {
                                 payload: if retransmit { b"XXXXXXXXXXkl" } else { b"" },
                                 ..initial
                             };
-                            crate::allocation_tests::fail_after(0, || {
-                                c.input_with_timestamps(20, 0, &final_ack, stamps(333))
-                            })
-                            .unwrap();
+                            // RX timestamp metadata never allocates on input;
+                            // new text's frame does (n0bw stage 1).
+                            let metadata = c.rx_timestamps.storage_bytes();
+                            c.input_with_timestamps(20, 0, &final_ack, stamps(333))
+                                .unwrap();
+                            assert_eq!(c.rx_timestamps.storage_bytes(), metadata);
                             assert!(c.handshake_complete());
                             assert!(c.deferred_syn.is_none());
                             let expected = if retransmit && capacity > 10 && !fin {
@@ -192,7 +193,6 @@ fn ordinary_syn_invalid_completion_reset_abort_and_timeout_never_publish() {
             0,
             &initial,
             false,
-            &mut None,
             metadata,
             stamps(111),
         )

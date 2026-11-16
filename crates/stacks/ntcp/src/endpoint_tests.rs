@@ -2978,7 +2978,10 @@ fn a_reopened_connection_that_fails_leaves_no_time_wait() {
         let seq = h.acknowledgment.wrapping_add(100);
         let syn = tw_segment_with_payload(ip, h, seq, 0, wire::SYN, Some((ts + 1, 0)), payload);
         b.input(4_000, ip, &syn).unwrap();
-        assert_eq!(b.buffer_bytes(), baseline + charge);
+        assert_eq!(
+            b.buffer_bytes(),
+            baseline + charge + syn_data_charge(payload.len())
+        );
         assert_eq!(b.time_wait_connections(), 0);
         if released {
             assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
@@ -3673,7 +3676,7 @@ fn time_wait_old_expiry_and_slot_generation_do_not_remove_or_restore_replacement
             .sequence;
         b.on_timeout(expiry, 64).unwrap();
         packets(&mut b, expiry);
-        assert_eq!(b.buffer_bytes(), baseline);
+        assert_eq!(b.buffer_bytes(), baseline + syn_data_charge(payload.len()));
         assert_eq!(b.state(old), Err(EndpointError::InvalidHandle));
         // Reuse the expired slot for another tuple before candidate resolution.
         let spare = b
@@ -4895,16 +4898,23 @@ pub(crate) fn ledger_target(segments: usize) -> usize {
     (segments.max(10) * 2 + crate::rack::SPARE).next_power_of_two()
 }
 
-// A connection's charge at open, and a pooled one's: its receive ring
-// (payload, 2-bit presence/PUSH and 1-bit report maps), scratch segment and
-// the sender ledgers' first entries (two RACK intervals, four SACK ranges).
+// What a child holds for `len` bytes of SYN data until establishment: a
+// frame of them and the deque slot reserved for their promotion.
+fn syn_data_charge(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let mut deque = alloc::collections::VecDeque::<ntcp_buffer::RxFrame>::new();
+    deque.try_reserve(1).unwrap();
+    len + deque.capacity() * core::mem::size_of::<ntcp_buffer::RxFrame>()
+}
+
+// A connection's charge at open: its scratch segment and the sender
+// ledgers' first entries (two RACK intervals, four SACK ranges).
 fn connection_charge(cfg: &EndpointConfig) -> usize {
-    let receive = cfg.connection.receive_capacity;
-    receive
-        + receive.div_ceil(4)
-        + receive.div_ceil(8)
-        + usize::from(cfg.connection.mss)
-        + open_ledgers()
+    // The receive window allocates nothing: received data is charged as it
+    // is held (n0bw stage 1).
+    usize::from(cfg.connection.mss) + open_ledgers()
 }
 
 // What a connection's first write, of `live` bytes, adds to its charge: the
@@ -4915,8 +4925,11 @@ fn first_write_charge(cfg: &EndpointConfig, live: usize) -> usize {
     2 * cfg.connection.send_capacity + ledgers(ledger_target(segments)) - open_ledgers()
 }
 
+// preallocate_connections reserves nothing since the receive rings it
+// pooled went (n0bw stage 1, Q4): it is validated as it was, within
+// max_connections and with that many open charges within the budget.
 #[test]
-fn receive_preallocation_validates_limits_and_overflow_before_allocating() {
+fn preallocate_connections_is_validated_and_reserves_nothing() {
     assert_eq!(EndpointConfig::default().preallocate_connections, 0);
     let mut cfg = config();
     cfg.preallocate_connections = cfg.max_connections + 1;
@@ -4932,7 +4945,7 @@ fn receive_preallocation_validates_limits_and_overflow_before_allocating() {
     ));
     cfg.max_buffer_bytes += 1;
     let endpoint = Endpoint::new(cfg, [1; 32], 0, test_policy).unwrap();
-    assert_eq!(endpoint.buffer_bytes(), 2 * connection_charge(&config()));
+    assert_eq!(endpoint.buffer_bytes(), 0);
     let mut cfg = config();
     cfg.max_connections = usize::MAX / 2;
     cfg.preallocate_connections = cfg.max_connections;
@@ -4941,23 +4954,15 @@ fn receive_preallocation_validates_limits_and_overflow_before_allocating() {
         Endpoint::new(cfg, [1; 32], 0, test_policy),
         Err(EndpointError::LimitReached)
     ));
-    let mut cfg = config();
-    cfg.connection.receive_capacity = usize::MAX;
-    cfg.preallocate_connections = 1;
-    assert!(matches!(
-        Endpoint::new(cfg, [1; 32], 0, test_policy),
-        Err(EndpointError::LimitReached)
-    ));
 }
 
 #[test]
-fn receive_preallocation_failed_constructors_preserve_reserved_budget() {
+fn failed_constructors_leave_no_charge() {
     let (local, remote) = addresses();
     for preallocate in [0, 1] {
         let mut cfg = config();
         cfg.preallocate_connections = preallocate;
         cfg.connection.mss = 0;
-        let charge = connection_charge(&cfg);
         let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
         let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
         b.listen(remote, 1).unwrap();
@@ -4973,21 +4978,28 @@ fn receive_preallocation_failed_constructors_preserve_reserved_budget() {
                 b.input(0, syn.0, &syn.1),
                 Err(EndpointError::Connection(Error::InvalidArgument))
             );
-            assert_eq!(a.buffer_bytes(), preallocate * charge);
-            assert_eq!(b.buffer_bytes(), preallocate * charge);
+            assert_eq!(a.buffer_bytes(), 0);
+            assert_eq!(b.buffer_bytes(), 0);
             assert!(packets(&mut a, 0).is_empty());
             assert!(packets(&mut b, 0).is_empty());
         }
     }
 }
 
+// The charge of `id`'s connection, as the Endpoint settled it.
+fn charge_of(e: &Endpoint, id: ConnectionId) -> usize {
+    e.transport_info(id).unwrap().buffer_charge
+}
+
+// With preallocate_connections set (it reserves nothing), a connection is
+// charged its open charge when it opens, its first write adds its send ring
+// and ledgers, data it holds unread is charged until read, and a reclaim
+// returns all of it; the budget admits opens up to what it holds.
 #[test]
-fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
+fn opens_are_charged_as_they_happen_and_reclaims_return_everything() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.preallocate_connections = 1;
-    // A connection is charged what it holds at open, as a pooled one is,
-    // and its first write adds its send ring and ledgers.
     let charge = connection_charge(&cfg);
     let written = first_write_charge(&cfg, 9);
     // While the grown ledgers are filled the first ones are still held.
@@ -4997,7 +5009,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     let mut b = Endpoint::new(cfg.clone(), [2; 32], 0, test_policy).unwrap();
     let listener = b.listen(remote, 4).unwrap();
-    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
+    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (0, 0));
     let first = a.connect(0, local, remote).unwrap();
     assert_eq!(a.buffer_bytes(), charge);
     assert_eq!(
@@ -5018,8 +5030,10 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     );
     pump(&mut a, &mut b, 0);
     let servers = [b.accept(listener).unwrap(), b.accept(listener).unwrap()];
-    assert_eq!(b.buffer_bytes(), 2 * charge);
-    // Reclaim two allocations into a one-entry pool: only one charge survives.
+    // One server holds the 9 bytes unread.
+    let charges = servers.map(|id| charge_of(&b, id));
+    assert_eq!(b.buffer_bytes(), charges[0] + charges[1]);
+    assert!(charges.contains(&charge) && charges.iter().any(|&c| c > charge + 9));
     for id in [first, second] {
         a.abort(id).unwrap();
         a.release(id).unwrap();
@@ -5029,14 +5043,13 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
         // Reclaimed once its reset is out.
         assert!(!a.connection_exists(id));
     }
-    assert_eq!(a.buffer_bytes(), charge);
+    assert_eq!(a.buffer_bytes(), 0);
     for id in servers {
         b.abort(id).unwrap();
         b.release(id).unwrap();
         packets(&mut b, 0);
     }
-    assert_eq!(b.buffer_bytes(), charge);
-    // At the reserved budget, active and passive opens must still be admitted.
+    assert_eq!(b.buffer_bytes(), 0);
     let fresh = a.connect(time_wait, local, remote).unwrap();
     pump(&mut a, &mut b, time_wait);
     let server = b.accept(listener).unwrap();
@@ -5047,14 +5060,15 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     a.shutdown(fresh).unwrap();
     pump(&mut a, &mut b, time_wait);
     assert_eq!(b.state(server), Ok(State::CloseWait));
-    // Keep old unread payload and EOF in the receive buffer through abort/reclaim.
+    assert!(b.buffer_bytes() > charge + 9);
+    // Old unread payload and EOF go with the abort and reclaim.
     b.abort(server).unwrap();
     b.release(server).unwrap();
     pump(&mut a, &mut b, time_wait);
     a.release(fresh).unwrap();
     packets(&mut a, time_wait);
     b.on_timeout(2 * time_wait, 1).unwrap();
-    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (charge, charge));
+    assert_eq!((a.buffer_bytes(), b.buffer_bytes()), (0, 0));
     let replacement = a.connect(2 * time_wait + 1, local, remote).unwrap();
     pump(&mut a, &mut b, 2 * time_wait + 1);
     let server = b.accept(listener).unwrap();
@@ -5075,6 +5089,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
     assert_eq!(b.read(server, &mut out), Ok(3));
     assert_eq!(&out[..3], b"new");
     assert_eq!(&out[3..], &[0xaa; 13]);
+    // The read released the frame: the server holds its open charge.
     assert_eq!(
         (a.buffer_bytes(), b.buffer_bytes()),
         (charge + first_write_charge(&cfg, 3), charge)
@@ -5082,7 +5097,7 @@ fn receive_preallocation_active_passive_recycle_and_budget_accounting() {
 }
 
 #[test]
-fn receive_preallocation_time_wait_reopen_keeps_charges() {
+fn time_wait_reopen_charges_only_the_new_connection() {
     let mut cfg = config();
     cfg.preallocate_connections = 2;
     let charge = connection_charge(&cfg);
@@ -5092,18 +5107,18 @@ fn receive_preallocation_time_wait_reopen_keeps_charges() {
         local: addresses().1,
         remote: addresses().0,
     };
-    // Released, the connection is reclaimed into its TIME-WAIT record and
-    // its receive storage returns to the pool.
+    // Released, the connection is reclaimed into its TIME-WAIT record,
+    // which holds no buffers.
     b.release(old).unwrap();
     assert!(!b.connection_exists(old));
-    assert_eq!(b.buffer_bytes(), 2 * charge);
+    assert_eq!(b.buffer_bytes(), 0);
     let seq = h.acknowledgment.wrapping_add(100);
     let syn = tw_segment(ip, h, seq, 0, wire::SYN, None);
     assert_eq!(b.input(4_000, ip, &syn), Ok(InputDisposition::Processed));
     let child = b.connection_id(tuple).unwrap();
     assert_ne!(child, old);
     assert_eq!(b.time_wait_connections(), 0);
-    assert_eq!(b.buffer_bytes(), 2 * charge);
+    assert_eq!(b.buffer_bytes(), charge);
     packets(&mut b, 4_000);
     let rst = tw_segment(ip, h, seq + 1, 0, wire::RST, None);
     b.input(5_000, ip, &rst).unwrap();
@@ -5112,9 +5127,9 @@ fn receive_preallocation_time_wait_reopen_keeps_charges() {
     assert_eq!(b.connection_id(tuple), None);
     assert_eq!(b.time_wait_connections(), 0);
     assert!(!b.connection_exists(child));
-    assert_eq!(b.buffer_bytes(), 2 * charge);
+    assert_eq!(b.buffer_bytes(), 0);
     assert!(b.connect(5_000, tuple.local, tuple.remote).is_ok());
-    assert_eq!(b.buffer_bytes(), 2 * charge);
+    assert_eq!(b.buffer_bytes(), charge);
 }
 
 // `b` accepts a connection from `a`, takes 13 bytes and `a`'s FIN without
@@ -6320,40 +6335,30 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
     assert_eq!(a.buffer_bytes(), original_charge);
     assert_eq!(a.write(client, b"!"), Err(Error::WouldBlock.into()));
+    // Neither size allocates: the send ring grows at write, and received
+    // data is held as it arrives (the receive ring this grew went in n0bw
+    // stage 1). No resize changes the charge or is refused for memory.
     a.set_buffer_capacities(client, 2048, 2048).unwrap();
-    let grown_charge = a.buffer_bytes();
-    assert!(grown_charge > original_charge);
+    assert_eq!(a.buffer_bytes(), original_charge);
     assert!(
         matches!(a.next_event(), Some(Event::Connection(id, events)) if id == client && events.writable)
     );
     a.set_buffer_capacities(client, 128, 128).unwrap();
-    assert_eq!(a.buffer_bytes(), grown_charge);
-    // The receive ring's three parts grow in place; the send ring grows at
-    // write. A part that grew before another failed keeps its storage, and
-    // its charge.
-    for allocation in 0..3 {
-        assert_eq!(
-            crate::allocation_tests::fail_after(allocation, || a
-                .set_buffer_capacities(client, 4096, 4096)),
-            Err(Error::NoMemory.into())
-        );
-        assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
-        let info = a.transport_info(client).unwrap();
-        assert_eq!(a.buffer_bytes(), info.buffer_charge);
-        assert!(a.buffer_bytes() >= grown_charge);
-        assert_eq!(info.send_used, 512);
-    }
-    let grown_charge = a.buffer_bytes();
+    assert_eq!(a.buffer_bytes(), original_charge);
+    crate::allocation_tests::fail_after(0, || a.set_buffer_capacities(client, 4096, 4096)).unwrap();
+    let info = a.transport_info(client).unwrap();
+    assert_eq!(a.buffer_bytes(), info.buffer_charge);
+    assert_eq!(a.buffer_bytes(), original_charge);
+    assert_eq!(info.send_used, 512);
     assert_eq!(
         a.set_buffer_capacities(client, 1 << 30, 1),
         Err(Error::InvalidArgument.into())
     );
-    assert_eq!(
-        a.set_buffer_capacities(client, 1 << 29, 1 << 29),
-        Err(Error::NoMemory.into())
-    );
+    a.set_buffer_capacities(client, 1 << 29, 1 << 29).unwrap();
+    assert_eq!(a.buffer_bytes(), original_charge);
+    a.set_buffer_capacities(client, 128, 128).unwrap();
     assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
-    assert_eq!(a.buffer_bytes(), grown_charge);
+    let grown_charge = a.buffer_bytes();
     pump(&mut a, &mut b, 0);
     let mut bytes = [0; 512];
     assert_eq!(b.read(server, &mut bytes), Ok(512));
@@ -6368,35 +6373,36 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
 }
 
 #[test]
-fn buffer_capacities_prehandshake_inheritance_and_pool_mismatch() {
+fn buffer_capacities_prehandshake_inheritance_and_open_charge() {
     let (local, remote) = addresses();
     let mut cfg = config();
     cfg.preallocate_connections = 1;
-    let reserved = connection_charge(&cfg);
-    cfg.max_buffer_bytes = reserved;
+    let charge = connection_charge(&cfg);
+    cfg.max_buffer_bytes = charge;
     let mut limited = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     for allocation in 0..4 {
         assert_eq!(
             crate::allocation_tests::fail_after(allocation, || limited.connect(0, local, remote)),
             Err(Error::NoMemory.into())
         );
-        assert_eq!(limited.buffer_bytes(), reserved);
+        assert_eq!(limited.buffer_bytes(), 0);
         assert_eq!(limited.connection_id(Tuple { local, remote }), None);
     }
-    // Incompatible pooled storage is neither reused nor silently enlarged.
-    assert_eq!(
-        limited.connect_with_buffer_capacities(0, local, remote, 32, 32),
-        Err(Error::NoMemory.into())
-    );
-    assert_eq!(limited.buffer_bytes(), reserved);
-    let id = limited
-        .connect_with_buffer_capacities(0, local, remote, 32, 1024)
-        .unwrap();
-    assert_eq!(limited.buffer_capacities(id), Ok((32, 1024)));
-    // No send ring before the first write: the send capacity is not charged.
-    assert_eq!(limited.buffer_bytes(), reserved);
+    // Neither size is charged at open: no send ring before the first
+    // write, and received data only as it is held (n0bw stage 1), so a
+    // budget of one open charge admits either.
+    for receive in [32, 1024] {
+        let id = limited
+            .connect_with_buffer_capacities(0, local, remote, 32, receive)
+            .unwrap();
+        assert_eq!(limited.buffer_capacities(id), Ok((32, receive)));
+        assert_eq!(limited.buffer_bytes(), charge);
+        limited.abort(id).unwrap();
+        limited.release(id).unwrap();
+        packets(&mut limited, 0);
+        assert_eq!(limited.buffer_bytes(), 0);
+    }
 
-    // Room for the 256 KiB and 128 KiB receive rings.
     cfg.max_buffer_bytes = 1 << 20;
     let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
     let mut b = Endpoint::new(cfg, [2; 32], 0, test_policy).unwrap();
@@ -6429,8 +6435,8 @@ fn buffer_capacities_prehandshake_inheritance_and_pool_mismatch() {
     assert_eq!(b.accept(listener), Ok(child));
     assert_eq!(b.buffer_capacities(child), Ok((4096, 131072)));
     assert_eq!(a.buffer_capacities(client), Ok((2048, 262144)));
-    // A mismatched pool remains charged alongside the new child.
-    assert!(b.buffer_bytes() > reserved);
+    // preallocate_connections reserved nothing: b holds its child alone.
+    assert_eq!(b.buffer_bytes(), charge_of(&b, child));
 }
 
 #[test]
@@ -6957,10 +6963,12 @@ fn rx_timestamp_endpoint_validation_peek_copyout_retry_and_sources() {
         b.peek_rx_timestamps(server, 1),
         Err(EndpointError::Connection(Error::InvalidArgument))
     );
-    crate::allocation_tests::fail_after(0, || {
-        b.input_with_timestamps(5, tx.ip, 0, Ipv4Options::default(), bytes, timestamps)
-    })
-    .unwrap();
+    // RX timestamp metadata never allocates on input; the payload's frame
+    // does (n0bw stage 1: received data is held as heap frames).
+    let metadata = b.rx_timestamp_storage(server);
+    b.input_with_timestamps(5, tx.ip, 0, Ipv4Options::default(), bytes, timestamps)
+        .unwrap();
+    assert_eq!(b.rx_timestamp_storage(server), metadata);
     let info = b.peek_rx_timestamps(server, 6).unwrap().unwrap();
     assert_eq!((info.start, info.end, info.timestamps), (0, 6, timestamps));
     assert_eq!(

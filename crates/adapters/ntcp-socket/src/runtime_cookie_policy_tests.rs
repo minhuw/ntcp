@@ -977,40 +977,41 @@ fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows
             config.fast_open_cookie_lifetime =
                 ntcp::FastOpenCookieLifetime::from_micros(100).unwrap();
             config.tcp.max_connections = 16;
-            config.tcp.preallocate_connections = 16;
             config.tcp.connection.timestamps = false;
-            let mut probe = Endpoint::new(config.tcp.clone(), [42; 32], 0, |_| true).unwrap();
-            probe.enable_fast_open().unwrap();
-            let lease = ntcp::FastOpenKeyLease::for_lifetime(
-                0,
-                config.fast_open_cookie_lifetime,
-                config.tcp.connection.timebase,
-                true,
-            )
-            .unwrap();
-            probe
-                .register_fast_open_key(0, ntcp::FastOpenServerKey::HmacSha256([1; 32]), lease)
+            // The owner up to its first flow, live, with budget `budget`.
+            let open = |budget: usize| {
+                let mut config = config.clone();
+                config.tcp.max_buffer_bytes = budget;
+                let mut owner = Owner::with_config(
+                    local,
+                    (local, if local.is_ipv4() { 32 } else { 128 }),
+                    [42; 32],
+                    None,
+                    config.tcp.clone(),
+                )
                 .unwrap();
-            config.tcp.max_buffer_bytes = probe.buffer_bytes();
-            let budget = config.tcp.max_buffer_bytes;
-            let mut owner = Owner::with_config(
-                local,
-                (local, if local.is_ipv4() { 32 } else { 128 }),
-                [42; 32],
-                None,
-                config.tcp.clone(),
-            )
-            .unwrap();
-            owner.test_now = Some(0);
-            owner.fast_open_entropy = Some(VecDeque::from([Ok([1; 32]), Ok([2; 32]), Ok([3; 32])]));
-            owner.apply_socket_config(&config).unwrap();
-            let id = listener(&mut owner, 8080);
-            owner
-                .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
-                .unwrap();
-            owner.execute(id, Op::Listen(16)).unwrap();
-            let (cookie, live) = native_exchange(&mut owner, id, 40000, None, false);
-            let cookie = cookie.unwrap();
+                owner.test_now = Some(0);
+                owner.fast_open_entropy =
+                    Some(VecDeque::from([Ok([1; 32]), Ok([2; 32]), Ok([3; 32])]));
+                owner.apply_socket_config(&config).unwrap();
+                let id = listener(&mut owner, 8080);
+                owner
+                    .execute(id, Op::Set(IPPROTO_TCP, TCP_FASTOPEN, 16))
+                    .unwrap();
+                owner.execute(id, Op::Listen(16)).unwrap();
+                let (cookie, live) = native_exchange(&mut owner, id, 40000, None, false);
+                assert!(cookie.is_some());
+                (owner, live)
+            };
+            // The budget is what the owner holds once its live flow is
+            // open: the registry has no room to grow. The 16 pooled
+            // connections preallocate_connections once reserved here let
+            // further flows open under it; since n0bw stage 1 it reserves
+            // nothing, and that a cookie stays valid until its key expires
+            // after failed rotations is the entropy-failure test's.
+            let budget = open(usize::MAX / 4).0.endpoint.buffer_bytes();
+            let (mut owner, live) = open(budget);
+            assert_eq!(owner.endpoint.buffer_bytes(), budget);
             let usage = owner.endpoint.fast_open_key_registry_usage();
             owner.test_now = Some(100);
             assert_eq!(owner.rotate_fast_open_keys(100), Err(ENOMEM));
@@ -1019,13 +1020,8 @@ fn automatic_rotation_registry_exhaustion_is_observable_and_preserves_live_flows
                 Some(ENOMEM)
             );
             assert_eq!(owner.fast_open_keys.as_ref().unwrap().next_rotation, 200);
-            native_exchange(&mut owner, id, 40001, Some(cookie), true);
             owner.test_now = Some(200);
             assert_eq!(owner.rotate_fast_open_keys(200), Err(ENOMEM));
-            assert_eq!(
-                native_exchange(&mut owner, id, 40002, Some(cookie), false).0,
-                None
-            );
             assert_eq!(owner.endpoint.state(live), Ok(State::Established));
             // The budget is exactly exhausted, and the live flow's first
             // write needs its send ring: it waits for memory, as Linux's

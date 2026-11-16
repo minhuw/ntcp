@@ -6,7 +6,7 @@ use core::{mem::MaybeUninit, net::SocketAddr, num::NonZeroU8};
 use crate::{
     DropReason, RxPacketTimestamps, RxReadTimestamps, SendProgress, TxStreamRange,
     TxTimestampClock, TxTimestampRequest, TxTimestampSource, TxTimestampStage,
-    buffer::{ReceiveBuffer, SendBuffer},
+    buffer::SendBuffer,
     output_reservation::Departure,
     pacing::Pacer,
     pmtud_config::min_mtu,
@@ -14,6 +14,7 @@ use crate::{
     recovery::{
         Congestion, CongestionAlgorithm, InitialWindow, Prr, RecoveryAlgorithm, RttEstimator,
     },
+    rx_queue::{RxPayload, RxQueue},
     rx_timestamp::RxTimestamps,
     sack::Scoreboard,
     seq::Seq,
@@ -149,8 +150,8 @@ impl Default for PacingConfig {
 
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
-    // The initial send limit and receive ring (and window), Linux's
-    // tcp_wmem[1] and tcp_rmem[1].
+    // The initial send limit and receive window, Linux's tcp_wmem[1] and
+    // tcp_rmem[1].
     pub send_capacity: usize,
     pub receive_capacity: usize,
     // Each direction's floor and ceiling, Linux's tcp_wmem[0]/tcp_wmem[2]
@@ -880,7 +881,10 @@ pub(crate) struct Connection {
     events: ConnectionEvents,
     now: Instant,
     send: SendBuffer,
-    receive: ReceiveBuffer,
+    receive: RxQueue,
+    // The receive queue's storage as last settled with the Endpoint's
+    // budget (`settle_receive_charge`), the part of buffer_charge it holds.
+    receive_charged: usize,
     scratch: Vec<u8>,
     iss: Seq,
     irs: Option<Seq>,
@@ -1146,10 +1150,8 @@ pub(crate) struct Connection {
     // nothing pending skips the walk over them.
     refresh_work: bool,
     // The receive direction's limits, as the send direction's: whether it
-    // is tuned, the ring below which memory pressure still lets it grow
-    // (tcp_rmem[0]) and the ring it may grow to (tcp_rmem[2]).
+    // is tuned and the window_clamp DRS may raise it to (tcp_rmem[2]).
     receive_tuned: bool,
-    receive_min: usize,
     receive_max: usize,
     // The receiver's RTT estimate, Linux's rcv_rtt_est: eight times the
     // smoothed microseconds, 0 before the first sample; the sequence that
@@ -1169,16 +1171,8 @@ pub(crate) struct Connection {
     // offers from RCV.NXT while it learns what the connection needs. It
     // starts at the initial size and rises with the data received
     // (`grow_window`) toward window_clamp, the limit DRS raises: here
-    // config.receive_capacity. u32::MAX for a fixed or locked direction,
-    // whose ring backs its whole window from the open.
+    // config.receive_capacity. u32::MAX for a fixed or locked direction.
     rcv_ssthresh: u32,
-    // The window to offer passed what the ring backs: the Endpoint grows
-    // the ring before the next read returns or the next segment is built
-    // (`receive_ring_target`).
-    receive_grow_pending: bool,
-    // That growth was refused for memory: no other is asked for until the
-    // next DRS measure, as a refused DRS growth waited for one.
-    receive_growth_refused: bool,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1194,7 +1188,8 @@ impl Connection {
         iss: u32,
         now: Instant,
     ) -> Result<Self, Error> {
-        Self::active_with_receive(tuple, config, iss, now, &mut None)
+        Self::active_with_path(tuple, config, iss, now, None, None, None)
+            .map(|connection| *connection)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-1
@@ -1208,25 +1203,11 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
     //= reason=Constructor rejects TLP unless both RACK and SACK are configured; runtime additionally requires negotiated SACK.
     //# TLP requires RACK.
-    #[cfg(test)]
-    pub(crate) fn active_with_receive(
-        tuple: Tuple,
-        config: ConnectionConfig,
-        iss: u32,
-        now: Instant,
-        receive: &mut Option<ReceiveBuffer>,
-    ) -> Result<Self, Error> {
-        Self::active_with_receive_path(tuple, config, iss, now, receive, None, None, None)
-            .map(|connection| *connection)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn active_with_receive_path(
+    pub(crate) fn active_with_path(
         tuple: Tuple,
         mut config: ConnectionConfig,
         iss: u32,
         now: Instant,
-        receive: &mut Option<ReceiveBuffer>,
         managed_path: Option<crate::PreparedPath>,
         receive_capability: Option<crate::ReceiveIpCapability>,
         initial_ip_header_len: Option<u16>,
@@ -1337,13 +1318,6 @@ impl Connection {
         let rack = Rack::with_timebase(SPARE, config.timebase).map_err(|_| Error::NoMemory)?;
         let scoreboard = Scoreboard::with_capacity(0).map_err(|_| Error::NoMemory)?;
         let storage = Self::storage()?;
-        // Take pooled storage only after every fallible allocation has succeeded.
-        let receive = match receive.take() {
-            Some(receive) => receive,
-            None => {
-                ReceiveBuffer::new(Seq(0), config.receive_capacity).map_err(|_| Error::NoMemory)?
-            }
-        };
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
         let ack_ato = config.ack_timeout_floor();
         let connection = Self {
@@ -1364,7 +1338,8 @@ impl Connection {
             events: ConnectionEvents::default(),
             now,
             send,
-            receive,
+            receive: RxQueue::new(Seq(0)),
+            receive_charged: 0,
             scratch,
             iss: Seq(iss),
             irs: None,
@@ -1549,7 +1524,6 @@ impl Connection {
             send_expand_pending: false,
             refresh_work: false,
             receive_tuned,
-            receive_min: receive_sizes.min,
             receive_max: receive_sizes.max,
             rcv_rtt_us8: 0,
             rcv_rtt_seq: Seq(0),
@@ -1563,8 +1537,6 @@ impl Connection {
             } else {
                 u32::MAX
             },
-            receive_grow_pending: false,
-            receive_growth_refused: false,
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
@@ -1605,7 +1577,6 @@ impl Connection {
             now,
             syn,
             false,
-            &mut None,
             RxTimestamps::default(),
             RxPacketTimestamps::default(),
         )
@@ -1627,18 +1598,16 @@ impl Connection {
         now: Instant,
         syn: &Segment<'_>,
         early_authorized: bool,
-        receive: &mut Option<ReceiveBuffer>,
         rx_timestamps: RxTimestamps,
         timestamps: RxPacketTimestamps,
     ) -> Result<Self, Error> {
-        Self::passive_with_receive_path(
+        Self::passive_with_path(
             tuple,
             config,
             iss,
             now,
             syn,
             early_authorized,
-            receive,
             rx_timestamps,
             timestamps,
             None,
@@ -1649,14 +1618,13 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn passive_with_receive_path(
+    pub(crate) fn passive_with_path(
         tuple: Tuple,
         config: ConnectionConfig,
         iss: u32,
         now: Instant,
         syn: &Segment<'_>,
         early_authorized: bool,
-        receive: &mut Option<ReceiveBuffer>,
         rx_timestamps: RxTimestamps,
         timestamps: RxPacketTimestamps,
         managed_path: Option<crate::PreparedPath>,
@@ -1675,16 +1643,28 @@ impl Connection {
         if early_authorized {
             config.initial_window = InitialWindow::Rfc5681;
         }
-        let mut connection = Self::active_with_receive_path(tuple, config, iss, now, receive, managed_path, receive_capability, initial_ip_header_len)?;
+        let mut connection = Self::active_with_path(
+            tuple,
+            config,
+            iss,
+            now,
+            managed_path,
+            receive_capability,
+            initial_ip_header_len,
+        )?;
         connection.rx_timestamps = rx_timestamps;
         connection.input_timestamps = timestamps;
         connection.passive_open = true;
         // Listener policy authorizes an early child even for a server-first
         // exchange. Payload presence separately controls readable data.
         connection.fast_open_early = early_authorized;
-        connection.learn_syn(syn, early_authorized);
+        if connection.learn_syn(syn, early_authorized) {
+            return Err(Error::NoMemory);
+        }
         connection.input_timestamps = RxPacketTimestamps::default();
         connection.state = State::SynReceived;
+        // SYN data the queue holds is charged from the open.
+        connection.receive_charged = connection.receive.storage();
         Ok(connection)
     }
 
@@ -1695,28 +1675,24 @@ impl Connection {
         Ok(())
     }
 
-    // What a connection with a `receive`-byte ring and an `mss`-byte scratch
-    // segment allocates at open, its charge until the first write: the
-    // receive ring, which backs every window it advertises, the scratch
-    // segment and the sender ledgers' initial entries (the RACK ledger's
-    // SPARE entries, the scoreboard's four spare ranges). The send ring and
-    // the ledgers' growth are allocated, and charged, at write.
-    pub(crate) fn open_bytes(receive: usize, mss: usize) -> Option<usize> {
-        ReceiveBuffer::allocation_bytes(receive)?
-            .checked_add(mss)?
-            .checked_add(Rack::storage_bytes(SPARE)?)?
+    // What a connection with an `mss`-byte scratch segment allocates at
+    // open, its charge until the first write: the scratch segment and the
+    // sender ledgers' initial entries (the RACK ledger's SPARE entries, the
+    // scoreboard's four spare ranges). The send ring and the ledgers'
+    // growth are allocated, and charged, at write; received data is charged
+    // as it is held (`settle_receive_charge`), as Linux charges skbs to
+    // sk_rmem_alloc when they are queued.
+    pub(crate) fn open_bytes(mss: usize) -> Option<usize> {
+        mss.checked_add(Rack::storage_bytes(SPARE)?)?
             .checked_add(Scoreboard::allocation_bytes(0)?)
     }
 
-    pub(crate) fn receive_allocation_capacity(&self) -> usize {
-        self.receive.capacity()
-    }
-
-    // What the connection's buffers and records hold allocated now: its
-    // share of the endpoint's max_buffer_bytes.
+    // What the connection's buffers and records hold allocated, as last
+    // settled with the Endpoint: its share of the endpoint's
+    // max_buffer_bytes.
     pub(crate) fn buffer_charge(&self) -> usize {
         self.send.storage_bytes()
-            + self.receive.storage_bytes()
+            + self.receive_charged
             + self.scoreboard.storage_bytes()
             + self.rack.allocation_bytes()
             + self.scratch.capacity()
@@ -1724,34 +1700,42 @@ impl Connection {
             + self.rx_timestamps.storage_bytes()
     }
 
-    // The charge at the peak of growing the receive ring to `receive` bytes
-    // (`set_receive_buffer`, DRS): the original storage stays live while the
-    // ring reallocates, to a multiple of 8 slots. A send limit allocates
-    // nothing; the next write grows the send ring.
-    pub(crate) fn resize_peak_charge(&self, receive: usize) -> Option<usize> {
-        let receiver = if receive > self.receive.capacity() {
-            ReceiveBuffer::allocation_bytes(receive.next_multiple_of(8))?
-        } else {
-            0
-        };
-        self.buffer_charge().checked_add(receiver)
+    // The receive queue's storage now and as charged, when they differ:
+    // the charge becomes the storage, and the Endpoint moves its budget by
+    // the difference. Input and reads settle at once; any other change of
+    // the queue (a clear, SACK output's anchors) leaves refresh work.
+    pub(crate) fn settle_receive_charge(&mut self) -> Option<(usize, usize)> {
+        let storage = self.receive.storage();
+        let old = core::mem::replace(&mut self.receive_charged, storage);
+        (old != storage).then_some((old, storage))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn receive_queue(&self) -> &RxQueue {
+        &self.receive
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn receive_charge_settled(&self) -> bool {
+        self.receive.debug_check();
+        self.receive_charged == self.receive.storage()
     }
 
     pub(crate) fn buffer_capacities(&self) -> (usize, usize) {
         (self.send.capacity(), self.config.receive_capacity)
     }
 
-    // Shorthand for tests: both setters, receive first so that a refused
-    // growth changes nothing.
+    // Shorthand for tests: both setters. The charge limit is left from
+    // when a larger receive size grew a ring; neither setter allocates.
     #[cfg(test)]
     pub(crate) fn set_buffer_capacities(
         &mut self,
         send: usize,
         receive: usize,
-        max_charge: usize,
+        _max_charge: usize,
     ) -> Result<(), Error> {
         Self::validate_buffer_capacities(send, receive)?;
-        self.set_receive_buffer(receive, max_charge)?;
+        self.set_receive_buffer(receive);
         self.set_send_buffer(send);
         Ok(())
     }
@@ -1771,30 +1755,13 @@ impl Connection {
     }
 
     // The receive window, locked as SO_RCVBUF sets SOCK_RCVBUF_LOCK: DRS no
-    // longer grows it. A larger size grows the ring in place now, if its
-    // peak charge fits `max_charge`; a smaller one keeps the ring and the
-    // window already offered.
-    pub(crate) fn set_receive_buffer(
-        &mut self,
-        receive: usize,
-        max_charge: usize,
-    ) -> Result<(), Error> {
-        // The original remains live while the ring reallocates.
-        if self
-            .resize_peak_charge(receive)
-            .is_none_or(|peak| peak > max_charge)
-        {
-            return Err(Error::NoMemory);
-        }
+    // longer grows it. A limit, as SO_RCVBUF is: it allocates nothing, and
+    // a smaller one never retracts the window already offered.
+    pub(crate) fn set_receive_buffer(&mut self, receive: usize) {
         let old_window = self.advertised_window(false);
-        if receive > self.receive.capacity() {
-            self.receive.grow(receive).map_err(|_| Error::NoMemory)?;
-        }
         self.receive_tuned = false;
-        // A locked ring backs its whole window, as a fixed one.
+        // A locked direction offers its whole window, as a fixed one.
         self.rcv_ssthresh = u32::MAX;
-        self.receive_grow_pending = false;
-        self.receive_growth_refused = false;
         self.config.receive_capacity = receive;
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
         //= reason=A receive size locked before the SYN reaches the wire sets the window scale from that size, as Linux clamps window_clamp to a locked SO_RCVBUF before tcp_select_initial_window; once the SYN has left, the scale stays as sent.
@@ -1821,13 +1788,10 @@ impl Connection {
                 self.advertised_edge = self.receive.next().wrapping_add(self.syn_window as u32);
             }
         }
-        // ponytail: retain backing on shrink until reclamation; compaction can
-        // reclaim slack later, but must preserve queued bytes and promised edges.
         self.refresh_writable();
         if self.synchronized() && self.advertised_window(false) > old_window {
             self.immediate_ack();
         }
-        Ok(())
     }
 
     // A setter's writability: an open send direction that is
@@ -1837,10 +1801,6 @@ impl Connection {
             && !self.read_closed
             && matches!(self.state, State::Established | State::CloseWait)
             && self.stream_writable(None);
-    }
-
-    pub(crate) fn into_receive(self: Box<Self>) -> ReceiveBuffer {
-        self.receive
     }
 
     pub(crate) fn tuple(&self) -> Tuple {
@@ -2744,21 +2704,26 @@ impl Connection {
         (new_response, further_loss)
     }
 
+    // Holds the new part of `payload`, the stream from `sequence`, within
+    // `limit`, the right edge of the window offered.
     fn receive_payload(
         &mut self,
         sequence: Seq,
-        payload: &[u8],
+        payload: RxPayload<'_>,
         fin: bool,
         push: bool,
-    ) -> crate::buffer::ReceiveOutcome {
+        limit: Seq,
+    ) -> crate::rx_queue::ReceiveOutcome {
         if !self.rx_timestamps.enabled() || self.input_timestamps == RxPacketTimestamps::default() {
-            return self.receive.insert_with_push(sequence, payload, fin, push);
+            return self
+                .receive
+                .insert(sequence, payload, fin, push, limit, |_, _| {});
         }
         let base = self.received_read;
         let timestamps = self.input_timestamps;
         let metadata = &mut self.rx_timestamps;
         self.receive
-            .insert_observed(sequence, payload, fin, push, |start, end| {
+            .insert(sequence, payload, fin, push, limit, |start, end| {
                 if let (Some(start), Some(end)) =
                     (base.checked_add(start as u64), base.checked_add(end as u64))
                 {
@@ -4666,7 +4631,9 @@ impl Connection {
     //# Window Scale option is received with a shift.cnt value larger than
     //# 14, the TCP SHOULD log the error but MUST use 14 instead of the
     //# specified value.
-    fn learn_syn(&mut self, syn: &Segment<'_>, early_authorized: bool) {
+    // Whether the allocator refused the memory to hold the SYN's text,
+    // which is then not taken.
+    fn learn_syn(&mut self, syn: &Segment<'_>, early_authorized: bool) -> bool {
         self.learn_ecn(syn.header.flags);
         self.sack_send |= self.config.sack && syn.options.sack_permitted;
         self.timestamps = self.config.timestamps && syn.options.timestamps.is_some();
@@ -4735,16 +4702,25 @@ impl Connection {
             .then(|| (syn.header.urgent_pointer - 1) as u64);
         if !early_authorized {
             if count == 0 && !fin && urgent.is_none() {
-                return;
+                return false;
             }
+            let Ok(frame) = crate::rx_queue::heap_copy(&syn.payload[..count]) else {
+                return true;
+            };
             // Conservative RFC 9293 reference ordering: retain ordinary SYN
             // text, but do not process it until validated establishment. The
             // staged prefix occupies the same window slots, not extra credit.
-            self.receive.defer_syn(
-                &syn.payload[..count],
-                fin,
-                syn.header.flags & PSH != 0 && count == syn.payload.len(),
-            );
+            if self
+                .receive
+                .defer_syn(
+                    frame,
+                    fin,
+                    syn.header.flags & PSH != 0 && count == syn.payload.len(),
+                )
+                .is_err()
+            {
+                return true;
+            }
             // Keep first-arrival metadata in its existing bounded store. It is
             // unreadable until promotion, but still constrains metadata resize.
             if count != 0 {
@@ -4756,14 +4732,18 @@ impl Connection {
                 urgent,
             });
             self.receive_used = count;
-            return;
+            return false;
         }
         let outcome = self.receive_payload(
             start,
-            &syn.payload[..count],
+            RxPayload::Borrowed(&syn.payload[..count]),
             fin,
             syn.header.flags & PSH != 0 && count == syn.payload.len(),
+            start.wrapping_add(u32::from(self.syn_window)),
         );
+        if outcome.refused {
+            return true;
+        }
         self.received_total = count as u64;
         self.receive_used += outcome.new_bytes;
         if outcome.new_bytes != 0 {
@@ -4775,6 +4755,7 @@ impl Connection {
             self.syn_window -= count as u16;
         }
         self.rcv_up = urgent;
+        false
     }
 
     //= https://www.rfc-editor.org/rfc/rfc6298#section-5
@@ -5012,6 +4993,8 @@ impl Connection {
                 .reset_start(next)
                 .expect("cleared receive buffer");
             self.receive_used = 0;
+            // The SYN data's charge goes back at the next refresh.
+            self.refresh_work = true;
         }
         self.state = State::Closed;
         self.local_resource = None;
@@ -6302,11 +6285,10 @@ impl Connection {
         Ok(count)
     }
 
-    // A read or a receive ring growth made room: ACK now if the window it
-    // opens is worth an update.
+    // A read made room: ACK now if the window it opens is worth an update.
     fn read_window_update(&mut self) {
-        // Only credit that an ordinary ACK can actually offer is useful:
-        // backing storage may exceed the wire cap, or be below a scale unit.
+        // Only credit that an ordinary ACK can actually offer is useful: the
+        // free space may exceed the wire cap, or be below a scale unit.
         let shift = if self.scaling { self.local_scale } else { 0 };
         let credit = (u32::from(self.advertised_window(false)) << shift)
             .saturating_sub(self.receive_window());
@@ -6327,13 +6309,6 @@ impl Connection {
 
     pub(crate) fn receive_tuned(&self) -> bool {
         self.receive_tuned
-    }
-
-    // A receive ring below its floor: as Linux lets a socket whose
-    // sk_rmem_alloc is below tcp_rmem[0] allocate under pressure
-    // (__sk_mem_raise_allocated).
-    pub(crate) fn receive_below_min(&self) -> bool {
-        self.receive.capacity() < self.receive_min
     }
 
     // Linux's tcp_rcv_rtt_update: a sample of `sample` microseconds. A
@@ -6406,8 +6381,7 @@ impl Connection {
     // still unread, and if they exceed the most read in one RTT so far the
     // window_clamp DRS asks for (`rcvbuf_grow`), when larger than the
     // current one. Reads the connection's clock as of its last event, as
-    // Linux reads the cached tcp_mstamp. A measure that ends lets a ring
-    // growth refused for memory be asked for again.
+    // Linux reads the cached tcp_mstamp.
     #[inline(never)]
     pub(crate) fn receive_space_adjust(&mut self) -> Option<usize> {
         if !self.receive_tuned || self.rcv_rtt_us8 == 0 {
@@ -6428,10 +6402,6 @@ impl Connection {
         };
         self.rcvq_seq = self.received_read;
         self.rcvq_time = self.now;
-        if self.receive_growth_refused {
-            self.receive_growth_refused = false;
-            self.receive_grow_pending = self.receive_ring_target().is_some();
-        }
         target
     }
 
@@ -6441,8 +6411,8 @@ impl Connection {
     // measure; below 1 ms (tcp_rcvbuf_low_rtt) only rtt/1 ms of the window
     // more, so short paths do not inflate the buffer; plus the span of the
     // data held beyond a gap. At most receive_capacity_max. It is the
-    // window_clamp, a limit: ntcp's receive ring holds payload only, where
-    // Linux's rcvbuf counts skb truesize (tcp_space_from_win).
+    // window_clamp, a limit in window bytes, where Linux's rcvbuf counts
+    // skb truesize (tcp_space_from_win).
     fn rcvbuf_grow(&mut self, copied: usize) -> Option<usize> {
         let old = self.rcvq_space.max(1) as u64;
         self.rcvq_space = copied;
@@ -6466,13 +6436,11 @@ impl Connection {
     // allocates nothing. The window offered stays within rcv_ssthresh,
     // which only the data received raises (`grow_window`).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
-    //= reason=Autotuning only raises window_clamp (receive_capacity), rcv_ssthresh and the ring that backs them; it never lowers any of them, so no right edge already offered moves left.
+    //= reason=Autotuning only raises window_clamp (receive_capacity) and rcv_ssthresh; it never lowers either, so no right edge already offered moves left.
     //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
     //# edge to the left (SHLD-14).
     pub(crate) fn raise_receive_clamp(&mut self, target: usize) {
         self.config.receive_capacity = target;
-        self.receive_grow_pending |=
-            !self.receive_growth_refused && self.receive_ring_target().is_some();
     }
 
     // Linux's tcp_grow_window, for a tuned receive direction, after `len`
@@ -6483,16 +6451,13 @@ impl Connection {
     // min(window_clamp, free space). Linux's check #2 and its slow part
     // (__tcp_grow_window) give a segment whose truesize overhead would not
     // fit the buffer at that window 2 * rcv_mss instead, or nothing; the
-    // ring charges each window byte the same whatever the segment
-    // (allocation_bytes), so every segment passes check #2. Under pressure
-    // Linux also lowers rcv_ssthresh to 4 * advmss (tcp_adjust_rcv_ssthresh)
-    // so that new skbs take less memory; the ring is already charged and
-    // never shrinks, so a lower window would free nothing and only stall
-    // the sender: here pressure only stops the growth. Linux also grants
-    // one quick ACK (icsk_ack.quick |= 1), which ntcp's ACK policy does
-    // not have; the ACK is sent as it would be.
+    // free space here is still counted in payload bytes, so every segment
+    // passes check #2. Under pressure Linux also lowers rcv_ssthresh to
+    // 4 * advmss (tcp_adjust_rcv_ssthresh); here pressure only stops the
+    // growth. Linux also grants one quick ACK (icsk_ack.quick |= 1), which
+    // ntcp's ACK policy does not have; the ACK is sent as it would be.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7
-    //= reason=A tuned receive window opens past its initial size only as full-size data arrives (rcv_ssthresh), up to the limit DRS set from what the application reads per RTT, and its ring is allocated only when that window is offered.
+    //= reason=A tuned receive window opens past its initial size only as full-size data arrives (rcv_ssthresh), up to the limit DRS set from what the application reads per RTT; received data is held, and charged, only as it arrives.
     //# Hence, implementers should take care to not open the TCP window
     //# drastically beyond the requirements of the connection.
     #[inline(never)]
@@ -6508,60 +6473,11 @@ impl Connection {
         }
         let increment = (2 * u32::from(self.advertised_payload_mss())).max(2 * len as u32);
         self.rcv_ssthresh += room.min(increment);
-        self.receive_grow_pending |=
-            !self.receive_growth_refused && self.receive_ring_target().is_some();
-    }
-
-    pub(crate) fn receive_grow_pending(&self) -> bool {
-        self.receive_grow_pending
     }
 
     #[cfg(test)]
     pub(crate) fn receive_ssthresh(&self) -> u32 {
         self.rcv_ssthresh
-    }
-
-    // The ring size to grow to when the window to offer, min(window_clamp
-    // less the unread bytes, rcv_ssthresh) as in Linux's __tcp_select_window,
-    // passes what the ring backs beyond them: twice the ring, and no less
-    // than what that window needs, within window_clamp. Doubling keeps a
-    // window that rises by segments to logarithmically many in-place
-    // growths, each moving at most the ring, as the send ring's
-    // (`send_ring_target`).
-    pub(crate) fn receive_ring_target(&self) -> Option<usize> {
-        if !self.receive_tuned || self.receive.eof() {
-            return None;
-        }
-        let readable = self.receive.readable();
-        let clamp = self.config.receive_capacity;
-        let window = clamp
-            .saturating_sub(readable)
-            .min(self.rcv_ssthresh as usize);
-        let needed = readable + window;
-        let ring = self.receive.capacity();
-        (needed > ring).then(|| needed.max(ring.saturating_mul(2)).min(clamp))
-    }
-
-    // The peak charge of growing the receive ring to `target` bytes: the
-    // old storage stays live while the new is filled.
-    pub(crate) fn receive_growth_peak(&self, target: usize) -> Option<usize> {
-        self.resize_peak_charge(target)
-    }
-
-    // Grows the receive ring in place to `target` bytes (card B's grow,
-    // whose failure leaves it as it was) to back the window to offer, if
-    // the budget `allowed` it. A refusal, for the budget or the allocator,
-    // holds further growths until the next DRS measure. Whether it grew.
-    pub(crate) fn grow_receive_ring(&mut self, target: usize, allowed: bool) -> bool {
-        self.receive_grow_pending = false;
-        let grown = allowed && self.receive.grow(target).is_ok();
-        self.receive_growth_refused = !grown;
-        grown
-    }
-
-    // Offers the room a ring growth made at once, if it is worth an update.
-    pub(crate) fn receive_grown(&mut self) {
-        self.read_window_update();
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.6
@@ -6958,8 +6874,8 @@ impl Connection {
                     },
                     false,
                 );
-            } else {
-                self.learn_syn(segment, early);
+            } else if self.learn_syn(segment, early) {
+                self.dropped = Some(DropReason::ProtoMem);
             }
             if !valid_ack {
                 self.fast_open_response = response;
@@ -8835,9 +8751,10 @@ impl Connection {
         //# processing (SHLD-31).
         let outcome = self.receive_payload(
             start,
-            &payload[skip..skip + count],
+            RxPayload::Borrowed(&payload[skip..skip + count]),
             fin && skip + count == payload.len(),
             flags & PSH != 0 && skip + count == payload.len(),
+            next.wrapping_add(window),
         );
         self.receive_used += outcome.new_bytes;
         // In-sequence data, as Linux's tcp_event_data_recv.
@@ -8955,7 +8872,9 @@ impl Connection {
                 self.unacked_segments = self.unacked_segments.saturating_add(segments);
             } else if !payload.is_empty() {
                 // None of the text was taken (Linux's tcp_data_queue drops).
-                self.dropped = Some(if skip == payload.len() {
+                self.dropped = Some(if outcome.refused {
+                    DropReason::ProtoMem
+                } else if skip == payload.len() {
                     DropReason::TcpOldData
                 } else if count == 0 {
                     if window == 0 {
@@ -9103,7 +9022,7 @@ impl Connection {
     //# The window field in a segment where the SYN bit is set (i.e., a <SYN>
     //# or <SYN,ACK>) MUST NOT be scaled.
     //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
-    //= reason=Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; backing and encoded edge tested through sub-scale advances.
+    //= reason=Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; window and encoded edge tested through sub-scale advances.
     //# o  The window field (SEG.WND) of every outgoing segment, with the
     //# exception of <SYN> segments, MUST be right-shifted by
     //# Rcv.Wind.Shift bits:
@@ -9113,7 +9032,7 @@ impl Connection {
     //# Implementations MUST ensure that they handle a shrinking
     //# window, as specified in Section 4.2.2.16 of [RFC1122].
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7
-    //= reason=Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
+    //= reason=Receive window bounded by the configured receive size less the unread data, and by rcv_ssthresh, never rounded up; no speculative unlimited window growth.
     //# Hence, implementers should take care to not open the TCP window
     //# drastically beyond the requirements of the connection.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-3
@@ -9136,7 +9055,6 @@ impl Connection {
         // no FIN case and keeps offering the free space.
         let shift = if self.scaling { self.local_scale } else { 0 };
         let unit = 1u32 << shift;
-        let backing = self.receive.room();
         // Linux's __tcp_select_window: the free space, at most rcv_ssthresh
         // (u32::MAX for a fixed or locked direction).
         let quota = (self
@@ -9145,7 +9063,7 @@ impl Connection {
             .saturating_sub(self.receive.readable()) as u32)
             .min(self.rcv_ssthresh);
         // Never retract credit already offered to the peer on shrink.
-        let available = backing.min(quota.max(self.receive_window()));
+        let available = quota.max(self.receive_window());
         let old = self.receive_window();
         // Apply both wire limits before SWS avoidance, not just at encoding.
         let candidate = (available / unit).min(u32::from(u16::MAX));
@@ -9154,7 +9072,7 @@ impl Connection {
         //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
         //# edge to the left (SHLD-14).
         // RFC 7323 section 2.4: sub-scale advances can require retraction
-        // on the wire. Never round beyond backing storage; retain the old
+        // on the wire. Never round beyond the free space; retain the old
         // promise separately so in-flight bytes remain acceptable.
         let old_field = old.div_ceil(unit).min(candidate);
         if candidate.saturating_mul(unit).saturating_sub(old) >= self.window_threshold() {
@@ -11664,7 +11582,9 @@ impl Connection {
         if flags & ACK != 0 {
             self.sack_data_turn = count == 0 && sack_option_len >= self.mss;
             if !sack_limited {
-                self.receive.commit_report();
+                // A report anchor taken frees its map entry: returned at
+                // the next refresh.
+                self.refresh_work |= self.receive.commit_report();
             }
             self.sack_omit = false;
         }

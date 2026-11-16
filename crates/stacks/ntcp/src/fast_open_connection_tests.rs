@@ -633,7 +633,6 @@ fn passive_repair_ack_provenance_and_handshake_latch() {
                     0,
                     &syn,
                     early,
-                    &mut None,
                     RxTimestamps::default(),
                     RxPacketTimestamps::default(),
                 )
@@ -1521,7 +1520,6 @@ fn authenticated_empty_syn_constructor_allows_server_first_only_after_synack() {
             0,
             &syn,
             authenticated,
-            &mut None,
             RxTimestamps::default(),
             RxPacketTimestamps::default(),
         )
