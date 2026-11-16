@@ -232,6 +232,15 @@ pub enum Event {
     /// a write whose storage the buffer budget refuses gets
     /// `WouldBlock(SendBuffer)`, and Writable follows once memory comes
     /// back to the budget.
+    ///
+    /// Two deliberate differences from Linux follow. After a memory
+    /// refusal, Writable waits for memory to return. Linux's tcp_sendmsg
+    /// wakes the writer at once when it fails with EAGAIN and empty queues,
+    /// so an edge-triggered writer would retry a write that cannot succeed
+    /// until memory returns, and spin. Memory freed by any connection of
+    /// the network also raises Writable on other connections whose writes
+    /// it refused. Linux has no such cross-socket wake: a writer blocked in
+    /// sk_stream_wait_memory only retries on its own vm_wait timeout.
     Writable(ConnId),
     Closed {
         connection: ConnId,

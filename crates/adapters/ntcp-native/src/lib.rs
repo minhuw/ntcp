@@ -1655,7 +1655,8 @@ impl<P: PacketIo> Network<P> {
     /// `writable` is Linux's tcp_poll EPOLLOUT test, which does not ask
     /// whether memory to store a write is there: a connection whose write
     /// the buffer budget refuses (`WouldBlock(SendBuffer)`) can be reported
-    /// writable, and its Writable comes once memory comes back.
+    /// writable, and its Writable comes once memory comes back, not at once
+    /// as Linux would wake it (see `Event::Writable`).
     pub fn readiness(&mut self, id: ConnId) -> Result<Readiness> {
         self.running()?;
         let c = self.conn(id)?;
