@@ -211,11 +211,20 @@ impl<P: PacketIo> Network<P> {
     /// `shutdown_write`, whose FIN Linux pushes at once.
     /// `Counters::autocorked` counts holds.
     ///
-    /// A push can arm a retransmission or pacing timer, so its
-    /// `next_deadline` is the network's, as `drive` reports it. An
-    /// embedding that sleeps until a deadline sleeps no later than the
-    /// earliest of its last drive's and its pushes' since, and drives first
-    /// when a push reports `more_work`.
+    /// A push can arm timers the last drive's `next_deadline` did not
+    /// cover: its connection's (retransmission, loss probe, persist,
+    /// pacing), and, on a link that resolves next hops, its next hop's (the
+    /// first use of a STALE entry starts DELAY, as Linux's neigh_event_send;
+    /// resolving a new one schedules its requests). Its `next_deadline` is
+    /// the earliest of those, not the network's: an embedding that sleeps
+    /// until a deadline sleeps no later than the earliest of its last
+    /// drive's `next_deadline` and those of its pushes since, and drives
+    /// first when a push reports `more_work`. No other timer moves earlier
+    /// in a push; one it ends or moves later (a timer its output stopped)
+    /// can leave that earliest before the network's next deadline, which
+    /// only wakes the embedding early. A push that applies queued path
+    /// changes (`Host::output_changes_pending`), which reach other
+    /// connections, reports the network's next deadline, as `drive` does.
     ///
     /// Errors as `drive`'s: `Stopped`, nothing done; `TimeWentBackwards`,
     /// nothing done and the network runs on; `InvalidHandle` for a
@@ -235,10 +244,14 @@ impl<P: PacketIo> Network<P> {
             }
             Err(error) => return Err(error),
         }
+        // The network's deadline before the push, which the reported one
+        // must bound with it (debug builds).
+        let before = cfg!(debug_assertions).then(|| self.next_deadline());
         let mut report = DriveReport::default();
+        let changes = self.host.output_changes_pending();
         let result = match self.autocork(id, core, now) {
             Ok(Some(held)) => return Ok(held),
-            Ok(None) => self.push_inner(core, now, &mut report),
+            Ok(None) => self.push_inner(core, now, changes, &mut report),
             Err(error) => Err(error),
         };
         self.wake_members_for_memory();
@@ -253,13 +266,43 @@ impl<P: PacketIo> Network<P> {
                 return Err(self.stop_with_cause(other));
             }
         };
+        let next_deadline = if changes {
+            self.next_deadline()
+        } else {
+            self.push_deadline(core)
+        };
+        if let Some(before) = before {
+            let bound = before.into_iter().chain(next_deadline).min();
+            let after = self.next_deadline();
+            debug_assert!(
+                after.is_none_or(|after| bound.is_some_and(|bound| bound <= after)),
+                "push moved a deadline it does not report: {before:?} {next_deadline:?} {after:?}"
+            );
+        }
         Ok(PushReport {
             transmitted: report.transmitted,
             tx_blocked: report.tx_blocked || self.tx_pending != 0,
             more,
             more_work: more || self.tx_pending != 0,
-            next_deadline: self.next_deadline(),
+            next_deadline,
         })
+    }
+    // The earliest deadline a push of `core` can have armed or moved
+    // earlier: the connection's (`Endpoint::connection_deadline`), and on
+    // a link that resolves next hops the neighbor tables', which its
+    // resolution can start (`Host::resolve_neighbor`) and, on a member of
+    // a shared table, its look at the member's wake can bring forward.
+    // Both are read, not computed: the endpoint's from its deadline heap,
+    // the tables' from their cached deadline.
+    fn push_deadline(&self, core: ntcp::ConnectionId) -> Option<Instant> {
+        let own = self.endpoint.connection_deadline(core);
+        if self.control.is_empty() {
+            return own;
+        }
+        match (own, self.host.next_neighbor_deadline()) {
+            (Some(own), Some(neighbor)) => Some(own.min(neighbor)),
+            (own, neighbor) => own.or(neighbor),
+        }
     }
     // Where the backend's transmission stands, for a frame submitted now
     // (`Connection::tx_mark`): the drive epoch for a NextPoll device, the
@@ -346,10 +389,12 @@ impl<P: PacketIo> Network<P> {
     }
     // The push's transmit loop for `core`; true when it ended at the frame
     // limit with the connection's output still selectable.
+    // `changes`: `Host::output_changes_pending`, as the push began.
     fn push_inner(
         &mut self,
         core: ntcp::ConnectionId,
         now: Instant,
+        changes: bool,
         report: &mut DriveReport,
     ) -> Result<bool> {
         // The shared neighbor table's mapping epoch, which egress resolution
@@ -359,7 +404,7 @@ impl<P: PacketIo> Network<P> {
         }
         // A path change an earlier drive queued reaches the connection
         // before its selection, as in the drive.
-        if self.host.output_changes_pending() {
+        if changes {
             let changes = self.host.service_changes(&mut self.endpoint, now)?;
             if let Some(error) = changes.first_error {
                 return Err(error.into());

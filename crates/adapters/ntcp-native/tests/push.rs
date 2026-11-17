@@ -361,6 +361,51 @@ fn a_push_sends_the_whole_write_and_a_second_push_nothing() {
     assert_eq!(net.read(id), data(10_000));
 }
 
+// A push reports what it armed, not the network's next deadline: a write
+// pushed on an idle connection arms its retransmission timer, which the
+// last drive's deadline did not have; it is the network's next deadline
+// then, as a drive right after reports.
+#[test]
+fn a_push_reports_the_retransmission_timer_it_arms_on_an_idle_connection() {
+    let mut net = Net::configured(false, |config| config.tcp.connection.tlp = false);
+    let id = net.connect(true);
+    let idle = net.server.drive(net.now, BUDGET).unwrap();
+    assert_eq!(idle.next_deadline, None);
+    net.write(id, 100);
+    let report = net.push(id);
+    assert_eq!(report.transmitted, 1);
+    let rto = report.next_deadline.unwrap();
+    assert!(rto > net.now);
+    let drive = net
+        .server
+        .drive(net.now, WorkBudget::new(0, 0, 0, 0))
+        .unwrap();
+    assert_eq!(drive.next_deadline, Some(rto));
+}
+
+// Another connection's earlier timer, which the last drive reported, is
+// not in a push's deadline: the caller sleeps no later than the earliest
+// of both.
+#[test]
+fn a_push_leaves_other_connections_timers_to_the_last_drives_deadline() {
+    let mut net = Net::configured(false, |config| config.tcp.connection.tlp = false);
+    let first = net.connect(true);
+    let second = net.connect(true);
+    net.write(first, 100);
+    let drive = net.server.drive(net.now, FLUSH).unwrap();
+    let earlier = drive.next_deadline.unwrap();
+    net.write(second, 100);
+    let report = net.push(second);
+    assert_eq!(report.transmitted, 1);
+    let own = report.next_deadline.unwrap();
+    assert!(earlier < own);
+    let drive = net
+        .server
+        .drive(net.now, WorkBudget::new(0, 0, 0, 0))
+        .unwrap();
+    assert_eq!(drive.next_deadline, Some(earlier));
+}
+
 // Minshall's Nagle (c148): with Nagle on, a write of two full segments and
 // a short tail leaves whole in its push, no earlier short segment being
 // unacknowledged; a second short write waits for that tail's ACK, which a

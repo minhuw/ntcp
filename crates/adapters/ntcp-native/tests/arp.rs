@@ -311,6 +311,37 @@ fn a_push_to_an_unresolved_next_hop_holds_its_frame_and_asks() {
     established(&mut a, &mut b, &mut now, listener);
 }
 
+// A push whose next hop's entry went STALE starts DELAY, as Linux's
+// neigh_event_send does on the entry's first use, and reports DELAY's end:
+// the push's connection arms nothing earlier (an RTO floor of 30 s, no
+// loss probes), and the last drive's deadline had none of it.
+#[test]
+fn a_push_to_a_stale_next_hop_reports_the_delay_it_starts() {
+    let mut slow = config(IP_A, MAC_A, None);
+    slow.tcp.connection.rto_min_us = 30 * SECOND;
+    slow.tcp.connection.tlp = false;
+    let mut a = Station::new(slow);
+    let mut b = Station::new(config(IP_B, MAC_B, None));
+    let listener = b.network.listen(80, 2).unwrap();
+    let client = a.network.connect(SocketAddr::new(IP_B.into(), 80)).unwrap();
+    let mut now = 0;
+    established(&mut a, &mut b, &mut now, listener);
+    run(&mut a, &mut b, &mut now, 10, 100_000);
+    // Idle beyond any ReachableTime: the entry is STALE, with no timer.
+    run(&mut a, &mut b, &mut now, 50, SECOND);
+    now += 10;
+    let idle = a.drive(now);
+    assert!(idle.next_deadline.is_none_or(|at| at > now + 6 * SECOND));
+    a.network
+        .try_write(client, b"stale", WriteOptions::default())
+        .unwrap();
+    let report = a.network.push(client, now).unwrap();
+    assert_eq!(report.transmitted, 1);
+    assert_eq!(report.next_deadline, Some(now + 5 * SECOND));
+    let drive = a.network.drive(now, WorkBudget::new(0, 0, 0, 0)).unwrap();
+    assert_eq!(drive.next_deadline, Some(now + 5 * SECOND));
+}
+
 #[test]
 fn a_silent_peer_fails_resolution_and_the_syn_is_never_sent() {
     let mut a = Station::new(config(IP_A, MAC_A, None));

@@ -100,6 +100,11 @@ impl Deadlines {
         self.heap.first().copied()
     }
 
+    // The deadline set for `index`, if any.
+    pub(crate) fn get(&self, index: usize) -> Option<u64> {
+        self.positions[index].map(|position| self.heap[position].0)
+    }
+
     fn swap(&mut self, a: usize, b: usize) {
         self.heap.swap(a, b);
         self.positions[self.heap[a].1] = Some(a);

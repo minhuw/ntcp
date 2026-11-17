@@ -324,9 +324,14 @@ pub struct PushReport {
     /// frame waiting for backend room, or output autocorking held, which
     /// the next drive sends (`Network::push`).
     pub more_work: bool,
-    /// The network's next deadline, as `DriveReport::next_deadline`, which
-    /// the push may have moved earlier (a retransmission or pacing timer
-    /// it armed); `now` when autocorking held output.
+    /// The earliest deadline the push can have armed or moved earlier, not
+    /// the network's: its connection's next timer, on a link that resolves
+    /// next hops also the neighbor tables' next deadline, and the network's
+    /// (as `DriveReport::next_deadline`) when the push applied queued path
+    /// changes; `now` when autocorking held output. None: none of them has
+    /// a deadline. Sleep no later than the earliest of this, those of the
+    /// other pushes since the last drive, and that drive's
+    /// `DriveReport::next_deadline` (`Network::push`).
     pub next_deadline: Option<Instant>,
 }
 
