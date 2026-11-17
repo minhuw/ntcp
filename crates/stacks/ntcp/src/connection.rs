@@ -5039,7 +5039,9 @@ impl Connection {
             } else if self.state == State::FinWait1 {
                 self.state = State::Closing;
             } else if self.state == State::FinWait2 {
+                // Linux's tcp_fin: tcp_send_ack, then tcp_time_wait.
                 self.time_wait();
+                self.immediate_ack();
             }
         }
         self.arm_work();
@@ -5140,7 +5142,6 @@ impl Connection {
             self.now
                 .saturating_add(self.config.timebase.ticks_from_us(self.config.time_wait_us)),
         );
-        self.immediate_ack();
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
@@ -8825,6 +8826,9 @@ impl Connection {
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
                 //# if the ACK acknowledges our FIN, then enter the TIME-WAIT state;
                 //# otherwise, ignore the segment.
+                // No ACK, as Linux's tcp_rcv_state_process (TCP_CLOSING ->
+                // tcp_time_wait): a bare in-window ACK restarts the peer's
+                // TIME-WAIT timer.
                 State::Closing => self.time_wait(),
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
                 //= reason=Terminal connection storage is reclaimed by Endpoint release, not by this transition.
@@ -9246,7 +9250,11 @@ impl Connection {
             match self.state {
                 State::Established => self.state = State::CloseWait,
                 State::FinWait1 => self.state = State::Closing,
-                State::FinWait2 => self.time_wait(),
+                // Linux's tcp_fin: tcp_send_ack, then tcp_time_wait.
+                State::FinWait2 => {
+                    self.time_wait();
+                    self.immediate_ack();
+                }
                 _ => {}
             }
         }

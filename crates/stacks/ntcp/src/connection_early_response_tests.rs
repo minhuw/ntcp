@@ -1282,6 +1282,53 @@ fn early_response_close_drains_queue_after_handshake_and_keeps_empty_early_fin()
 }
 
 #[test]
+fn early_fin_handshake_completion_in_fin_wait2_acks_once() {
+    // The peer's SYN carries data and FIN; the responder closes before the
+    // handshake completes, so the ACK completing it also acknowledges our
+    // FIN and establish() finds FIN-WAIT-2 with the peer's FIN received.
+    let c = cfg(1_000_000);
+    let mut peer = Connection::active(reverse(tuple()), c.clone(), 900, 0).unwrap();
+    let mut cache = crate::fast_open::FastOpen::new().unwrap();
+    cache.learn(
+        0,
+        peer.tuple.local.ip(),
+        peer.tuple.remote.ip(),
+        wire::FastOpenCookie::new(&[7; 8]).unwrap(),
+        Some(1000),
+    );
+    let cached = cache.get(0, 100, peer.tuple.local.ip(), peer.tuple.remote.ip());
+    assert_eq!(peer.prepare_fast_open(cached, b"request").unwrap(), 7);
+    let bytes = packet(&mut peer, 0);
+    let mut syn = wire::parse(ip(peer.tuple()), &bytes).unwrap();
+    syn.header.flags |= FIN;
+    let mut a = Connection::passive_with_receive(
+        tuple(),
+        c,
+        100,
+        0,
+        &syn,
+        true,
+        RxTimestamps::default(),
+        RxPacketTimestamps::default(),
+    )
+    .unwrap();
+    assert_eq!(a.read(&mut [0; 32]).unwrap(), 7);
+    a.close().unwrap();
+    emit_at_us(&mut a, 20_000, false);
+    let bytes = emit_at_us(&mut a, 30_000, false);
+    let fin = wire::parse(ip(a.tuple()), &bytes).unwrap();
+    assert_eq!(fin.header.flags & FIN, FIN);
+    assert!(a.handshake_pending());
+    acknowledge(&mut a, 40_000, 1, &[]);
+    assert_eq!(a.state, State::TimeWait);
+    let bytes = emit_at_us(&mut a, 40_000, false);
+    let ack = wire::parse(ip(a.tuple()), &bytes).unwrap();
+    assert_eq!(ack.header.flags, ACK);
+    assert_eq!(ack.header.acknowledgment, a.receive.next().0);
+    assert_eq!(a.transmit(40_000, &mut [0; 2048]), Ok(None));
+}
+
+#[test]
 fn passive_tfo_split_ack_history_uses_single_wire_advance() {
     for iss in [100, u32::MAX] {
         for count in [0, 500, 1000] {

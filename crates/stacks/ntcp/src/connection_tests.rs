@@ -11118,6 +11118,66 @@ fn simultaneous_close_and_fin_retransmission() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
 //= type=test
+//# if the ACK acknowledges our FIN, then enter the TIME-WAIT state;
+//# otherwise, ignore the segment.
+fn closing_enters_time_wait_without_second_ack() {
+    let (mut a, mut b) = pair(config(64, 8), 100);
+    a.shutdown().unwrap();
+    b.shutdown().unwrap();
+    let af = packet(&mut a, 40);
+    let bf = packet(&mut b, 40);
+    a.input(50, &wire::parse(ip(reverse(tuple())), &bf).unwrap())
+        .unwrap();
+    b.input(50, &wire::parse(ip(tuple()), &af).unwrap())
+        .unwrap();
+    assert_eq!((a.state(), b.state()), (State::Closing, State::Closing));
+    // Each side ACKs the peer's FIN once (Linux's tcp_fin, FIN_WAIT1 case).
+    let a_ack = packet(&mut a, 50);
+    let b_ack = packet(&mut b, 50);
+    for (ack, from) in [(&a_ack, tuple()), (&b_ack, reverse(tuple()))] {
+        let ack = wire::parse(ip(from), ack).unwrap();
+        assert_eq!(ack.header.flags, ACK);
+        assert!(ack.payload.is_empty());
+    }
+    assert_eq!(a.transmit(50, &mut [0; 128]), Ok(None));
+    assert_eq!(b.transmit(50, &mut [0; 128]), Ok(None));
+    a.input(60, &wire::parse(ip(reverse(tuple())), &b_ack).unwrap())
+        .unwrap();
+    b.input(60, &wire::parse(ip(tuple()), &a_ack).unwrap())
+        .unwrap();
+    assert_eq!((a.state(), b.state()), (State::TimeWait, State::TimeWait));
+    // Linux's tcp_rcv_state_process, TCP_CLOSING: tcp_time_wait, no ACK. A
+    // second pure ACK would restart a Linux peer's TIME-WAIT timer.
+    assert_eq!(a.transmit(60, &mut [0; 128]), Ok(None));
+    assert_eq!(b.transmit(60, &mut [0; 128]), Ok(None));
+}
+
+#[test]
+fn fin_wait2_fin_enters_time_wait_with_one_ack() {
+    let (mut a, mut b) = pair(config(64, 8), 100);
+    a.shutdown().unwrap();
+    deliver(&mut a, &mut b, 40);
+    deliver(&mut b, &mut a, 50);
+    assert_eq!(a.state(), State::FinWait2);
+    b.shutdown().unwrap();
+    let fin = deliver(&mut b, &mut a, 60);
+    assert_eq!(a.state(), State::TimeWait);
+    // Linux's tcp_fin, FIN_WAIT2 case: tcp_send_ack, then tcp_time_wait.
+    let ack = packet(&mut a, 60);
+    let ack = wire::parse(ip(tuple()), &ack).unwrap();
+    let fin = wire::parse(ip(reverse(tuple())), &fin).unwrap();
+    assert_eq!(fin.header.flags & FIN, FIN);
+    assert_eq!(ack.header.flags, ACK);
+    assert_eq!(
+        ack.header.acknowledgment,
+        fin.header.sequence.wrapping_add(1)
+    );
+    assert_eq!(a.transmit(60, &mut [0; 128]), Ok(None));
+}
+
+#[test]
+//= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+//= type=test
 //# 3) If the RST bit is set and the sequence number does not exactly match the
 //# next expected sequence value, yet is within the current receive window, TCP
 //# endpoints MUST send an acknowledgment (challenge ACK):
