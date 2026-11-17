@@ -9,18 +9,22 @@ mod ethtool;
 #[cfg(feature = "host")]
 pub use ethtool::{Rss, RssFields, RssFunction};
 
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+use ntcp_io::{
+    DeviceCounters, PacketIo, PacketLayer, ReceivedFrame, ReceivedPacket, RxFrame, RxFrameCount,
+    RxFrameVtable, TxOutcome,
+};
 use std::{
     io,
     marker::PhantomData,
     mem::{align_of, size_of},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    ptr,
+    ptr::{self, NonNull},
     rc::Rc,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 const SOL_XDP: i32 = 283;
+const XDP_STATISTICS: i32 = 7;
 const KERNEL_HEADROOM: u32 = 256;
 const COMPLETION_BUDGET: u32 = 64;
 const RX_VALIDATION_BUDGET: u32 = 64;
@@ -115,6 +119,18 @@ struct SockAddr {
     queue: u32,
     shared_fd: u32,
 }
+// struct xdp_statistics (linux/if_xdp.h); kernels before 5.9 fill the
+// first three fields only.
+#[repr(C)]
+#[derive(Default)]
+struct XdpStatistics {
+    rx_dropped: u64,
+    rx_invalid_descs: u64,
+    tx_invalid_descs: u64,
+    rx_ring_full: u64,
+    rx_fill_ring_empty_descs: u64,
+    tx_ring_empty_descs: u64,
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Descriptor {
@@ -156,6 +172,113 @@ impl Drop for Mapping {
         // SAFETY: this mapping is exclusively owned and no references escape it.
         unsafe {
             libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
+}
+
+// Frames `receive_frame` handed over and released since the adapter last
+// looked, and the UMEM they live in: the block every frame's release
+// reaches, freed by the last of the adapter and its frames
+// (`RxFrameCount`), so that a frame held past the adapter's drop keeps its
+// memory mapped. The released frames' indices form a stack, pushed by
+// releases on any thread and taken whole by the adapter (`take`): a stack
+// only ever pushed while one consumer swaps it empty has no ABA hazard, as
+// a push that finds the top it read links to it whatever happened between.
+struct Returns {
+    umem: Mapping,
+    count: RxFrameCount,
+    // The last frame pushed, NO_FRAME for none; `next` links each frame to
+    // the one pushed before it.
+    top: AtomicU32,
+    next: Box<[AtomicU32]>,
+}
+
+const NO_FRAME: u32 = u32::MAX;
+
+impl Returns {
+    fn new(umem: Mapping, frames: u32) -> NonNull<Self> {
+        let next = (0..frames).map(|_| AtomicU32::new(NO_FRAME)).collect();
+        NonNull::from(Box::leak(Box::new(Self {
+            umem,
+            count: RxFrameCount::new(),
+            top: AtomicU32::new(NO_FRAME),
+            next,
+        })))
+    }
+    // From any thread: frame `index` is back.
+    fn push(&self, index: u32) {
+        let mut top = self.top.load(Ordering::Relaxed);
+        loop {
+            self.next[index as usize].store(top, Ordering::Relaxed);
+            // Release: the link, and whatever the releaser did with the
+            // frame, happen before the adapter's `take` of it.
+            match self
+                .top
+                .compare_exchange_weak(top, index, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(current) => top = current,
+            }
+        }
+    }
+    // The adapter: the last frame pushed (follow `next`), every one pushed
+    // so far with it, and the stack empty.
+    fn take(&self) -> u32 {
+        if self.top.load(Ordering::Relaxed) == NO_FRAME {
+            return NO_FRAME;
+        }
+        self.top.swap(NO_FRAME, Ordering::Acquire)
+    }
+}
+
+// The release of a frame `receive_frame` handed over: its index (`token`)
+// goes back on the adapter's stack, and the return is counted.
+static UMEM_FRAME: RxFrameVtable = RxFrameVtable {
+    release: release_frame,
+};
+
+// SAFETY (caller): `context` is an adapter's Returns block, given up with
+// Box::leak and live until the last of the adapter and its frames frees
+// it, and `token` the index of a frame the adapter handed over, released
+// once.
+unsafe fn release_frame(context: *mut (), token: usize) {
+    let block = context.cast::<Returns>();
+    // SAFETY: as the caller guarantees; this release is not yet counted.
+    let returns = unsafe { &*block };
+    returns.push(token as u32);
+    if returns.count.release() {
+        // SAFETY: the adapter has left and this was its last frame.
+        drop(unsafe { Box::from_raw(block) });
+    }
+}
+
+// The UMEM the adapter maps, in its Returns block, with the frames it
+// handed out. Dropped after the socket and its rings (field order): the
+// mapping stays until every frame held past the adapter is released.
+struct Umem {
+    block: NonNull<Returns>,
+    taken: u64,
+}
+impl Umem {
+    fn new(umem: Mapping, frames: u32) -> Self {
+        Self {
+            block: Returns::new(umem, frames),
+            taken: 0,
+        }
+    }
+    fn returns(&self) -> &Returns {
+        // SAFETY: the block lives at least as long as the adapter.
+        unsafe { self.block.as_ref() }
+    }
+    fn ptr(&self) -> *mut u8 {
+        self.returns().umem.ptr
+    }
+}
+impl Drop for Umem {
+    fn drop(&mut self) {
+        if self.returns().count.leave(self.taken) {
+            // SAFETY: nothing was outstanding: no release can reach it.
+            drop(unsafe { Box::from_raw(self.block.as_ptr()) });
         }
     }
 }
@@ -262,6 +385,9 @@ impl<T: Copy> Ring<T> {
 enum Frame {
     Rx,
     RxValidated,
+    // Received and handed over by reference (`receive_frame`) until its
+    // release returns it to `free`.
+    Held,
     Free,
     Tx,
     Completed,
@@ -290,7 +416,7 @@ pub struct AfXdp {
     tx: Ring<Descriptor>,
     fill: Ring<u64>,
     completion: Ring<u64>,
-    umem: Mapping,
+    umem: Umem,
     config: Config,
     frames: Vec<Frame>,
     free: Vec<u32>,
@@ -322,7 +448,7 @@ impl AfXdp {
     pub fn new(config: Config) -> io::Result<Self> {
         let len = config.validate()?;
         // Allocate before fd: construction failures also close the socket before UMEM.
-        let umem = Mapping::new(-1, 0, len)?;
+        let umem = Umem::new(Mapping::new(-1, 0, len)?, config.frame_count);
         // SAFETY: socket returns a new owned fd, checked before wrapping.
         let raw = unsafe {
             libc::socket(
@@ -339,7 +465,7 @@ impl AfXdp {
             raw,
             4,
             &UmemReg {
-                addr: umem.ptr as u64,
+                addr: umem.ptr() as u64,
                 len: len as u64,
                 chunk_size: config.frame_size,
                 headroom: config.headroom,
@@ -446,7 +572,7 @@ impl AfXdp {
         if self.poisoned {
             return Err(corrupt("AF_XDP adapter poisoned"));
         }
-        let result = self.reclaim();
+        let result = self.take_returns().and_then(|()| self.reclaim());
         if result.is_err() {
             self.poisoned = true;
         }
@@ -500,6 +626,21 @@ impl AfXdp {
         }
         Ok(())
     }
+    // Frames released since the last look are free again, for TX and for
+    // refilling RX. Each returns once: anything else is corruption.
+    fn take_returns(&mut self) -> io::Result<()> {
+        let returns = self.umem.returns();
+        let mut index = returns.take();
+        while index != NO_FRAME {
+            match self.frames.get_mut(index as usize) {
+                Some(frame @ Frame::Held) => *frame = Frame::Free,
+                _ => return Err(corrupt("invalid returned frame")),
+            }
+            self.free.push(index);
+            index = returns.next[index as usize].load(Ordering::Relaxed);
+        }
+        Ok(())
+    }
     fn kick(&self) -> io::Result<()> {
         // SAFETY: zero-length sendto is the AF_XDP TX wakeup operation, not a packet.
         if unsafe {
@@ -523,7 +664,9 @@ impl AfXdp {
         }
         Ok(())
     }
-    fn receive_one(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+    // The next received descriptor once its whole snapshot is validated
+    // (`Backlog`), not yet consumed: its frame and the frame's offset.
+    fn next_rx(&mut self) -> io::Result<Option<(Descriptor, usize, usize)>> {
         if self.rx_backlog.is_none() {
             self.rx_backlog = Some(Backlog::snapshot(&self.rx)?);
         }
@@ -560,6 +703,21 @@ impl AfXdp {
         if !self.fill.has_space()? {
             return Err(corrupt("RX refill ring unexpectedly full"));
         }
+        Ok(Some((desc, index, offset)))
+    }
+    // The descriptor `next_rx` returned is consumed.
+    fn consume_rx(&mut self) -> io::Result<()> {
+        self.rx.consume();
+        let end = self.rx_backlog.as_ref().unwrap().end;
+        if self.rx.indices()?.1 == end {
+            self.rx_backlog = None;
+        }
+        Ok(())
+    }
+    fn receive_one(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+        let Some((desc, index, offset)) = self.next_rx()? else {
+            return Ok(None);
+        };
         let len = desc.len as usize;
         let result = if out.len() < len {
             // Drop whole packet, never return a truncated successful receive.
@@ -568,7 +726,7 @@ impl AfXdp {
             // SAFETY: complete snapshot validated bounds and unique RX ownership
             // before any of its frames were accessed or republished to FILL.
             unsafe {
-                ptr::copy_nonoverlapping(self.umem.ptr.add(offset), out.as_mut_ptr(), len);
+                ptr::copy_nonoverlapping(self.umem.ptr().add(offset), out.as_mut_ptr(), len);
             }
             Ok(Some(len))
         };
@@ -576,10 +734,44 @@ impl AfXdp {
         self.fill
             .push(index as u64 * u64::from(self.config.frame_size))?;
         self.frames[index] = Frame::Rx;
-        if self.rx.indices()?.1 == backlog.end {
+        if self.rx.indices()?.1 == self.rx_backlog.as_ref().unwrap().end {
             self.rx_backlog = None;
         }
         result
+    }
+    // The next received frame by reference: its frame is Held, and a free
+    // one refills the fill ring in its place. With none free (every frame
+    // held, posted or sending), the fill ring runs short, and the kernel
+    // counts the packets it then cannot place (`device_counters`).
+    fn receive_held(&mut self) -> io::Result<Option<RxFrame>> {
+        let Some((desc, index, offset)) = self.next_rx()? else {
+            return Ok(None);
+        };
+        self.consume_rx()?;
+        self.frames[index] = Frame::Held;
+        if let Some(refill) = self.free.pop() {
+            self.fill
+                .push(u64::from(refill) * u64::from(self.config.frame_size))?;
+            self.frames[refill as usize] = Frame::Rx;
+        }
+        self.umem.taken += 1;
+        // SAFETY: the complete snapshot validated the descriptor's bounds
+        // inside one frame and its unique RX ownership; the kernel wrote it
+        // and does not again until the frame is in the fill ring, which
+        // only `take_returns` after its release allows. The release is
+        // sound on any thread at any later time: it pushes the index on the
+        // Returns block, which holds the mapping until the last of the
+        // adapter and its frames frees it.
+        Ok(Some(unsafe {
+            RxFrame::from_raw_parts(
+                NonNull::new(self.umem.ptr().add(offset)).unwrap(),
+                desc.len,
+                self.config.frame_size,
+                &UMEM_FRAME,
+                self.umem.block.as_ptr().cast(),
+                index,
+            )
+        }))
     }
     fn transmit_one(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
         if packet.len() > self.max_packet_len().unwrap() {
@@ -600,7 +792,7 @@ impl AfXdp {
         unsafe {
             ptr::copy_nonoverlapping(
                 packet.as_ptr(),
-                self.umem.ptr.add(addr as usize),
+                self.umem.ptr().add(addr as usize),
                 packet.len(),
             );
         }
@@ -650,6 +842,65 @@ impl PacketIo for AfXdp {
             self.poisoned = true;
         }
         result
+    }
+    // The UMEM frame itself, held until the frame drops (D7: the kernel's
+    // XDP_COPY copy remains; holding removes the copy out of the UMEM and
+    // the core's heap copy). Its truesize is the frame size.
+    fn receive_frame(&mut self, _scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+        self.service()?;
+        match self.receive_held() {
+            Ok(frame) => Ok(frame.map(|frame| ReceivedFrame {
+                metadata: ReceivedPacket {
+                    len: frame.len(),
+                    timestamps: Default::default(),
+                    tcp_segment_size: None,
+                    l4_checksum: Default::default(),
+                },
+                frame,
+            })),
+            Err(error) => {
+                if error.kind() == io::ErrorKind::InvalidData {
+                    self.poisoned = true;
+                }
+                Err(error)
+            }
+        }
+    }
+    // F: the UMEM less the fill ring's frames and the TX ring's.
+    fn rx_frame_budget(&self) -> Option<usize> {
+        Some((self.config.frame_count - 2 * self.config.ring_size) as usize)
+    }
+    fn rx_frames_outstanding(&self) -> Option<usize> {
+        Some((self.umem.taken - self.umem.returns().count.released()) as usize)
+    }
+    // The socket's XDP_STATISTICS: packets it found no fill-ring frame for
+    // (rx_fill_ring_empty_descs, how often the kernel found the fill ring
+    // empty) as rx_nombuf, and the packets it dropped for want of one or
+    // with its RX ring full (rx_dropped plus rx_ring_full, the sum a
+    // kernel reports as rx_dropped to a caller of the version 1 struct) as
+    // rx_missed. A failed query, or a kernel without the extended struct,
+    // leaves what it cannot report zero.
+    fn device_counters(&self) -> DeviceCounters {
+        let mut stats = XdpStatistics::default();
+        let mut size = size_of::<XdpStatistics>() as libc::socklen_t;
+        // SAFETY: the output buffer has the supplied length.
+        let result = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                SOL_XDP,
+                XDP_STATISTICS,
+                (&mut stats as *mut XdpStatistics).cast(),
+                &mut size,
+            )
+        };
+        if result < 0 {
+            return DeviceCounters::default();
+        }
+        DeviceCounters {
+            rx_nombuf: stats.rx_fill_ring_empty_descs,
+            rx_missed: stats.rx_dropped + stats.rx_ring_full,
+            tx_nombuf: 0,
+        }
     }
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
         // Reject before service/kick or any descriptor publication.
@@ -702,8 +953,14 @@ mod tests {
     }
     fn adapter_with_config(config: Config) -> AfXdp {
         let len = config.validate().unwrap();
-        let umem = Mapping::new(-1, 0, len).unwrap();
-        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        let umem = Umem::new(Mapping::new(-1, 0, len).unwrap(), config.frame_count);
+        // Miri models no sockets; an eventfd stands in for the frame tests,
+        // which never wake the socket.
+        let raw = if cfg!(miri) {
+            unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) }
+        } else {
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) }
+        };
         assert!(raw >= 0);
         AfXdp {
             fd: unsafe { OwnedFd::from_raw_fd(raw) },
@@ -749,7 +1006,7 @@ mod tests {
     fn inject(a: &mut AfXdp, index: u32, packet: &[u8]) {
         let addr = index as usize * a.config.frame_size as usize + a.data_offset() as usize;
         unsafe {
-            ptr::copy_nonoverlapping(packet.as_ptr(), a.umem.ptr.add(addr), packet.len());
+            ptr::copy_nonoverlapping(packet.as_ptr(), a.umem.ptr().add(addr), packet.len());
         }
         assert!(
             a.rx.push(Descriptor {
@@ -760,6 +1017,130 @@ mod tests {
             .unwrap()
         );
     }
+    // 8 frames, 2 posted to RX and 2 for TX: F = 4.
+    fn frame_adapter() -> AfXdp {
+        adapter_with_config(Config {
+            frame_count: 8,
+            ring_size: 2,
+            ..config()
+        })
+    }
+    // The fill ring's entries, oldest first, as frame indices.
+    fn fill_frames(a: &mut AfXdp) -> Vec<u64> {
+        let mut frames = Vec::new();
+        while let Some(addr) = a.fill.peek().unwrap() {
+            frames.push(addr / u64::from(a.config.frame_size));
+            a.fill.consume();
+        }
+        frames
+    }
+
+    #[test]
+    fn a_held_frame_is_its_umem_bytes_and_a_free_frame_refills_for_it() {
+        let mut a = frame_adapter();
+        assert_eq!(a.rx_frame_budget(), Some(4));
+        assert_eq!(a.rx_frames_outstanding(), Some(0));
+        inject(&mut a, 0, &[42; 100]);
+        let frame = a.receive_held().unwrap().unwrap();
+        assert_eq!(frame.as_slice(), &[42; 100]);
+        let at = a.umem.ptr().wrapping_add(a.data_offset() as usize);
+        assert_eq!(
+            frame.as_ptr(),
+            at.cast_const(),
+            "the UMEM itself, not a copy"
+        );
+        assert_eq!(frame.truesize(), 4096);
+        assert!(!frame.is_heap());
+        assert!(a.frames[0] == Frame::Held);
+        // The last free frame went to the fill ring in its place.
+        assert_eq!(fill_frames(&mut a), [7]);
+        assert!(a.frames[7] == Frame::Rx);
+        assert_eq!(a.free, [2, 3, 4, 5, 6]);
+        assert_eq!(a.rx_frames_outstanding(), Some(1));
+        assert!(a.receive_held().unwrap().is_none());
+        // Back, and free again for TX or a refill once the adapter looks.
+        drop(frame);
+        assert_eq!(a.rx_frames_outstanding(), Some(0));
+        assert!(a.frames[0] == Frame::Held);
+        a.take_returns().unwrap();
+        assert!(a.frames[0] == Frame::Free);
+        assert_eq!(a.free, [2, 3, 4, 5, 6, 0]);
+        a.take_returns().unwrap();
+        assert_eq!(a.free.len(), 6);
+    }
+
+    #[test]
+    fn with_every_frame_held_the_fill_ring_runs_short_until_one_returns() {
+        let mut a = frame_adapter();
+        let mut held = Vec::new();
+        // Frames 0 and 1 posted, 2..8 free: every receive refills until
+        // the free frames run out.
+        let mut posted = vec![0u32, 1];
+        for round in 0..8u8 {
+            let index = posted.remove(0);
+            inject(&mut a, index, &[round; 64]);
+            let frame = a.receive_held().unwrap().unwrap();
+            assert_eq!(frame.as_slice(), &[round; 64]);
+            held.push(frame);
+            posted.extend(fill_frames(&mut a).into_iter().map(|f| f as u32));
+        }
+        assert!(posted.is_empty() && a.free.is_empty());
+        assert!(a.frames.iter().all(|f| *f == Frame::Held));
+        assert_eq!(a.rx_frames_outstanding(), Some(8));
+        // TX finds no frame either: backpressure, as the ring full.
+        assert_eq!(a.transmit_one(&[1; 64]).unwrap(), TxOutcome::WouldBlock);
+        // Released on another thread; the next look frees them.
+        let last = held.pop().unwrap();
+        std::thread::spawn(move || drop(held)).join().unwrap();
+        assert_eq!(a.rx_frames_outstanding(), Some(1));
+        a.take_returns().unwrap();
+        assert_eq!(a.free.len(), 7);
+        let still = (last.as_ptr() as usize - a.umem.ptr() as usize) / 4096;
+        assert!(!a.free.contains(&(still as u32)) && a.frames[still] == Frame::Held);
+        assert_eq!(last.as_slice(), &[7; 64]);
+        drop(last);
+    }
+
+    #[test]
+    fn a_frame_held_past_its_adapter_keeps_the_umem_mapped() {
+        let mut a = frame_adapter();
+        inject(&mut a, 1, &[9; 1500]);
+        inject(&mut a, 0, &[8; 60]);
+        let first = a.receive_held().unwrap().unwrap();
+        let second = a.receive_held().unwrap().unwrap();
+        drop(a);
+        // The adapter has gone: the frames still read the UMEM, and the
+        // last release frees the block with the mapping (Miri checks the
+        // leak and the use after free).
+        assert_eq!(first.as_slice(), &[9; 1500]);
+        drop(first);
+        assert_eq!(second.as_slice(), &[8; 60]);
+        std::thread::spawn(move || drop(second)).join().unwrap();
+        // An adapter that leaves with nothing out frees it itself.
+        let mut a = frame_adapter();
+        inject(&mut a, 0, &[1; 64]);
+        drop(a.receive_held().unwrap().unwrap());
+        drop(a);
+    }
+
+    // Through PacketIo: each receive first frees what was released, and
+    // reports the frame's length. A socket that is not AF_XDP reports no
+    // statistics. (Its socket calls are beyond Miri.)
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn receive_frame_takes_releases_back_first() {
+        let mut a = frame_adapter();
+        let _peer = wakeup_peer(&mut a);
+        assert_eq!(a.device_counters(), DeviceCounters::default());
+        inject(&mut a, 0, &[5; 70]);
+        let received = a.receive_frame(&mut []).unwrap().unwrap();
+        assert_eq!(received.metadata.len, 70);
+        assert_eq!(received.frame.as_slice(), &[5; 70]);
+        drop(received);
+        assert!(a.receive_frame(&mut []).unwrap().is_none());
+        assert!(a.frames[0] == Frame::Free && a.free.contains(&0));
+    }
+
     #[test]
     fn capacity_is_not_live_mtu_and_oversize_never_publishes() {
         let mut a = adapter();
@@ -1086,7 +1467,7 @@ mod tests {
         }
         let first = a.tx.peek().unwrap().unwrap();
         packet.fill(99);
-        let copy = unsafe { std::slice::from_raw_parts(a.umem.ptr.add(first.addr as usize), 64) };
+        let copy = unsafe { std::slice::from_raw_parts(a.umem.ptr().add(first.addr as usize), 64) };
         assert_eq!(copy, &[17; 64]);
         assert_eq!(a.transmit_one(&packet).unwrap(), TxOutcome::WouldBlock);
         a.tx.consume();
@@ -1171,7 +1552,7 @@ mod tests {
             let index = (desc.addr / 4096) as usize;
             assert!(a.frames[index] == Frame::Tx);
             let copy =
-                unsafe { std::slice::from_raw_parts(a.umem.ptr.add(desc.addr as usize), 64) };
+                unsafe { std::slice::from_raw_parts(a.umem.ptr().add(desc.addr as usize), 64) };
             assert_eq!(copy, &[byte; 64]);
             a.tx.consume();
             a.completion.push(desc.addr).unwrap();

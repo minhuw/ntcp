@@ -268,9 +268,12 @@ impl PortConfig {
         Self {
             interface: interface.into(),
             mode: XdpMode::Native,
-            frame_size: 4096,
-            // Half the frames fill the RX rings, half are free for TX.
-            frame_count: 2048,
+            // 2048-octet frames, 16384 of them: a 32 MiB UMEM per queue,
+            // of which ring_size fill the RX ring and ring_size more TX
+            // may hold, and the rest, 14,336, received frames held by
+            // reference (`PacketIo::rx_frame_budget`, decision Q3).
+            frame_size: 2048,
+            frame_count: 16384,
             ring_size: 1024,
             headroom: 0,
             mtu: 1500,
