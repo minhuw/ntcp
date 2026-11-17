@@ -151,6 +151,9 @@ pub(crate) struct RxQueue {
     // Start -> end of each maximal run of held out-of-order bytes.
     runs: BTreeMap<u64, u64>,
     anchors: BTreeSet<u64>,
+    // Whether ofo, runs or anchors may hold a root leaf: set by every
+    // insertion, cleared once shed finds all three empty.
+    rooted: bool,
     // The sequence and stream offset of the first unread byte.
     read_base: Seq,
     read: u64,
@@ -189,6 +192,7 @@ impl RxQueue {
             ofo: BTreeMap::new(),
             runs: BTreeMap::new(),
             anchors: BTreeSet::new(),
+            rooted: false,
             read_base: start,
             read: 0,
             readable: 0,
@@ -305,6 +309,11 @@ impl RxQueue {
     // std's BTreeMap keeps its root leaf after its last entry is removed:
     // an emptied map gives it back, so an idle queue holds no storage.
     fn shed(&mut self) {
+        if !self.rooted {
+            debug_assert!(self.ofo.is_empty() && self.runs.is_empty() && self.anchors.is_empty());
+            return;
+        }
+        self.rooted = !self.ofo.is_empty() || !self.runs.is_empty() || !self.anchors.is_empty();
         if self.ofo.is_empty() {
             self.ofo = BTreeMap::new();
         }
@@ -392,6 +401,7 @@ impl RxQueue {
         self.ofo = BTreeMap::new();
         self.runs = BTreeMap::new();
         self.anchors = BTreeSet::new();
+        self.rooted = false;
         self.read_base = Seq(0);
         self.read = 0;
         self.readable = 0;
@@ -667,8 +677,10 @@ impl RxQueue {
         self.dsack = undo.dsack;
         self.report_debt = undo.report_debt;
         self.pending_first = undo.pending_first;
-        undo.anchor
-            .is_some_and(|anchor| self.anchors.insert(anchor))
+        undo.anchor.is_some_and(|anchor| {
+            self.rooted = true;
+            self.anchors.insert(anchor)
+        })
     }
 
     // Called only after a SACK-bearing packet has been successfully encoded.
@@ -873,6 +885,7 @@ impl RxQueue {
         }
         debug_assert_eq!(frame.len() as u64, to - from);
         self.hold(&frame);
+        self.rooted = true;
         self.ofo.insert(from, OfoSeg { frame, push });
         let mut start = from;
         let mut end = to;
@@ -884,6 +897,7 @@ impl RxQueue {
         if let Some(right) = self.runs.remove(&to) {
             end = right;
         }
+        self.rooted = true;
         self.runs.insert(start, end);
     }
 
@@ -1048,6 +1062,7 @@ impl RxQueue {
             && (outcome.out_of_order || had_holes)
         {
             let offset = stored.unwrap().0;
+            self.rooted = true;
             self.anchors.insert(offset);
             if self.pending_first.is_none_or(|old| {
                 anchor.distance_from(self.read_base) < old.distance_from(self.read_base)
@@ -1265,6 +1280,7 @@ impl RxQueue {
             collapsed += freed;
             for (start, frame, push) in frames {
                 self.hold(&frame);
+                self.rooted = true;
                 self.ofo.insert(start, OfoSeg { frame, push });
             }
         }
@@ -1356,6 +1372,7 @@ impl RxQueue {
             if run == start {
                 self.runs.remove(&run);
             } else {
+                self.rooted = true;
                 self.runs.insert(run, start);
             }
             drop(self.anchors.split_off(&start));
@@ -1454,6 +1471,9 @@ impl RxQueue {
             assert!(anchor >= self.read && anchor < held);
             assert!(anchor < edge || self.run_at(anchor).is_some());
         }
+        assert!(
+            self.rooted || (self.ofo.is_empty() && self.runs.is_empty() && self.anchors.is_empty())
+        );
     }
 }
 
@@ -1834,6 +1854,47 @@ mod tests {
             (queue.queue.storage(), queue.queue.rmem(), queue.live),
             (0, 0, 0)
         );
+    }
+
+    // Out-of-order input roots all three maps; once promotion and reads
+    // empty them, shed gives every root back, and the next out-of-order
+    // arrival roots them again.
+    #[test]
+    fn emptied_maps_give_their_roots_back() {
+        let start = Seq(5000);
+        let limit = start.wrapping_add(65536);
+        let mut queue = Counted::create(start, 0);
+        assert!(!queue.queue.rooted);
+        let insert = |queue: &mut Counted, offset: u32, len: usize| {
+            queue.insert(
+                start.wrapping_add(offset),
+                heap_frame(&alloc::vec![offset as u8; len], 0),
+                false,
+                false,
+                limit,
+                &mut |_, _| {},
+            )
+        };
+        for base in [0, 150] {
+            assert!(insert(&mut queue, base + 100, 50).out_of_order);
+            let held = &queue.queue;
+            assert!(held.rooted);
+            assert_eq!(
+                (held.ofo.len(), held.runs.len(), held.anchors.len()),
+                (1, 1, 1)
+            );
+            queue.check();
+            // Filling the hole promotes the held run.
+            insert(&mut queue, base, 100);
+            assert!(queue.queue.ofo.is_empty() && queue.queue.runs.is_empty());
+            queue.check();
+            let mut out = [0; 150];
+            assert_eq!(queue.read(&mut out), 150);
+            queue.check();
+            let held = &queue.queue;
+            assert!(!held.rooted && held.anchors.is_empty());
+            assert_eq!((held.storage(), held.rmem(), queue.live), (0, 0, 0));
+        }
     }
 
     // Each frame stays charged its whole truesize until its last byte is
