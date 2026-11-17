@@ -12097,13 +12097,13 @@ fn invalid_configuration_and_unscaled_peer_defaults() {
 //# window edge to the left (SHLD-14).
 //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
 //= type=test
-//= reason=Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; backing and encoded edge tested through sub-scale advances.
+//= reason=Ordinary outgoing receive window divides by scale unit (floor), SYN is raw; window and encoded edge tested through sub-scale advances.
 //# o  The window field (SEG.WND) of every outgoing segment, with the
 //# exception of <SYN> segments, MUST be right-shifted by
 //# Rcv.Wind.Shift bits:
 //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
 //= type=test
-//= reason=Previously committed receive promises remain valid across scaled rounding and wrap. Capacity-backed presence bits accept arbitrary fragmentation without an interval-count limit; tests combine delayed promised bytes, batching and complete retained delivery.
+//= reason=Previously committed receive promises remain valid across scaled rounding and wrap: acceptance tests the highest edge advertised, never the current free space. The out-of-order map accepts arbitrary fragmentation without an interval-count limit. Holding the data is subject to the receive memory rules, as in Linux (a segment past the limit after collapse and prune is dropped, PROTO_MEM); the limit starts at twice the window (n0bw Q2), so a promise filled with small segments is held. Tests combine delayed promised bytes, batching and complete retained delivery.
 //# 1)  The receiver MUST honor, as in window, any segment that would
 //# have been in window for any <ACK> sent by the receiver.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
@@ -12116,7 +12116,7 @@ fn invalid_configuration_and_unscaled_peer_defaults() {
 //# any data in the receive buffer).
 //= https://www.rfc-editor.org/rfc/rfc7323#section-7
 //= type=test
-//= reason=Receive window bounded by explicit configured receive allocation, never rounds beyond backing; no speculative unlimited window growth.
+//= reason=Receive window bounded by the configured receive size (window_clamp) less the window the held frames take at the scaling ratio (tcp_space, in order and beyond a gap), and by rcv_ssthresh, never rounded up; no speculative unlimited window growth.
 //# Hence, implementers should take care to not open the TCP window
 //# drastically beyond the requirements of the connection.
 fn scaled_window_rounding_never_overruns_storage_or_revokes_old_credit() {
@@ -18079,7 +18079,7 @@ fn timestamps_negotiate_fallback_and_atomic_output() {
 //# edge), then accept it normally.
 //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
 //= type=test
-//= reason=Timestamp-validated in-window data uses capacity-backed presence bits, without a range-count admission gate. Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
+//= reason=Timestamp-validated in-window out-of-sequence data is queued as frames in the out-of-order map, without a range-count admission gate; only the receive memory rules bound it (collapse, prune, PROTO_MEM drop, as Linux). Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
 //# R5)  Otherwise, treat the segment as a normal in-window,
 //# out-of-sequence TCP segment (e.g., queue it for later delivery
 //# to the user).

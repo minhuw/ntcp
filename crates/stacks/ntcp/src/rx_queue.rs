@@ -1328,11 +1328,16 @@ impl RxQueue {
     // over sk_rcvbuf) or `pressure` holds. If anything was dropped, the SACK
     // state is reset (tcp_sack_reset): reported blocks, the latest
     // arrival's and any pending D-SACK go, as do the report anchors in the
-    // dropped ranges.
-    // This is RFC 2018 section 8's reneging; the duvet exceptions that say
-    // it is not selected are rewritten with the other annotations (n0bw
-    // stage 1 C7). The sender keeps all data until cumulatively
+    // dropped ranges. The sender keeps all data until cumulatively
     // acknowledged.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-8
+    //= reason=Reneging as Linux's tcp_prune_ofo_queue: past the receive memory limit, after collapse, out-of-order frames already reported in SACK blocks are dropped from the top (DropReason::TcpOfoQueuePrune, OfoPruned).
+    //# The data receiver MAY elect not to keep data which it has reported in a SACK
+    //# option.
+    //= https://www.rfc-editor.org/rfc/rfc2018#section-8
+    //= reason=After a prune the SACK state is reset as Linux's tcp_sack_reset: the reported blocks, the latest arrival's, any pending D-SACK and the report anchors in the dropped ranges go, and blocks are built only from the out-of-order runs still held.
+    //# * Except for the newest segment, all SACK blocks MUST NOT report any old
+    //# data which is no longer actually held by the receiver.
     pub(crate) fn prune_ofo(&mut self, incoming: Seq, limit: usize, pressure: bool) -> Pruned {
         let mut pruned = Pruned::default();
         let incoming = self.offset(incoming).unwrap_or(self.read);

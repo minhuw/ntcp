@@ -818,7 +818,7 @@ fn members_share_one_buffer_budget_and_wake_each_others_writers() {
     lan.members[0].network.abort(ids[0]).unwrap();
     let held = lan.members[0].network.counters().buffer_bytes;
     let mut woken = false;
-    // A pooled receive ring stays charged; the send storage goes.
+    // Its send storage goes (it holds no received data).
     while lan.members[0].network.counters().buffer_bytes > held - write / 2 {
         assert!(lan.now < 200 * SECOND, "member 0 returned its storage");
         lan.now += SECOND;

@@ -111,33 +111,17 @@ SACKed segment is available for retransmission.
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
-reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
-quote = '''
-The data receiver MAY elect not to keep data which it has reported in a SACK
-option.
-'''
-
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
-reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
+reason = "ntcp reneges as Linux does (the section 8 MAY and the rule for old data are cited at RxQueue::prune_ofo): past the receive memory limit, after collapse, out-of-order data is pruned from the top (tcp_prune_ofo_queue) and the SACK state is reset (tcp_sack_reset). A newest segment that the receive memory rules refuse (PROTO_MEM, TCPOFODrop) is not reported: Linux's tcp_data_queue_ofo drops it without scheduling an ACK, and ntcp follows Linux rather than send a block for data it does not hold. A newest segment that is taken is reported first, as section 4 requires. Overflow SACK omission remains a section-4 TODO, not excused here."
 quote = '''
 * The first SACK block MUST reflect the newest segment.
 '''
 
 [[exception]]
 target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
-reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
+reason = "ntcp reneges as Linux does (the section 8 MAY and the rule for old data are cited at RxQueue::prune_ofo): past the receive memory limit, after collapse, out-of-order data is pruned from the top (tcp_prune_ofo_queue) and the SACK state is reset (tcp_sack_reset). A newest segment that the receive memory rules refuse (PROTO_MEM, TCPOFODrop) is not reported: Linux's tcp_data_queue_ofo drops it without scheduling an ACK, and ntcp follows Linux rather than send a block for data it does not hold. A newest segment that is taken is reported first, as section 4 requires. Overflow SACK omission remains a section-4 TODO, not excused here."
 quote = '''
 Even if the newest segment is going to be discarded and the receiver has
 already discarded adjacent segments, the first SACK block MUST report, at a
 minimum, the left and right edges of the newest segment.
-'''
-
-[[exception]]
-target = "https://www.rfc-editor.org/rfc/rfc2018#section-8"
-reason = "RFC 2018 section 8 qualifies these receiver rules with \"The data receiver MAY elect not to keep data which it has reported in a SACK option. In this case\". ReceiveBuffer retains previously accepted/SACKed bytes; range-cap overflow rejects new bytes transactionally rather than reneging on a prior report (overflow_is_transactional_and_bridging_at_capacity_succeeds). This optional reneging algorithm is not selected. Overflow SACK omission remains a section-4 TODO, not excused here."
-quote = '''
-* Except for the newest segment, all SACK blocks MUST NOT report any old
-data which is no longer actually held by the receiver.
 '''
 

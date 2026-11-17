@@ -431,7 +431,7 @@ impl OutputReservation {
                 // containing second block, so the pair is never split into an
                 // ordinary SACK. Without room for both the D-SACK is omitted
                 // and its containing block reported, as a one-block option
-                // is chosen at selection (ReceiveBuffer::sack_blocks).
+                // is chosen at selection (RxQueue::sack_blocks).
                 if r.sacks == 0 && blocks >= 2 && emitted_sacks < 2 {
                     let block = |index: usize| sacks[index].unwrap();
                     let ((left, right), (outer_left, outer_right)) = (block(0), block(1));

@@ -229,7 +229,7 @@ fn clear_releases_storage_without_exposing_old_payload_push_fin_or_sack() {
 //# advanced the Acknowledgment Number field in the header.
 //= https://www.rfc-editor.org/rfc/rfc2018#section-4
 //= type=test
-//= reason=Four successful first-block anchors provide report history; anchors resolve through the presence bitmap after merges and cumulative advancement. Encoding failure does not change history.
+//= reason=Four successful first-block anchors provide report history; anchors resolve through the out-of-order runs after merges and cumulative advancement. Encoding failure does not change history.
 //# * The SACK option SHOULD be filled out by repeating the most recently
 //# reported SACK blocks (based on first SACK blocks in previous SACK options)
 //# that are not subsets of a SACK block already included in the SACK option

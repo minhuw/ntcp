@@ -156,6 +156,29 @@ impl Default for PacingConfig {
 pub struct ConnectionConfig {
     // The initial send limit and receive window, Linux's tcp_wmem[1] and
     // tcp_rmem[1].
+    //
+    // Receive sizes are window bytes (n0bw D2): `receive_capacity`, like
+    // the window DRS or `Endpoint::set_receive_buffer` sets, is Linux's
+    // window_clamp. Received data is charged by its memory, as Linux's
+    // sk_rmem_alloc: each held frame's truesize (its allocation) plus
+    // RX_ENTRY_TRUESIZE (192 B, the queue entry, as SKB_TRUESIZE adds the
+    // sk_buff). The memory limit, Linux's sk_rcvbuf, is the window at the
+    // ratio of payload to truesize that the first full-size in-order
+    // segment measures (tcp_measure_rcv_mss), twice the window until then
+    // (Linux's 50% start), and never below SOCK_MIN_RCVBUF (2304 B). Past
+    // it the receive queue is collapsed into 4 KiB copies, then
+    // out-of-order data is pruned, then segments are dropped
+    // (`MemoryCounters`, DropReason::ProtoMem and TcpOfoQueuePrune).
+    // The window offered is the window less what the held frames take at
+    // the ratio (tcp_space), within rcv_ssthresh on a tuned direction; the
+    // ratio starts at 1:1, so the configured window is offered in full.
+    // Besides reads and DRS, four rules of Linux's move it: out-of-order
+    // frames count against it; a small segment costs its entry overhead as
+    // well as its payload; a partly read frame keeps its whole truesize
+    // until its last byte is read; and on a tuned direction a segment
+    // whose truesize the window would not back raises rcv_ssthresh by
+    // 2 * rcv_mss or nothing (__tcp_grow_window), not 2 * advmss. The edge
+    // offered never moves left.
     pub send_capacity: usize,
     pub receive_capacity: usize,
     // Each direction's floor and ceiling, Linux's tcp_wmem[0]/tcp_wmem[2]
@@ -7232,7 +7255,7 @@ impl Connection {
         //# R4)  If an arriving segment is in sequence (i.e., at the left window
         //# edge), then accept it normally.
         //= https://www.rfc-editor.org/rfc/rfc7323#section-5.3
-        //= reason=Timestamp-validated in-window data uses capacity-backed presence bits, without a range-count admission gate. Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
+        //= reason=Timestamp-validated in-window out-of-sequence data is queued as frames in the out-of-order map, without a range-count admission gate; only the receive memory rules bound it (collapse, prune, PROTO_MEM drop, as Linux). Alternating-window and timestamp fragmentation tests cover more than 64 intervals, gap filling, retained delivery and wrap.
         //# R5)  Otherwise, treat the segment as a normal in-window,
         //# out-of-sequence TCP segment (e.g., queue it for later delivery
         //# to the user).
@@ -9320,7 +9343,7 @@ impl Connection {
     //# Implementations MUST ensure that they handle a shrinking
     //# window, as specified in Section 4.2.2.16 of [RFC1122].
     //= https://www.rfc-editor.org/rfc/rfc7323#section-7
-    //= reason=Receive window bounded by the configured receive size less the unread data, and by rcv_ssthresh, never rounded up; no speculative unlimited window growth.
+    //= reason=Receive window bounded by the configured receive size (window_clamp) less the window the held frames take at the scaling ratio (tcp_space, in order and beyond a gap), and by rcv_ssthresh, never rounded up; no speculative unlimited window growth.
     //# Hence, implementers should take care to not open the TCP window
     //# drastically beyond the requirements of the connection.
     //= https://www.rfc-editor.org/rfc/rfc6928#section-3
@@ -12006,7 +12029,7 @@ impl Connection {
             };
             let edge = self.receive.next().wrapping_add((window as u32) << shift);
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-            //= reason=Previously committed receive promises remain valid across scaled rounding and wrap. Capacity-backed presence bits accept arbitrary fragmentation without an interval-count limit; tests combine delayed promised bytes, batching and complete retained delivery.
+            //= reason=Previously committed receive promises remain valid across scaled rounding and wrap: acceptance tests the highest edge advertised, never the current free space. The out-of-order map accepts arbitrary fragmentation without an interval-count limit. Holding the data is subject to the receive memory rules, as in Linux (a segment past the limit after collapse and prune is dropped, PROTO_MEM); the limit starts at twice the window (n0bw Q2), so a promise filled with small segments is held. Tests combine delayed promised bytes, batching and complete retained delivery.
             //# 1)  The receiver MUST honor, as in window, any segment that would
             //# have been in window for any <ACK> sent by the receiver.
             //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4

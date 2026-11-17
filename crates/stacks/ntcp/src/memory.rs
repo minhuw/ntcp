@@ -92,24 +92,35 @@ pub struct MemoryCounters {
     /// inference about it until a block or the cumulative ACK covers all
     /// of it.
     pub ledger_split_refusals: u64,
-    /// Receive queue prunes started, Linux's PruneCalled: a segment found
-    /// the queue past its limit (`rmem` over the receive buffer the window
-    /// clamp needs) or the budget without room for it.
+    /// Receive queue prunes started, Linux's PruneCalled
+    /// (tcp_prune_queue): a segment with new bytes found its connection's
+    /// receive memory past the limit (the held frames' truesize, each with
+    /// its 192 B entry, over the window at the payload-to-truesize ratio:
+    /// see `ConnectionConfig::receive_capacity`) or the budget without
+    /// room for its frame.
     pub prune_called: u64,
-    /// Prunes that collapsing and dropping out-of-order data could not
-    /// bring within the limit, Linux's RcvPruned: the segment is dropped.
+    /// Prunes that neither collapsing nor dropping out-of-order data
+    /// brought within the limit, Linux's RcvPruned. The segment is then
+    /// refused (`rcv_queue_drops`, `ofo_drops`), unless it is in order and
+    /// nothing unread is queued: that one is taken past the limit, as
+    /// Linux's sk_forced_mem_schedule takes it.
     pub rcv_pruned: u64,
-    /// Prunes that dropped out-of-order data (and reset SACK), Linux's
-    /// OfoPruned.
+    /// Prunes that dropped out-of-order frames, from the highest down
+    /// (each a DropReason::TcpOfoQueuePrune), and reset the SACK state:
+    /// RFC 2018 section 8 reneging, Linux's OfoPruned
+    /// (tcp_prune_ofo_queue). The peer retransmits that data.
     pub ofo_pruned: u64,
-    /// Received frames copied into larger ones to free memory, Linux's
-    /// TCPRcvCollapsed.
+    /// Received frames freed by copying them, with their neighbours, into
+    /// heap frames of at most 4 KiB whose truesize is near their length,
+    /// Linux's TCPRcvCollapsed (tcp_collapse).
     pub rcv_collapsed: u64,
-    /// In-order segments dropped for memory while unread data was queued,
-    /// Linux's TCPRcvQDrop (DropReason::ProtoMem).
+    /// In-order segments refused for memory while unread data was queued,
+    /// Linux's TCPRcvQDrop: each a DropReason::ProtoMem, answered at once
+    /// by an ACK offering a zero window that moves no edge (Linux's
+    /// ICSK_ACK_NOMEM).
     pub rcv_queue_drops: u64,
-    /// Out-of-order segments dropped for memory, Linux's TCPOFODrop
-    /// (DropReason::ProtoMem).
+    /// Out-of-order segments refused for memory, Linux's TCPOFODrop: each
+    /// a DropReason::ProtoMem, with no ACK (tcp_data_queue_ofo).
     pub ofo_drops: u64,
 }
 

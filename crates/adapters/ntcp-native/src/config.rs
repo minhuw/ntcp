@@ -94,7 +94,11 @@ impl NetworkConfig {
     /// its RACK and SACK ledgers grow with the bytes it holds queued, and
     /// the data it receives is charged, frame by frame, while it is held
     /// unread or beyond a gap (a heap frame of its length plus its queue
-    /// slot), and returned as it is read. A write whose storage the cap
+    /// slot), and returned as it is read. Received data is held up to each
+    /// connection's receive memory limit, and only while the cap has room:
+    /// past either the queue is collapsed, out-of-order data pruned, and
+    /// segments dropped, as Linux's (`Counters::prune_called` and the
+    /// counters after it). A write whose storage the cap
     /// refuses takes what the connection's storage holds and then waits for
     /// memory, as Linux's: a partial write or `Error::WouldBlock`, the
     /// connection writable again once memory comes back
@@ -191,12 +195,14 @@ impl NetworkConfig {
     /// - ephemeral ports 32768 to 60999 (ip_local_port_range);
     /// - receive buffers of 4 KiB, 64 KiB and 32 MiB (min, initial, max):
     ///   each starts at 64 KiB, its limit grows at read with the bytes the
-    ///   application takes per round trip, up to 32 MiB, and its window and
-    ///   ring follow the full-size segments received, as Linux's
+    ///   application takes per round trip, up to 32 MiB, and its window
+    ///   follows the full-size segments received, as Linux's
     ///   tcp_rmem = 4096 131072 33554432 with tcp_moderate_rcvbuf (its
     ///   128 KiB of memory starts a window of about 64 KiB; here sizes are
-    ///   window bytes). The 32 MiB maximum gives the SYN a window scale of
-    ///   10, as tcp_select_initial_window takes it from tcp_rmem[2];
+    ///   window bytes, and the memory a window may hold starts at twice it,
+    ///   as Linux's, until the first full-size segment measures it). The
+    ///   32 MiB maximum gives the SYN a window scale of 10, as
+    ///   tcp_select_initial_window takes it from tcp_rmem[2];
     /// - send limits of 4 KiB, 64 KiB and 4 MiB: each starts at 64 KiB and
     ///   rises with the congestion window, to twice it, up to 4 MiB, as
     ///   Linux's tcp_wmem[2] = 4 MiB with tcp_sndbuf_expand. The 64 KiB

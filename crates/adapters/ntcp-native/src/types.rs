@@ -512,16 +512,25 @@ pub struct Counters {
     // entries the writes allocated ran out: the entry stays whole and
     // that SACK block yields no loss inference about it.
     pub ledger_split_refusals: u64,
-    // Receive memory (ntcp::MemoryCounters, Linux's MIB names): prunes
-    // started (PruneCalled), failed (RcvPruned) and dropping out-of-order
-    // data (OfoPruned); frames collapsed (TCPRcvCollapsed); segments
-    // dropped for memory, in order with unread data queued (TCPRcvQDrop)
-    // and out of order (TCPOFODrop).
+    // Receive memory, as ntcp::MemoryCounters counts it, by Linux's
+    // TcpExt names. Receive prunes started: a segment found its
+    // connection's receive memory past the limit or the budget without
+    // room (PruneCalled).
     pub prune_called: u64,
+    // Prunes that could not bring the queue within its limit: the segment
+    // is refused unless it is in order into an empty queue (RcvPruned).
     pub rcv_pruned: u64,
+    // Prunes that dropped out-of-order data and reset SACK, reneging
+    // (OfoPruned; the frames are DropReason::TcpOfoQueuePrune).
     pub ofo_pruned: u64,
+    // Received frames freed by copying them into 4 KiB frames
+    // (TCPRcvCollapsed).
     pub rcv_collapsed: u64,
+    // In-order segments refused for memory with unread data queued, each
+    // answered by a zero-window ACK (TCPRcvQDrop; DropReason::ProtoMem).
     pub rcv_queue_drops: u64,
+    // Out-of-order segments refused for memory (TCPOFODrop;
+    // DropReason::ProtoMem).
     pub ofo_drops: u64,
     // Every discard by reason (`ntcp::DropReason`), which `discarded` sums:
     // Linux's per-reason kfree_skb counts. tcp_checksum_errors is

@@ -476,7 +476,7 @@ fn reserved_real_ack_keeps_consumed_dsack() {
 // NOP, NOP, SACK): at the IPv4 floor a 2-block SACK no longer fits beside the
 // timestamp, so an above-ACK D-SACK, which cannot be split from its containing
 // block, is omitted and the containing block reported, as selection chooses
-// for a one-block budget (ReceiveBuffer::sack_blocks).
+// for a one-block budget (RxQueue::sack_blocks).
 #[test]
 fn reserved_above_ack_dsack_pair_without_room_reports_its_containing_block() {
     let (mut a, _, id, _) = pair();

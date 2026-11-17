@@ -143,6 +143,16 @@ fn collapse_copies_bloated_frames_within_the_limit() {
 // follows prunes from the top (tcp_prune_ofo_queue, 4096 / 8 = 512 B of
 // truesize: three frames) and resets the SACK state, then is taken.
 #[test]
+//= https://www.rfc-editor.org/rfc/rfc2018#section-8
+//= type=test
+//= reason=Out-of-order frames reported in SACK blocks are dropped from the top past the limit (TCP_OFO_QUEUE_PRUNE, OfoPruned).
+//# The data receiver MAY elect not to keep data which it has reported in a SACK
+//# option.
+//= https://www.rfc-editor.org/rfc/rfc2018#section-8
+//= type=test
+//= reason=The ACK after the prune reports no block above the highest frame still held.
+//# * Except for the newest segment, all SACK blocks MUST NOT report any old
+//# data which is no longer actually held by the receiver.
 fn prune_drops_out_of_order_frames_from_the_top_and_resets_sack() {
     let (mut a, mut b, client, server) = pair(2048, true);
     let sent = segments(&mut a, client, 61, 1);
@@ -187,6 +197,33 @@ fn prune_drops_out_of_order_frames_from_the_top_and_resets_sack() {
             "{block:?} above {highest}"
         );
     }
+}
+
+// An out-of-order segment below the highest held frame prunes from the top
+// to make room and is taken; it is then the newest segment, and the ACK's
+// first SACK block reports it (RFC 2018 sections 4 and 8), merged with its
+// held neighbours: bytes 1 to 3.
+#[test]
+fn an_out_of_order_segment_taken_after_a_prune_is_the_first_sack_block() {
+    let (mut a, mut b, client, server) = pair(2048, true);
+    let sent = segments(&mut a, client, 45, 1);
+    for (ip, bytes) in sent.iter().skip(1).step_by(2) {
+        b.input(0, *ip, bytes).unwrap();
+        flight(&mut b, 0);
+    }
+    assert_eq!(rmem(&b, server), 22 * (1 + RX_ENTRY_TRUESIZE));
+    let (ip, bytes) = &sent[2];
+    b.input(0, *ip, bytes).unwrap();
+    assert_eq!(b.drop_counts()[DropReason::TcpOfoQueuePrune], 3);
+    assert_eq!(b.drop_counts()[DropReason::ProtoMem], 0);
+    assert_eq!(rmem(&b, server), 20 * (1 + RX_ENTRY_TRUESIZE));
+    let ack = flight(&mut b, 0);
+    let segment = wire::parse(ack[0].0, &ack[0].1).unwrap();
+    let next = segment.header.acknowledgment;
+    assert_eq!(
+        segment.options.sack_blocks[0],
+        Some((next.wrapping_add(1), next.wrapping_add(4)))
+    );
 }
 
 // With the budget at its cap the queue has no room (sk_rmem_schedule

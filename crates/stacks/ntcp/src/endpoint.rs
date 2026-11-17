@@ -2906,8 +2906,13 @@ impl Endpoint {
     /// Sets the receive window of `id` to `bytes` and locks its receive
     /// direction, as SO_RCVBUF sets SOCK_RCVBUF_LOCK: DRS no longer grows
     /// it. A limit: it allocates nothing, and a smaller size never retracts
-    /// the window offered. Before the SYN leaves, it also sets the window
-    /// scale. 0 < `bytes` ≤ 65535·2^14.
+    /// the window offered. It also sets the receive memory limit (twice
+    /// `bytes` until a full-size segment measures the payload-to-truesize
+    /// ratio, then `bytes` at that ratio, at least 2304 B): data already
+    /// held stays, and segments arriving past the limit are collapsed,
+    /// pruned or dropped as `ConnectionConfig::receive_capacity` describes.
+    /// Before the SYN leaves, it also sets the window scale.
+    /// 0 < `bytes` ≤ 65535·2^14.
     pub fn set_receive_buffer(
         &mut self,
         id: ConnectionId,

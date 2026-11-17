@@ -79,11 +79,12 @@ fn socket_buffer_value(name: i32, value: i32) -> usize {
 // takes the live window back through the inverse, __tcp_space_from_win.
 // Deviation, kept: Linux measures the ratio again from the first segment
 // larger than rcv_mss (tcp_measure_rcv_mss) and resets window_clamp to
-// tcp_win_from_space(sk_rcvbuf) even when SO_RCVBUF locked it. The
-// ratio is the memory a driver's receive buffers hold per payload byte;
-// ntcp copies each payload into its receive ring, one byte of ring per
-// byte of window whatever the NIC buffers were, so it has no such
-// measurement and keeps the default ratio.
+// tcp_win_from_space(sk_rcvbuf) even when SO_RCVBUF locked it. ntcp
+// configures receive sizes in window bytes (n0bw D2): the window set here
+// is the core's window_clamp, which no measurement changes. The core
+// measures the ratio as Linux does and moves its receive memory limit
+// (sk_rcvbuf) instead: twice the window, the sk_rcvbuf set here, until
+// that segment, then the window at the measured ratio.
 //
 // Send: writes stop once sk_wmem_queued, the queued skbs' truesize,
 // reaches sk_sndbuf (sk_stream_memory_free). tcp_sendmsg_locked charges
