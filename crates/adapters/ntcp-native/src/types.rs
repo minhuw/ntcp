@@ -572,6 +572,10 @@ pub struct Counters {
     // and rx_missed, not here.
     pub rx_frames_held: usize,
     pub rx_frames_copied: u64,
+    // Of the backend's frames connections held unread, those copied into
+    // heap frames and given back to it, past ¾ of the frame budget, to
+    // bring the frames out down to ½ (`Endpoint::collapse_device_frames`).
+    pub rx_frames_collapsed: u64,
     // Pushes that held a connection's output (`Network::push`,
     // autocorking), once per hold: a push that starts a hold on a
     // connection not already held counts; the hold ends when a data frame

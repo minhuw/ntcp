@@ -298,8 +298,9 @@ fn a_stalled_reader_never_holds_past_three_quarters_of_the_budget() {
         assert!(net.held() <= budget * 3 / 4, "{}", net.held());
     }
     let stalled = net.server.counters();
-    assert_eq!(most, budget * 3 / 4, "held up to ¾ F");
-    assert!(stalled.rx_frames_copied > 0);
+    // Up to ¾ F; past it the queue is collapsed down to ½ F and refills.
+    assert!(most >= budget / 2 && most <= budget * 3 / 4, "{most}");
+    assert!(stalled.rx_frames_collapsed > 0);
     assert_eq!(stalled.rx_missed, 0, "the pool never ran dry");
     let mut read = net.read(server);
     for _ in 0..2000 {
@@ -319,8 +320,8 @@ fn a_stalled_reader_never_holds_past_three_quarters_of_the_budget() {
     assert_eq!(read, bulk);
     assert_eq!(net.held(), 0);
     // A held device frame is charged its element: the stalled queue held
-    // ¾ F of them.
-    assert!(ELEMENT * budget * 3 / 4 <= stalled.buffer_bytes);
+    // at least ½ F of them.
+    assert!(ELEMENT * budget / 2 <= stalled.buffer_bytes);
 }
 
 // A segment for a connection whose output waits for TX room is retained
@@ -371,4 +372,93 @@ fn the_frame_budget_is_at_most_the_backends() {
         Network::new(config, wire(), [2; 32], 0),
         Err(Error::InvalidConfig(_))
     ));
+}
+
+// One reader stops, holding its frames, while another connection's
+// requests keep arriving: the frames out reach ¾ F, the stalled queue's
+// are collapsed into heap frames down to ½ F (Counters::rx_frames_collapsed),
+// and the active connection's arrivals are held by reference again rather
+// than all copied. The stalled data is whole once read.
+#[test]
+fn holders_past_three_quarters_are_collapsed_and_arrivals_held_again() {
+    // A stalled 64 KiB window holds about 45 frames: past ¾ F of 48.
+    let (elements, budget) = (256, 48);
+    let mut net = Net::new(Some((elements, budget)));
+    let (stalled_client, stalled) = net.connect();
+    let (active_client, active) = net.connect();
+    // Requests a round apart: none waits for the server's delayed ACK.
+    net.client.set_nodelay(active_client, true).unwrap();
+    let bulk = data(1 << 20);
+    let mut written = 0;
+    for _ in 0..300 {
+        if written < bulk.len()
+            && let Ok(receipt) =
+                net.client
+                    .try_write(stalled_client, &bulk[written..], WriteOptions::default())
+        {
+            written += receipt.accepted;
+        }
+        net.step();
+        assert!(net.held() <= budget * 3 / 4, "{}", net.held());
+    }
+    let before = net.server.counters();
+    assert!(before.rx_frames_collapsed > 0, "the stall reached ¾ F");
+    // The active connection's requests while the reader stays stopped.
+    for round in 0..64 {
+        let request = data(100 + round);
+        net.client
+            .try_write(active_client, &request, WriteOptions::default())
+            .unwrap();
+        let mut got = Vec::new();
+        for _ in 0..8 {
+            net.step();
+            got.extend(net.read(active));
+            if got.len() == request.len() {
+                break;
+            }
+        }
+        if got != request {
+            let c = net.server.counters();
+            let reasons: Vec<_> = DropReason::ALL
+                .iter()
+                .filter(|&&r| c.drops[r] != 0)
+                .map(|&r| (r, c.drops[r]))
+                .collect();
+            panic!(
+                "round {round}: got {} of {}; drops {reasons:?} held {} copied {} collapsed {}",
+                got.len(),
+                request.len(),
+                c.rx_frames_held,
+                c.rx_frames_copied,
+                c.rx_frames_collapsed
+            );
+        }
+    }
+    let after = net.server.counters();
+    let copied = after.rx_frames_copied - before.rx_frames_copied;
+    eprintln!(
+        "stall: held {} copied {} collapsed {}; active rounds copied {copied}",
+        before.rx_frames_held, before.rx_frames_copied, before.rx_frames_collapsed
+    );
+    assert!(
+        copied < 8,
+        "the active connection's arrivals were copied: {copied}"
+    );
+    let mut read = net.read(stalled);
+    for _ in 0..4000 {
+        if read.len() == bulk.len() {
+            break;
+        }
+        if written < bulk.len()
+            && let Ok(receipt) =
+                net.client
+                    .try_write(stalled_client, &bulk[written..], WriteOptions::default())
+        {
+            written += receipt.accepted;
+        }
+        net.step();
+        read.extend(net.read(stalled));
+    }
+    assert_eq!(read, bulk);
+    assert_eq!(net.held(), 0);
 }

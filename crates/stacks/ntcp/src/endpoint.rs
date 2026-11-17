@@ -3870,6 +3870,39 @@ impl Endpoint {
         )
     }
 
+    /// Copies the backend frames (`RxFrame::from_raw_parts`: a DPDK mbuf,
+    /// an AF_XDP UMEM frame) connections hold unread into heap frames,
+    /// connection by connection in the order they were opened, until at
+    /// least `goal` have gone back to their backend or none is left:
+    /// how many went back. The data and every window stay as they were;
+    /// the receive memory charged is the copies'. An embedding whose
+    /// backend's frame pool runs short calls it between inputs (ntcp-native
+    /// does past ¾ of its frame budget), so that readers that stop do not
+    /// keep every later arrival from being held by reference. Linux has no
+    /// counterpart: its page_pool allocates more pages instead.
+    pub fn collapse_device_frames(&mut self, goal: usize) -> usize {
+        debug_assert!(self.ingress.is_none() && self.lent.is_none());
+        let mut freed = 0;
+        let mut next = self.occupied.first();
+        while freed < goal
+            && let Some(index) = next
+        {
+            next = self.occupied.next_of(index);
+            let Some(slot) = self.slots[index].as_mut() else {
+                continue;
+            };
+            let released = slot.connection.collapse_device_frames();
+            if released == 0 {
+                continue;
+            }
+            freed += released as usize;
+            if let Some((old, new)) = slot.connection.settle_receive_charge() {
+                self.recharge(old, new);
+            }
+        }
+        freed
+    }
+
     /// Input of a received TCP segment held in `frame` (IP header removed),
     /// as `input_with_metadata`, except that the payload the connection
     /// accepts is not copied: the frame itself, trimmed to that payload, is

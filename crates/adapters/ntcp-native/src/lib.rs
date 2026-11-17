@@ -237,6 +237,8 @@ pub struct Network<P: PacketIo> {
     // (`PacketIo::rx_frame_budget`): ¾ of the frame budget, past which an
     // arrival is copied into a heap frame and the backend's let go.
     frame_threshold: Option<usize>,
+    // ½ of the frame budget, what a collapse of held frames aims for.
+    frame_target: usize,
     // Last: everything above that holds the backend's frames (the
     // endpoint's receive queues, retained input) drops before it, so that
     // a DPDK pool is full when its port goes.
@@ -863,7 +865,9 @@ impl<P: PacketIo> Network<P> {
         )?;
         let segmentation = gso.and(io.tcp_segmentation_capabilities());
         let tx_completion = io.tx_completion();
-        let frame_threshold = config.frame_budget(&io)?.map(|budget| budget * 3 / 4);
+        let frame_budget = config.frame_budget(&io)?;
+        let frame_threshold = frame_budget.map(|budget| budget * 3 / 4);
+        let frame_target = frame_budget.map_or(0, |budget| budget / 2);
         // The largest frame an aggregate fills: the backend's, within the
         // largest IP packet of the local family.
         let aggregate = match segmentation {
@@ -1001,6 +1005,7 @@ impl<P: PacketIo> Network<P> {
             stopped_event: false,
             failure: None,
             frame_threshold,
+            frame_target,
             io,
         })
     }

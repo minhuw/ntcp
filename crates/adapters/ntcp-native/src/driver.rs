@@ -1228,12 +1228,24 @@ impl<P: PacketIo> Network<P> {
             return Ok(None);
         };
         // The backend copied it already (a scatter chain, an attached
-        // external buffer), or the budget is spent.
+        // external buffer), or the budget is spent. Then the connections'
+        // backend frames are copied into heap frames until half the budget
+        // is out (`Endpoint::collapse_device_frames`), so that readers that
+        // stop do not keep every later arrival from being held; what it
+        // cannot bring below ¾ is copied on arrival.
         if frame.is_heap() {
             self.counters.rx_frames_copied += 1;
-        } else if self.io.rx_frames_outstanding().unwrap_or(0) > threshold {
-            frame = RxFrame::copy_from_slice(&frame);
-            self.counters.rx_frames_copied += 1;
+        } else if let Some(out) = self.io.rx_frames_outstanding()
+            && out > threshold
+        {
+            let collapsed = self
+                .endpoint
+                .collapse_device_frames(out - self.frame_target);
+            self.counters.rx_frames_collapsed += collapsed as u64;
+            if self.io.rx_frames_outstanding().unwrap_or(0) > threshold {
+                frame = RxFrame::copy_from_slice(&frame);
+                self.counters.rx_frames_copied += 1;
+            }
         }
         *arrival = Some(frame);
         Ok(Some(metadata))

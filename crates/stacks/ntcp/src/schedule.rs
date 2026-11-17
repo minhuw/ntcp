@@ -35,6 +35,15 @@ impl ReadyQueue {
         self.first.is_none()
     }
 
+    pub(crate) fn first(&self) -> Option<usize> {
+        self.first
+    }
+
+    // The entry after `index`, which is queued.
+    pub(crate) fn next_of(&self, index: usize) -> Option<usize> {
+        self.links[index].next
+    }
+
     pub(crate) fn contains(&self, index: usize) -> bool {
         self.links[index].queued
     }

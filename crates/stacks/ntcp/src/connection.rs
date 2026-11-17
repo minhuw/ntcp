@@ -6721,6 +6721,12 @@ impl Connection {
         false
     }
 
+    // The receive queue's backend frames copied into heap frames
+    // (`RxQueue::collapse_device`): how many went back to the backend.
+    pub(crate) fn collapse_device_frames(&mut self) -> u32 {
+        self.receive.collapse_device()
+    }
+
     // Linux's tcp_clamp_window, the queue at or past its limit: a tuned
     // direction outside pressure, with the budget below its low threshold,
     // raises window_clamp to the window whose limit is the memory held

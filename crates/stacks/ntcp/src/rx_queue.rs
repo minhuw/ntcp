@@ -1337,6 +1337,85 @@ impl RxQueue {
         freed
     }
 
+    // Every backend frame held (a device's, not a heap frame: RxFrame::
+    // is_heap) copied into page-sized heap frames, in order and out of
+    // order, from the first one on in each run, so that the device's pool
+    // has it back: the holder collapse of a backend whose frames are held
+    // by reference (ntcp-native's frame budget, n0bw 1b C7). Bytes, runs,
+    // anchors and SACK state are unchanged. The device frames given back;
+    // an allocation refusal stops the copy (fewer given back).
+    pub(crate) fn collapse_device(&mut self) -> u32 {
+        self.assert_lend_untaken();
+        let devices = |frames: &Collapsed| frames.iter().filter(|(_, f, _)| !f.is_heap()).count();
+        let mut freed = 0;
+        if let Some(first) = self.inorder.iter().position(|frame| !frame.is_heap()) {
+            let bytes: usize = self.inorder.iter().skip(first).map(|f| f.len()).sum();
+            let count = self.inorder.len() - first;
+            let mut sources = Collapsed::new();
+            if sources.try_reserve_exact(count).is_ok()
+                && self
+                    .inorder
+                    .try_reserve(bytes.div_ceil(COLLAPSE_CHUNK) + count)
+                    .is_ok()
+            {
+                let mut at = self.read
+                    + self
+                        .inorder
+                        .iter()
+                        .take(first)
+                        .map(|f| f.len() as u64)
+                        .sum::<u64>();
+                for frame in self.inorder.drain(first..) {
+                    self.frames -= frame.truesize();
+                    self.entries -= 1;
+                    let len = frame.len() as u64;
+                    sources.push((at, frame, false));
+                    at += len;
+                }
+                let before = devices(&sources);
+                let frames = collapse_frames(sources).map_or_else(|kept| kept, |(done, _)| done);
+                freed += before - devices(&frames);
+                for (_, frame, _) in frames {
+                    self.hold(&frame);
+                    self.inorder.push_back(frame);
+                }
+            }
+        }
+        let mut at = 0;
+        while let Some((&start, &end)) = self.runs.range(at..).next() {
+            at = end;
+            let Some((&from, _)) = self
+                .ofo
+                .range(start..end)
+                .find(|(_, seg)| !seg.frame.is_heap())
+            else {
+                continue;
+            };
+            let mut sources = Collapsed::new();
+            if sources
+                .try_reserve_exact(self.ofo.range(from..end).count())
+                .is_err()
+            {
+                break;
+            }
+            while let Some(entry) = self.ofo.range(from..end).next().map(|(&k, _)| k) {
+                let seg = self.ofo.remove(&entry).unwrap();
+                self.frames -= seg.frame.truesize();
+                self.entries -= 1;
+                sources.push((entry, seg.frame, seg.push));
+            }
+            let before = devices(&sources);
+            let frames = collapse_frames(sources).map_or_else(|kept| kept, |(done, _)| done);
+            freed += before - devices(&frames);
+            for (start, frame, push) in frames {
+                self.hold(&frame);
+                self.rooted = true;
+                self.ofo.insert(start, OfoSeg { frame, push });
+            }
+        }
+        freed as u32
+    }
+
     // Linux's tcp_prune_ofo_queue for an arrival at `incoming`: drops
     // out-of-order frames from the last one down, stopping at one that
     // starts before the arrival (which would then land last), `limit` / 8

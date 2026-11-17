@@ -955,3 +955,52 @@ fn a_managed_time_wait_replacement_takes_frames() {
     let copy = run(Mode::Copy);
     assert_eq!(copy, run(Mode::Frame(2000)));
 }
+
+// Backend frames held unread, in order and out of order, are copied into
+// heap frames (Endpoint::collapse_device_frames): every one goes back to
+// its backend, the bytes read are the same, the charge falls to the
+// copies', and heap frames are left alone. A goal stops it early.
+#[test]
+fn held_backend_frames_collapse_into_heap_frames() {
+    let mode = Mode::Frame(2000);
+    // Room for the frames: no receive memory rule collapses them first.
+    let (mut a, mut b, listener, client) = endpoints_with(16 * 2304);
+    pump(&mut a, &mut b, mode, 0);
+    let server = b.accept(listener).unwrap();
+    let data: Vec<u8> = (0..640).map(|i| (i % 251) as u8).collect();
+    a.write(client, &data).unwrap();
+    let mut segments = packets(&mut a, 0);
+    assert!(segments.len() >= 4);
+    // The first segment lost for now: the rest wait out of order.
+    let first = segments.remove(0);
+    for (ip, bytes) in &segments {
+        input(&mut b, mode, 0, *ip, bytes).unwrap();
+    }
+    let ofo = segments.len() as isize;
+    assert_eq!(LIVE.get(), ofo);
+    assert_eq!(
+        b.collapse_device_frames(1),
+        ofo as usize,
+        "one run at a time"
+    );
+    assert_eq!(LIVE.get(), 0);
+    input(&mut b, mode, 0, first.0, &first.1).unwrap();
+    assert_eq!(LIVE.get(), 1);
+    let charged = held(&b, server);
+    assert_eq!(b.collapse_device_frames(usize::MAX), 1);
+    assert_eq!(b.collapse_device_frames(usize::MAX), 0, "heap frames stay");
+    assert_eq!(LIVE.get(), 0);
+    assert!(held(&b, server) < charged, "{} {charged}", held(&b, server));
+    // What the initial window carried, whole.
+    let mut out = [0; 640];
+    let mut read = 0;
+    while let Ok(n) = b.read(server, &mut out[read..]) {
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    assert_eq!(read, 64 * (segments.len() + 1));
+    assert_eq!(&out[..read], &data[..read]);
+    assert_eq!(held(&b, server), 0);
+}
