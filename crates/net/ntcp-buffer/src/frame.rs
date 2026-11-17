@@ -141,6 +141,7 @@ impl RxFrame {
     ///
     /// # Panics
     /// If `count` exceeds the frame's length.
+    #[inline]
     pub fn advance(&mut self, count: usize) {
         assert!(count <= self.len(), "advance past the frame's end");
         // SAFETY: count <= len, so the result stays inside the frame's
@@ -152,6 +153,7 @@ impl RxFrame {
     /// Keeps only the first `len` bytes; no effect when the frame is
     /// already that short. As for `advance`, the bytes cut off stay valid
     /// until the frame is dropped.
+    #[inline]
     pub fn truncate(&mut self, len: usize) {
         if len < self.len() {
             self.len = len as u32;
