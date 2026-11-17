@@ -239,6 +239,18 @@ fn port_lifecycle(eal: &'static Eal) {
     assert_eq!(main.transmit(&sent).unwrap(), TxOutcome::Submitted);
     assert_eq!(main.receive(&mut out).unwrap(), Some(60));
     assert_eq!(&out[..60], sent.as_slice());
+    // The hosted queue forwards the frame path to its adapter.
+    assert_eq!(main.rx_frame_budget(), main.dpdk().rx_frame_budget());
+    assert_eq!(
+        main.rx_frames_outstanding(),
+        main.dpdk().rx_frames_outstanding()
+    );
+    let sent = frame(4, 200);
+    assert_eq!(main.transmit(&sent).unwrap(), TxOutcome::Submitted);
+    let received = main.receive_frame(&mut out).unwrap().unwrap();
+    assert_eq!(received.frame.as_slice(), sent.as_slice());
+    assert_eq!(received.metadata.len, 200);
+    drop(received);
     drop(main);
     assert_eq!(lcore(), 0);
     assert_eq!(pools(), (4, 4)); // Every mbuf is back.

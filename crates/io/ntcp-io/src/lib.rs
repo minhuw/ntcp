@@ -659,6 +659,27 @@ pub trait PacketIo {
         }))
     }
 
+    // The frame budget F of a backend that receives into a fixed pool of
+    // its own (DPDK mbufs, AF_XDP UMEM frames) and hands those frames over
+    // by reference (`receive_frame`): how many of them its consumer may
+    // hold at once, the pool less what the device's rings and the backend
+    // need to keep receiving and sending. A frame held is one the device
+    // cannot post, so a consumer holding past this starves the receive ring
+    // (the device then drops, DeviceCounters::rx_missed); it copies an
+    // arrival into a heap frame instead, as Linux's page_pool falls back to
+    // the page allocator. None, the default: the backend copies on receive
+    // (`receive_frame`'s default), and its consumer takes the copying path.
+    fn rx_frame_budget(&self) -> Option<usize> {
+        None
+    }
+    // Frames of the pool `rx_frame_budget` bounds that this backend handed
+    // out and that are not yet released, wherever their holders are. A
+    // load or two, no device access: read once per received frame. None
+    // where `rx_frame_budget` is None.
+    fn rx_frames_outstanding(&self) -> Option<usize> {
+        None
+    }
+
     // One packet given as header bytes and payload ranges, sent as the
     // request says. Outcomes as for the transmit method the request names.
     // The default gathers the packet into one buffer and calls that method:
@@ -1131,6 +1152,9 @@ mod tests {
             Err(TransmitError::InvalidInput)
         ));
         assert!(io.receive_frame(&mut [0; 16]).unwrap().is_none());
+        // A copying backend has no frame budget: its consumer copies.
+        assert_eq!(io.rx_frame_budget(), None);
+        assert_eq!(io.rx_frames_outstanding(), None);
         let mut source = io.tx_chunk_source();
         assert_eq!(source.chunk_size(), HeapChunkSource::DEFAULT_CHUNK_SIZE);
         assert_eq!(source.allocate().unwrap().capacity(), 16 * 1024);

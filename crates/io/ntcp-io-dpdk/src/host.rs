@@ -9,9 +9,10 @@
 use crate::native::{Dpdk, driver_name, rx_checksum_check, tso_check, tx_checksum_check};
 use ntcp_io::{
     ClockDescriptor, ClockDomain, DeviceCounters, OwnedPacket, PacketIo, PacketLayer, Payload,
-    ReceivedPacket, TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
-    TimestampCapabilities, TimestampUnit, TransmitTime, TxOutcome, TxSchedulingCapabilities,
-    TxSchedulingError, TxTimestampCompletion, TxTimestampRequest, ZeroCopyCapabilities,
+    ReceivedFrame, ReceivedPacket, TcpSegmentationCapabilities, TcpSegmentationError,
+    TcpSegmentationRequest, TimestampCapabilities, TimestampUnit, TransmitTime, TxOutcome,
+    TxSchedulingCapabilities, TxSchedulingError, TxTimestampCompletion, TxTimestampRequest,
+    ZeroCopyCapabilities,
 };
 use std::{
     cell::Cell,
@@ -1217,6 +1218,15 @@ impl PacketIo for HostedQueue {
     }
     fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
         self.io.receive_with_metadata(out)
+    }
+    fn receive_frame(&mut self, scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+        self.io.receive_frame(scratch)
+    }
+    fn rx_frame_budget(&self) -> Option<usize> {
+        self.io.rx_frame_budget()
+    }
+    fn rx_frames_outstanding(&self) -> Option<usize> {
+        self.io.rx_frames_outstanding()
     }
     fn transmit_with_timestamp(
         &mut self,

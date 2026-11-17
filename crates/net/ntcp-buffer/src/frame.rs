@@ -126,8 +126,18 @@ impl RxFrame {
         self.truesize as usize
     }
 
+    /// Whether this is a heap frame (`from_vec`, `copy_from_slice`), memory
+    /// the allocator gave, rather than a backend's (a device pool's mbuf, a
+    /// UMEM frame) built with `from_raw_parts`.
+    pub fn is_heap(&self) -> bool {
+        core::ptr::eq(self.vtable, &HEAP)
+    }
+
     /// Drops the first `count` bytes, as a holder trims data it already has
-    /// or no longer wants.
+    /// or no longer wants. Trimming moves and releases nothing: bytes the
+    /// frame covered stay valid and unchanged until it is dropped, so a
+    /// pointer taken to them before the trim may still be read while the
+    /// frame lives.
     ///
     /// # Panics
     /// If `count` exceeds the frame's length.
@@ -140,7 +150,8 @@ impl RxFrame {
     }
 
     /// Keeps only the first `len` bytes; no effect when the frame is
-    /// already that short.
+    /// already that short. As for `advance`, the bytes cut off stay valid
+    /// until the frame is dropped.
     pub fn truncate(&mut self, len: usize) {
         if len < self.len() {
             self.len = len as u32;
@@ -209,6 +220,7 @@ mod tests {
         let copied = RxFrame::copy_from_slice(&[9; 71]);
         assert_eq!(copied.len(), 71);
         assert_eq!(copied.truesize(), 71);
+        assert!(copied.is_heap());
         let empty = RxFrame::from_vec(Vec::new());
         assert!(empty.is_empty());
         assert_eq!(empty.truesize(), 0);
@@ -249,6 +261,7 @@ mod tests {
         };
         assert_eq!(frame.as_slice(), &[7; 20]);
         assert_eq!(frame.truesize(), 32);
+        assert!(!frame.is_heap());
         frame.advance(20);
         assert!(frame.is_empty());
         assert_eq!(RELEASED.load(Ordering::SeqCst), before);
