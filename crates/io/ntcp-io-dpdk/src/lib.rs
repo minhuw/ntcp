@@ -15,6 +15,13 @@
 //! mbufs), 160.0 MB for a port of 4 queues; EAL must be given that much
 //! hugepage memory on the device's NUMA socket (`-m`/`--socket-mem`, or the
 //! hugepages reserved) besides its own.
+//!
+//! Received frames: `Dpdk::receive_frame` hands the mbuf itself over (one
+//! segment of the queue's own pool), released back to the pool from any
+//! thread when the frame drops, also after the adapter and its queue have
+//! gone (the pool is kept while any mbuf is out). `HostedQueue` reports
+//! the frame budget a Network holds them within (`PortConfig::
+//! mbufs_per_queue`).
 
 mod calibration;
 pub use calibration::{

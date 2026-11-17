@@ -409,6 +409,11 @@ impl Backlog {
     }
 }
 
+/// One AF_XDP socket on one queue, its UMEM and rings: copy mode
+/// (XDP_COPY). `receive` copies a packet out of its UMEM frame;
+/// `receive_frame` hands the frame itself over, released (from any thread,
+/// also after the adapter has gone, which keeps its UMEM mapped until the
+/// last is back) to the free frames the fill ring and TX take from.
 pub struct AfXdp {
     // Fields drop in declaration order: close socket before unmapping rings/UMEM.
     fd: OwnedFd,

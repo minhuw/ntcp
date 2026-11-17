@@ -268,6 +268,21 @@ pub struct PortConfig {
     /// descriptor), and each worker lcore's cache holds up to 384 more; the
     /// rest is what frames held beyond the rings can take.
     ///
+    /// A hosted queue hands received mbufs over by reference
+    /// (`PacketIo::receive_frame`): a Network holds each until its
+    /// application reads the data, charging the mbuf's 2368 octets to the
+    /// connection. Its frame budget (`PacketIo::rx_frame_budget`) is F =
+    /// `mbufs_per_queue` - `rx_desc` - 2 x `tx_desc` - 1.5 x cache x
+    /// `queues` (the pool's cache is min(256, mbufs / 2); each queue's
+    /// worker may free this queue's mbufs, through a shared-flow handoff,
+    /// into its own cache): 12,927 with the defaults and one queue, 30.6 MB
+    /// of mbufs. Past 3/4 F out, a Network copies arrivals instead of
+    /// holding them, so readers that stop cannot drain the pool; frames
+    /// held long show as `DeviceCounters::rx_nombuf` and `rx_missed` only
+    /// when the pool is sized below that. A scatter chain (`mtu` beyond
+    /// one mbuf) or an externally attached mbuf (mlx5's `mprq_en`, whose
+    /// packets share a stride buffer) is copied, never held.
+    ///
     /// Each queue's pool is hugepage memory on the device's NUMA socket,
     /// allocated whole at `Port::start`. With the default `mbuf_data_size`
     /// an mbuf takes 2368 octets (DPDK 26.03: 64 mempool object header, 128

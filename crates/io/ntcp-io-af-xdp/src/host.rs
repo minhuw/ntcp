@@ -256,6 +256,15 @@ pub struct PortConfig {
     pub interface: String,
     pub mode: XdpMode,
     /// UMEM and ring sizes of every hosted queue's socket; see `Config`.
+    /// Each queue maps `frame_size` x `frame_count` octets (32 MiB by
+    /// default): `ring_size` frames fill the RX ring, `ring_size` more may
+    /// be sending, and the rest, F = `frame_count` - 2 x `ring_size`
+    /// (14,336 by default), received frames a Network holds by reference
+    /// until its application reads them (`PacketIo::rx_frame_budget`),
+    /// each charged `frame_size`. Past 3/4 F out, a Network copies arrivals
+    /// instead of holding them. The kernel's copy into the UMEM (XDP_COPY)
+    /// remains. With F 0 (`frame_count` = 2 x `ring_size`) every arrival
+    /// is copied.
     pub frame_size: u32,
     pub frame_count: u32,
     pub ring_size: u32,
