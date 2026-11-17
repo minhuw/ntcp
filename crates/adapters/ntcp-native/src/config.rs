@@ -77,6 +77,20 @@ pub struct NetworkConfig {
     /// no Time Exceeded follows.
     /// `Network::reassembly_counters` reports every completion and discard.
     pub reassembly_datagrams: usize,
+    /// On a backend that hands its received frames over by reference (DPDK
+    /// mbufs, AF_XDP UMEM frames: `PacketIo::rx_frame_budget`), how many of
+    /// them this Network may hold at once, F; None, the default, takes the
+    /// backend's, and a value beyond it is refused, as is one for a backend
+    /// that copies. The Network holds a frame until the application reads
+    /// what it carries, charging the memory it keeps from the device's pool
+    /// (its truesize: 2368 octets for a DPDK mbuf of the default geometry)
+    /// against the connection's receive memory and `tcp.max_buffer_bytes`.
+    /// Past ¾ F frames out, an arrival is copied into a heap frame of its
+    /// length and the device's frame given back at once
+    /// (`Counters::rx_frames_copied`), so that readers that stop cannot
+    /// take the pool the device receives into: the NIC would then drop for
+    /// want of buffers (`Counters::rx_nombuf`, `rx_missed`).
+    pub rx_frame_budget: Option<usize>,
 }
 impl NetworkConfig {
     /// The smallest `tcp.max_buffer_bytes` with which a Network with this
@@ -256,6 +270,18 @@ impl NetworkConfig {
             neighbor_entries: 16,
             static_neighbors: Vec::new(),
             reassembly_datagrams: 64,
+            rx_frame_budget: None,
+        }
+    }
+    // The frame budget F the Network holds received frames within
+    // (`rx_frame_budget`); None on a backend that copies.
+    pub(crate) fn frame_budget(&self, io: &impl PacketIo) -> Result<Option<usize>> {
+        match (io.rx_frame_budget(), self.rx_frame_budget) {
+            (backend, None) => Ok(backend),
+            (Some(backend), Some(budget)) if budget <= backend => Ok(Some(budget)),
+            _ => Err(Error::InvalidConfig(
+                "rx_frame_budget beyond the backend's frame budget",
+            )),
         }
     }
     // The Host's reassembly of `reassembly_datagrams` datagrams, each up to

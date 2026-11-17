@@ -7,7 +7,7 @@
 //! connection (held frames, clamp, receive MSS estimate, edge), never a
 //! window it computed, and checks the window of every segment the receiver
 //! sends through randomized transfers with loss, reordering, duplication,
-//! small and full-size segments, copied input and 2304 B frames.
+//! small and full-size segments, copied input and 2304 B and 2368 B frames.
 extern crate std;
 
 use super::*;
@@ -327,7 +327,9 @@ fn the_receive_window_follows_the_linux_model() {
         grown: 0,
     };
     for trial in 0..10 {
-        for input in [Input::Copy, Input::Frame(2304)] {
+        // A DPDK mbuf's truesize at the default geometry (n0bw 1b, Q2),
+        // and report §Q1's 2304.
+        for input in [Input::Copy, Input::Frame(2304), Input::Frame(2368)] {
             transfer(trial, input, &mut stats);
         }
     }

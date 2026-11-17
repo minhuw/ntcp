@@ -1,12 +1,14 @@
 use super::*;
+use crate::inbox::Handed;
 use ntcp::DropReason;
+use ntcp::RxFrame;
 use ntcp_host::{
     Advice, BackendOutcome, Datagram, DeferredIcmp, EgressContext, IcmpDispatch, NeighborHop,
     NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
-    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, RxChecksum, TcpSegmentationError,
-    TcpSegmentationRequest, TimestampUnit, TxOutcome,
+    ClockDomain, PacketLayer, PacketTimestamp, ReceivedFrame, ReceivedPacket, RxChecksum,
+    TcpSegmentationError, TcpSegmentationRequest, TimestampUnit, TxOutcome,
 };
 
 pub(super) struct PendingFrame {
@@ -42,8 +44,14 @@ struct Syn {
     reassembled: Option<ntcp_host::Envelope>,
 }
 pub(super) struct RetainedInput {
+    // A receive buffer, holding the datagram's copy unless `frame` holds it.
     bytes: Vec<u8>,
     len: usize,
+    // The frame the datagram arrived in, kept in place of a copy, and where
+    // the datagram's `len` bytes start in its memory: the frame is trimmed
+    // to the TCP segment (`Host::input_datagram_frame`), and trimming
+    // releases nothing, so they stay valid while it lives.
+    frame: Option<(RxFrame, *const u8)>,
     owner: ntcp::ConnectionId,
     envelope: Option<ProcessedEnvelope>,
     icmp: Option<DeferredIcmp>,
@@ -573,22 +581,34 @@ impl<P: PacketIo> Network<P> {
                     Ok(IcmpDispatch::Completed(_)) => {}
                     Err(error) => self.input_failed(&Error::Host(error), &[]),
                 }
-            } else if let Some(processed) = item
-                .envelope
-                .and_then(|e| e.datagram(&item.bytes[..item.len]))
-            {
-                // Its connection went away while it waited.
-                if !self.endpoint.connection_exists(item.owner) {
-                    self.drop_ip(DropReason::NoSocket, processed.bytes());
-                } else if let Err(error) = self.host.input_datagram(
-                    &mut self.endpoint,
-                    now,
-                    processed,
-                    item.metadata,
-                    self.config.tcp.dscp,
-                ) {
-                    self.input_failed(&Error::Host(error), processed.bytes());
+            } else {
+                let (mut held, datagram) = match item.frame.take() {
+                    Some((frame, datagram)) => (Some(frame), Some(datagram)),
+                    None => (None, None),
+                };
+                #[allow(unsafe_code)]
+                let bytes: &[u8] = match (&held, datagram) {
+                    // SAFETY: `datagram` points at `len` bytes of the held
+                    // frame's memory (`retain`), which stay valid and
+                    // unchanged while it lives: it is dropped only after the
+                    // last use of `bytes` below, or held by a receive queue,
+                    // which lets it go only in a later input, read or clear.
+                    (Some(_), Some(datagram)) => unsafe {
+                        core::slice::from_raw_parts(datagram, item.len)
+                    },
+                    _ => &item.bytes[..item.len],
+                };
+                if let Some(processed) = item.envelope.and_then(|e| e.datagram(bytes)) {
+                    // Its connection went away while it waited.
+                    if !self.endpoint.connection_exists(item.owner) {
+                        self.drop_ip(DropReason::NoSocket, processed.bytes());
+                    } else if let Err(error) =
+                        self.input_datagram(processed, item.metadata, &mut held)
+                    {
+                        self.input_failed(&Error::Host(error), processed.bytes());
+                    }
                 }
+                drop(held);
             }
             self.receive_free.push(item.bytes);
         }
@@ -611,7 +631,8 @@ impl<P: PacketIo> Network<P> {
             handoffs = more;
         }
         while receive_work < budget.receive && !self.receive_free.is_empty() {
-            let packet = match self.io.receive_with_metadata(rx) {
+            let mut arrival = None;
+            let packet = match self.receive_packet(rx, &mut arrival) {
                 Ok(Some(packet)) => packet,
                 Ok(None) => break,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -629,20 +650,37 @@ impl<P: PacketIo> Network<P> {
             };
             receive_work += 1;
             report.received += 1;
-            if packet.len > rx.len() {
-                return Err(Error::Backend(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "backend returned an invalid packet length",
-                )));
-            }
+            #[allow(unsafe_code)]
+            let bytes: &[u8] = match &arrival {
+                // SAFETY: an RxFrame's bytes stay valid and unchanged until
+                // it is dropped, and neither moving nor trimming it moves or
+                // releases them. This one is dropped at the end of this
+                // iteration, after the last use of `bytes`; before that it
+                // moves only into the Host, which gives it back unless a
+                // receive queue holds it (and a queue lets it go only in a
+                // later input, read or clear), into `retain`, which keeps it,
+                // or into another member's inbox (`hand_off_frame`), after
+                // which this iteration reads nothing more. No function this
+                // loop calls keeps the slice.
+                Some(frame) => unsafe { core::slice::from_raw_parts(frame.as_ptr(), frame.len()) },
+                None => {
+                    if packet.len > rx.len() {
+                        return Err(Error::Backend(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "backend returned an invalid packet length",
+                        )));
+                    }
+                    &rx[..packet.len]
+                }
+            };
             let frame = if self.io.layer() == PacketLayer::Ethernet {
-                match ntcp_ethernet::parse_ethernet_fragment(&rx[..packet.len]) {
+                match ntcp_ethernet::parse_ethernet_fragment(bytes) {
                     Ok(frame) => {
                         let Link::Ethernet { local_mac, .. } = self.config.link else {
                             unreachable!()
                         };
                         if frame.destination != local_mac {
-                            self.drop_received(DropReason::OtherHost, &rx[..packet.len]);
+                            self.drop_received(DropReason::OtherHost, bytes);
                             continue;
                         }
                         frame.payload
@@ -650,7 +688,6 @@ impl<P: PacketIo> Network<P> {
                     Err(error) => {
                         // ARP rides its own EtherType, which the IP parser
                         // refuses.
-                        let bytes = &rx[..packet.len];
                         let arp = bytes.get(12..14) == Some(&[0x08, 0x06]);
                         let result = match (arp, self.control.is_empty()) {
                             (true, false) => self.arp_input(bytes),
@@ -664,7 +701,7 @@ impl<P: PacketIo> Network<P> {
                     }
                 }
             } else {
-                &rx[..packet.len]
+                bytes
             };
             // A member of shared flows hands a packet of another member's
             // flow, or a fragment another member reassembles, to it as it
@@ -684,7 +721,15 @@ impl<P: PacketIo> Network<P> {
                         syn: matches!(key, flows::Key::Flow { syn: true, .. }),
                         held: route.held,
                     };
-                    self.hand_off(owner, frame, handoff);
+                    match arrival.take() {
+                        // The frame itself, trimmed to the IP packet.
+                        Some(mut moved) => {
+                            moved.advance(frame.as_ptr() as usize - moved.as_ptr() as usize);
+                            moved.truncate(frame.len());
+                            self.hand_off_frame(owner, moved, handoff);
+                        }
+                        None => self.hand_off(owner, frame, handoff),
+                    }
                     continue;
                 }
                 if let flows::Key::Flow {
@@ -706,14 +751,15 @@ impl<P: PacketIo> Network<P> {
                         reassembled: None,
                     };
                     self.take_syn(syn, frame, |network| {
-                        network.input(frame, packet, false, completed)
+                        network.input(frame, packet, false, completed, &mut arrival)
                     })
                 }
-                None => self.input(frame, packet, fragment, completed),
+                None => self.input(frame, packet, fragment, completed, &mut arrival),
             };
             if let Err(error) = result {
                 self.input_failed(&error, frame);
             }
+            drop(arrival);
         }
         if handoffs && receive_work < budget.receive {
             let (taken, more) = self.take_handoffs(budget.receive - receive_work, completed);
@@ -1148,13 +1194,59 @@ impl<P: PacketIo> Network<P> {
             clock,
         })
     }
+    // The next received packet, and in `arrival` the frame it is in on a
+    // backend whose frames are held by reference (`PacketIo::
+    // rx_frame_budget`); a copying backend's receive is called as it was,
+    // with nothing else on its path.
+    #[inline]
+    fn receive_packet(
+        &mut self,
+        rx: &mut [u8],
+        arrival: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
+        match self.frame_threshold {
+            None => self.io.receive_with_metadata(rx),
+            Some(threshold) => self.receive_held(rx, threshold, arrival),
+        }
+    }
+    // The next received frame of a backend whose frames are held by
+    // reference: its own frame while fewer than ¾ of its budget
+    // (`threshold`) are out, a heap copy past that, so that a reader that
+    // stops cannot take the pool the device receives into (Linux's
+    // page_pool falls back to the page allocator).
+    fn receive_held(
+        &mut self,
+        rx: &mut [u8],
+        threshold: usize,
+        arrival: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
+        let Some(ReceivedFrame {
+            mut frame,
+            metadata,
+        }) = self.io.receive_frame(rx)?
+        else {
+            return Ok(None);
+        };
+        // The backend copied it already (a scatter chain, an attached
+        // external buffer), or the budget is spent.
+        if frame.is_heap() {
+            self.counters.rx_frames_copied += 1;
+        } else if self.io.rx_frames_outstanding().unwrap_or(0) > threshold {
+            frame = RxFrame::copy_from_slice(&frame);
+            self.counters.rx_frames_copied += 1;
+        }
+        *arrival = Some(frame);
+        Ok(Some(metadata))
+    }
     // `fragment`: a member of shared flows keyed the packet as a fragment.
+    // `held`: the frame `frame` lies in, if the backend handed one over.
     fn input(
         &mut self,
         frame: &[u8],
         packet: ReceivedPacket,
         fragment: bool,
         completed: &mut [u8],
+        held: &mut Option<RxFrame>,
     ) -> Result<()> {
         let metadata = self.receive_metadata(packet);
         let received = self
@@ -1195,11 +1287,11 @@ impl<P: PacketIo> Network<P> {
                     reassembled: Some(datagram.envelope()),
                 };
                 return self.take_syn(syn, datagram.bytes(), |network| {
-                    network.dispatch(datagram, metadata)
+                    network.dispatch(datagram, metadata, held)
                 });
             }
         }
-        self.dispatch(datagram, metadata)
+        self.dispatch(datagram, metadata, held)
     }
     // A SYN of a flow this member takes in, `bytes` as it arrived (or the
     // datagram reassembled), which `take` takes in. A member of shared flows hands one it
@@ -1280,11 +1372,13 @@ impl<P: PacketIo> Network<P> {
     // reassembled here), or as the datagram the sender reassembled, which
     // the Host adopts and processes as if it had reassembled it. Only a
     // datagram completed here is keyed again.
+    // `held`: the frame `bytes` lies in, when the sender moved it in.
     fn take_handoff(
         &mut self,
         bytes: &[u8],
         handoff: flows::Handoff,
         completed: &mut [u8],
+        held: &mut Option<RxFrame>,
     ) -> Result<()> {
         // The device's checksum verdict stays with the queue that received
         // the packet: what it hands over is verified here in software.
@@ -1308,9 +1402,9 @@ impl<P: PacketIo> Network<P> {
         let Some(envelope) = handoff.reassembled else {
             return match syn {
                 Some(syn) => self.take_syn(syn, bytes, |network| {
-                    network.input(bytes, packet, false, completed)
+                    network.input(bytes, packet, false, completed, held)
                 }),
-                None => self.input(bytes, packet, handoff.fragment, completed),
+                None => self.input(bytes, packet, handoff.fragment, completed, held),
             };
         };
         let metadata = self.receive_metadata(packet);
@@ -1319,8 +1413,10 @@ impl<P: PacketIo> Network<P> {
         ))?;
         let datagram = self.host.adopt_datagram(self.ingress, datagram)?;
         match syn {
-            Some(syn) => self.take_syn(syn, bytes, |network| network.dispatch(datagram, metadata)),
-            None => self.dispatch(datagram, metadata),
+            Some(syn) => self.take_syn(syn, bytes, |network| {
+                network.dispatch(datagram, metadata, held)
+            }),
+            None => self.dispatch(datagram, metadata, held),
         }
     }
     // Up to `limit` packets from this member's inbox, no more than there are
@@ -1334,9 +1430,26 @@ impl<P: PacketIo> Network<P> {
             return (0, false);
         };
         let limit = limit.min(self.receive_free.len());
-        let taken = inlet.drain(limit, |packet, handoff| {
-            if let Err(error) = self.take_handoff(packet, handoff, completed) {
-                self.input_failed(&error, packet);
+        let taken = inlet.drain(limit, |packet, handoff| match packet {
+            Handed::Bytes(packet) => {
+                if let Err(error) = self.take_handoff(packet, handoff, completed, &mut None) {
+                    self.input_failed(&error, packet);
+                }
+            }
+            Handed::Frame(frame) => {
+                let mut held = Some(frame);
+                // SAFETY: as for a frame received here (`drive_inner`): the
+                // frame is dropped after the last use of `bytes`, or held
+                // by a receive queue or `retain`.
+                #[allow(unsafe_code)]
+                let packet = unsafe {
+                    let frame = held.as_ref().unwrap();
+                    core::slice::from_raw_parts(frame.as_ptr(), frame.len())
+                };
+                if let Err(error) = self.take_handoff(packet, handoff, completed, &mut held) {
+                    self.input_failed(&error, packet);
+                }
+                drop(held);
             }
         });
         self.inlet = Some(inlet);
@@ -1351,6 +1464,19 @@ impl<P: PacketIo> Network<P> {
         } else {
             self.counters.handoffs_dropped += 1;
             self.drop_ip(DropReason::CpuBacklog, packet);
+        }
+    }
+    // Moves a received frame, trimmed to its IP packet, into member
+    // `owner`'s inbox, counted either way. It takes no slice of the frame:
+    // once in the inbox, the owner may release it at any time.
+    fn hand_off_frame(&mut self, owner: usize, frame: RxFrame, handoff: flows::Handoff) {
+        let flows = self.flows.as_ref().expect("a member of shared flows");
+        match flows.hand_off_frame(owner, frame, handoff) {
+            Ok(()) => self.counters.handed_off += 1,
+            Err(frame) => {
+                self.counters.handoffs_dropped += 1;
+                self.drop_ip(DropReason::CpuBacklog, &frame);
+            }
         }
     }
     // Every discard this Network recorded.
@@ -1405,8 +1531,14 @@ impl<P: PacketIo> Network<P> {
         };
         self.drop_ip(reason, packet);
     }
-    // Destination processing and dispatch of one complete datagram.
-    fn dispatch(&mut self, datagram: Datagram<'_>, metadata: ntcp::RxPacketMetadata) -> Result<()> {
+    // Destination processing and dispatch of one complete datagram. `held`:
+    // the frame it arrived in, if the backend handed one over.
+    fn dispatch(
+        &mut self,
+        datagram: Datagram<'_>,
+        metadata: ntcp::RxPacketMetadata,
+        held: &mut Option<RxFrame>,
+    ) -> Result<()> {
         let processed = self.host.process(datagram, None)?;
         // `process` found the destination owned on the Host's one link,
         // which is what `decode_datagram` would check again.
@@ -1417,17 +1549,11 @@ impl<P: PacketIo> Network<P> {
                 self.host
                     .input_icmp_datagram(&mut self.endpoint, self.now, processed)?
             {
-                self.retain(icmp.owner(), None, Some(icmp), metadata)?;
+                self.retain(icmp.owner(), None, Some(icmp), metadata, &mut None)?;
             }
             return Ok(());
         }
-        match self.host.input_datagram(
-            &mut self.endpoint,
-            self.now,
-            processed,
-            metadata,
-            self.config.tcp.dscp,
-        ) {
+        match self.input_datagram(processed, metadata, held) {
             // Not taken in (malformed, or refused by the endpoint): the
             // Endpoint or Host recorded why.
             Ok(ntcp::InputDisposition::Processed | ntcp::InputDisposition::Dropped) => Ok(()),
@@ -1447,31 +1573,78 @@ impl<P: PacketIo> Network<P> {
                     .endpoint
                     .scoped_connection_id(self.scoped(tuple))
                     .ok_or(Error::InvalidHandle)?;
-                self.retain(owner, Some(processed), None, metadata)
+                self.retain(owner, Some(processed), None, metadata, held)
             }
             Err(error) => Err(error.into()),
         }
     }
+    // The Host's input of a processed datagram, from `held`, the frame it
+    // arrived in, when there is one (which comes back unless a receive
+    // queue holds it).
+    fn input_datagram(
+        &mut self,
+        processed: Processed<'_>,
+        metadata: ntcp::RxPacketMetadata,
+        held: &mut Option<RxFrame>,
+    ) -> core::result::Result<ntcp::InputDisposition, ntcp_host::Error> {
+        let Some(frame) = held.take() else {
+            return self.host.input_datagram(
+                &mut self.endpoint,
+                self.now,
+                processed,
+                metadata,
+                self.config.tcp.dscp,
+            );
+        };
+        let (result, back) = self.host.input_datagram_frame(
+            &mut self.endpoint,
+            self.now,
+            processed,
+            frame,
+            metadata,
+            self.config.tcp.dscp,
+        );
+        *held = back;
+        result
+    }
+    // Keeps a datagram whose connection's output is reserved, or a deferred
+    // ICMP message, for a retry. The datagram stays in `held`, the frame it
+    // arrived in, when it lies there; otherwise it is copied into a receive
+    // buffer, which bounds what is retained either way.
     fn retain(
         &mut self,
         owner: ntcp::ConnectionId,
         processed: Option<Processed<'_>>,
         icmp: Option<DeferredIcmp>,
         metadata: ntcp::RxPacketMetadata,
+        held: &mut Option<RxFrame>,
     ) -> Result<()> {
         let mut bytes = self.receive_free.pop().ok_or(Error::Capacity)?;
         let mut len = 0;
+        let mut frame = None;
         if let Some(processed) = processed {
-            len = processed.bytes().len();
-            if len > bytes.len() {
-                self.receive_free.push(bytes);
-                return Err(Error::Capacity);
+            let datagram = processed.bytes();
+            len = datagram.len();
+            // The frame Host gave back is the datagram's TCP segment or a
+            // part of it: the datagram lies in that frame's memory.
+            let start = datagram.as_ptr() as usize;
+            if let Some(held) = held.take_if(|held| {
+                let at = held.as_ptr() as usize;
+                start <= at && at + held.len() <= start + len
+            }) {
+                frame = Some((held, datagram.as_ptr()));
+            } else {
+                if len > bytes.len() {
+                    self.receive_free.push(bytes);
+                    return Err(Error::Capacity);
+                }
+                bytes[..len].copy_from_slice(datagram);
             }
-            bytes[..len].copy_from_slice(processed.bytes());
         }
         self.retained.push_back(RetainedInput {
             bytes,
             len,
+            frame,
             owner,
             envelope: processed.map(|p| p.envelope()),
             icmp,

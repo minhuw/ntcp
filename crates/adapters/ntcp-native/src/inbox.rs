@@ -40,7 +40,13 @@
 // `packet_bytes`, so an inbox at rest holds `packets` buffers of that size
 // whatever it carried, and the reallocation falls on the consumer, not on
 // the producers.
+//
+// A producer whose backend hands its frames over by reference
+// (`PacketIo::rx_frame_budget`) moves the frame itself into the slot
+// instead of copying it (`push_frame`); the consumer takes it out and holds
+// it as it would one it received.
 use crate::{Error, Result};
+use ntcp::RxFrame;
 use std::{
     hint,
     sync::{
@@ -77,7 +83,16 @@ struct Slot<M> {
 
 struct Packet<M> {
     bytes: Vec<u8>,
+    // A frame handed over by reference, in place of `bytes`.
+    frame: Option<RxFrame>,
     meta: Option<M>,
+}
+
+/// What a consumer is handed: the bytes a producer copied in, or the frame
+/// it moved in.
+pub(crate) enum Handed<'a> {
+    Bytes(&'a [u8]),
+    Frame(RxFrame),
 }
 
 impl<M: Copy + Send> Inbox<M> {
@@ -102,7 +117,11 @@ impl<M: Copy + Send> Inbox<M> {
                 .map_err(|_| Error::Capacity)?;
             slots.push(Slot {
                 stamp: AtomicUsize::new(index),
-                packet: Mutex::new(Packet { bytes, meta: None }),
+                packet: Mutex::new(Packet {
+                    bytes,
+                    frame: None,
+                    meta: None,
+                }),
             });
         }
         Ok(Self {
@@ -127,6 +146,40 @@ impl<M: Copy + Send> Inbox<M> {
             }
             own = Some(bytes);
         }
+        let Some(tail) = self.claim() else {
+            return false;
+        };
+        let slot = self.slot(tail);
+        let mut held = slot.packet.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(bytes) = own {
+            held.bytes = bytes;
+        }
+        held.bytes.clear();
+        held.bytes.extend_from_slice(packet);
+        held.meta = Some(meta);
+        drop(held);
+        slot.stamp.store(tail + 1, Ordering::Release);
+        true
+    }
+
+    /// `push` of a frame, moved in rather than copied; the frame back if
+    /// the inbox is full.
+    pub(crate) fn push_frame(&self, frame: RxFrame, meta: M) -> core::result::Result<(), RxFrame> {
+        let Some(tail) = self.claim() else {
+            return Err(frame);
+        };
+        let slot = self.slot(tail);
+        let mut held = slot.packet.lock().unwrap_or_else(PoisonError::into_inner);
+        held.frame = Some(frame);
+        held.meta = Some(meta);
+        drop(held);
+        slot.stamp.store(tail + 1, Ordering::Release);
+        Ok(())
+    }
+
+    // The next position, claimed for this producer, which must publish it;
+    // None if the inbox is full.
+    fn claim(&self) -> Option<usize> {
         let mut tail = self.tail.0.load(Ordering::Relaxed);
         loop {
             let slot = self.slot(tail);
@@ -137,18 +190,7 @@ impl<M: Copy + Send> Inbox<M> {
                     Ordering::SeqCst,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => {
-                        let mut held = slot.packet.lock().unwrap_or_else(PoisonError::into_inner);
-                        if let Some(bytes) = own {
-                            held.bytes = bytes;
-                        }
-                        held.bytes.clear();
-                        held.bytes.extend_from_slice(packet);
-                        held.meta = Some(meta);
-                        drop(held);
-                        slot.stamp.store(tail + 1, Ordering::Release);
-                        return true;
-                    }
+                    Ok(_) => return Some(tail),
                     Err(current) => tail = current,
                 }
             } else {
@@ -158,7 +200,7 @@ impl<M: Copy + Send> Inbox<M> {
                 // full inbox; the second retries at the new tail.
                 fence(Ordering::SeqCst);
                 if self.head.0.load(Ordering::Relaxed).wrapping_add(self.lap) == tail {
-                    return false;
+                    return None;
                 }
                 tail = self.tail.0.load(Ordering::Relaxed);
             }
@@ -166,10 +208,19 @@ impl<M: Copy + Send> Inbox<M> {
         }
     }
 
+    /// `drain_handed` of byte packets: a frame is handed as its bytes.
+    #[cfg(test)]
+    pub(crate) fn drain(&self, budget: usize, mut f: impl FnMut(&[u8], M)) -> usize {
+        self.drain_handed(budget, |handed, meta| match handed {
+            Handed::Bytes(bytes) => f(bytes, meta),
+            Handed::Frame(frame) => f(&frame, meta),
+        })
+    }
+
     /// The consumer: hands at most `budget` packets to `f` in the order
     /// they were pushed and returns how many it handed. It stops early at a
     /// position claimed by a producer that is still copying its packet in.
-    pub(crate) fn drain(&self, budget: usize, mut f: impl FnMut(&[u8], M)) -> usize {
+    pub(crate) fn drain_handed(&self, budget: usize, mut f: impl FnMut(Handed<'_>, M)) -> usize {
         let mut handed = 0;
         while handed < budget {
             let head = self.head.0.load(Ordering::Relaxed);
@@ -180,7 +231,10 @@ impl<M: Copy + Send> Inbox<M> {
             let free = Free { inbox: self, head };
             let mut held = slot.packet.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(meta) = held.meta.take() {
-                f(&held.bytes, meta);
+                match held.frame.take() {
+                    Some(frame) => f(Handed::Frame(frame), meta),
+                    None => f(Handed::Bytes(&held.bytes), meta),
+                }
                 handed += 1;
             }
             if held.bytes.capacity() > self.packet_bytes {
@@ -341,6 +395,38 @@ mod tests {
         assert!(after.iter().all(|&(capacity, _)| capacity == 1500));
         assert_eq!(after[0], before[0]);
         assert_eq!(after[2..], before[2..]);
+    }
+
+    // A frame moved in comes out as the same frame, in order with byte
+    // packets; one refused by a full inbox comes back; one left in the
+    // inbox is released with it.
+    #[test]
+    fn inbox_moves_frames() {
+        let inbox = Inbox::new(2, 64).unwrap();
+        let frame = RxFrame::copy_from_slice(b"frame");
+        let at = frame.as_ptr();
+        assert!(inbox.push(b"bytes", 1));
+        assert!(inbox.push_frame(frame, 2).is_ok());
+        let refused = inbox.push_frame(RxFrame::copy_from_slice(b"late"), 3);
+        assert_eq!(&refused.unwrap_err()[..], b"late");
+        let mut handed = Vec::new();
+        inbox.drain_handed(usize::MAX, |packet, meta| match packet {
+            Handed::Bytes(bytes) => handed.push((bytes.to_vec(), meta, false)),
+            Handed::Frame(frame) => {
+                assert_eq!(frame.as_ptr(), at, "moved, not copied");
+                handed.push((frame.to_vec(), meta, true));
+            }
+        });
+        assert_eq!(
+            handed,
+            [(b"bytes".to_vec(), 1, false), (b"frame".to_vec(), 2, true)]
+        );
+        assert!(
+            inbox
+                .push_frame(RxFrame::copy_from_slice(b"kept"), 4)
+                .is_ok()
+        );
+        drop(inbox);
     }
 
     #[test]

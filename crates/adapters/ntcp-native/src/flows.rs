@@ -23,7 +23,11 @@
 // that member's in its share's table of redirected flows, which every
 // member consults, while the table holds any, for the segments of its
 // flows. The holder removes the record once the connection is reclaimed.
-use crate::{Error, Result, inbox::Inbox, toeplitz::Toeplitz};
+use crate::{
+    Error, Result,
+    inbox::{Handed, Inbox},
+    toeplitz::Toeplitz,
+};
 use std::{
     collections::hash_map::RandomState,
     fs::File,
@@ -737,7 +741,8 @@ impl SharedFlows {
         // this member's, which answers it as a restarted host would, and by
         // address the Host refuses another address. Either way its producer
         // counted it handed off (`Counters::handed_off`).
-        slot.inbox.drain(shared.limits.inbox_packets, |_, _| {});
+        slot.inbox
+            .drain_handed(shared.limits.inbox_packets, |_, _| {});
         slot.wake.woken.store(false, Ordering::Relaxed);
         slot.address.store(word, Ordering::Release);
         Ok(Member {
@@ -1029,8 +1034,8 @@ impl Inlet {
     pub(crate) fn pending(&self) -> bool {
         !self.shared.slots[self.index].inbox.is_empty()
     }
-    pub(crate) fn drain(&self, budget: usize, f: impl FnMut(&[u8], Handoff)) -> usize {
-        self.shared.slots[self.index].inbox.drain(budget, f)
+    pub(crate) fn drain(&self, budget: usize, f: impl FnMut(Handed<'_>, Handoff)) -> usize {
+        self.shared.slots[self.index].inbox.drain_handed(budget, f)
     }
 }
 
@@ -1158,12 +1163,32 @@ impl Member {
         if slot.address.load(Ordering::Acquire) == 0 || !slot.inbox.push(packet, handoff) {
             return false;
         }
+        self.woke(slot);
+        true
+    }
+    /// `hand_off` of a received frame, moved into the inbox rather than
+    /// copied (`PacketIo::rx_frame_budget`); the frame back if refused.
+    pub(crate) fn hand_off_frame(
+        &self,
+        to: usize,
+        frame: ntcp::RxFrame,
+        handoff: Handoff,
+    ) -> core::result::Result<(), ntcp::RxFrame> {
+        let slot = &self.shared.slots[to];
+        if slot.address.load(Ordering::Acquire) == 0 {
+            return Err(frame);
+        }
+        slot.inbox.push_frame(frame, handoff)?;
+        self.woke(slot);
+        Ok(())
+    }
+    // A handoff to `slot` landed: wake its member.
+    fn woke(&self, slot: &Slot) {
         // The fences order the push before the read of `woken` here and the
         // owner's clear before its reads of the inbox (`Wake`); the swap
         // only elects the one handoff that writes.
         fence(Ordering::SeqCst);
         slot.wake.wake();
-        true
     }
     /// This member's endpoint joins the members' shared buffer memory, if
     /// they share one.
@@ -1626,7 +1651,13 @@ mod tests {
         assert!(!a.hand_off(1, &[5], handoff()));
         assert!(inlet.pending());
         let mut taken = Vec::new();
-        assert_eq!(inlet.drain(8, |bytes, _| taken.push(bytes.to_vec())), 2);
+        assert_eq!(
+            inlet.drain(8, |packet, _| match packet {
+                Handed::Bytes(bytes) => taken.push(bytes.to_vec()),
+                Handed::Frame(frame) => taken.push(frame.to_vec()),
+            }),
+            2
+        );
         assert_eq!(taken, [vec![1, 2, 3], vec![4]]);
         assert!(!inlet.pending());
         // Left: refused, and a new member starts with an empty inbox.

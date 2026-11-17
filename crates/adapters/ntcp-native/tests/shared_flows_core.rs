@@ -3,7 +3,9 @@
 // port reaches the first member's queue, which hands each packet of another
 // member's flow to that member. A peer station with its own MAC and tables
 // opens connections to them and accepts theirs.
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+mod frame_pool;
+
+use ntcp_io::{PacketIo, PacketLayer, ReceivedFrame, TxOutcome};
 use ntcp_native::*;
 use std::{
     collections::VecDeque,
@@ -28,6 +30,16 @@ type Queue = Arc<Mutex<VecDeque<Vec<u8>>>>;
 struct Port {
     incoming: Queue,
     outgoing: Queue,
+    // A queue receiving into a pool it hands frames of over by reference
+    // (`frame_pool`), as a DPDK queue does; None copies.
+    pool: Option<frame_pool::Pool>,
+}
+impl Port {
+    fn take(&mut self, out: &mut [u8]) -> Option<usize> {
+        let frame = self.incoming.lock().unwrap().pop_front()?;
+        out[..frame.len()].copy_from_slice(&frame);
+        Some(frame.len())
+    }
 }
 impl PacketIo for Port {
     fn layer(&self) -> PacketLayer {
@@ -37,11 +49,39 @@ impl PacketIo for Port {
         Some(1514)
     }
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
-        let Some(frame) = self.incoming.lock().unwrap().pop_front() else {
-            return Ok(None);
+        Ok(self.take(out))
+    }
+    fn receive_frame(&mut self, scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+        let Some(mut pool) = self.pool.take() else {
+            let Some(len) = self.take(scratch) else {
+                return Ok(None);
+            };
+            return Ok(Some(ReceivedFrame {
+                frame: ntcp_io::RxFrame::copy_from_slice(&scratch[..len]),
+                metadata: ntcp_io::ReceivedPacket {
+                    len,
+                    timestamps: Default::default(),
+                    tcp_segment_size: None,
+                    l4_checksum: Default::default(),
+                },
+            }));
         };
-        out[..frame.len()].copy_from_slice(&frame);
-        Ok(Some(frame.len()))
+        let received = pool.receive_with(|out| {
+            Ok(self.take(out).map(|len| ntcp_io::ReceivedPacket {
+                len,
+                timestamps: Default::default(),
+                tcp_segment_size: None,
+                l4_checksum: Default::default(),
+            }))
+        });
+        self.pool = Some(pool);
+        received
+    }
+    fn rx_frame_budget(&self) -> Option<usize> {
+        self.pool.as_ref().map(frame_pool::Pool::budget)
+    }
+    fn rx_frames_outstanding(&self) -> Option<usize> {
+        self.pool.as_ref().map(frame_pool::Pool::outstanding)
     }
     fn transmit(&mut self, frame: &[u8]) -> io::Result<TxOutcome> {
         self.outgoing.lock().unwrap().push_back(frame.to_vec());
@@ -60,6 +100,7 @@ impl Station {
         let network = build(Port {
             incoming: incoming.clone(),
             outgoing: outgoing.clone(),
+            pool: None,
         });
         Self {
             network,
@@ -451,6 +492,7 @@ fn active_opens_avoid_every_members_listening_ports() {
     let port = Port {
         incoming: Queue::default(),
         outgoing: Queue::default(),
+        pool: None,
     };
     let config = config(SHARED, PORT_MAC);
     assert!(matches!(
@@ -521,6 +563,7 @@ fn port() -> Port {
     Port {
         incoming: Queue::default(),
         outgoing: Queue::default(),
+        pool: None,
     }
 }
 
@@ -1169,4 +1212,66 @@ fn shared_flows_share_buffer_memory_unless_told_not_to() {
         };
         assert_eq!(SharedFlows::new(ownership(), fixed).is_ok(), valid);
     }
+}
+
+// The first member receives into a pool and hands its frames over by
+// reference (`PacketIo::rx_frame_budget`): the second member holds them,
+// unread, in its own receive queues, charged to the first's pool, and they
+// come back as it reads; nothing is copied.
+#[test]
+fn handoffs_move_frames_the_receiving_member_holds_for_another() {
+    const MEMBERS: usize = 2;
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: (0..16).map(|i| i % MEMBERS).collect(),
+    };
+    let flows = SharedFlows::new(ownership, limits(MEMBERS)).unwrap();
+    let neighbors = neighbors(MEMBERS);
+    let members = (0..MEMBERS)
+        .map(|k| {
+            Station::new(|mut port| {
+                if k == 0 {
+                    port.pool = Some(frame_pool::Pool::new(512, 448));
+                }
+                let config = config(SHARED, PORT_MAC);
+                Network::with_shared_flows(config, port, [7; 32], 0, Some(&neighbors), &flows, k)
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut lan = lan(members);
+    let pairs = exchange(&mut lan, &[SHARED]);
+    let counters: Vec<_> = lan.members.iter().map(|m| m.network.counters()).collect();
+    assert!(counters[0].handed_off > 0 && counters[1].handoffs_received > 0);
+    assert_eq!(
+        (counters[0].rx_frames_held, counters[0].rx_frames_copied),
+        (0, 0)
+    );
+    assert_eq!(
+        counters[1].received, 0,
+        "the second member's queue took nothing"
+    );
+    // The peer writes to a connection of the second member, which does not
+    // read: the first member's frames wait in the second's receive queue.
+    let pair = pairs.iter().find(|p| p.member == 1).unwrap();
+    let data = payload(99);
+    lan.peer
+        .network
+        .try_write(pair.far, &data, WriteOptions::default())
+        .unwrap();
+    for _ in 0..50 {
+        lan.step();
+    }
+    let held = lan.members[0].network.counters().rx_frames_held;
+    assert!(held >= data.len().div_ceil(1460), "{held}");
+    let mut read = Vec::new();
+    let mut out = [0; 4096];
+    while let Ok(ReadOutcome::Data { len, .. }) =
+        lan.members[1].network.try_read(pair.near, &mut out)
+    {
+        read.extend_from_slice(&out[..len]);
+    }
+    assert_eq!(read, data);
+    assert_eq!(lan.members[0].network.counters().rx_frames_held, 0);
+    assert_eq!(lan.members[0].network.counters().rx_frames_copied, 0);
 }

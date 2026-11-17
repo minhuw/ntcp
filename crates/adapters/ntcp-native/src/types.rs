@@ -560,6 +560,18 @@ pub struct Counters {
     pub rx_nombuf: u64,
     pub rx_missed: u64,
     pub tx_nombuf: u64,
+    // On a backend whose received frames are held by reference
+    // (`PacketIo::rx_frame_budget`, `NetworkConfig::rx_frame_budget`): the
+    // backend's frames out now, read from it by each `counters()` call,
+    // wherever they are held (receive queues, retained input, another
+    // member's inbox); and the arrivals taken in as heap copies instead,
+    // those copied because ¾ of the frame budget was out and those the
+    // backend copied itself (a DPDK scatter chain or attached external
+    // buffer). No Linux MIB counts these; page_pool's statistics are the
+    // nearest. A pool the device cannot receive into shows as rx_nombuf
+    // and rx_missed, not here.
+    pub rx_frames_held: usize,
+    pub rx_frames_copied: u64,
     // Pushes that held a connection's output (`Network::push`,
     // autocorking), once per hold: a push that starts a hold on a
     // connection not already held counts; the hold ends when a data frame

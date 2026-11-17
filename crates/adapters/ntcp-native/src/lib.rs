@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+// Unsafe code is refused but for the driver's slices over a received frame
+// it moves on while it reads them (driver.rs: `#[allow(unsafe_code)]` on
+// each, with its SAFETY argument).
+#![deny(unsafe_code)]
 
 mod config;
 mod driver;
@@ -131,7 +134,6 @@ struct Listener {
 pub struct Network<P: PacketIo> {
     config: NetworkConfig,
     instance: u64,
-    io: P,
     endpoint: Endpoint,
     host: Host,
     ingress: IngressContext,
@@ -231,6 +233,14 @@ pub struct Network<P: PacketIo> {
     stopped: bool,
     stopped_event: bool,
     failure: Option<io::Error>,
+    // A backend whose received frames are held by reference
+    // (`PacketIo::rx_frame_budget`): ¾ of the frame budget, past which an
+    // arrival is copied into a heap frame and the backend's let go.
+    frame_threshold: Option<usize>,
+    // Last: everything above that holds the backend's frames (the
+    // endpoint's receive queues, retained input) drops before it, so that
+    // a DPDK pool is full when its port goes.
+    io: P,
 }
 
 fn table<T>(capacity: usize) -> Result<Vec<Slot<T>>> {
@@ -853,6 +863,7 @@ impl<P: PacketIo> Network<P> {
         )?;
         let segmentation = gso.and(io.tcp_segmentation_capabilities());
         let tx_completion = io.tx_completion();
+        let frame_threshold = config.frame_budget(&io)?.map(|budget| budget * 3 / 4);
         // The largest frame an aggregate fills: the backend's, within the
         // largest IP packet of the local family.
         let aggregate = match segmentation {
@@ -936,7 +947,6 @@ impl<P: PacketIo> Network<P> {
         Ok(Self {
             config,
             instance,
-            io,
             endpoint,
             host,
             ingress,
@@ -990,6 +1000,8 @@ impl<P: PacketIo> Network<P> {
             stopped: false,
             stopped_event: false,
             failure: None,
+            frame_threshold,
+            io,
         })
     }
     // A link whose fixed MAC or L3 endpoint is the forwarder of every
@@ -1087,6 +1099,7 @@ impl<P: PacketIo> Network<P> {
             out_segments: self
                 .tcp_segments
                 .saturating_sub(loss.retransmitted_segments),
+            rx_frames_held: self.io.rx_frames_outstanding().unwrap_or(0),
             rx_nombuf: device.rx_nombuf,
             rx_missed: device.rx_missed,
             tx_nombuf: device.tx_nombuf,
