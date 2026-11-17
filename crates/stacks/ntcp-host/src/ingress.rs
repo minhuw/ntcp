@@ -1144,6 +1144,56 @@ impl Host {
         metadata: RxPacketMetadata,
         outgoing_dscp: u8,
     ) -> Result<InputDisposition, Error> {
+        self.dispatch_datagram(endpoint, now, processed, metadata, outgoing_dscp, &mut None)
+    }
+
+    /// `input_datagram` of a datagram received in `frame`, which
+    /// `processed` borrows: a TCP segment whose bytes lie in the frame is
+    /// taken in by reference (`Endpoint::input_frame_with_path_provider`),
+    /// the frame trimmed to the segment (its Ethernet and IP headers and
+    /// any Ethernet padding dropped), so that the payload the connection
+    /// accepts is held as the frame itself. Anything else (ICMP, UDP, a
+    /// datagram reassembled or rewritten into the caller's completion
+    /// buffer) is dispatched from its bytes as `input_datagram` does. The
+    /// frame comes back unless a receive queue holds it, untouched when it
+    /// was not handed to the Endpoint, else trimmed to the segment or less;
+    /// trimming releases nothing, so the caller's bytes of the datagram stay
+    /// valid while it lives (`RxFrame::advance`).
+    pub fn input_datagram_frame(
+        &mut self,
+        endpoint: &mut ntcp::Endpoint,
+        now: Instant,
+        processed: Processed<'_>,
+        frame: ntcp::RxFrame,
+        metadata: RxPacketMetadata,
+        outgoing_dscp: u8,
+    ) -> (Result<InputDisposition, Error>, Option<ntcp::RxFrame>) {
+        let mut frame = Some(frame);
+        let result = self.dispatch_datagram(
+            endpoint,
+            now,
+            processed,
+            metadata,
+            outgoing_dscp,
+            &mut frame,
+        );
+        (result, frame)
+    }
+
+    // `input_datagram`, with the frame the datagram arrived in when the
+    // caller has one: TCP takes it out and puts back what the Endpoint
+    // gives back (`input_transport`). Inlined into both: input_datagram's
+    // code stays one call deep, as it was before the frame entry.
+    #[inline]
+    fn dispatch_datagram(
+        &mut self,
+        endpoint: &mut ntcp::Endpoint,
+        now: Instant,
+        processed: Processed<'_>,
+        metadata: RxPacketMetadata,
+        outgoing_dscp: u8,
+        frame: &mut Option<ntcp::RxFrame>,
+    ) -> Result<InputDisposition, Error> {
         self.check_endpoint(endpoint)?;
         let packet = self.processed_packet(processed)?;
         // A device's checksum verdict is about the packet that arrived, not
@@ -1177,6 +1227,7 @@ impl Host {
             &packet,
             metadata,
             outgoing_dscp,
+            frame,
         )
     }
 

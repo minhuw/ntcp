@@ -13,6 +13,7 @@ mod emitter;
 mod extensions;
 mod fanout;
 mod fragment_icmp;
+mod frame_input;
 mod ingress;
 mod ipv4_policy;
 mod neighbor;

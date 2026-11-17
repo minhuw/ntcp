@@ -477,6 +477,13 @@ impl EgressContext {
     }
 }
 
+// Whether `bytes` lie inside `frame`'s: a datagram received in place,
+// not one reassembled or rewritten into another buffer.
+fn holds(frame: &ntcp::RxFrame, bytes: &[u8]) -> bool {
+    let (start, at) = (frame.as_ptr() as usize, bytes.as_ptr() as usize);
+    start <= at && at + bytes.len() <= start + frame.len()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IngressPacket<'a> {
     pub ip: IpMetadata,
@@ -2273,6 +2280,10 @@ impl Host {
 
     // UDP and TCP input of one processed complete datagram: its options are
     // the result of destination processing, never recorded again here.
+    // `frame`: the frame the packet arrived in, if the caller has one
+    // (`Host::input_datagram_frame`): a TCP segment inside it is taken in
+    // by reference, and the frame put back unless a receive queue holds it.
+    #[allow(clippy::too_many_arguments)]
     fn input_transport(
         &mut self,
         endpoint: &mut Endpoint,
@@ -2281,6 +2292,7 @@ impl Host {
         packet: &IngressPacket,
         metadata: RxPacketMetadata,
         outgoing_dscp: u8,
+        frame: &mut Option<ntcp::RxFrame>,
     ) -> Result<ntcp::InputDisposition, Error> {
         self.owned_on_link(context, packet.ip.destination)?;
         if metadata.tcp_segment_size.is_some() && !self.port(context.link)?.receive.gro {
@@ -2297,17 +2309,37 @@ impl Host {
             if self.live_bindings.len() == self.bindings.len() {
                 self.collect(endpoint)?;
             }
-            let disposition = endpoint.input_with_path_provider(
-                now,
-                context.link,
-                packet.ip,
-                packet.traffic_class,
-                packet.options,
-                packet.payload,
-                metadata,
-                outgoing_dscp,
-                self,
-            )?;
+            let disposition = match frame.take_if(|frame| holds(frame, packet.payload)) {
+                Some(mut segment) => {
+                    let offset = packet.payload.as_ptr() as usize - segment.as_ptr() as usize;
+                    segment.advance(offset);
+                    segment.truncate(packet.payload.len());
+                    let (result, back) = endpoint.input_frame_with_path_provider(
+                        now,
+                        context.link,
+                        packet.ip,
+                        packet.traffic_class,
+                        packet.options,
+                        segment,
+                        metadata,
+                        outgoing_dscp,
+                        self,
+                    );
+                    *frame = back;
+                    result?
+                }
+                None => endpoint.input_with_path_provider(
+                    now,
+                    context.link,
+                    packet.ip,
+                    packet.traffic_class,
+                    packet.options,
+                    packet.payload,
+                    metadata,
+                    outgoing_dscp,
+                    self,
+                )?,
+            };
             self.take_progress(endpoint);
             Ok(disposition)
         } else {

@@ -19,7 +19,7 @@ const OUTPUT: IcmpOutputLimits = IcmpOutputLimits {
     hop_limit: 64,
 };
 
-fn reassembly() -> ReassemblyLimits {
+pub(super) fn reassembly() -> ReassemblyLimits {
     ReassemblyLimits {
         assemblies: 4,
         fragments: 600,
@@ -106,7 +106,7 @@ fn echo(ip: IpMetadata, identifier: u16, sequence: u16, data: &[u8]) -> Vec<u8> 
 
 // Source fragments of a complete option-free datagram, `chunk` data octets
 // each (a multiple of 8), through the codecs' fragmenters.
-fn fragments(packet: &[u8], identification: u32, chunk: usize) -> Vec<Vec<u8>> {
+pub(super) fn fragments(packet: &[u8], identification: u32, chunk: usize) -> Vec<Vec<u8>> {
     let v6 = packet[0] >> 4 == 6;
     let (parsed_ip, protocol, data) = if v6 {
         let p = ntcp_ip6::parse(packet).unwrap();
