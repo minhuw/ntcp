@@ -239,6 +239,9 @@ pub struct Network<P: PacketIo> {
     frame_threshold: Option<usize>,
     // ½ of the frame budget, what a collapse of held frames aims for.
     frame_target: usize,
+    // How many more of the backend's frames may arrive before its count
+    // of frames out must be read again to know it within ¾ of the budget.
+    frame_slack: usize,
     // Last: everything above that holds the backend's frames (the
     // endpoint's receive queues, retained input) drops before it, so that
     // a DPDK pool is full when its port goes.
@@ -1006,6 +1009,7 @@ impl<P: PacketIo> Network<P> {
             failure: None,
             frame_threshold,
             frame_target,
+            frame_slack: 0,
             io,
         })
     }

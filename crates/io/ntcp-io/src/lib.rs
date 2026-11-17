@@ -674,8 +674,9 @@ pub trait PacketIo {
     }
     // Frames of the pool `rx_frame_budget` bounds that this backend handed
     // out and that are not yet released, wherever their holders are. A
-    // load or two, no device access: read once per received frame. None
-    // where `rx_frame_budget` is None.
+    // load or two, no device access. Only `receive_frame` raises it, by at
+    // most one a call, so a consumer that read it may count its receives
+    // in place of reading it again. None where `rx_frame_budget` is None.
     fn rx_frames_outstanding(&self) -> Option<usize> {
         None
     }
