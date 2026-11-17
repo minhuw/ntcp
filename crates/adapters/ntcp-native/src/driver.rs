@@ -1611,15 +1611,6 @@ impl<P: PacketIo> Network<P> {
         metadata: ntcp::RxPacketMetadata,
         held: &mut Option<RxFrame>,
     ) -> core::result::Result<ntcp::InputDisposition, ntcp_host::Error> {
-        if held.is_none() {
-            return self.host.input_datagram(
-                &mut self.endpoint,
-                self.now,
-                processed,
-                metadata,
-                self.config.tcp.dscp,
-            );
-        }
         self.host.input_datagram_frame(
             &mut self.endpoint,
             self.now,
