@@ -1220,12 +1220,16 @@ impl<P: PacketIo> Network<P> {
         threshold: usize,
         arrival: &mut Option<RxFrame>,
     ) -> io::Result<Option<ReceivedPacket>> {
-        let Some(ReceivedFrame {
+        // Matched in place: `?` would first move the whole result (a
+        // ReceivedFrame is over 128 bytes, so a memcpy call), on every
+        // receive, the empty ones included.
+        let ReceivedFrame {
             mut frame,
             metadata,
-        }) = self.io.receive_frame(rx)?
-        else {
-            return Ok(None);
+        } = match self.io.receive_frame(rx) {
+            Ok(Some(received)) => received,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(error),
         };
         // The backend copied it already (a scatter chain, an attached
         // external buffer), or the budget is spent. Then the connections'
