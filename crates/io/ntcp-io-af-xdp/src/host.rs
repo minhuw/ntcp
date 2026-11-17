@@ -69,10 +69,25 @@ struct BpfProgram {
 }
 
 // struct bpf_link_create_opts up to `flags`; libbpf reads later fields as zero.
+// For an XDP link libbpf refuses (EINVAL, before the bpf() call) opts with a
+// nonzero byte past `flags` up to `sz` (OPTS_ZEROED(opts, flags)), so the
+// 4 octets that pad `flags` to `sz` are a field: implicit padding is
+// undefined after a struct literal or any typed copy.
 #[repr(C)]
 struct LinkCreateOpts {
     sz: usize,
     flags: u32,
+    _zero: u32,
+}
+
+impl LinkCreateOpts {
+    fn new(flags: u32) -> Self {
+        Self {
+            sz: size_of::<Self>(),
+            flags,
+            _zero: 0,
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -341,10 +356,7 @@ impl Port {
             XdpMode::Native => XDP_FLAGS_DRV_MODE,
             XdpMode::Generic => XDP_FLAGS_SKB_MODE,
         };
-        let opts = LinkCreateOpts {
-            sz: size_of::<LinkCreateOpts>(),
-            flags,
-        };
+        let opts = LinkCreateOpts::new(flags);
         // SAFETY: loaded XDP program; ifindex as the target; opts is valid
         // for its stated size.
         let link = unsafe {
@@ -798,6 +810,45 @@ mod tests {
             assert_eq!(bpf_map__max_entries(map), 8);
         }
         assert!(object.map("missing").is_err());
+    }
+
+    // libbpf validates opts bytewise, padding included: OPTS_VALID past the
+    // fields it knows, and bpf_link_create OPTS_ZEROED past `flags` for an
+    // XDP link. Every opts byte must therefore be a field (the field sizes
+    // add up to the struct's: implicit padding is undefined) and every unset
+    // field zero, whatever the memory held before.
+    #[test]
+    fn opts_bytes_are_fields() {
+        assert_eq!(
+            size_of::<LinkCreateOpts>(),
+            size_of::<usize>() + 2 * size_of::<u32>()
+        );
+        assert_eq!(
+            size_of::<TestRunOpts>(),
+            size_of::<usize>() + 4 * size_of::<*const c_void>() + 10 * size_of::<u32>()
+        );
+        let mut slot = std::mem::MaybeUninit::<LinkCreateOpts>::uninit();
+        // SAFETY: writes size_of::<LinkCreateOpts>() octets into the slot.
+        unsafe { slot.as_mut_ptr().write_bytes(0xaa, 1) };
+        slot.write(LinkCreateOpts::new(XDP_FLAGS_DRV_MODE));
+        // SAFETY: the slot holds a LinkCreateOpts, which has no padding
+        // (asserted above): every octet is initialized.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(slot.as_ptr().cast::<u8>(), size_of::<LinkCreateOpts>())
+        };
+        let mut expected = size_of::<LinkCreateOpts>().to_ne_bytes().to_vec();
+        expected.extend_from_slice(&XDP_FLAGS_DRV_MODE.to_ne_bytes());
+        expected.extend_from_slice(&[0; 4]);
+        assert_eq!(bytes, expected);
+        // libbpf's own check, without privileges: opts it accepts reach the
+        // bpf() call, which refuses program -1 (EBADF, or EPERM where
+        // unprivileged BPF is off); opts it refuses fail with EINVAL first.
+        // SAFETY: opts valid for its stated size; no descriptor is created.
+        let result = unsafe { bpf_link_create(-1, 1, BPF_XDP, slot.as_ptr()) };
+        assert!(
+            [-libc::EBADF, -libc::EPERM].contains(&result),
+            "bpf_link_create: {result}"
+        );
     }
 
     fn run(program: &OwnedFd, frame: &[u8]) -> u32 {
