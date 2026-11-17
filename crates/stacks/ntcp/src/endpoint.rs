@@ -6208,6 +6208,14 @@ impl Endpoint {
         }
     }
 
+    /// Advance the endpoint's clock to `now`, running no timer: what
+    /// `on_timeout(now, 0)` does, without finding out whether a timer is
+    /// due. Fails as it does (`TimeWentBackwards`, `AmbiguousTimeJump`),
+    /// without effect.
+    pub fn advance_clock(&mut self, now: Instant) -> Result<(), EndpointError> {
+        self.clock(now)
+    }
+
     pub fn on_timeout(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
         self.clock(now)?;
         let mut drained = false;

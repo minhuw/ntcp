@@ -1205,7 +1205,7 @@ impl<P: PacketIo> Network<P> {
     // Advances logical time without servicing timers or touching packet I/O.
     pub fn advance_time(&mut self, now: Instant) -> Result<()> {
         self.running()?;
-        self.endpoint.on_timeout(now, 0)?;
+        self.endpoint.advance_clock(now)?;
         self.now = now;
         Ok(())
     }
