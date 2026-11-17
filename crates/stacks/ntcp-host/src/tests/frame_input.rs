@@ -38,16 +38,18 @@ fn deliver(side: &mut Side, mode: Mode, now: u64, packet: &[u8]) -> Option<usize
             Some(frame.len())
         }
         Mode::Frame => {
-            let (result, back) = side.0.input_datagram_frame(
-                &mut side.1,
-                now,
-                processed,
-                frame,
-                RxPacketMetadata::default(),
-                0,
-            );
-            result.unwrap();
-            back.map(|frame| frame.len())
+            let mut frame = Some(frame);
+            side.0
+                .input_datagram_frame(
+                    &mut side.1,
+                    now,
+                    processed,
+                    &mut frame,
+                    RxPacketMetadata::default(),
+                    0,
+                )
+                .unwrap();
+            frame.map(|frame| frame.len())
         }
     }
 }

@@ -1599,7 +1599,7 @@ impl<P: PacketIo> Network<P> {
         metadata: ntcp::RxPacketMetadata,
         held: &mut Option<RxFrame>,
     ) -> core::result::Result<ntcp::InputDisposition, ntcp_host::Error> {
-        let Some(frame) = held.take() else {
+        if held.is_none() {
             return self.host.input_datagram(
                 &mut self.endpoint,
                 self.now,
@@ -1607,17 +1607,15 @@ impl<P: PacketIo> Network<P> {
                 metadata,
                 self.config.tcp.dscp,
             );
-        };
-        let (result, back) = self.host.input_datagram_frame(
+        }
+        self.host.input_datagram_frame(
             &mut self.endpoint,
             self.now,
             processed,
-            frame,
+            held,
             metadata,
             self.config.tcp.dscp,
-        );
-        *held = back;
-        result
+        )
     }
     // Keeps a datagram whose connection's output is reserved, or a deferred
     // ICMP message, for a retry. The datagram stays in `held`, the frame it

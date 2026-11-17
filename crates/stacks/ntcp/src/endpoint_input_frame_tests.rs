@@ -722,13 +722,15 @@ impl ManagedPair {
             Mode::Frame(spare) => frame(bytes, spare),
             Mode::Heap(spare) => heap(bytes, spare),
         };
-        let (result, back) = self.b.input_frame_with_path_provider(
+        let mut back = None;
+        let result = self.b.input_frame_with_path_provider(
             now,
             self.link,
             ip,
             0,
             Ipv4Options::default(),
             frame,
+            &mut back,
             crate::RxPacketMetadata::default(),
             0,
             &mut self.paths,
@@ -847,13 +849,15 @@ fn a_reserved_connections_segment_gives_its_frame_back_whole() {
     let data = packets(&mut m.a, 1);
     let (ip, segment) = &data[0];
     let frame = heap(segment, 64);
-    let (result, back) = m.b.input_frame_with_path_provider(
+    let mut back = None;
+    let result = m.b.input_frame_with_path_provider(
         1,
         m.link,
         *ip,
         0,
         Ipv4Options::default(),
         frame,
+        &mut back,
         crate::RxPacketMetadata::default(),
         0,
         &mut m.paths,
@@ -865,13 +869,15 @@ fn a_reserved_connections_segment_gives_its_frame_back_whole() {
     let back = back.expect("given back");
     assert_eq!(&back[..], &segment[..], "untouched");
     assert!(m.b.accept_transmit(1, attempt).unwrap());
-    let (result, again) = m.b.input_frame_with_path_provider(
+    let mut again = None;
+    let result = m.b.input_frame_with_path_provider(
         2,
         m.link,
         *ip,
         0,
         Ipv4Options::default(),
         back,
+        &mut again,
         crate::RxPacketMetadata::default(),
         0,
         &mut m.paths,

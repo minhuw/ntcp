@@ -3918,37 +3918,44 @@ impl Endpoint {
         frame: RxFrame,
         metadata: crate::RxPacketMetadata,
     ) -> Result<InputDisposition, EndpointError> {
-        let (result, frame) = self.lend_ingress(frame, |endpoint, bytes| {
-            endpoint.input_scoped(now, ip, None, traffic_class, options, bytes, metadata)
-        });
-        drop(frame);
+        // SAFETY: `bytes` serves this input alone, which ends before
+        // `end_ingress` (`lend_ingress`).
+        let bytes = unsafe { self.lend_ingress(frame) };
+        let result = self.input_scoped(now, ip, None, traffic_class, options, bytes, metadata);
+        drop(self.end_ingress());
         result
     }
 
-    // `input` of the segment in `frame` with its bytes, while the frame is
-    // the ingress frame a connection's receive queue may take
-    // (`input_admitted`): the frame given back unless the queue holds it.
-    // A frame the queue took and let go again is given back trimmed to the
-    // part it took; its other bytes stay valid while it lives (`RxFrame::
-    // advance`), so the caller may still read the slice it had over it.
-    pub(crate) fn lend_ingress<T>(
-        &mut self,
-        frame: RxFrame,
-        input: impl FnOnce(&mut Self, &[u8]) -> T,
-    ) -> (T, Option<RxFrame>) {
+    // Makes `frame` the ingress frame a connection's receive queue may take
+    // (`input_admitted`) during the input of the segment it holds, and
+    // gives that segment's bytes for the input. `end_ingress` ends it.
+    //
+    // # Safety
+    // The bytes are used only by inputs that end before the `end_ingress`
+    // that follows, and nothing else is lent before it.
+    #[inline]
+    pub(crate) unsafe fn lend_ingress<'a>(&mut self, frame: RxFrame) -> &'a [u8] {
         debug_assert!(self.ingress.is_none() && self.lent.is_none());
         // SAFETY: an RxFrame's bytes stay valid and unchanged until it is
         // dropped, and neither moving nor trimming it moves them. This one
         // is dropped only after the input: it stays in `ingress`, or is
         // lent to the connection's receive queue, which until `end_lend`
         // gives back every frame it lets go of that is this one, and the
-        // lend ends below or when `reclaim` drops the connection (after a
-        // clear that gives it back to `ingress`). Only a frame the queue
-        // still holds after the input stays with the queue. `input` cannot
-        // keep the slice: it is borrowed for that call alone.
+        // lend ends in `end_ingress` or when `reclaim` drops the connection
+        // (after a clear that gives it back to `ingress`). Only a frame the
+        // queue still holds after the input stays with the queue, and the
+        // caller reads the bytes no later than `end_ingress`.
         let bytes = unsafe { core::slice::from_raw_parts(frame.as_ptr(), frame.len()) };
         self.ingress = Some(frame);
-        let result = input(self, bytes);
+        bytes
+    }
+
+    // Ends `lend_ingress`: the frame given back unless the queue holds it.
+    // A frame the queue took and let go again is given back trimmed to the
+    // part it took; its other bytes stay valid while it lives (`RxFrame::
+    // advance`), so the caller may still read the slice it had over it.
+    #[inline]
+    pub(crate) fn end_ingress(&mut self) -> Option<RxFrame> {
         let mut back = self.ingress.take();
         if let Some(index) = self.lent.take()
             && let Some(slot) = self.slots[index].as_mut()
@@ -3956,7 +3963,7 @@ impl Endpoint {
             debug_assert!(back.is_none(), "a lent frame is not the ingress frame");
             back = slot.connection.end_lend(false);
         }
-        (result, back)
+        back
     }
 
     #[allow(clippy::too_many_arguments)]

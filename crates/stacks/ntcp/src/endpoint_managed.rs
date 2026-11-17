@@ -780,13 +780,17 @@ impl Endpoint {
     /// `input_with_path_provider` of a received TCP segment held in `frame`
     /// (IP header removed), whose accepted payload the connection holds as
     /// the frame itself, trimmed, in place of a copy, as `input_frame`
-    /// does. The frame comes back unless the receive queue holds it, for
-    /// the caller to record a discard from its bytes or keep it for a
-    /// retry (an `OutputReserved` refusal takes nothing from it). A frame
-    /// the queue took and let go again in the same input comes back
-    /// trimmed to the part it took; bytes the caller read through it
-    /// before stay valid until it is dropped.
+    /// does. The frame is put in `back` unless the receive queue holds it,
+    /// for the caller to record a discard from its bytes or keep it for a
+    /// retry (an `OutputReserved` refusal takes nothing from it); `back` is
+    /// left None when the queue holds it. A frame the queue took and let go
+    /// again in the same input comes back trimmed to the part it took;
+    /// bytes the caller read through it before stay valid until it is
+    /// dropped.
+    // Always inlined: as a call of its own it passes the input's arguments
+    // once more, which the copying entry does not.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn input_frame_with_path_provider<P: PathProvider>(
         &mut self,
         now: Instant,
@@ -795,26 +799,27 @@ impl Endpoint {
         traffic_class: u8,
         options: Ipv4Options,
         frame: RxFrame,
+        back: &mut Option<RxFrame>,
         metadata: crate::RxPacketMetadata,
         outgoing_dscp: u8,
         provider: &mut P,
-    ) -> (
-        Result<InputDisposition, ManagedError<P::Error>>,
-        Option<RxFrame>,
-    ) {
-        self.lend_ingress(frame, |endpoint, bytes| {
-            endpoint.input_with_path_provider(
-                now,
-                arrival,
-                ip,
-                traffic_class,
-                options,
-                bytes,
-                metadata,
-                outgoing_dscp,
-                provider,
-            )
-        })
+    ) -> Result<InputDisposition, ManagedError<P::Error>> {
+        // SAFETY: `bytes` serves this input alone, which ends before
+        // `end_ingress` (`lend_ingress`).
+        let bytes = unsafe { self.lend_ingress(frame) };
+        let result = self.input_with_path_provider(
+            now,
+            arrival,
+            ip,
+            traffic_class,
+            options,
+            bytes,
+            metadata,
+            outgoing_dscp,
+            provider,
+        );
+        *back = self.end_ingress();
+        result
     }
 
     /// Use the Endpoint's own wildcard/exact listener precedence when selecting

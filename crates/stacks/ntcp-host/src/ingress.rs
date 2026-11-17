@@ -1155,29 +1155,21 @@ impl Host {
     /// accepts is held as the frame itself. Anything else (ICMP, UDP, a
     /// datagram reassembled or rewritten into the caller's completion
     /// buffer) is dispatched from its bytes as `input_datagram` does. The
-    /// frame comes back unless a receive queue holds it, untouched when it
-    /// was not handed to the Endpoint, else trimmed to the segment or less;
-    /// trimming releases nothing, so the caller's bytes of the datagram stay
-    /// valid while it lives (`RxFrame::advance`).
+    /// frame stays in `frame` unless a receive queue holds it (then `frame`
+    /// is None), untouched when it was not handed to the Endpoint, else
+    /// trimmed to the segment or less; trimming releases nothing, so the
+    /// caller's bytes of the datagram stay valid while it lives
+    /// (`RxFrame::advance`). With `frame` None, this is `input_datagram`.
     pub fn input_datagram_frame(
         &mut self,
         endpoint: &mut ntcp::Endpoint,
         now: Instant,
         processed: Processed<'_>,
-        frame: ntcp::RxFrame,
+        frame: &mut Option<ntcp::RxFrame>,
         metadata: RxPacketMetadata,
         outgoing_dscp: u8,
-    ) -> (Result<InputDisposition, Error>, Option<ntcp::RxFrame>) {
-        let mut frame = Some(frame);
-        let result = self.dispatch_datagram(
-            endpoint,
-            now,
-            processed,
-            metadata,
-            outgoing_dscp,
-            &mut frame,
-        );
-        (result, frame)
+    ) -> Result<InputDisposition, Error> {
+        self.dispatch_datagram(endpoint, now, processed, metadata, outgoing_dscp, frame)
     }
 
     // `input_datagram`, with the frame the datagram arrived in when the

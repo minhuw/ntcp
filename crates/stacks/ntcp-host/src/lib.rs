@@ -2314,19 +2314,18 @@ impl Host {
                     let offset = packet.payload.as_ptr() as usize - segment.as_ptr() as usize;
                     segment.advance(offset);
                     segment.truncate(packet.payload.len());
-                    let (result, back) = endpoint.input_frame_with_path_provider(
+                    endpoint.input_frame_with_path_provider(
                         now,
                         context.link,
                         packet.ip,
                         packet.traffic_class,
                         packet.options,
                         segment,
+                        frame,
                         metadata,
                         outgoing_dscp,
                         self,
-                    );
-                    *frame = back;
-                    result?
+                    )?
                 }
                 None => endpoint.input_with_path_provider(
                     now,
