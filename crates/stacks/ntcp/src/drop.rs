@@ -114,6 +114,13 @@ drop_reasons! {
     IcmpCsum = "ICMP_CSUM",
     /// A malformed ICMP message, or one this host does not accept here.
     IcmpInvalid = "ICMP_INVALID",
+    /// An ICMPv6 Neighbor Discovery message (Router or Neighbor
+    /// Solicitation or Advertisement, Redirect) or MLD message this host
+    /// does not process: ntcp's own Neighbor Discovery, on a port that has
+    /// it, consumes Neighbor Solicitations, Advertisements and Redirects
+    /// before this. Not an ICMP error: Linux's ndisc_rcv and MLD handlers
+    /// process or ignore these without counting one.
+    Ipv6NdiscIgnored = "IPV6_NDISC_IGNORED",
     /// An ICMP Source Quench, discarded (RFC 6633).
     IcmpSourceQuench = "ICMP_SOURCE_QUENCH",
     /// An ICMP error or Echo Reply that names no connection, submission or

@@ -489,6 +489,14 @@ pub enum Received<'a> {
     Discarded,
 }
 
+// The ICMPv6 types Linux's icmpv6_rcv hands to Neighbor Discovery (Router
+// Solicitation and Advertisement, Neighbor Solicitation and Advertisement,
+// Redirect: RFC 4861 section 4) and to MLD (Query, MLDv1 Report and Done:
+// RFC 2710 section 3; MLDv2 Report: RFC 3810 section 5.2).
+fn link_control(kind: u8) -> bool {
+    matches!(kind, 130..=137 | 143)
+}
+
 fn is_link_local(address: IpAddr) -> bool {
     matches!(address, IpAddr::V6(v) if v.is_unicast_link_local())
 }
@@ -712,6 +720,41 @@ impl Host {
         self.drops.record_error(reason, now, frame.len(), || {
             ntcp::DropSubject::of_ip_packet(frame)
         });
+        Error::Unsupported
+    }
+
+    // An ICMPv6 Neighbor Discovery or MLD message `packet` (`link_control`)
+    // that reached dispatch, which processes none: refused, as Linux's
+    // icmpv6_rcv refuses any ICMPv6 message, by its checksum and then its
+    // length as an ICMP error; an ND message with a Fragment header (RFC
+    // 6980 section 5) as a fragment; otherwise recorded as
+    // IPV6_NDISC_IGNORED, never as an invalid ICMP message: Linux hands
+    // these to ndisc_rcv and the MLD handlers, which process or ignore them
+    // without counting an ICMP error.
+    #[cold]
+    #[inline(never)]
+    fn link_control_refused(
+        &mut self,
+        now: Instant,
+        packet: &crate::IngressPacket,
+        processed: Processed<'_>,
+    ) -> Error {
+        match ntcp_icmp::icmpv6_checksum(packet.ip, packet.payload) {
+            Ok(0) => {}
+            Ok(_) => return ntcp_ip::Error::Checksum.into(),
+            Err(error) => return error.into(),
+        }
+        if packet.payload.len() < 8 {
+            return ntcp_ip::Error::Truncated.into();
+        }
+        if processed.contained_fragment_header() && (133..=137).contains(&packet.payload[0]) {
+            return ntcp_ip::Error::FragmentationUnsupported.into();
+        }
+        let bytes = processed.bytes();
+        self.drops
+            .record_error(DropReason::Ipv6NdiscIgnored, now, bytes.len(), || {
+                ntcp::DropSubject::of_ip_packet(bytes)
+            });
         Error::Unsupported
     }
 
@@ -1187,25 +1230,18 @@ impl Host {
             (128, 129)
         };
         // Neighbor Discovery is consumed by `receive` from unfragmented
-        // packets only; one that reaches dispatch arrived with a Fragment
-        // header (RFC 6980 section 5) or bypassed physical input. A
-        // Redirect is acted on only where Neighbor Discovery resolves the
-        // first hops it changes.
-        let link = processed.context().link;
+        // packets only, on an ND-capable port; MLD is never consumed. Such a
+        // message that reaches dispatch (on a port without ND, after
+        // physical input bypassed, or with a Fragment header, which RFC
+        // 6980 section 5 refuses) is not processed, and is not an ICMP
+        // error either.
         if packet.ip.source.is_ipv6()
-            && match packet.payload.first() {
-                Some(135 | 136) => true,
-                Some(137) => {
-                    processed.contained_fragment_header() || self.neighbors.port(link).is_some()
-                }
-                _ => false,
-            }
+            && packet
+                .payload
+                .first()
+                .is_some_and(|&kind| link_control(kind))
         {
-            return Err(if processed.contained_fragment_header() {
-                ntcp_ip::Error::FragmentationUnsupported.into()
-            } else {
-                Error::Unsupported
-            });
+            return Err(self.link_control_refused(now, &packet, processed));
         }
         if packet.ip.source.is_ipv4() && packet.payload.first() == Some(&5) {
             return Ok(IcmpDispatch::Completed(IcmpOutcome::Redirect(

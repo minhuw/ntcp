@@ -888,6 +888,91 @@ fn ipv6_redirect_to_a_router_with_its_link_layer_address() {
     assert_eq!(next_hop(&a, id), scoped(&a, "fe80::1"));
 }
 
+// On an ND-capable port the Host's Neighbor Discovery consumes Neighbor
+// Solicitations, Advertisements and Redirects (no drop); Router
+// Solicitations and Advertisements and MLD messages to the port's own
+// address, which it does not process, and ND that bypassed physical input,
+// are IPV6_NDISC_IGNORED, never ICMP_INVALID (Linux's icmpv6_rcv hands
+// them to ndisc_rcv and the MLD handlers, which count no ICMP error).
+#[test]
+fn neighbor_discovery_consumed_or_ignored_never_invalid() {
+    let (mut a, _, syn) = ipv6_connection(720);
+    let drops = a.0.drop_counts();
+    let own = v6("2001:db8::10");
+    let redirect = redirect6(
+        v6("fe80::1"),
+        v6("fe80::2"),
+        v6("2001:db8:1::7"),
+        Some(R2),
+        Some(&syn),
+    );
+    assert_eq!(
+        redirected(&mut a, 2, &redirect),
+        Ok(RedirectOutcome::Installed)
+    );
+    let na = NeighborAdvertisement {
+        router: true,
+        solicited: false,
+        override_: true,
+        target: v6("fe80::2"),
+        target_link_layer: Some(R2),
+    };
+    let ip = IpMetadata {
+        source: IpAddr::V6(v6("fe80::2")),
+        destination: IpAddr::V6(own),
+    };
+    let mut message = [0; 32];
+    let len = ntcp_icmp::encode_advertisement(ip, na, &mut message).unwrap();
+    let advertisement = arriving(v6("fe80::2"), own, &message[..len]);
+    assert_eq!(receive(&mut a, 3, &advertisement), Ok(true));
+    learn_router(&mut a, v6("fe80::1"), R1, 4);
+    assert_eq!(a.0.drop_counts(), drops);
+    let ip = IpMetadata {
+        source: IpAddr::V6(v6("fe80::1")),
+        destination: IpAddr::V6(own),
+    };
+    let ignored = |a: &Side| a.0.drop_counts()[ntcp::DropReason::Ipv6NdiscIgnored];
+    // MLD Query, MLDv1 Report and Done, RS, RA, MLDv2 Report by their
+    // minimum lengths.
+    for (kind, len) in [
+        (130, 24),
+        (131, 24),
+        (132, 24),
+        (133, 8),
+        (134, 16),
+        (143, 8),
+    ] {
+        let mut m = vec![0; len];
+        m[0] = kind;
+        let sum = ntcp_icmp::icmpv6_checksum(ip, &m).unwrap();
+        m[2..4].copy_from_slice(&sum.to_be_bytes());
+        let frame = arriving(v6("fe80::1"), own, &m);
+        assert_eq!(receive(&mut a, 5, &frame), Ok(false), "type {kind}");
+        let before = ignored(&a);
+        assert_eq!(
+            a.0.input_icmp(&mut a.1, a.2, 5, &frame, None).map(|_| ()),
+            Err(Error::Unsupported),
+            "type {kind}"
+        );
+        assert_eq!(ignored(&a), before + 1, "type {kind}");
+    }
+    // Neighbor Discovery handed to ICMP dispatch, bypassing physical input.
+    for frame in [&advertisement, &redirect] {
+        let before = ignored(&a);
+        assert_eq!(
+            a.0.input_icmp(&mut a.1, a.2, 6, frame, None).map(|_| ()),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(ignored(&a), before + 1);
+    }
+    assert_eq!(
+        a.0.drop_counts().total() - drops.total(),
+        8,
+        "every message once, and nothing else"
+    );
+    assert_eq!(a.0.drop_counts()[ntcp::DropReason::IcmpInvalid], 0);
+}
+
 // Without a Target Link-Layer Address the router target is still a
 // router (section 8.3 MUST) once resolution creates its entry; when its
 // resolution fails, the override ends with it. A target equal to the

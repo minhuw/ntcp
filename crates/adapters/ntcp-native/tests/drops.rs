@@ -61,11 +61,16 @@ impl Station {
         config.tcp.max_connections = 4;
         config.tcp.max_listeners = 1;
         if layer == PacketLayer::Ethernet {
+            // ARP resolves IPv4 next hops; an IPv6 port has a fixed one.
             config.link = Link::Ethernet {
                 local_mac: MAC,
-                next_hop: EthernetNextHop::Arp {
-                    prefix_len: 24,
-                    gateway: None,
+                next_hop: if local.is_ipv4() {
+                    EthernetNextHop::Arp {
+                        prefix_len: 24,
+                        gateway: None,
+                    }
+                } else {
+                    EthernetNextHop::Fixed([2, 0, 0, 0, 0, 1])
                 },
             };
         }
@@ -269,6 +274,77 @@ fn a_family_the_port_does_not_receive() {
             s.ip(ROUTER_SOLICITATION.to_vec()),
             [DropReason::IpInaddrerrors]
         );
+    }
+}
+
+// An ICMPv6 message `message` (its checksum filled in) from fe80::1 to
+// `local` with Hop Limit 255.
+fn icmpv6(local: &str, mut message: Vec<u8>) -> Vec<u8> {
+    let source: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+    let destination: std::net::Ipv6Addr = local.parse().unwrap();
+    let mut pseudo = source.octets().to_vec();
+    pseudo.extend(destination.octets());
+    pseudo.extend((message.len() as u32).to_be_bytes());
+    pseudo.extend([0, 0, 0, 58]);
+    pseudo.extend(&message);
+    let sum = checksum(&pseudo);
+    message[2..4].copy_from_slice(&sum.to_be_bytes());
+    let mut packet = vec![0x60, 0, 0, 0];
+    packet.extend((message.len() as u16).to_be_bytes());
+    packet.extend([58, 255]);
+    packet.extend(source.octets());
+    packet.extend(destination.octets());
+    packet.extend(message);
+    packet
+}
+
+// Neighbor Discovery (RFC 4861 section 4) and MLD (RFC 2710 section 3, RFC
+// 3810 section 5.2) messages of their minimum lengths, by type.
+const LINK_CONTROL: [(u8, usize); 9] = [
+    (130, 24), // MLD Query
+    (131, 24), // MLDv1 Report
+    (132, 24), // MLDv1 Done
+    (133, 8),  // Router Solicitation
+    (134, 16), // Router Advertisement
+    (135, 24), // Neighbor Solicitation
+    (136, 24), // Neighbor Advertisement
+    (137, 40), // Redirect
+    (143, 8),  // MLDv2 Report
+];
+
+// ND and MLD messages to the port's own unicast address that ntcp does not
+// process (an ntcp-native port has no Neighbor Discovery: its next hop is
+// the TUN or a fixed MAC) are IPV6_NDISC_IGNORED, not invalid ICMP
+// messages: Linux's icmpv6_rcv hands them to ndisc_rcv and the MLD handlers,
+// which process or ignore them without an ICMP error. A bad checksum is
+// still ICMP_CSUM, checked first as Linux does.
+#[test]
+fn neighbor_discovery_and_mld_this_host_does_not_process() {
+    const LOCAL6: &str = "2001:db8::2";
+    for layer in [PacketLayer::Ip, PacketLayer::Ethernet] {
+        let mut s = Station::at(layer, LOCAL6.parse().unwrap());
+        let deliver = |s: &mut Station, packet: Vec<u8>| match layer {
+            PacketLayer::Ip => s.ip(packet),
+            _ => s.take(vec![Ok(ethernet(MAC, 0x86dd, &packet))]),
+        };
+        for (kind, len) in LINK_CONTROL {
+            let mut message = vec![0; len];
+            message[0] = kind;
+            let packet = icmpv6(LOCAL6, message);
+            assert_eq!(
+                deliver(&mut s, packet.clone()),
+                [DropReason::Ipv6NdiscIgnored],
+                "{layer:?} type {kind}"
+            );
+            let mut bad = packet;
+            bad[42] ^= 1;
+            assert_eq!(
+                deliver(&mut s, bad),
+                [DropReason::IcmpCsum],
+                "{layer:?} type {kind}"
+            );
+        }
+        assert_eq!(s.network.counters().drops[DropReason::IcmpInvalid], 0);
     }
 }
 
