@@ -3107,7 +3107,7 @@ impl Owner {
             return Err(EAGAIN);
         }
         let now = self.clock()?;
-        self.endpoint.on_timeout(now, 0).map_err(engine)?;
+        self.endpoint.advance_clock(now).map_err(engine)?;
         self.collect_paths()?;
         let result = self.dispatch(id, op);
         let _ = self.refresh_readiness(id);
