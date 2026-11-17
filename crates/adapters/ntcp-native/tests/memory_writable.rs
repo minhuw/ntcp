@@ -260,3 +260,111 @@ fn a_writable_connection_refused_memory_is_woken_by_a_return_and_writes() {
     let charge = run(None);
     assert_eq!(run(Some(charge + 65536)), charge);
 }
+
+// A connection whose first write the cap refuses with nothing queued, the
+// cap leaving some room but less than its first send ring, gets no
+// Writable while no memory comes back, over many vm_wait retries: each
+// would only bring the same WouldBlock, and an edge-triggered writer would
+// spin on it (Stackbench c184, where the retries raised Writable every
+// 74-337 ms). Once another connection's unread data is read, its return
+// raises one Writable, and the write goes through.
+#[test]
+fn a_refused_writer_gets_no_writable_until_a_return_fits_its_growth() {
+    let (server_ip, client_ip): (IpAddr, IpAddr) =
+        ("198.18.0.1".parse().unwrap(), "198.18.0.2".parse().unwrap());
+    let request: Vec<u8> = (0..16384).map(|i: u32| (i * 7 % 251) as u8).collect();
+    // The server's charge once it holds `request` unread; then a cap 1000
+    // bytes above it, less than a send ring.
+    let run = |cap: Option<usize>| -> usize {
+        let (near, far) = wires();
+        let mut server = match cap {
+            Some(cap) => capped(server_ip, near, cap),
+            None => network(server_ip, near, CONNECTIONS, CONNECTIONS * 70 * 65536),
+        };
+        let mut client = network(client_ip, far, CONNECTIONS, CONNECTIONS * 70 * 65536);
+        let listener = server.listen(7000, 4).unwrap();
+        let now = Cell::new(0u64);
+        let drive = |network: &mut Network<Wire>, step: u64| {
+            now.set(now.get() + step);
+            network.drive(now.get(), BUDGET).unwrap();
+            let mut events = Vec::new();
+            let mut out = [Event::NetworkStopped; 8];
+            loop {
+                let report = network.drain_events(&mut out);
+                events.extend_from_slice(&out[..report.written]);
+                if !report.more {
+                    return events;
+                }
+            }
+        };
+        let dialers: Vec<_> = (0..2)
+            .map(|_| client.connect(SocketAddr::new(server_ip, 7000)).unwrap())
+            .collect();
+        let mut accepted = Vec::new();
+        while accepted.len() < 2 {
+            drive(&mut server, 20_000);
+            drive(&mut client, 20_000);
+            match server.accept(listener) {
+                Ok(id) => accepted.push(id),
+                Err(error) => assert!(error.is_would_block(), "{error:?}"),
+            }
+        }
+        let (holder, waiter) = (accepted[0], accepted[1]);
+        let receipt = client
+            .try_write(dialers[0], &request, WriteOptions::default())
+            .unwrap();
+        assert_eq!(receipt.accepted, request.len());
+        for _ in 0..64 {
+            drive(&mut client, 20_000);
+            drive(&mut server, 20_000);
+        }
+        assert_eq!(server.counters().memory_throttled_writes, 0);
+        let charge = server.counters().buffer_bytes;
+        if cap.is_none() {
+            return charge;
+        }
+        let error = server
+            .try_write(waiter, &request, WriteOptions::default())
+            .unwrap_err();
+        assert!(error.is_would_block(), "{error:?}");
+        assert_eq!(server.counters().memory_throttled_writes, 1);
+        // Writable by Linux's rule, but no Writable over 10 s of retries.
+        assert!(server.readiness(waiter).unwrap().writable);
+        for _ in 0..1000 {
+            let events = drive(&mut server, 10_000_000);
+            assert!(
+                !events.contains(&Event::Writable(waiter)),
+                "{:?}",
+                server.counters()
+            );
+            drive(&mut client, 0);
+        }
+        assert_eq!(server.counters().memory_throttled_writes, 1);
+        assert_eq!(server.counters().buffer_bytes, charge);
+        // The server reads `holder`'s data: its return wakes the waiter.
+        let mut buffer = vec![0u8; 65536];
+        let mut received = 0;
+        while let Ok(ReadOutcome::Data { len, .. }) = server.try_read(holder, &mut buffer) {
+            received += len;
+        }
+        assert_eq!(received, request.len());
+        let mut woken = 0;
+        for _ in 0..64 {
+            let events = drive(&mut server, 20_000);
+            woken += events
+                .iter()
+                .filter(|&&e| e == Event::Writable(waiter))
+                .count();
+            drive(&mut client, 20_000);
+        }
+        assert_eq!(woken, 1, "{:?}", server.counters());
+        let receipt = server
+            .try_write(waiter, &request[..1000], WriteOptions::default())
+            .unwrap();
+        assert_eq!(receipt.accepted, 1000);
+        assert_eq!(server.counters().memory_throttled_writes, 1);
+        charge
+    };
+    let charge = run(None);
+    assert_eq!(run(Some(charge + 1000)), charge);
+}

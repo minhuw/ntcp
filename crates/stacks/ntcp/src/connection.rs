@@ -5951,6 +5951,8 @@ impl Connection {
         // As tcp_sendmsg copies skb by skb until sk_wmem_schedule refuses,
         // grow for the longest prefix the budget takes, halving the bytes
         // asked for (costs only, until one fits); the write takes that.
+        // With no byte spare in the storage the last prefix holds one more
+        // byte, the growth a wake asks to fit (`send_next_growth`).
         let held = self.send.len() + self.allocated_send_room();
         let mut part = accepted / 2;
         while self.send.len() + part > held {
@@ -5968,6 +5970,19 @@ impl Connection {
         }
         self.throttle_send();
         Ok(Some(wanted))
+    }
+
+    // What the next write needs added to the charge to take any byte: none
+    // while the allocated storage holds one beyond those queued, and
+    // otherwise the growth to hold one byte more, the last a refused write
+    // tries (`prepare_send_storage`); None if it overflows. Derived from
+    // the storage as it is now, so a ring or ledgers freed since the
+    // refusal change it at once.
+    pub(crate) fn send_next_growth(&self) -> Option<usize> {
+        if self.allocated_send_room() != 0 {
+            return Some(0);
+        }
+        self.send_growth_cost(self.send.len().checked_add(1)?)
     }
 
     // The peak bytes growing the send ring and both ledgers to hold `live`
