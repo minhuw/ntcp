@@ -247,10 +247,14 @@ impl RxQueue {
 
     // The frame holding `bytes`, part of the payload being inserted: the
     // lent frame trimmed to them, or else a heap copy, whose allocation may
-    // be refused.
+    // be refused. Empty bytes (a SYN's empty text, deferred with its FIN)
+    // take nothing from the lend: trimmed to nothing at the segment's end,
+    // the lent frame would lie past its range, and `discard` would not
+    // know it for the lent frame and would release it during its input.
     pub(crate) fn frame_of(&mut self, bytes: &[u8]) -> Result<RxFrame, ()> {
         let at = bytes.as_ptr() as usize;
         if let Some(lend) = &mut self.lend
+            && !bytes.is_empty()
             && !lend.taken
             && lend.bytes.start <= at
             && at + bytes.len() <= lend.bytes.end

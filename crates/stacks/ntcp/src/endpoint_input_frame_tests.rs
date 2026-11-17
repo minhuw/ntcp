@@ -593,6 +593,33 @@ fn syn_ack_data_refused_a_deque_slot_outlives_its_input() {
     assert!(refusals != 0, "no allocation refusal reached defer_syn");
 }
 
+// A SYN with FIN and no data to an active opener (simultaneous open):
+// learn_syn defers its empty text (frame_of of the empty slice at the
+// segment's end, then defer_syn, which keeps no frame for it). The lent
+// frame must come back whole, not be taken and released while the input
+// that brought it still borrows its bytes.
+#[test]
+fn an_empty_deferred_syn_gives_its_frame_back() {
+    let (mut a, mut b, _listener, _client) = endpoints();
+    let syn = packets(&mut a, 0);
+    b.input(0, syn[0].0, &syn[0].1).unwrap();
+    let synack = packets(&mut b, 0);
+    let (ip, mut bytes) = synack[0].clone();
+    bytes[13] = 0x03; // SYN | FIN: a crossing SYN, not the SYN-ACK
+    bytes[16..18].fill(0);
+    let sum = crate::wire::checksum(ip, &bytes).unwrap();
+    bytes[16..18].copy_from_slice(&sum.to_be_bytes());
+    let live = LIVE.get();
+    // SAFETY (test): `segment` serves the one input before end_ingress.
+    let segment = unsafe { a.lend_ingress(frame(&bytes, 64)) };
+    a.input(0, ip, segment).unwrap();
+    assert_eq!(LIVE.get(), live + 1, "released during its own input");
+    let back = a.end_ingress().expect("given back");
+    assert_eq!(&back[..], &bytes[..], "untouched");
+    drop(back);
+    assert_eq!(LIVE.get(), live);
+}
+
 // The path authority of a managed endpoint owning 192.0.2.2, with
 // 192.0.2.0/24 on-link.
 struct Paths(ntcp_path::PathService, ntcp_path::SourceId);
