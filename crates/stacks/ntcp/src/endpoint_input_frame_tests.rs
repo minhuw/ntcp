@@ -10,6 +10,7 @@ extern crate std;
 
 use super::*;
 use crate::rx_queue::{ReceiveOutcome, RxPayload, RxQueue};
+use crate::{ManagedError, PathFactoryRequest, PathProvider};
 use ntcp_buffer::RxFrameVtable;
 use std::{
     boxed::Box,
@@ -590,4 +591,367 @@ fn syn_ack_data_refused_a_deque_slot_outlives_its_input() {
         }
     }
     assert!(refusals != 0, "no allocation refusal reached defer_syn");
+}
+
+// The path authority of a managed endpoint owning 192.0.2.2, with
+// 192.0.2.0/24 on-link.
+struct Paths(ntcp_path::PathService, ntcp_path::SourceId);
+
+impl Paths {
+    fn new() -> (Self, ntcp_path::LinkId) {
+        use ntcp_path::{ContextId, InterfaceKey, IpPrefix, Limits, NextHop, Route, ScopedAddress};
+        let limits = Limits {
+            links: 1,
+            sources: 1,
+            source_owners: 1,
+            routes: 1,
+            paths: 4,
+            clients: 8,
+        };
+        let mut service = ntcp_path::PathService::new(ContextId::new(79), limits, [2; 16]).unwrap();
+        let link = service.register_link(InterfaceKey(1), 1500).unwrap();
+        let address = ScopedAddress::new("192.0.2.2".parse().unwrap(), None).unwrap();
+        let source = service.register_source(address, link).unwrap();
+        service
+            .add_route(Route {
+                destination: IpPrefix::new("192.0.2.0".parse().unwrap(), 24).unwrap(),
+                source: None,
+                dscp: None,
+                link,
+                next_hop: NextHop::OnLink,
+                metric: 0,
+            })
+            .unwrap();
+        (Self(service, source), link)
+    }
+}
+
+impl PathProvider for Paths {
+    type Error = ntcp_path::Error;
+    fn prepare(
+        &mut self,
+        request: PathFactoryRequest,
+    ) -> Result<crate::PreparedFactory, Self::Error> {
+        let destination = ntcp_path::ScopedAddress::new(request.tuple.remote.ip(), request.zone)?;
+        let (client, snapshot) = self.0.acquire(ntcp_path::PathRequest {
+            source: self.1,
+            destination,
+            dscp: request.dscp,
+        })?;
+        Ok(crate::PreparedFactory {
+            path: crate::PreparedPath { client, snapshot },
+            receive: crate::ReceiveIpCapability::new(self.0.context(), false, 1500).unwrap(),
+        })
+    }
+    fn commit(&mut self, _: crate::PreparedPath, _: ConnectionId) {}
+    fn cancel(&mut self, prepared: crate::PreparedPath) {
+        self.0.release(prepared.client).unwrap();
+    }
+}
+
+// A managed input's result.
+type Managed = Result<InputDisposition, ManagedError<ntcp_path::Error>>;
+
+// The client (raw) and a managed server listening on 192.0.2.2:8080.
+struct ManagedPair {
+    a: Endpoint,
+    b: Endpoint,
+    paths: Paths,
+    link: ntcp_path::LinkId,
+    listener: ListenerId,
+    client: ConnectionId,
+    mode: Mode,
+}
+
+impl ManagedPair {
+    fn new(mode: Mode, reuse_time_wait: bool) -> Self {
+        let config = EndpointConfig {
+            max_connections: 8,
+            max_listeners: 2,
+            reuse_time_wait,
+            connection: ConnectionConfig {
+                mss: 64,
+                send_capacity: 1024,
+                receive_capacity: 8 * 2304,
+                nagle: false,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let (local, remote) = addresses();
+        let (paths, link) = Paths::new();
+        let mut a = Endpoint::new(config.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(config, [2; 32], 0, |_| true).unwrap();
+        b.enable_managed_paths(link.context()).unwrap();
+        let listener = b.listen(remote, 4).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        Self {
+            a,
+            b,
+            paths,
+            link,
+            listener,
+            client,
+            mode,
+        }
+    }
+
+    // The server's managed input of `bytes`, by copy or as a frame; the
+    // frame it gave back, if any, as (length, truesize).
+    fn input(
+        &mut self,
+        now: u64,
+        ip: IpMetadata,
+        bytes: &[u8],
+    ) -> (Managed, Option<(usize, usize)>) {
+        let frame = match self.mode {
+            Mode::Copy => {
+                let result = self.b.input_with_path_provider(
+                    now,
+                    self.link,
+                    ip,
+                    0,
+                    Ipv4Options::default(),
+                    bytes,
+                    crate::RxPacketMetadata::default(),
+                    0,
+                    &mut self.paths,
+                );
+                return (result, None);
+            }
+            Mode::Frame(spare) => frame(bytes, spare),
+            Mode::Heap(spare) => heap(bytes, spare),
+        };
+        let (result, back) = self.b.input_frame_with_path_provider(
+            now,
+            self.link,
+            ip,
+            0,
+            Ipv4Options::default(),
+            frame,
+            crate::RxPacketMetadata::default(),
+            0,
+            &mut self.paths,
+        );
+        (result, back.map(|frame| (frame.len(), frame.truesize())))
+    }
+
+    // Both ways until quiet, every packet and input recorded.
+    fn pump(&mut self, now: u64, trace: &mut Vec<Step>) {
+        for _ in 0..128 {
+            let ab = packets(&mut self.a, now);
+            let ba = packets(&mut self.b, now);
+            if ab.is_empty() && ba.is_empty() {
+                return;
+            }
+            for (ip, bytes) in ab {
+                trace.push(Step::Packet(true, now, bytes.clone()));
+                let (result, _) = self.input(now, ip, &bytes);
+                trace.push(Step::Input(result.map_err(|e| match e {
+                    ManagedError::Endpoint(e) => e,
+                    ManagedError::Provider(_) => EndpointError::InvalidAddress,
+                })));
+            }
+            for (ip, bytes) in ba {
+                trace.push(Step::Packet(false, now, bytes.clone()));
+                trace.push(Step::Input(self.a.input(now, ip, &bytes)));
+            }
+        }
+        panic!("unexpected infinite packet exchange");
+    }
+}
+
+// Managed input of frames is managed input of bytes: the SYN through the
+// provider's factory, data out of order and in order, reads, a reply and
+// both closes leave the same packets, dispositions and streams, and the
+// frames are held only while unread.
+#[test]
+fn managed_frame_input_is_the_copying_managed_input() {
+    let run = |mode| {
+        let mut m = ManagedPair::new(mode, false);
+        let mut trace = Vec::new();
+        m.pump(0, &mut trace);
+        let server = m.b.accept(m.listener).unwrap();
+        // Four 64 B segments, the initial window.
+        let data: Vec<u8> = (0..256).map(|i| (i % 251) as u8).collect();
+        m.a.write(m.client, &data).unwrap();
+        let mut segments = packets(&mut m.a, 1);
+        segments.reverse();
+        for (ip, bytes) in &segments {
+            trace.push(Step::Packet(true, 1, bytes.clone()));
+            let (result, back) = m.input(1, *ip, bytes);
+            trace.push(Step::Input(
+                result.map_err(|_| EndpointError::InvalidAddress),
+            ));
+            // Every data segment is held, out of order or in order.
+            assert!(back.is_none(), "{mode:?}");
+        }
+        if let Mode::Frame(_) = mode {
+            assert_eq!(LIVE.get(), segments.len() as isize);
+        }
+        assert_eq!(segments.len(), 4);
+        let mut out = [0; 256];
+        let mut read = 0;
+        while read < out.len() {
+            let n =
+                m.b.read(server, &mut out[read..read + 100.min(256 - read)])
+                    .unwrap();
+            assert_ne!(n, 0);
+            read += n;
+        }
+        assert_eq!(&out[..], &data[..]);
+        assert_eq!(LIVE.get(), 0);
+        m.b.write(server, b"reply").unwrap();
+        m.pump(2, &mut trace);
+        let mut reply = [0; 5];
+        assert_eq!(m.a.read(m.client, &mut reply).unwrap(), 5);
+        m.a.close(m.client).unwrap();
+        m.pump(3, &mut trace);
+        m.b.close(server).unwrap();
+        m.pump(4, &mut trace);
+        trace.push(Step::State(m.a.state(m.client), m.b.state(server)));
+        assert_eq!(LIVE.get(), 0);
+        trace
+    };
+    let copy = run(Mode::Copy);
+    assert_eq!(copy, run(Mode::Frame(2000)));
+    assert_eq!(copy, run(Mode::Heap(64)));
+}
+
+// A segment refused because its connection's output is reserved takes
+// nothing from its frame: it comes back whole, and the same frame is taken
+// in once the reservation ends.
+#[test]
+fn a_reserved_connections_segment_gives_its_frame_back_whole() {
+    let mut m = ManagedPair::new(Mode::Heap(64), false);
+    m.b.enable_output_reservations().unwrap();
+    // The handshake, the server's SYN-ACK through a reservation.
+    let syn = packets(&mut m.a, 0);
+    let (result, back) = m.input(0, syn[0].0, &syn[0].1);
+    assert_eq!(result.unwrap(), InputDisposition::Processed);
+    assert!(back.is_some(), "a SYN's frame is not held");
+    let mut bytes = [0; 2048];
+    let (output, attempt) = m.b.poll_reserved_transmit(0, &mut bytes, 16).unwrap();
+    let packet = output.packet.unwrap();
+    assert!(m.b.accept_transmit(0, attempt.unwrap()).unwrap());
+    m.a.input(0, packet.ip, &bytes[..packet.len]).unwrap();
+    let ack = packets(&mut m.a, 0);
+    m.input(0, ack[0].0, &ack[0].1).0.unwrap();
+    let server = m.b.accept(m.listener).unwrap();
+    // The server's data waits in a reservation while the client's arrives.
+    m.b.write(server, b"held").unwrap();
+    let (_, attempt) = m.b.poll_reserved_transmit(1, &mut bytes, 16).unwrap();
+    let attempt = attempt.unwrap();
+    assert!(m.b.is_output_reserved(server));
+    m.a.write(m.client, b"client data").unwrap();
+    let data = packets(&mut m.a, 1);
+    let (ip, segment) = &data[0];
+    let frame = heap(segment, 64);
+    let (result, back) = m.b.input_frame_with_path_provider(
+        1,
+        m.link,
+        *ip,
+        0,
+        Ipv4Options::default(),
+        frame,
+        crate::RxPacketMetadata::default(),
+        0,
+        &mut m.paths,
+    );
+    assert!(matches!(
+        result,
+        Err(ManagedError::Endpoint(EndpointError::OutputReserved))
+    ));
+    let back = back.expect("given back");
+    assert_eq!(&back[..], &segment[..], "untouched");
+    assert!(m.b.accept_transmit(1, attempt).unwrap());
+    let (result, again) = m.b.input_frame_with_path_provider(
+        2,
+        m.link,
+        *ip,
+        0,
+        Ipv4Options::default(),
+        back,
+        crate::RxPacketMetadata::default(),
+        0,
+        &mut m.paths,
+    );
+    assert_eq!(result.unwrap(), InputDisposition::Processed);
+    assert!(again.is_none(), "held by the queue");
+    let mut out = [0; 16];
+    assert_eq!(m.b.read(server, &mut out).unwrap(), 11);
+    assert_eq!(&out[..11], b"client data");
+}
+
+// A frame taken and let go again by its own input (new text after the
+// server's reader closed aborts the connection and clears its queue)
+// comes back, trimmed to the payload it took, and the reset is the
+// copying input's.
+#[test]
+fn a_managed_frame_cleared_by_its_own_input_comes_back() {
+    let mut resets = Vec::new();
+    for mode in [Mode::Copy, Mode::Frame(512), Mode::Heap(512)] {
+        let mut m = ManagedPair::new(mode, false);
+        let mut trace = Vec::new();
+        m.pump(0, &mut trace);
+        let server = m.b.accept(m.listener).unwrap();
+        m.b.close(server).unwrap();
+        m.pump(0, &mut trace);
+        m.a.write(m.client, b"late").unwrap();
+        let data = packets(&mut m.a, 0);
+        assert_eq!(data.len(), 1);
+        let (result, back) = m.input(0, data[0].0, &data[0].1);
+        result.unwrap();
+        if mode != Mode::Copy {
+            let (len, _) = back.expect("let go by the abort");
+            assert_eq!(len, 4, "trimmed to the payload taken");
+        }
+        assert_eq!(LIVE.get(), 0);
+        assert_eq!(
+            m.b.close_reason(server).unwrap(),
+            Some(crate::CloseReason::Aborted)
+        );
+        resets.push(packets(&mut m.b, 0));
+    }
+    assert_eq!(resets[0].len(), 1);
+    assert_eq!(resets[0], resets[1]);
+    assert_eq!(resets[0], resets[2]);
+}
+
+// A SYN that reopens a TIME-WAIT connection (reuse_time_wait) goes through
+// the provider's factory as a replacement, by frame as by copy, and the new
+// connection holds its data frames.
+#[test]
+fn a_managed_time_wait_replacement_takes_frames() {
+    let run = |mode| {
+        let mut m = ManagedPair::new(mode, true);
+        let mut trace = Vec::new();
+        m.pump(0, &mut trace);
+        let server = m.b.accept(m.listener).unwrap();
+        // The server closes first, and stays in TIME-WAIT.
+        m.b.close(server).unwrap();
+        m.pump(1, &mut trace);
+        m.a.close(m.client).unwrap();
+        m.pump(2, &mut trace);
+        assert_eq!(m.b.state(server), Ok(State::TimeWait));
+        let ticks = 1_000_000;
+        packets(&mut m.a, ticks);
+        let (local, remote) = addresses();
+        m.client = m.a.connect(ticks, local, remote).unwrap();
+        m.pump(ticks, &mut trace);
+        let replacement = m.b.accept(m.listener).unwrap();
+        assert_ne!(replacement, server);
+        m.a.write(m.client, &[7; 300]).unwrap();
+        m.pump(ticks + 1, &mut trace);
+        if let Mode::Frame(_) = mode {
+            assert!(LIVE.get() > 0, "the replacement holds frames");
+        }
+        let mut out = [0; 300];
+        assert_eq!(m.b.read(replacement, &mut out).unwrap(), 300);
+        assert_eq!(out, [7; 300]);
+        assert_eq!(LIVE.get(), 0);
+        trace
+    };
+    let copy = run(Mode::Copy);
+    assert_eq!(copy, run(Mode::Frame(2000)));
 }

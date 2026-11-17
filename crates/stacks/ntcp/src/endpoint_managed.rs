@@ -777,6 +777,46 @@ impl Endpoint {
         result
     }
 
+    /// `input_with_path_provider` of a received TCP segment held in `frame`
+    /// (IP header removed), whose accepted payload the connection holds as
+    /// the frame itself, trimmed, in place of a copy, as `input_frame`
+    /// does. The frame comes back unless the receive queue holds it, for
+    /// the caller to record a discard from its bytes or keep it for a
+    /// retry (an `OutputReserved` refusal takes nothing from it). A frame
+    /// the queue took and let go again in the same input comes back
+    /// trimmed to the part it took; bytes the caller read through it
+    /// before stay valid until it is dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn input_frame_with_path_provider<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        arrival: ntcp_path::LinkId,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Ipv4Options,
+        frame: RxFrame,
+        metadata: crate::RxPacketMetadata,
+        outgoing_dscp: u8,
+        provider: &mut P,
+    ) -> (
+        Result<InputDisposition, ManagedError<P::Error>>,
+        Option<RxFrame>,
+    ) {
+        self.lend_ingress(frame, |endpoint, bytes| {
+            endpoint.input_with_path_provider(
+                now,
+                arrival,
+                ip,
+                traffic_class,
+                options,
+                bytes,
+                metadata,
+                outgoing_dscp,
+                provider,
+            )
+        })
+    }
+
     /// Use the Endpoint's own wildcard/exact listener precedence when selecting
     /// outbound listener policy before a managed passive factory transaction.
     pub fn matching_listener(&self, local: SocketAddr) -> Option<ListenerId> {
