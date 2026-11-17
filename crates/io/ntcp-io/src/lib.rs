@@ -1,5 +1,5 @@
 pub use ntcp_buffer::{
-    ChunkSlice, HeapChunkSource, Payload, PayloadSlice, RxFrame, RxFrameVtable,
+    ChunkSlice, HeapChunkSource, Payload, PayloadSlice, RxFrame, RxFrameCount, RxFrameVtable,
     StablePayloadStorage, TxChunk, TxChunkSource, TxChunkVtable,
 };
 use std::io;

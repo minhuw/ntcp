@@ -111,6 +111,7 @@ fn hosted_ring_ports() {
     rss_ports(eal);
     segmentation_not_offered(eal);
     receive_pool_exhausted(eal);
+    held_frames(eal);
     outstanding_mbufs_retain_pool(eal);
 }
 
@@ -239,7 +240,10 @@ fn port_lifecycle(eal: &'static Eal) {
     assert_eq!(main.transmit(&sent).unwrap(), TxOutcome::Submitted);
     assert_eq!(main.receive(&mut out).unwrap(), Some(60));
     assert_eq!(&out[..60], sent.as_slice());
-    // The hosted queue forwards the frame path to its adapter.
+    // The hosted queue forwards the frame path to its adapter. Four queues'
+    // caches (1.5 x 255 each) and the rings take the whole of a 511-mbuf
+    // pool: nothing may be held.
+    assert_eq!(main.rx_frame_budget(), Some(0));
     assert_eq!(main.rx_frame_budget(), main.dpdk().rx_frame_budget());
     assert_eq!(
         main.rx_frames_outstanding(),
@@ -611,6 +615,48 @@ impl Drop for TempFile {
             std::fs::remove_file(&self.0).unwrap();
         }
     }
+}
+
+// A hosted queue's frame budget is its pool less the rings and its lcore
+// cache (one queue), and its frames are the pool's mbufs, charged the
+// pool's element: held until they drop, the queue gone or not, after
+// which the port's pool is full and freed.
+fn held_frames(eal: &'static Eal) {
+    let mut config = PortConfig::new("net_ring8");
+    config.rx_desc = 64;
+    config.tx_desc = 64;
+    config.mbufs_per_queue = 4095;
+    let port = Port::start(eal, config).unwrap();
+    let mut queue = port.take_queue(0).unwrap().attach().unwrap();
+    // 4095 - 64 - 2 x 64 - 1.5 x 256.
+    assert_eq!(queue.rx_frame_budget(), Some(3519));
+    let (mut size, mut object) = (0, 0);
+    // SAFETY: EAL is initialized; outputs are writable.
+    assert_eq!(
+        unsafe { ntcp_host_test_pool_geometry(&mut size, &mut object) },
+        0
+    );
+    assert_eq!((size, object), (4095, 2368));
+    let mut scratch = vec![0; 4096];
+    let mut frames = Vec::new();
+    for len in [60, 1514] {
+        let sent = frame(len as u8, len);
+        assert_eq!(queue.transmit(&sent).unwrap(), TxOutcome::Submitted);
+        let received = queue.receive_frame(&mut scratch).unwrap().unwrap();
+        assert_eq!(received.frame.as_slice(), sent.as_slice());
+        assert_eq!(received.frame.truesize(), 2368);
+        frames.push(received.frame);
+    }
+    assert_eq!(queue.rx_frames_outstanding(), Some(2));
+    assert_eq!(pools(), (1, 0));
+    drop(frames.pop());
+    assert_eq!(queue.rx_frames_outstanding(), Some(1));
+    drop(queue);
+    assert_eq!(pools(), (1, 0));
+    drop(frames);
+    assert_eq!(pools(), (1, 1));
+    drop(port);
+    assert_eq!(pools(), (0, 0));
 }
 
 // Last: a pool whose mbuf is lost inside the ring PMD is retained, not freed

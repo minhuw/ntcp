@@ -8,6 +8,8 @@
 // the pool had no mbuf for it, and a negative errno when the packet was
 // refused. Nothing is kept on 0 or NTCP_DPDK_NOMBUF: the caller may retry.
 #define NTCP_DPDK_NOMBUF 2
+// ntcp_dpdk_receive_meta: the mbuf is to be copied, not held.
+#define NTCP_DPDK_COPY 2
 int ntcp_dpdk_get_mtu(uint16_t port, uint16_t *mtu);
 int ntcp_dpdk_valid_port(uint16_t port);
 int ntcp_dpdk_tx_timestamp_lookup(int *offset, uint64_t *flag);
@@ -24,6 +26,12 @@ int ntcp_dpdk_receive(void *packet, uint8_t *out,
                       size_t capacity, size_t *length, int timestamp_offset,
                       uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid,
                       int l4_checksum, int *l4_status);
+int ntcp_dpdk_receive_meta(void *packet, const void *pool, int timestamp_offset,
+                           uint64_t timestamp_flag, uint64_t *timestamp,
+                           int *timestamp_valid, int l4_checksum, int *l4_status,
+                           void **data, uint16_t *length);
+void ntcp_dpdk_pool_geometry(const void *pool, uint32_t *element, uint32_t *cache,
+                             uint32_t *size);
 int ntcp_dpdk_tx_checksum_check(uint16_t port, uint16_t queue);
 int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
                        const uint8_t *packet, size_t length, int timestamp_offset,

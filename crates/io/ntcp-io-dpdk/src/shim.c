@@ -6,6 +6,7 @@
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_mbuf_dyn.h>
+#include <rte_mempool.h>
 #include <rte_errno.h>
 
 int ntcp_dpdk_get_mtu(uint16_t port, uint16_t *mtu) {
@@ -109,44 +110,40 @@ int ntcp_dpdk_rx_checksum_check(uint16_t port, uint16_t queue) {
 
 enum { NTCP_L4_UNKNOWN, NTCP_L4_GOOD, NTCP_L4_BAD };
 
-int ntcp_dpdk_receive(void *packet, uint8_t *out,
-                      size_t capacity, size_t *length, int timestamp_offset,
-                      uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid,
-                      int l4_checksum, int *l4_status) {
-    struct rte_mbuf *m = packet;
-    *length = 0;
-    *timestamp = 0;
-    *timestamp_valid = 0;
-    *l4_status = NTCP_L4_UNKNOWN;
+// 0 for an mbuf chain the adapter takes, else the negative errno it is
+// refused with: transformed bytes, or a chain that is malformed or longer
+// than `capacity`. Reads only; frees nothing.
+static int receive_check(const struct rte_mbuf *m, size_t capacity) {
     // PacketIo carries bytes only: stripped tags and coalesced packets cannot
     // be reconstructed from offload metadata without changing its contract.
-    int result = -ENOTSUP;
     if (m->ol_flags & (RTE_MBUF_F_RX_VLAN_STRIPPED |
                        RTE_MBUF_F_RX_QINQ_STRIPPED | RTE_MBUF_F_RX_LRO))
-        goto done;
-    result = -EMSGSIZE;
+        return -ENOTSUP;
     size_t total = m->pkt_len;
     if (total > NTCP_DPDK_MAX_PACKET_LEN || total > capacity)
-        goto done;
-    // Validate the entire chain before writing any caller bytes.
+        return -EMSGSIZE;
+    // Validate the entire chain before any of its bytes are used.
     size_t sum = 0;
-    struct rte_mbuf *segment = m;
-    result = -EIO;
+    const struct rte_mbuf *segment = m;
     for (uint32_t i = 0; i < m->nb_segs; ++i) {
         if (!segment || segment->data_off > segment->buf_len ||
             segment->data_len > segment->buf_len - segment->data_off ||
             segment->data_len > total - sum)
-            goto done;
+            return -EIO;
         sum += segment->data_len;
         segment = segment->next;
     }
     if (segment || !m->nb_segs || sum != total)
-        goto done;
-    size_t offset = 0;
-    for (segment = m; segment; segment = segment->next) {
-        memcpy(out + offset, rte_pktmbuf_mtod(segment, const void *), segment->data_len);
-        offset += segment->data_len;
-    }
+        return -EIO;
+    return 0;
+}
+
+static void receive_metadata(const struct rte_mbuf *m, int timestamp_offset,
+                             uint64_t timestamp_flag, uint64_t *timestamp,
+                             int *timestamp_valid, int l4_checksum, int *l4_status) {
+    *timestamp = 0;
+    *timestamp_valid = 0;
+    *l4_status = NTCP_L4_UNKNOWN;
     if (timestamp_offset >= 0 && (m->ol_flags & timestamp_flag)) {
         *timestamp = *RTE_MBUF_DYNFIELD(m, timestamp_offset, rte_mbuf_timestamp_t *);
         *timestamp_valid = 1;
@@ -161,12 +158,72 @@ int ntcp_dpdk_receive(void *packet, uint8_t *out,
         default: break;
         }
     }
-    *length = total;
-    result = 1;
-done:
+}
+
+int ntcp_dpdk_receive(void *packet, uint8_t *out,
+                      size_t capacity, size_t *length, int timestamp_offset,
+                      uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid,
+                      int l4_checksum, int *l4_status) {
+    struct rte_mbuf *m = packet;
+    *length = 0;
+    receive_metadata(m, -1, 0, timestamp, timestamp_valid, 0, l4_status);
+    int result = receive_check(m, capacity);
+    if (result == 0) {
+        size_t offset = 0;
+        for (struct rte_mbuf *segment = m; segment; segment = segment->next) {
+            memcpy(out + offset, rte_pktmbuf_mtod(segment, const void *), segment->data_len);
+            offset += segment->data_len;
+        }
+        receive_metadata(m, timestamp_offset, timestamp_flag, timestamp, timestamp_valid,
+                         l4_checksum, l4_status);
+        *length = m->pkt_len;
+        result = 1;
+    }
     // RX dequeue transferred this entire chain to us, even on rejection.
     rte_pktmbuf_free(m);
     return result;
+}
+
+// The receive of an mbuf the adapter may hand over by reference: 1 with
+// its bytes (*data, *length) and metadata when it is one segment of
+// `pool`'s own memory, uniquely held (direct, refcount 1), and kept by the
+// caller; NTCP_DPDK_COPY, nothing consumed, for one the caller copies
+// with ntcp_dpdk_receive instead (a scatter chain, an indirect or
+// extbuf-attached mbuf, whose memory is another's: mlx5 MPRQ attaches a
+// packet to a stride of a multi-packet buffer, which holding would pin
+// whole; an mbuf of another pool); a negative errno, the mbuf freed, as
+// ntcp_dpdk_receive refuses it.
+int ntcp_dpdk_receive_meta(void *packet, const void *pool, int timestamp_offset,
+                           uint64_t timestamp_flag, uint64_t *timestamp,
+                           int *timestamp_valid, int l4_checksum, int *l4_status,
+                           void **data, uint16_t *length) {
+    struct rte_mbuf *m = packet;
+    *data = NULL;
+    *length = 0;
+    int result = receive_check(m, NTCP_DPDK_MAX_PACKET_LEN);
+    if (result < 0) {
+        rte_pktmbuf_free(m);
+        return result;
+    }
+    if (m->nb_segs != 1 || !RTE_MBUF_DIRECT(m) || m->pool != pool ||
+        rte_mbuf_refcnt_read(m) != 1)
+        return NTCP_DPDK_COPY;
+    receive_metadata(m, timestamp_offset, timestamp_flag, timestamp, timestamp_valid,
+                     l4_checksum, l4_status);
+    *data = rte_pktmbuf_mtod(m, void *);
+    *length = m->data_len;
+    return 1;
+}
+
+// What an element of `pool` takes (its object header, the element and its
+// trailer: the memory one mbuf keeps from the pool), the per-lcore cache
+// size, and the element count.
+void ntcp_dpdk_pool_geometry(const void *pool, uint32_t *element, uint32_t *cache,
+                             uint32_t *size) {
+    const struct rte_mempool *mp = pool;
+    *element = mp->header_size + mp->elt_size + mp->trailer_size;
+    *cache = mp->cache_size;
+    *size = mp->size;
 }
 
 // Whether TCP checksum offload is enabled on TX queue `queue`, as

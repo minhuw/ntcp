@@ -22,6 +22,9 @@ unsafe extern "C" {
     fn ntcp_test_hold(leave: u32);
     fn ntcp_test_release();
     fn ntcp_test_finish();
+    fn ntcp_test_external(length: u32);
+    fn ntcp_test_external_freed() -> u32;
+    fn ntcp_test_element() -> u32;
 }
 
 // Explicit test-pmd opt-in builds this fixture, not a replacement backend.
@@ -255,6 +258,7 @@ fn real_ring_pmd_copy_and_ownership() {
             );
         } // Ending the adapter lifetime does not stop the borrowed port/pool.
         buffered_receive_ownership(port as u16, pool);
+        frames_by_reference(port as u16, pool);
         let mut again = Dpdk::from_borrowed(port as u16, 0, 0, pool).unwrap();
         assert_eq!(again.transmit(&[1; 64]).unwrap(), TxOutcome::Submitted);
         ntcp_test_loopback();
@@ -384,6 +388,102 @@ unsafe fn buffered_receive_ownership(port: u16, pool: *mut c_void) {
             assert_eq!(&out[..64], &[sequence; 64]);
         }
         assert_eq!(io.receive(&mut out).unwrap(), None);
+        assert_eq!(ntcp_test_available(), 1023);
+    }
+}
+
+// receive_frame hands the mbuf itself over: the same bytes and metadata as
+// the copying receive, its truesize the pool element, held from the pool
+// until the frame drops, on whatever thread, the adapter gone or not.
+// Chains and extbuf-attached mbufs come as heap copies, freed at once.
+unsafe fn frames_by_reference(port: u16, pool: *mut c_void) {
+    unsafe {
+        let mut scratch = vec![0xa5; MAX_PACKET_LEN];
+        let mut out = [0; 256];
+        let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
+        assert_eq!(io.receive_frame(&mut scratch).unwrap().map(|_| ()), None);
+        // No budget until a host sets one; the frames are mbufs either way.
+        assert_eq!(
+            (io.rx_frame_budget(), io.rx_frames_outstanding()),
+            (None, None)
+        );
+        io.set_rx_frame_budget(Some(100));
+        assert_eq!(io.rx_frames_outstanding(), Some(0));
+        let element = ntcp_test_element() as usize;
+
+        let packet: Vec<u8> = (0..100u8).collect();
+        for _ in 0..2 {
+            assert_eq!(io.transmit(&packet).unwrap(), TxOutcome::Submitted);
+            ntcp_test_loopback();
+        }
+        let copied = io.receive_with_metadata(&mut out).unwrap().unwrap();
+        let held = io.receive_frame(&mut scratch).unwrap().unwrap();
+        assert_eq!(held.frame.as_slice(), &out[..copied.len]);
+        assert_eq!(held.metadata, copied);
+        assert!(!held.frame.is_heap());
+        assert_eq!(held.frame.truesize(), element);
+        assert_eq!(scratch[0], 0xa5, "a held mbuf is not copied");
+        assert_eq!(ntcp_test_available(), 1023 - 1);
+        assert_eq!(io.rx_frames_outstanding(), Some(1));
+        drop(held);
+        assert_eq!(ntcp_test_available(), 1023);
+        assert_eq!(io.rx_frames_outstanding(), Some(0));
+
+        // Timestamps read from the mbuf it hands over, as the copy reads them.
+        let clock = ClockDescriptor {
+            domain: ClockDomain::Device(17),
+            unit: TimestampUnit::RawTicks { identity: 23 },
+        };
+        io.enable_rx_timestamps(clock).unwrap();
+        ntcp_test_timestamp(77, 1, 0);
+        let held = io.receive_frame(&mut scratch).unwrap().unwrap();
+        assert_eq!(held.frame.as_slice(), &[0x42; 64]);
+        assert_eq!(held.metadata.timestamps.hardware.unwrap().value, 77);
+        drop(held);
+
+        // Released on another thread, which DPDK does not know (no lcore).
+        let mut frames = Vec::new();
+        for value in 0..4u8 {
+            assert_eq!(io.transmit(&[value; 64]).unwrap(), TxOutcome::Submitted);
+            ntcp_test_loopback();
+            frames.push(io.receive_frame(&mut scratch).unwrap().unwrap().frame);
+        }
+        assert_eq!(io.rx_frames_outstanding(), Some(4));
+        assert_eq!(ntcp_test_available(), 1023 - 4);
+        let last = frames.pop().unwrap();
+        std::thread::spawn(move || {
+            for (value, frame) in frames.into_iter().enumerate() {
+                assert_eq!(frame.as_slice(), &[value as u8; 64]);
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(io.rx_frames_outstanding(), Some(1));
+        assert_eq!(ntcp_test_available(), 1023 - 1);
+
+        // A scatter chain (129 octets in 128-octet mbufs) and an
+        // extbuf-attached mbuf are copied into heap frames.
+        assert_eq!(io.transmit(&[0x33; 129]).unwrap(), TxOutcome::Submitted);
+        assert_eq!(ntcp_test_loopback(), 2);
+        let chain = io.receive_frame(&mut scratch).unwrap().unwrap();
+        assert!(chain.frame.is_heap());
+        assert_eq!(chain.frame.as_slice(), &[0x33; 129]);
+        assert_eq!((chain.metadata.len, chain.frame.truesize()), (129, 129));
+        ntcp_test_external(200);
+        let external = io.receive_frame(&mut scratch).unwrap().unwrap();
+        assert!(external.frame.is_heap());
+        assert_eq!(external.frame.as_slice(), &[0x5a; 200]);
+        assert_eq!(ntcp_test_external_freed(), 1);
+        assert_eq!(ntcp_test_available(), 1023 - 1);
+        assert_eq!(io.rx_frames_outstanding(), Some(1));
+        drop((chain, external));
+
+        // The adapter goes first: the frame keeps its mbuf, and its
+        // release frees the block.
+        drop(io);
+        assert_eq!(ntcp_test_available(), 1023 - 1);
+        assert_eq!(last.as_slice(), &[3; 64]);
+        drop(last);
         assert_eq!(ntcp_test_available(), 1023);
     }
 }

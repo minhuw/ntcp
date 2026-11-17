@@ -338,3 +338,36 @@ void ntcp_test_check_shared(const void *first, unsigned first_len,
     assert(!s);
     rte_pktmbuf_free(m);
 }
+
+// `length` octets of 0x5a on the rx ring in an mbuf of the fixture's pool
+// attached to an external buffer (as mlx5 MPRQ attaches a stride of its
+// multi-packet buffer), whose release ntcp_test_external_freed counts.
+static uint8_t external[512];
+static unsigned external_freed;
+static void external_free(void *address, void *opaque) {
+    (void)address;
+    (void)opaque;
+    ++external_freed;
+}
+unsigned ntcp_test_external_freed(void) { return external_freed; }
+void ntcp_test_external(unsigned length) {
+    static struct rte_mbuf_ext_shared_info shared;
+    assert(length <= sizeof(external));
+    struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+    assert(m);
+    memset(external, 0x5a, sizeof(external));
+    shared.free_cb = external_free;
+    shared.fcb_opaque = NULL;
+    rte_mbuf_ext_refcnt_set(&shared, 1);
+    rte_pktmbuf_attach_extbuf(m, external, rte_mem_virt2iova(external), sizeof(external),
+                              &shared);
+    m->data_off = 0;
+    m->data_len = (uint16_t)length;
+    m->pkt_len = length;
+    assert(rte_ring_enqueue(rx, m) == 0);
+}
+// What an mbuf of the fixture's pool keeps from it: its mempool header,
+// element and trailer.
+unsigned ntcp_test_element(void) {
+    return pool->header_size + pool->elt_size + pool->trailer_size;
+}

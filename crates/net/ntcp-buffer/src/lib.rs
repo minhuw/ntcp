@@ -15,10 +15,12 @@ extern crate alloc;
 
 mod arena;
 mod chunk;
+mod count;
 mod frame;
 
 pub use arena::{ChunkArena, ChunkRef};
 pub use chunk::{ChunkSlice, HeapChunkSource, TxChunk, TxChunkSource, TxChunkVtable};
+pub use count::RxFrameCount;
 pub use frame::{RxFrame, RxFrameVtable};
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};

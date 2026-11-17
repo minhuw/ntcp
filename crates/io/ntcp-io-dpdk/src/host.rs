@@ -6,7 +6,9 @@
 //! `Eal::init` refuses EAL arguments that would probe PCI devices implicitly
 //! (see `eal_args`).
 
-use crate::native::{Dpdk, driver_name, rx_checksum_check, tso_check, tx_checksum_check};
+use crate::native::{
+    Dpdk, driver_name, pool_geometry, rx_checksum_check, tso_check, tx_checksum_check,
+};
 use ntcp_io::{
     ClockDescriptor, ClockDomain, DeviceCounters, OwnedPacket, PacketIo, PacketLayer, Payload,
     ReceivedFrame, ReceivedPacket, TcpSegmentationCapabilities, TcpSegmentationError,
@@ -357,6 +359,9 @@ struct PortInner {
     owner: u64,
     started: bool,
     pools: Vec<NonNull<c_void>>,
+    // Each queue's ring sizes, as the PMD adjusted them.
+    rx_desc: u16,
+    tx_desc: u16,
     taken: Box<[AtomicBool]>,
     clock: Option<ClockDescriptor>,
     rss: bool,
@@ -438,6 +443,8 @@ impl Port {
             owner,
             started: false,
             pools: Vec::with_capacity(usize::from(config.queues)),
+            rx_desc: 0,
+            tx_desc: 0,
             taken: (0..config.queues).map(|_| AtomicBool::new(false)).collect(),
             clock: config.rx_timestamps.then_some(ClockDescriptor {
                 domain: ClockDomain::Device(u64::from(port)),
@@ -512,6 +519,7 @@ impl Port {
             return Err(dpdk_error(context, result));
         }
         inner.tcp_segmentation = tcp_segmentation != 0;
+        (inner.rx_desc, inner.tx_desc) = (rx_desc, tx_desc);
         inner.rx_checksum = checksums & 1 != 0;
         inner.tx_checksum = checksums & 2 != 0;
         if u64::from(config.mbufs_per_queue) <= u64::from(rx_desc) + u64::from(tx_desc) {
@@ -1020,6 +1028,15 @@ impl QueueHandle {
         if self.port.tx_checksum {
             io.enable_tx_checksum()?;
         }
+        // SAFETY: the queue's pool is live while the port is.
+        let (_, cache, mbufs) = unsafe { pool_geometry(pool.as_ptr()) };
+        io.set_rx_frame_budget(Some(rx_frame_budget(
+            mbufs,
+            self.port.rx_desc,
+            self.port.tx_desc,
+            cache,
+            self.port.taken.len(),
+        )));
         self.attached = true;
         Ok(HostedQueue {
             io,
@@ -1028,6 +1045,22 @@ impl QueueHandle {
             queue: self.queue,
         })
     }
+}
+
+// The receive frames a consumer of a queue may hold by reference
+// (`PacketIo::rx_frame_budget`), F: the queue's pool of `mbufs` less the
+// mbufs posted to its RX ring, twice its TX ring (frames the device has
+// yet to send, and the reference and header mbufs of a frame sent by
+// reference), and what the mempool caches of the lcores that may free its
+// mbufs keep from it: each holds up to 1.5 x `cache` before it flushes
+// (CALC_CACHE_FLUSHTHRESH), and `lcores` of them may, the workers of every
+// queue of the port, which free this queue's mbufs when a member of shared
+// flows hands one of its frames to another. At the default geometry, one
+// queue: 16383 - 1024 - 2 x 1024 - 384 = 12,927.
+fn rx_frame_budget(mbufs: u32, rx_desc: u16, tx_desc: u16, cache: u32, lcores: usize) -> usize {
+    let rings = u64::from(rx_desc) + 2 * u64::from(tx_desc);
+    let caches = u64::from(cache) * 3 / 2 * lcores as u64;
+    u64::from(mbufs).saturating_sub(rings + caches) as usize
 }
 
 thread_local! {
@@ -1261,6 +1294,16 @@ mod tests {
             replies.pop().unwrap()
         });
         (result, calls)
+    }
+
+    #[test]
+    fn frame_budget_leaves_the_rings_and_the_lcore_caches() {
+        // PortConfig::new: one queue, its pool's cache 256.
+        assert_eq!(rx_frame_budget(16383, 1024, 1024, 256, 1), 12_927);
+        // Four queues: each worker's cache may hold this queue's mbufs.
+        assert_eq!(rx_frame_budget(16383, 1024, 1024, 256, 4), 11_775);
+        // Rings and caches beyond the pool leave nothing to hold.
+        assert_eq!(rx_frame_budget(4095, 1024, 1024, 256, 4), 0);
     }
 
     #[test]
