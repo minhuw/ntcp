@@ -188,6 +188,8 @@ pub struct Network<P: PacketIo> {
     // IPv4 next hops resolve through a port's shared table
     // (`with_shared_neighbors`), not the Host's own.
     shared_neighbors: bool,
+    // Its member's wake and epoch, read without the Host (`shared::Probe`).
+    member_probe: Option<shared::Probe>,
     // Membership in a port's shared flows (`with_shared_flows`), and its
     // inbox.
     flows: Option<flows::Member>,
@@ -759,6 +761,7 @@ impl<P: PacketIo> Network<P> {
             path_lookup_key(&secret),
         )?;
         let shared_neighbors = member.is_some();
+        let member_probe = member.as_ref().map(shared::Member::probe);
         if let Some(member) = member {
             host.set_ipv4_neighbor_table(Box::new(member))?;
         }
@@ -963,6 +966,7 @@ impl<P: PacketIo> Network<P> {
             tx_frames,
             arp_input: false,
             shared_neighbors,
+            member_probe,
             flows,
             inlet,
             held_flows,

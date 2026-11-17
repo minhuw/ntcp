@@ -346,6 +346,35 @@ pub(crate) struct Member {
     reported: Vec<Ipv4Addr>,
 }
 
+// A Network's look at its member's wake and at the table's mapping epoch,
+// without reaching the member through its Host. The member's epoch is
+// always one the table published, and both only grow: while no wake waits
+// and the table still publishes the epoch the member loaded when it last
+// began (`began`), the member holds that epoch and `Member::begin` would
+// change nothing.
+pub(crate) struct Probe {
+    shared: Arc<Shared>,
+    index: usize,
+    epoch: u64,
+}
+
+impl Probe {
+    // Whether `Member::begin` would leave the member as it is: the same
+    // loads, the wake's first.
+    #[inline]
+    pub(crate) fn current(&self) -> bool {
+        !self.shared.wakes[self.index].load(Ordering::Relaxed)
+            && self.shared.generation.load(Ordering::Acquire) == self.epoch
+    }
+    // The member began, loading `epoch`.
+    pub(crate) fn began(&mut self, epoch: u64) {
+        self.epoch = epoch;
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
 // The member a Network's Host resolves through, when it has one.
 pub(crate) fn member(host: &mut Host) -> Option<&mut Member> {
     let table: &mut dyn Any = host.ipv4_neighbor_table_mut()?;
@@ -364,6 +393,17 @@ impl Member {
     }
     pub(crate) fn woken(&self) -> bool {
         self.woken
+    }
+    // The mapping epoch the member resolves in.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.generation
+    }
+    pub(crate) fn probe(&self) -> Probe {
+        Probe {
+            shared: self.shared.clone(),
+            index: self.index,
+            epoch: self.generation,
+        }
     }
     pub(crate) fn settled(&mut self) {
         self.woken = false;

@@ -270,6 +270,58 @@ fn members_resolving_one_slow_next_hop_send_one_request_per_retrans_timer() {
     assert_eq!(shared.counters().requests_sent, 3);
 }
 
+// A push on a member after another member learned that the next hop moved
+// to another MAC sends to the new MAC: the member begins again when the
+// table's mapping epoch moved since it last began, as a drive begins it.
+#[test]
+fn a_push_after_another_member_remapped_the_next_hop_sends_to_the_new_mac() {
+    const MOVED: [u8; 6] = [2, 0, 0, 0, 0, 3];
+    let shared = table(2);
+    let mut members: Vec<_> = (0..2).map(|k| Station::member(&shared, k)).collect();
+    let mut peer = Station::peer();
+    let listener = peer.network.listen(80, 4).unwrap();
+    let client = members[0]
+        .network
+        .connect(SocketAddr::new(PEER.into(), 80))
+        .unwrap();
+    members[0].network.set_nodelay(client, true).unwrap();
+    let mut now = 0;
+    let mut accepted = None;
+    while accepted.is_none() && now < SECOND {
+        now += 1000;
+        exchange(&mut members, &mut peer, now, 0);
+        accepted = peer.network.accept(listener).ok();
+    }
+    assert!(accepted.is_some());
+    for _ in 0..5 {
+        now += 1000;
+        exchange(&mut members, &mut peer, now, 0);
+    }
+    let push = |member: &mut Station, now: u64, data: &[u8]| {
+        member
+            .network
+            .try_write(client, data, WriteOptions::default())
+            .unwrap();
+        member.network.push(client, now).unwrap();
+        let sent = member.sent();
+        let frames: Vec<Vec<u8>> = ipv4(&sent).into_iter().cloned().collect();
+        assert_eq!(frames.len(), 1);
+        frames[0][..6].to_vec()
+    };
+    now += 10;
+    assert_eq!(push(&mut members[0], now, b"one"), PEER_MAC);
+    // The peer announces its address at another MAC; only member 1 hears it.
+    members[1].deliver(&[frame(
+        ntcp_ethernet::BROADCAST,
+        &request((MOVED, PEER), PEER),
+    )]);
+    now += 10;
+    members[1].drive(now);
+    members[1].sent();
+    now += 10;
+    assert_eq!(push(&mut members[0], now, b"two"), MOVED);
+}
+
 #[test]
 fn a_reply_delivered_to_one_member_releases_held_syns_on_every_member() {
     let shared = table(3);

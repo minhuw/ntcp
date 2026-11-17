@@ -398,9 +398,22 @@ impl<P: PacketIo> Network<P> {
         report: &mut DriveReport,
     ) -> Result<bool> {
         // The shared neighbor table's mapping epoch, which egress resolution
-        // checks its front cache against.
-        if let Some(member) = super::shared::member(&mut self.host) {
+        // checks its front cache against, and the member's wake: the member
+        // begins only when either moved since it last began, which is what
+        // beginning it would find (`shared::Probe`).
+        if self.member_probe.as_ref().is_some_and(|p| !p.current())
+            && let Some(member) = super::shared::member(&mut self.host)
+        {
             member.begin();
+            let epoch = member.epoch();
+            if let Some(probe) = &mut self.member_probe {
+                probe.began(epoch);
+            }
+        } else if cfg!(debug_assertions)
+            && let Some(probe) = &self.member_probe
+            && let Some(member) = super::shared::member(&mut self.host)
+        {
+            debug_assert_eq!(member.epoch(), probe.epoch());
         }
         // A path change an earlier drive queued reaches the connection
         // before its selection, as in the drive.
@@ -530,6 +543,10 @@ impl<P: PacketIo> Network<P> {
     ) -> Result<()> {
         if let Some(member) = super::shared::member(&mut self.host) {
             member.begin();
+            let epoch = member.epoch();
+            if let Some(probe) = &mut self.member_probe {
+                probe.began(epoch);
+            }
         }
         self.maintain_connections()?;
         report.more_work |= self.endpoint.on_timeout(now, budget.timers)?;
