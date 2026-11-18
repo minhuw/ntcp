@@ -140,6 +140,7 @@ impl RateLimiter {
     }
 
     // Bytes of storage held.
+    #[inline]
     pub fn memory(&self) -> usize {
         self.peers.capacity() * core::mem::size_of::<Option<Peer>>()
     }

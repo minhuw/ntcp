@@ -790,8 +790,18 @@ impl<P: PacketIo> Network<P> {
         // The Host's ICMP messages, queued by this drive's input or by
         // reassembly expiry, take at most half of what is left, so that
         // neither they nor data starve the other.
-        let icmp = self.icmp_output(now, (budget.transmit - control).div_ceil(2), false, report)?;
-        let control = control + icmp;
+        // Only messages this pass leaves behind are sent after data:
+        // nothing in between queues one.
+        let mut icmp_left = false;
+        if self.icmp_due() {
+            control += self.drain_icmp_output(
+                now,
+                (budget.transmit - control).div_ceil(2),
+                false,
+                report,
+            )?;
+            icmp_left = self.host.icmp_output_pending() != 0;
+        }
         let mut data = 0;
         // Once the endpoint offers nothing and no slot holds a frame to retry,
         // further polls at this instant cannot transmit anything. A held
@@ -839,8 +849,10 @@ impl<P: PacketIo> Network<P> {
         }
         // ICMP messages within what data left, then requests for next hops
         // data or ICMP output just began resolving, within what is left.
-        let icmp = self.icmp_output(now, budget.transmit - control - data, true, report)?;
-        let control = control + icmp;
+        if icmp_left {
+            control +=
+                self.drain_icmp_output(now, budget.transmit - control - data, true, report)?;
+        }
         if self.shared_neighbors {
             self.shared_output(now, budget.transmit - control - data, false, report)?;
         } else if !self.control.is_empty() {
@@ -992,6 +1004,13 @@ impl<P: PacketIo> Network<P> {
         }
         Ok(())
     }
+    // Whether the Host's ICMP output has work: messages queued, or storage
+    // charged other than it holds. On every drive of a TCP-only network it
+    // has none, and this is two loads and compares, inline.
+    #[inline(always)]
+    fn icmp_due(&self) -> bool {
+        self.host.icmp_output_pending() != 0 || self.host.icmp_memory() != self.icmp_charge
+    }
     // Up to `limit` of the Host's queued ICMP messages, each through the
     // backend as one frame per packet (a message beyond the path's size is
     // fragmented by the Host); returns how many messages were tried. A
@@ -999,9 +1018,9 @@ impl<P: PacketIo> Network<P> {
     // one with no route or path left, or refused, is consumed unsent and
     // counted by the Host. In the drive's `last` pass, messages left for
     // want of budget are more work. Then the Host's ICMP storage is charged
-    // again, as it changed with this drive's input and output. With nothing
-    // queued this is one check.
-    fn icmp_output(
+    // again, as it changed with this drive's input and output.
+    #[inline(never)]
+    fn drain_icmp_output(
         &mut self,
         now: Instant,
         limit: usize,

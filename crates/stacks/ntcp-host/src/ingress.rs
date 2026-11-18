@@ -56,6 +56,7 @@ impl IcmpOutputLimits {
     /// The storage the queue holds with no message in it, allocated with
     /// the Host: what `Host::icmp_memory` reports when nothing is queued and
     /// no rate-limited message was sent.
+    #[inline]
     pub fn queue_bytes(&self) -> usize {
         self.messages * (core::mem::size_of::<Option<Queued>>() + core::mem::size_of::<Vec<u8>>())
     }
@@ -191,6 +192,7 @@ impl IcmpOutput {
         })
     }
     // Bytes of storage held: the fixed queue and the messages in it.
+    #[inline]
     pub fn memory(&self) -> usize {
         self.limits.queue_bytes() + self.held
     }
@@ -1257,7 +1259,7 @@ impl Host {
         self.input_transport(
             endpoint,
             now,
-            processed,
+            &processed,
             &packet,
             metadata,
             outgoing_dscp,
@@ -1562,10 +1564,12 @@ impl Host {
     /// queue, the messages in it and the rate limits' destination entries
     /// (`IcmpRateLimits::destinations`). It changes only as messages are
     /// queued or leave, and as the entries are first allocated.
+    #[inline]
     pub fn icmp_memory(&self) -> usize {
         self.icmp_output.memory() + self.errors.memory()
     }
     /// Messages waiting for `icmp_output`.
+    #[inline]
     pub fn icmp_output_pending(&self) -> usize {
         self.icmp_output.len
     }
@@ -1931,7 +1935,7 @@ impl Host {
     pub(crate) fn queue_unreachable(
         &mut self,
         now: Instant,
-        processed: Processed<'_>,
+        processed: &Processed<'_>,
         kind: ErrorMessage,
     ) {
         let link = processed.context().link;

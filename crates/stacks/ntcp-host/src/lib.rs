@@ -2290,7 +2290,7 @@ impl Host {
         &mut self,
         endpoint: &mut Endpoint,
         now: Instant,
-        processed: Processed<'_>,
+        processed: &Processed<'_>,
         packet: &IngressPacket,
         metadata: RxPacketMetadata,
         outgoing_dscp: u8,

@@ -929,7 +929,7 @@ impl Host {
         &mut self,
         endpoint: &Endpoint,
         now: ntcp::Instant,
-        processed: crate::Processed<'_>,
+        processed: &crate::Processed<'_>,
         packet: &IngressPacket,
     ) -> InputDisposition {
         let link = processed.context().link;
