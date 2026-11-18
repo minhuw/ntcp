@@ -786,11 +786,14 @@ pub struct Endpoint {
     setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
     // What the connections' receive memory rules did (MemoryCounters).
     receive_memory: crate::memory::ReceiveMemoryEvents,
-    // The frame `input_frame` is processing until it lends it to its
-    // connection (`lent`, the slot), or gets it back: the segment borrows its
-    // bytes until that input returns.
+    // The frame `input_frame` is processing, except while its connection's
+    // input has it lent (`input_admitted`) or after its receive queue kept
+    // it: the segment borrows its bytes until that input returns.
     ingress: Option<RxFrame>,
-    lent: Option<usize>,
+    // The bytes of the frame `input_frame` is processing, for the check
+    // that no connection holding it is reclaimed before the input returns.
+    #[cfg(debug_assertions)]
+    ingress_bytes: Option<core::ops::Range<usize>>,
 }
 
 // A member of shared buffer memory that goes leaves its group
@@ -1019,7 +1022,8 @@ impl Endpoint {
             budget,
             embedding_charge: 0,
             ingress: None,
-            lent: None,
+            #[cfg(debug_assertions)]
+            ingress_bytes: None,
             receive_memory: crate::memory::ReceiveMemoryEvents::default(),
         })
     }
@@ -3190,11 +3194,21 @@ impl Endpoint {
     fn reclaim(&mut self, index: usize) {
         let id = self.id(index);
         debug_assert!(!self.is_output_reserved(id));
-        let mut slot = self.slots[index].take().unwrap();
-        // A frame `input_frame` lent it outlives the input.
-        if self.lent == Some(index) {
-            self.lent = None;
-            self.ingress = slot.connection.end_lend(true);
+        let slot = self.slots[index].take().unwrap();
+        // The lend of a frame `input_frame` is processing ends with the
+        // connection's input (`input_admitted`), so a reclaim during the
+        // rest of it, which refresh may do, drops none of the frame's bytes
+        // unless the receive queue kept it. Then the connection received
+        // data in this input, and no state that refresh reclaims follows
+        // that within it: a reader that closed aborts on new text and
+        // clears its queue during the lend; a released connection is
+        // CLOSED or in TIME-WAIT, where no text is taken.
+        #[cfg(debug_assertions)]
+        if let Some(bytes) = &self.ingress_bytes {
+            assert!(
+                !slot.connection.receive_holds(bytes.clone()),
+                "a reclaim during an input drops the frame that input reads"
+            );
         }
         self.occupied.remove(index);
         self.budget.close_socket();
@@ -3897,7 +3911,9 @@ impl Endpoint {
     /// keep every later arrival from being held by reference. Linux has no
     /// counterpart: its page_pool allocates more pages instead.
     pub fn collapse_device_frames(&mut self, goal: usize) -> usize {
-        debug_assert!(self.ingress.is_none() && self.lent.is_none());
+        debug_assert!(self.ingress.is_none());
+        #[cfg(debug_assertions)]
+        assert!(self.ingress_bytes.is_none());
         let mut freed = 0;
         let mut next = self.occupied.first();
         while freed < goal
@@ -3951,17 +3967,26 @@ impl Endpoint {
     // that follows, and nothing else is lent before it.
     #[inline]
     pub(crate) unsafe fn lend_ingress<'a>(&mut self, frame: RxFrame) -> &'a [u8] {
-        debug_assert!(self.ingress.is_none() && self.lent.is_none());
+        debug_assert!(self.ingress.is_none());
         // SAFETY: an RxFrame's bytes stay valid and unchanged until it is
         // dropped, and neither moving nor trimming it moves them. This one
         // is dropped only after the input: it stays in `ingress`, or is
-        // lent to the connection's receive queue, which until `end_lend`
-        // gives back every frame it lets go of that is this one, and the
-        // lend ends in `end_ingress` or when `reclaim` drops the connection
-        // (after a clear that gives it back to `ingress`). Only a frame the
-        // queue still holds after the input stays with the queue, and the
-        // caller reads the bytes no later than `end_ingress`.
+        // lent to the connection's receive queue for the connection's
+        // input, which gives back every frame it lets go of that is this
+        // one until `end_lend`, and ends the lend before it returns
+        // (`input_admitted`), putting the frame back in `ingress` unless the
+        // queue holds it. A queue that holds it does not let it go before
+        // the input returns: the connection neither reads nor clears its
+        // queue outside its own input and reads, and a reclaim of a
+        // connection whose queue holds it does not happen during the
+        // input (`reclaim` checks it in debug builds). The caller reads
+        // the bytes no later than `end_ingress`.
         let bytes = unsafe { core::slice::from_raw_parts(frame.as_ptr(), frame.len()) };
+        #[cfg(debug_assertions)]
+        {
+            let start = frame.as_ptr() as usize;
+            self.ingress_bytes = Some(start..start + frame.len());
+        }
         self.ingress = Some(frame);
         bytes
     }
@@ -3972,14 +3997,11 @@ impl Endpoint {
     // advance`), so the caller may still read the slice it had over it.
     #[inline]
     pub(crate) fn end_ingress(&mut self) -> Option<RxFrame> {
-        let mut back = self.ingress.take();
-        if let Some(index) = self.lent.take()
-            && let Some(slot) = self.slots[index].as_mut()
+        #[cfg(debug_assertions)]
         {
-            debug_assert!(back.is_none(), "a lent frame is not the ingress frame");
-            back = slot.connection.end_lend(false);
+            self.ingress_bytes = None;
         }
-        back
+        self.ingress.take()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4155,10 +4177,12 @@ impl Endpoint {
             slot.connection.receive_room = receive_room;
             slot.connection.receive_memory_low = receive_memory_low;
             slot.received_dscp = Some(traffic_class >> 2);
-            if let Some(frame) = self.ingress.take() {
+            let lent = if let Some(frame) = self.ingress.take() {
                 slot.connection.lend_frame(frame);
-                self.lent = Some(index);
-            }
+                true
+            } else {
+                false
+            };
             let admitted = if let Some(authorization) = authorization {
                 slot.connection.input_with_receive_authorization(
                     now,
@@ -4172,6 +4196,11 @@ impl Endpoint {
                     .input_with_metadata(now, traffic_class, segment, metadata)
                     .map(|()| false)
             };
+            // The lend ends with the connection's input, with its slot in
+            // hand: the frame comes back unless the queue holds it.
+            if lent {
+                self.ingress = slot.connection.end_lend();
+            }
             let dropped = slot.connection.dropped.take();
             let events = core::mem::take(&mut slot.connection.receive_events);
             let admitted = admitted?;

@@ -426,9 +426,10 @@ fn a_frame_cleared_by_its_own_input_outlives_it() {
 // frames, whose release frees their memory: under Miri, a read of a lent
 // frame after its release is a use after free.
 
-// White box, for a defensive path: Endpoint::reclaim of the connection a
-// frame is lent to, inside the input, takes the lent frame back
-// (end_lend(true)). Here refresh reclaims a failed child (an unaccepted
+// White box: Endpoint::reclaim, inside the input, of the connection the
+// frame was lent to drops nothing of it, as the lend ended with the
+// connection's input, which kept nothing of it (`reclaim` checks that in
+// debug builds). Here refresh reclaims a failed child (an unaccepted
 // SYN-RECEIVED connection the peer's reset closes) whose output is drained.
 // Through the public API no input reaches a reclaim (closed_output_drained
 // is set only on a CLOSED connection, which refresh unmaps, and TIME-WAIT
@@ -455,7 +456,9 @@ fn a_frame_lent_to_a_connection_reclaimed_by_its_input_outlives_it() {
         input(&mut b, mode, 0, reset.0, &reset.1).unwrap();
         assert_eq!(b.reclaimed(), reclaimed + 1, "{mode:?}");
         assert!(b.slots[child].is_none());
-        assert!(b.ingress.is_none() && b.lent.is_none());
+        assert!(b.ingress.is_none());
+        #[cfg(debug_assertions)]
+        assert!(b.ingress_bytes.is_none());
     }
 }
 
@@ -515,10 +518,11 @@ fn a_lent_frame_refused_a_deque_slot_goes_back_to_the_lend() {
     assert_eq!(&out[..40], [[2; 20], [3; 20]].concat());
 }
 
-// Endpoint::reclaim of the connection a frame is lent to clears its queue
-// first (Connection::end_lend(true)): a frame it took, held in order, out
-// of order or as deferred SYN data, goes back to the lend and outlives the
-// clear, while the queue's other frames are dropped.
+// A clear of the queue a frame is lent to (an input that aborts its
+// connection, `a_frame_cleared_by_its_own_input_outlives_it`): a frame it
+// took, held in order, out of order or as deferred SYN data, goes back to
+// the lend and outlives the clear, while the queue's other frames are
+// dropped.
 #[test]
 fn a_taken_frame_cleared_before_the_lend_ends_goes_back() {
     for case in 0..3 {

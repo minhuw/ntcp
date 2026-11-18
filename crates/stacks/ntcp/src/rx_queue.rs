@@ -1503,6 +1503,16 @@ impl RxQueue {
 
 #[cfg(debug_assertions)]
 impl RxQueue {
+    // Whether a held frame's bytes lie in `bytes`. Linear: debug builds
+    // only.
+    #[cfg(debug_assertions)]
+    pub(crate) fn holds(&self, bytes: core::ops::Range<usize>) -> bool {
+        let within = |frame: &RxFrame| bytes.contains(&(frame.as_ptr() as usize));
+        self.inorder.iter().any(within)
+            || self.ofo.values().any(|seg| within(&seg.frame))
+            || matches!(&self.deferred_syn, Some((Some(frame), ..)) if within(frame))
+    }
+
     // A full recount of every running total and structural invariant:
     // entries apart and in order, runs the maximal unions of the entries
     // beyond a gap, anchors on held bytes. Linear: debug builds only.

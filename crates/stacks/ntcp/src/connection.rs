@@ -1776,13 +1776,14 @@ impl Connection {
     }
 
     // Ends `lend_frame`'s lend: the frame unless the queue holds it.
-    // `clear` first when the connection is to be dropped before the
-    // segment is processed, so that the queue lets the frame go.
-    pub(crate) fn end_lend(&mut self, clear: bool) -> Option<ntcp_buffer::RxFrame> {
-        if clear {
-            self.receive.clear();
-        }
+    pub(crate) fn end_lend(&mut self) -> Option<ntcp_buffer::RxFrame> {
         self.receive.end_lend()
+    }
+
+    // Whether the receive queue holds a frame whose bytes lie in `bytes`.
+    #[cfg(debug_assertions)]
+    pub(crate) fn receive_holds(&self, bytes: core::ops::Range<usize>) -> bool {
+        self.receive.holds(bytes)
     }
 
     #[cfg(test)]
