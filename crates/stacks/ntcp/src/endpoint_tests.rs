@@ -5089,6 +5089,10 @@ fn opens_are_charged_as_they_happen_and_reclaims_return_everything() {
     assert_eq!(b.read(server, &mut out), Ok(3));
     assert_eq!(&out[..3], b"new");
     assert_eq!(&out[3..], &[0xaa; 13]);
+    // The drained deque goes with the ACK owed, which is delayed.
+    let later = 2 * time_wait + 1_000_001;
+    b.on_timeout(later, 64).unwrap();
+    packets(&mut b, later);
     // The read released the frame: the server holds its open charge.
     assert_eq!(
         (a.buffer_bytes(), b.buffer_bytes()),

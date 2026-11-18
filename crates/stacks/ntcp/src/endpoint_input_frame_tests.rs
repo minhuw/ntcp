@@ -388,7 +388,12 @@ fn accepted_payload_is_the_frame_held_until_read() {
     assert_eq!(LIVE.get(), 2, "a partly read frame stays held");
     assert_eq!(b.read(server, &mut out[63..]).unwrap(), 37);
     assert_eq!(out, [5; 100]);
-    assert_eq!((LIVE.get(), held(&b, server)), (0, 0));
+    assert_eq!(LIVE.get(), 0);
+    // The drained deque stays while the ACK is owed, and goes with the
+    // ACK.
+    assert_ne!(held(&b, server), 0);
+    packets(&mut b, 0);
+    assert_eq!(held(&b, server), 0);
 
     drop((a, b));
     assert_eq!(LIVE.get(), 0);
@@ -1039,5 +1044,7 @@ fn held_backend_frames_collapse_into_heap_frames() {
     }
     assert_eq!(read, 64 * (segments.len() + 1));
     assert_eq!(&out[..read], &data[..read]);
+    // The drained deque goes with the ACK owed.
+    packets(&mut b, 0);
     assert_eq!(held(&b, server), 0);
 }

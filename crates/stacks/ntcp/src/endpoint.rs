@@ -3503,6 +3503,12 @@ impl Endpoint {
             let new = connection.buffer_charge();
             self.recharge(old, new);
         }
+        // A drained in-order deque its connection no longer keeps.
+        if let Some(slot) = self.slots[index].as_mut()
+            && slot.connection.receive_spare_reclaimable()
+        {
+            slot.connection.reclaim_receive_spare();
+        }
         // A change of the receive queue outside input and reads: a clear,
         // or report anchors SACK output took or put back.
         if let Some(slot) = self.slots[index].as_mut()

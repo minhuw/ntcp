@@ -528,7 +528,7 @@ fn exhausted_output_bounds_report_work_without_losing_readable_bytes() {
         recv.commit_report();
     }
     assert!(!recv.has_pending_report());
-    assert_eq!(recv.storage(), 0);
+    assert_eq!(recv.storage_less_spare(), 0);
 }
 
 // In-order arrivals beyond no retained byte take the copying path, the
@@ -738,7 +738,7 @@ fn in_order_text_with_fin_ends_the_stream_across_the_wrap() {
     assert!(!recv.insert(Seq(9), b"", true).fin);
     assert_eq!(recv.read(&mut out), 6);
     assert_eq!(&out[..6], b"fghijk");
-    assert_eq!(recv.storage(), 0);
+    assert_eq!(recv.storage_less_spare(), 0);
 }
 
 #[test]
@@ -814,7 +814,7 @@ fn adversarial_gaps_are_held_and_released_at_read() {
     for (offset, &byte) in out.iter().enumerate() {
         assert_eq!(byte, offset as u8);
     }
-    assert_eq!((recv.storage(), recv.rmem()), (0, 0));
+    assert_eq!((recv.storage_less_spare(), recv.rmem()), (0, 0));
 }
 
 #[test]
@@ -830,7 +830,7 @@ fn empty_queue_holds_nothing_and_has_data_follows_held_bytes() {
     assert!(recv.has_data());
     assert_eq!(recv.read(&mut [0; 4]), 4);
     assert!(!recv.has_data());
-    assert_eq!(recv.storage(), 0);
+    assert_eq!(recv.storage_less_spare(), 0);
     assert_eq!(recv.reset_start(Seq(20)), Ok(()));
 }
 
@@ -862,7 +862,7 @@ fn exact_capacity_wrap_overlap_push_and_fin() {
             assert_eq!(recv.read(&mut out), capacity);
             assert_eq!(&out[..capacity - 1], &payload[1..]);
             assert_eq!(out[capacity - 1], b'z');
-            assert_eq!(recv.storage(), 0);
+            assert_eq!(recv.storage_less_spare(), 0);
             assert!(!recv.has_data());
         }
         let start = recv.next();
@@ -873,7 +873,7 @@ fn exact_capacity_wrap_overlap_push_and_fin() {
         assert_eq!(recv.next(), fin.wrapping_add(1));
         assert_eq!(recv.read(&mut out), capacity - 1);
         assert_eq!(&out[..capacity - 1], &payload[..capacity - 1]);
-        assert_eq!(recv.storage(), 0);
+        assert_eq!(recv.storage_less_spare(), 0);
     }
 }
 
@@ -952,7 +952,7 @@ fn push_marks_remain_bounded_across_gaps_overlaps_and_slot_reuse() {
         }
         assert!(!recv.take_push());
         assert_eq!(recv.read(&mut [0; 64]), 64);
-        assert_eq!(recv.storage(), 0, "cycle {cycle}");
+        assert_eq!(recv.storage_less_spare(), 0, "cycle {cycle}");
     }
     let start = recv.next();
     recv.insert_with_push(start.wrapping_add(3), b"d", false, false);
@@ -985,7 +985,7 @@ fn duplicate_out_of_order_text_can_introduce_push() {
         recv.insert_with_push(start.wrapping_add(4), b"efgh", false, true);
         recv.insert_with_push(recv.next(), b"", false, true);
         assert!(!recv.take_push());
-        assert_eq!(recv.storage(), 0);
+        assert_eq!(recv.storage_less_spare(), 0);
     }
 }
 

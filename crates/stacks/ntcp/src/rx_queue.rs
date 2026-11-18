@@ -10,7 +10,8 @@
 // out-of-order arrival, at its first new byte) are a set of offsets.
 // Offsets are u64 stream offsets from the queue's start; sequence numbers
 // are converted at the edge, so the maps never compare wrapped sequences.
-// An empty queue holds no heap storage.
+// An empty queue holds no heap storage, except a drained in-order deque
+// its connection keeps while active (`spare`).
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::mem::size_of;
 use ntcp_buffer::RxFrame;
@@ -121,6 +122,10 @@ const ANCHOR_PAIR: usize = size_of::<u64>();
 pub(crate) const RX_ENTRY_TRUESIZE: usize =
     (size_of::<RxFrame>() + node_bytes(OFO_PAIR).div_ceil(5)).next_multiple_of(64);
 
+// The in-order deque storage a drained queue keeps for its connection:
+// one page, as the send ring's SEND_RING_RESERVE.
+pub(crate) const DEQUE_RESERVE: usize = 4096;
+
 #[derive(Clone, Copy)]
 pub(crate) struct RxOutputUndo {
     reported: [Option<Seq>; 4],
@@ -210,6 +215,30 @@ impl RxQueue {
             entries: 0,
             lend: None,
         }
+    }
+
+    // Whether the in-order deque is drained and still allocated, and its
+    // release. Deferred SYN data keeps the slot it reserved for its
+    // promotion (`defer_syn`).
+    pub(crate) fn spare(&self) -> bool {
+        self.inorder.is_empty() && self.inorder.capacity() != 0 && self.deferred_syn.is_none()
+    }
+
+    pub(crate) fn release_spare(&mut self) {
+        debug_assert!(self.inorder.is_empty());
+        self.inorder = VecDeque::new();
+    }
+
+    // What the queue holds less a spare deque (at most DEQUE_RESERVE), as
+    // the tests of a drained queue weigh it.
+    #[cfg(test)]
+    pub(crate) fn storage_less_spare(&self) -> usize {
+        if !self.spare() {
+            return self.storage();
+        }
+        let deque = self.inorder.capacity() * size_of::<RxFrame>();
+        assert!(deque <= DEQUE_RESERVE, "{deque}");
+        self.storage() - deque
     }
 
     // Lends `frame`, the received segment whose payload the next insertions
@@ -799,7 +828,11 @@ impl RxQueue {
             let frame = self.inorder.pop_front().unwrap();
             self.release(frame);
         }
-        if self.inorder.is_empty() {
+        // A drained deque within DEQUE_RESERVE keeps its allocation,
+        // charged as held, until its connection frees it (`release_spare`);
+        // a larger one, grown for a burst of small frames, goes at once.
+        if self.inorder.is_empty() && self.inorder.capacity() * size_of::<RxFrame>() > DEQUE_RESERVE
+        {
             self.inorder = VecDeque::new();
         }
         self.readable -= count;
@@ -1986,7 +2019,10 @@ mod tests {
             queue.check();
             let held = &queue.queue;
             assert!(!held.rooted && held.anchors.is_empty());
-            assert_eq!((held.storage(), held.rmem(), queue.live), (0, 0, 0));
+            assert_eq!((held.storage_less_spare(), held.rmem()), (0, 0));
+            // The spare deque is the heap left.
+            queue.with(RxQueue::release_spare);
+            assert_eq!((queue.queue.storage(), queue.live), (0, 0));
         }
     }
 
@@ -2032,9 +2068,11 @@ mod tests {
         assert_eq!(queue.storage(), 50 + deque);
         assert_eq!(queue.read(&mut out), 50);
         assert_eq!(
-            (queue.storage(), queue.rmem(), queue.inorder.capacity()),
-            (0, 0, 0)
+            (queue.storage_less_spare(), queue.rmem()),
+            (0, 0)
         );
+        queue.release_spare();
+        assert_eq!((queue.storage(), queue.inorder.capacity()), (0, 0));
         assert!(queue.take_push());
     }
 

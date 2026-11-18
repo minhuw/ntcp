@@ -5562,11 +5562,27 @@ impl Connection {
     // Whether Endpoint::refresh has work to take from this connection:
     // anything `refresh_work_held` reads, or a drained send ring or ledger
     // set above its reserve. Both reclaims need an empty send queue, which
-    // a connection with data queued tests in one load.
+    // a connection with data queued tests in one load. Or a drained
+    // receive deque the connection no longer keeps.
     pub(crate) fn refresh_work(&self) -> bool {
         debug_assert!(self.refresh_work || !self.refresh_work_held());
         self.refresh_work
             || self.send.len() == 0 && (self.send_ring_reclaimable() || self.ledgers_reclaimable())
+            || self.receive_spare_reclaimable()
+    }
+
+    // The drained in-order receive deque stays allocated (charged as held)
+    // while the connection is active, so that request/response traffic
+    // does not free and reallocate it per exchange: while data it sent is
+    // unacknowledged, or data it received is not yet acknowledged, either
+    // of which a later input or output ends. The refresh that finds
+    // neither frees it, so an idle connection holds none.
+    pub(crate) fn receive_spare_reclaimable(&self) -> bool {
+        self.receive.spare() && self.flight() == 0 && self.last_ack_sent == self.receive.next()
+    }
+
+    pub(crate) fn reclaim_receive_spare(&mut self) {
+        self.receive.release_spare();
     }
 
     // After Endpoint::refresh took what it could: work stays pending only
