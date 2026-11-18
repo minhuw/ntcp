@@ -1298,6 +1298,7 @@ impl Host {
         self.attached = true;
         Ok(())
     }
+    #[inline]
     fn check_endpoint(&self, endpoint: &Endpoint) -> Result<(), Error> {
         if endpoint.managed_context() != Some(self.paths.context()) {
             return Err(Error::InvalidContext);
@@ -1908,7 +1909,21 @@ impl Host {
         }
     }
 
+    #[inline]
     pub fn collect(&mut self, endpoint: &Endpoint) -> Result<(), Error> {
+        // With no connection reclaimed since the last collection, no output
+        // lease held and no ledger work due, a collection frees nothing.
+        if endpoint.reclaimed() == self.reclaimed
+            && self.leases.iter().all(Option::is_none)
+            && !self.ledger.due(self.now)
+        {
+            return self.check_endpoint(endpoint);
+        }
+        self.collect_pass(endpoint)
+    }
+
+    #[inline(never)]
+    fn collect_pass(&mut self, endpoint: &Endpoint) -> Result<(), Error> {
         self.check_endpoint(endpoint)?;
         // A committed binding outlives its connection until the endpoint
         // reclaims it (and a reclaimed connection holds no reservation):

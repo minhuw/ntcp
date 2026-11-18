@@ -2336,7 +2336,20 @@ impl<P: PacketIo> Network<P> {
     }
     // Carries on the closes and aborts some change may have advanced, then
     // frees the slots of released connections the endpoint has reclaimed.
+    // With no close, abort or shutdown queued, no connection reclaimed since
+    // the last pass and no TIME-WAIT flow due, a pass changes nothing.
+    #[inline]
     fn maintain_connections(&mut self) -> Result<()> {
+        if self.maintain.is_empty()
+            && self.endpoint.reclaimed() == self.reclaimed
+            && self.time_wait_flows.due.is_empty()
+        {
+            return Ok(());
+        }
+        self.maintain_pass()
+    }
+    #[inline(never)]
+    fn maintain_pass(&mut self) -> Result<()> {
         let connections = self.connections.len();
         // A close blocked by a reservation is queued again, for the next
         // pass: reservations end within a few drives.

@@ -1089,6 +1089,7 @@ impl Ledger {
     /// The first unsealed reservation at or after `from`.
     /// Whether `maintain` work waits at `now`: a reservation that its
     /// attempt may have outlived, or evidence due to expire.
+    #[inline]
     pub fn due(&self, now: Instant) -> bool {
         self.live_pending.len() != 0 || now >= self.next_expiry
     }
