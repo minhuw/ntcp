@@ -143,13 +143,15 @@ fn port_lifecycle(eal: &'static Eal) {
     );
     assert_eq!(pools(), (4, 4));
 
-    // The ring PMD has no rte_flow support.
+    // The ring PMD has no rte_flow support: the first rule of the set is
+    // refused in validation, so none is created.
     let error = port
         .steer_ipv4(Ipv4Addr::new(10, 0, 0, 1), 1)
         .err()
         .unwrap();
     assert_eq!(error.kind(), ErrorKind::Unsupported);
-    assert!(error.to_string().contains("rte_flow_create"), "{error}");
+    let validate = "rte_flow_validate (eth / ipv4 / tcp priority 1)";
+    assert!(error.to_string().contains(validate), "{error}");
     assert_eq!(
         port.steer_ipv4(Ipv4Addr::new(10, 0, 0, 1), 4)
             .err()

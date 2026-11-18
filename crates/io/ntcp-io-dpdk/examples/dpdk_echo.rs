@@ -90,14 +90,14 @@
 // - Do the rules overlap? Without `--isolate` they do not: what they leave
 //   follows RSS, or lands on queue 0, with no rule of its own. An isolated
 //   port takes in only what rules match, so the address's other traffic
-//   needs `steer_ipv4` to queue 0, which matches the tagged ports too, at
-//   the port rules' rte_flow priority. rte_flow leaves the order of such
-//   rules undefined; mlx5 matches the deepest layer first, so its port
-//   rules win. The example combines the two only on mlx5
-//   (`Port::driver_name` `mlx5_pci` or `mlx5_auxiliary`) and refuses rules
-//   on any other isolated port: where the address rule won, every frame
-//   would reach queue 0, which still works by handoff but is not the
-//   steering it would report.
+//   needs `steer_ipv4` to queue 0, which matches the tagged ports too. Its
+//   rules sit at rte_flow priority 1, behind the port rules, where the PMD
+//   takes priorities (mlx5); one that refuses them gets both at 0, where
+//   rte_flow leaves the order undefined. The example combines the two only
+//   on mlx5 (`Port::driver_name` `mlx5_pci` or `mlx5_auxiliary`) and
+//   refuses rules on any other isolated port: where the address rules won,
+//   every frame would reach queue 0, which still works by handoff but is
+//   not the steering it would report.
 // - Why is ownership fixed at start? A connection's owner must not change
 //   while it lives: active opens pick local ports whose flows they own, and
 //   members route packets by the function without asking each other. It is
@@ -177,9 +177,10 @@ const MAX_REQUEST: usize = 1 << 24;
 // 49152-65535, NetworkConfig's default ephemeral ports.
 const TAG_PREFIX: u16 = 0xC000;
 const TAG_MASK: u16 = 0xC000;
-// Drivers that match a TCP port rule before an IPv4 rule for the same
-// address at one rte_flow priority: mlx5 orders such rules by their deepest
-// layer, on PCI functions and subfunctions alike.
+// Drivers that match a TCP port rule before the IPv4 rules for the same
+// address: mlx5 takes rte_flow priorities, so `steer_ipv4`'s rules sit at
+// priority 1 behind the port rules' 0, on PCI functions and subfunctions
+// alike.
 const PORT_RULES_FIRST: [&str; 2] = ["mlx5_pci", "mlx5_auxiliary"];
 
 static ORIGIN: OnceLock<Instant> = OnceLock::new();

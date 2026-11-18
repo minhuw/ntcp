@@ -810,16 +810,26 @@ int ntcp_dpdk_port_driver(uint16_t port, char *name, size_t capacity) {
     return 0;
 }
 
-// ETH / IPV4 (exact destination) -> QUEUE. dst is in network byte order.
-void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *error,
-                          char *message, size_t capacity) {
-    struct rte_flow_attr attr = { .ingress = 1 };
+// ETH / IPV4 (exact destination) [/ TCP or UDP, any header] -> QUEUE at
+// priority. dst is in network byte order; l4 is 0 (no L4 item), IPPROTO_TCP
+// or IPPROTO_UDP. With flow NULL the rule is only validated, otherwise
+// created into *flow. Returns 0 or a negative errno; on failure
+// *priority_refused tells whether the PMD refused the priority attribute
+// (RTE_FLOW_ERROR_TYPE_ATTR_PRIORITY).
+int ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint8_t l4, uint32_t priority,
+                        uint16_t queue, void **flow, int *priority_refused, char *message,
+                        size_t capacity) {
+    if (l4 != 0 && l4 != IPPROTO_TCP && l4 != IPPROTO_UDP) return -EINVAL;
+    struct rte_flow_attr attr = { .ingress = 1, .priority = priority };
     struct rte_flow_item_ipv4 spec = {0}, mask = {0};
     spec.hdr.dst_addr = dst;
     mask.hdr.dst_addr = UINT32_MAX;
     struct rte_flow_item pattern[] = {
         { .type = RTE_FLOW_ITEM_TYPE_ETH },
         { .type = RTE_FLOW_ITEM_TYPE_IPV4, .spec = &spec, .mask = &mask },
+        { .type = l4 == IPPROTO_TCP   ? RTE_FLOW_ITEM_TYPE_TCP
+                  : l4 == IPPROTO_UDP ? RTE_FLOW_ITEM_TYPE_UDP
+                                      : RTE_FLOW_ITEM_TYPE_END },
         { .type = RTE_FLOW_ITEM_TYPE_END },
     };
     struct rte_flow_action_queue target = { .index = queue };
@@ -828,19 +838,25 @@ void *ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint16_t queue, int *erro
         { .type = RTE_FLOW_ACTION_TYPE_END },
     };
     struct rte_flow_error flow_error = {0};
-    struct rte_flow *flow = rte_flow_create(port, &attr, pattern, actions, &flow_error);
-    *error = flow ? 0 : -rte_errno;
-    if (!flow) flow_message(&flow_error, message, capacity);
-    return flow;
+    int result;
+    if (flow) {
+        *flow = rte_flow_create(port, &attr, pattern, actions, &flow_error);
+        result = *flow ? 0 : -rte_errno;
+    } else {
+        result = rte_flow_validate(port, &attr, pattern, actions, &flow_error);
+    }
+    *priority_refused = result < 0 && flow_error.type == RTE_FLOW_ERROR_TYPE_ATTR_PRIORITY;
+    if (result < 0) flow_message(&flow_error, message, capacity);
+    return result;
 }
 
 // ETH / IPV4 (exact destination) / TCP (destination port under mask) ->
 // QUEUE. dst and dst_port are in network byte order, mask in host order.
 // Validated first, so a PMD that cannot match this pattern refuses it before
-// anything is installed (stage 1); stage 2 is the creation itself. The
-// priority equals ntcp_dpdk_flow_ipv4's (0): mlx5 orders rules of one
-// priority by their deepest layer, so this L4 rule matches before an L3 rule
-// for the same address. rte_flow itself leaves such overlaps undefined.
+// anything is installed (stage 1); stage 2 is the creation itself. Priority
+// 0, ahead of the address rules Port::steer_ipv4 installs at 1 where the PMD
+// takes priorities (at 0 where it refuses them, and rte_flow leaves the
+// overlap undefined).
 void *ntcp_dpdk_flow_tcp_port(uint16_t port, uint32_t dst, uint16_t dst_port,
                               uint16_t mask, uint16_t queue, int *error, int *stage,
                               char *message, size_t capacity) {
