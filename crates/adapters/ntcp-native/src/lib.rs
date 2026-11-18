@@ -2342,7 +2342,16 @@ impl<P: PacketIo> Network<P> {
             }
         }
     }
+    // The endpoint's events into the network's queues. An endpoint without
+    // any (`Endpoint::has_events`) gives none until another call changes it.
+    #[inline]
     fn collect_core_events(&mut self) {
+        if self.endpoint.has_events() {
+            self.collect_events_pass();
+        }
+    }
+    #[inline(never)]
+    fn collect_events_pass(&mut self) {
         while self.events.len() < self.event_capacity {
             match self.endpoint.next_event() {
                 Some(ntcp::Event::Connection(core, events)) => {

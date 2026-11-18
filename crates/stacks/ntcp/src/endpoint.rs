@@ -6339,7 +6339,26 @@ impl Endpoint {
         self.clock(now)
     }
 
+    #[inline]
     pub fn on_timeout(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
+        // At the endpoint's clock with nothing due by `now`, a run only
+        // moves the wheel's time to `now`, and finds nothing due.
+        if now == self.now
+            && budget != 0
+            && self
+                .deadlines
+                .first()
+                .is_none_or(|(deadline, _)| deadline > now)
+            && self.wheel.idle(now)
+        {
+            self.wheel.finish(now);
+            return Ok(false);
+        }
+        self.on_timeout_pass(now, budget)
+    }
+
+    #[inline(never)]
+    fn on_timeout_pass(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
         self.clock(now)?;
         let mut drained = false;
         for _ in 0..budget {

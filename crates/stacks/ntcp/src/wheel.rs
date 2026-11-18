@@ -115,6 +115,7 @@ fn level_of(delta: u64, slots: u64, levels: u32) -> u32 {
     ((63 - (delta / (slots - 1)).leading_zeros()) / LEVEL_SHIFT + 1).min(levels - 1)
 }
 
+#[inline]
 fn sat_shl(value: u64, shift: u32) -> u64 {
     if shift >= 64 || value > u64::MAX >> shift {
         u64::MAX
@@ -199,6 +200,7 @@ impl Wheel {
         (1 << self.slot_bits) - 1
     }
 
+    #[inline]
     fn due_list(&self) -> u32 {
         self.levels << self.slot_bits
     }
@@ -356,6 +358,7 @@ impl Wheel {
     }
 
     // The earliest occupied bucket: its expiry tick and index.
+    #[inline]
     fn first_bucket(&self) -> Option<(u64, u32)> {
         if self.stale.get() {
             let found = (0..self.levels)
@@ -404,8 +407,19 @@ impl Wheel {
         ))
     }
 
+    /// Whether `due(now)` finds nothing: no timer in the due list, and no
+    /// bucket expired by `now`.
+    #[inline]
+    pub(crate) fn idle(&self, now: u64) -> bool {
+        self.heads[self.due_list() as usize] == NONE
+            && self
+                .first_bucket()
+                .is_none_or(|(expiry, _)| sat_shl(expiry, self.tick_shift) > now)
+    }
+
     /// Nothing more is due at `now` (`due` returned None): every bucket up
     /// to it has run, and timers filed from now on are placed against it.
+    #[inline]
     pub(crate) fn finish(&mut self, now: u64) {
         debug_assert!(self.heads[self.due_list() as usize] == NONE);
         debug_assert!(

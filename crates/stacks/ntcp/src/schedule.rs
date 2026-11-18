@@ -105,6 +105,7 @@ impl Deadlines {
         Ok(Self { heap, positions })
     }
 
+    #[inline]
     pub(crate) fn first(&self) -> Option<(u64, usize)> {
         self.heap.first().copied()
     }
