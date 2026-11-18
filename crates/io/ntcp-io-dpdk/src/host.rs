@@ -166,7 +166,10 @@ fn flow_error(context: &str, result: i32, message: &[c_char]) -> io::Error {
 const IPV4_RULES: [u8; 3] = [6, 17, 0];
 
 // rte_flow priority of the `steer_ipv4` rules, behind `steer_tcp_port`'s 0;
-// 0 on a PMD that refuses priorities (i40e_flow_parse_attr).
+// 0 on a PMD that refuses it. The refusal cannot be recognised by its error:
+// i40e's fdir parser refuses the priority (i40e_flow_parse_attr), then its
+// parse loop tries the cloud-filter parser, whose "Invalid IPv4 item" is the
+// error returned. So any refusal of the first rule is retried once at 0.
 const ADDRESS_PRIORITY: u32 = 1;
 
 fn ipv4_pattern(l4: u8) -> &'static str {
@@ -177,10 +180,9 @@ fn ipv4_pattern(l4: u8) -> &'static str {
     }
 }
 
-// A rule the flow API refused, and whether for its priority attribute.
+// A rule the flow API refused.
 struct Refusal {
     error: io::Error,
-    priority: bool,
 }
 
 // The flow API calls of `install_ipv4`, apart so that its all-or-nothing
@@ -199,7 +201,8 @@ struct DeviceIpv4Rules {
 
 impl DeviceIpv4Rules {
     fn call(&self, l4: u8, priority: u32, flow: *mut *mut c_void) -> Result<(), Refusal> {
-        let (mut refused, mut message) = (0, [0; 128]);
+        // The shim's priority-refused flag is not trusted (`ADDRESS_PRIORITY`).
+        let (mut _refused, mut message) = (0, [0; 128]);
         // SAFETY: started port; buffer capacity is passed; flow is null or
         // points to a slot of the caller's.
         let result = unsafe {
@@ -210,7 +213,7 @@ impl DeviceIpv4Rules {
                 priority,
                 self.queue,
                 flow,
-                &mut refused,
+                &mut _refused,
                 message.as_mut_ptr(),
                 message.len(),
             )
@@ -226,7 +229,6 @@ impl DeviceIpv4Rules {
         let context = format!("{step} ({} priority {priority})", ipv4_pattern(l4));
         Err(Refusal {
             error: flow_error(&context, result, &message),
-            priority: refused != 0,
         })
     }
 }
@@ -241,7 +243,6 @@ impl Ipv4Rules for DeviceIpv4Rules {
         self.call(l4, priority, &mut flow)?;
         NonNull::new(flow).ok_or_else(|| Refusal {
             error: io::Error::other("rte_flow_create returned no flow"),
-            priority: false,
         })
     }
 
@@ -264,11 +265,19 @@ fn install_ipv4(rules: &mut impl Ipv4Rules) -> io::Result<Vec<NonNull<c_void>>> 
     let (first, rest) = (IPV4_RULES[0], &IPV4_RULES[1..]);
     let priority = match rules.validate(first, ADDRESS_PRIORITY) {
         Ok(()) => ADDRESS_PRIORITY,
-        Err(refusal) if refusal.priority => {
-            rules.validate(first, 0).map_err(unsupported)?;
-            0
-        }
-        Err(refusal) => return Err(unsupported(refusal)),
+        Err(at_address) => match rules.validate(first, 0) {
+            Ok(()) => 0,
+            Err(at_0) => {
+                let error = unsupported(at_0);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; at priority {ADDRESS_PRIORITY}: {}",
+                        at_address.error
+                    ),
+                ));
+            }
+        },
     };
     for &l4 in rest {
         rules.validate(l4, priority).map_err(unsupported)?;
@@ -817,7 +826,7 @@ impl Port {
     /// are validated first, then created; any refusal returns the error with
     /// none of them installed (Unsupported for a refused specification).
     /// They use rte_flow priority 1, behind `steer_tcp_port`, or 0 on a PMD
-    /// that refuses priorities (i40e). The rules are destroyed when the
+    /// that refuses the first rule at 1 (i40e). The rules are destroyed when the
     /// `Flow` drops, always before the port stops.
     ///
     /// On i40e, IPv4 fragments and SCTP (flow director pctypes FRAG_IPV4 and
@@ -1481,8 +1490,8 @@ mod tests {
         Destroy(usize),
     }
 
-    // A flow API that refuses what `refuse` picks, with (errno, priority
-    // refused), and fails the destructions listed.
+    // A flow API that refuses what `refuse` picks, with an errno, and fails
+    // the destructions listed.
     struct Script<F> {
         refuse: F,
         destroy_fails: Vec<usize>,
@@ -1490,7 +1499,7 @@ mod tests {
         created: usize,
     }
 
-    fn script<F: FnMut(&Call) -> Option<(i32, bool)>>(refuse: F) -> Script<F> {
+    fn script<F: FnMut(&Call) -> Option<i32>>(refuse: F) -> Script<F> {
         Script {
             refuse,
             destroy_fails: Vec::new(),
@@ -1499,21 +1508,20 @@ mod tests {
         }
     }
 
-    impl<F: FnMut(&Call) -> Option<(i32, bool)>> Script<F> {
+    impl<F: FnMut(&Call) -> Option<i32>> Script<F> {
         fn answer(&mut self, call: Call) -> Result<(), Refusal> {
             let refused = (self.refuse)(&call);
             self.calls.push(call);
             match refused {
                 None => Ok(()),
-                Some((result, priority)) => Err(Refusal {
+                Some(result) => Err(Refusal {
                     error: dpdk_error("scripted", result),
-                    priority,
                 }),
             }
         }
     }
 
-    impl<F: FnMut(&Call) -> Option<(i32, bool)>> Ipv4Rules for Script<F> {
+    impl<F: FnMut(&Call) -> Option<i32>> Ipv4Rules for Script<F> {
         fn validate(&mut self, l4: u8, priority: u32) -> Result<(), Refusal> {
             self.answer(Call::Validate(l4, priority))
         }
@@ -1559,9 +1567,10 @@ mod tests {
 
     #[test]
     fn ipv4_rules_drop_to_priority_0_where_priorities_are_refused() {
-        // i40e_flow_parse_attr: any priority but 0 is refused as such.
+        // i40e refuses any priority but 0, and reports it as "Invalid IPv4
+        // item" (EINVAL, not ATTR_PRIORITY): any refusal at 1 is retried.
         let mut rules = script(|call| match call {
-            Call::Validate(_, 1) => Some((EINVAL, true)),
+            Call::Validate(_, 1) => Some(EINVAL),
             _ => None,
         });
         install_ipv4(&mut rules).unwrap();
@@ -1582,27 +1591,28 @@ mod tests {
 
     #[test]
     fn ipv4_rules_refused_in_validation_install_nothing() {
-        // Another refusal is not retried at another priority.
+        // The first rule refused at both priorities: both errors reported.
         let mut rules = script(|call| match call {
-            Call::Validate(6, _) => Some((EINVAL, false)),
+            Call::Validate(6, _) => Some(EINVAL),
             _ => None,
         });
         let error = install_ipv4(&mut rules).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(rules.calls, [Call::Validate(6, 1)]);
+        assert!(error.to_string().contains("at priority 1:"), "{error}");
+        assert_eq!(rules.calls, [Call::Validate(6, 1), Call::Validate(6, 0)]);
         // One rule of the set refused: none is created.
         let mut rules = script(|call| match call {
-            Call::Validate(17, _) => Some((EINVAL, false)),
+            Call::Validate(17, _) => Some(EINVAL),
             _ => None,
         });
         let error = install_ipv4(&mut rules).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert_eq!(rules.calls, [Call::Validate(6, 1), Call::Validate(17, 1)]);
         // No flow API (the ring PMD).
-        let mut rules = script(|_| Some((ENOSYS, false)));
+        let mut rules = script(|_| Some(ENOSYS));
         let error = install_ipv4(&mut rules).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(rules.calls, [Call::Validate(6, 1)]);
+        assert_eq!(rules.calls, [Call::Validate(6, 1), Call::Validate(6, 0)]);
     }
 
     #[test]
@@ -1610,7 +1620,7 @@ mod tests {
         // i40e checks a pctype's input set against its rules only when
         // creating (i40e_flow_set_fdir_inset).
         let mut rules = script(|call| match call {
-            Call::Create(0, _) => Some((EINVAL, false)),
+            Call::Create(0, _) => Some(EINVAL),
             _ => None,
         });
         let error = install_ipv4(&mut rules).unwrap_err();
@@ -1631,7 +1641,7 @@ mod tests {
     #[test]
     fn ipv4_rules_left_installed_are_reported() {
         let mut rules = script(|call| match call {
-            Call::Create(0, _) => Some((EINVAL, false)),
+            Call::Create(0, _) => Some(EINVAL),
             _ => None,
         });
         rules.destroy_fails = vec![1];
