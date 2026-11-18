@@ -817,6 +817,16 @@ impl<P: PacketIo> Network<P> {
             } else {
                 index + 1
             };
+            // An endpoint with nothing pending (every reservation free, so no
+            // slot holds a frame; no output queued, no stateless reply, no
+            // listener cleanup) gives a poll at its clock, `now`, nothing to
+            // select or change, and no more work to report: the loop ends as
+            // after such a poll.
+            if !self.endpoint.has_pending_output() {
+                debug_assert!(self.tx_pending == 0 && self.tx_held == 0);
+                exhausted = true;
+                continue;
+            }
             // The table is set aside while one slot is served in place: a
             // slot carries its frame's egress context, too large to move out
             // and back for every frame.
