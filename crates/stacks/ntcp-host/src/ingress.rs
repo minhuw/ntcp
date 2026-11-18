@@ -1352,9 +1352,9 @@ impl Host {
         self.dispatch_icmp(endpoint, now, processed.context(), &packet)
     }
 
-    // RFC 1122 section 3.2.2.6:
-    //   Every host MUST implement an ICMP Echo server function that
-    //   receives Echo Requests and sends corresponding Echo Replies.
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2.6
+    //# Every host MUST implement an ICMP Echo server function that
+    //# receives Echo Requests and sends corresponding Echo Replies.
     // RFC 1122 section 3.2.2.6 and RFC 4443 sections 4.1 and 4.2: the reply
     // comes from the request's specific destination (one of this Host's
     // unicast addresses on the arrival link) and echoes identifier, sequence
@@ -1911,12 +1911,17 @@ impl Host {
         })
     }
 
-    // RFC 1122 section 3.2.2.1:
-    //   A host SHOULD generate Destination Unreachable messages with code:
-    //   2 (Protocol Unreachable), when the designated transport protocol
-    //   is not supported; or 3 (Port Unreachable), when the designated
-    //   transport protocol (e.g., UDP) is unable to demultiplex the
-    //   datagram but has no protocol mechanism to inform the sender.
+    //= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2.1
+    //# A host SHOULD generate Destination Unreachable messages with
+    //# code:
+    //#
+    //# 2    (Protocol Unreachable), when the designated transport
+    //#      protocol is not supported; or
+    //#
+    //# 3    (Port Unreachable), when the designated transport
+    //#      protocol (e.g., UDP) is unable to demultiplex the
+    //#      datagram but has no protocol mechanism to inform the
+    //#      sender.
     // Queue error `kind` about `processed`, a datagram for this Host that no
     // transport protocol or port took, under the rules every originated
     // error obeys (`originate`): never about a link-layer multicast or

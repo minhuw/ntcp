@@ -1382,6 +1382,24 @@ fn reassembly_errors_carry_family_codes_pointers_and_bounded_quotes() {
     assert_eq!(&message[8..], &misaligned);
 }
 
+//= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2
+//= type=test
+//# An ICMP error message MUST NOT be sent as the result of
+//# receiving:
+//#
+//# *    an ICMP error message, or
+//#
+//# *    a datagram destined to an IP broadcast or IP multicast
+//#      address, or
+//#
+//# *    a datagram sent as a link-layer broadcast, or
+//#
+//# *    a non-initial fragment, or
+//#
+//# *    a datagram whose source address does not define a single
+//#      host -- e.g., a zero address, a loopback address, a
+//#      broadcast address, a multicast address, or a Class E
+//#      address.
 #[test]
 fn error_suppression_is_family_specific() {
     let f = fixture();

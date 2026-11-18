@@ -2,7 +2,7 @@
   "rfc": 1122,
   "document_status": "Internet Standard",
   "scope_kind": "scoped-operative",
-  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and ARP (section 2.3.2): the ntcp-arp cache's validation and per-destination request rate limit (2.3.2.1), and the 2.3.2.2 packet queue of ntcp-native Ethernet ports that resolve IPv4 next hops by ARP, which keep each owner's latest frame while its next hop resolves and send it once resolved (ntcp-socket's IPv4 ports still use static neighbours). RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly (but for the section 3.3.2 reassembly timeout recommendation, recorded as an exception), security facilities, address administration, legacy ToS policy, other ARP embeddings and general host/socket APIs are outside this inventory.",
+  "scope": "SCOPED: IPv4 codec version/checksum/TTL validation and transport parameters, bounded option parsing, selected source-route origin/final-destination helpers including old-encoding return-route tolerance, Record Route and Timestamp helpers, and ARP (section 2.3.2): the ntcp-arp cache's validation and per-destination request rate limit (2.3.2.1), and the 2.3.2.2 packet queue of ntcp-native Ethernet ports that resolve IPv4 next hops by ARP, which keep each owner's latest frame while its next hop resolves and send it once resolved (ntcp-socket's IPv4 ports still use static neighbours). ICMP origination by the ntcp-host Host ICMP output (ntcp-native Networks and ntcp-socket): the section 3.2.2 restrictions on originating errors, the 3.2.2.1 Protocol and Port Unreachable codes and the 3.2.2.6 Echo server. RFC6864 amends Identification for atomic datagrams. No full-document or full IPv4 host conformance: forwarding/routing, fragmentation/reassembly (but for the section 3.3.2 reassembly timeout recommendation, recorded as an exception), security facilities, address administration, legacy ToS policy, other ARP embeddings and general host/socket APIs are outside this inventory.",
   "text_sha256": "9f526e6bebc868324fedb90aebbcf6e5b15c53fd373ca5d5ce1c2cdcd264e04f",
   "paragraphs": [
     {
@@ -232,6 +232,42 @@
         "crates/adapters/ntcp-clock/src/tests.rs::fn actual_cadence_characterization()"
       ],
       "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.1.8"
+    },
+    {
+      "id": "1122-icmp-error-restrictions",
+      "section": "3.2.2",
+      "quote": "An ICMP error message MUST NOT be sent as the result of receiving: * an ICMP error message, or * a datagram destined to an IP broadcast or IP multicast address, or * a datagram sent as a link-layer broadcast, or * a non-initial fragment, or * a datagram whose source address does not define a single host -- e.g., a zero address, a loopback address, a broadcast address, a multicast address, or a Class E address.",
+      "status": "covered",
+      "reason": "Every error the Host originates passes originate (icmp_error.rs): ipv4_allowed refuses an invoking ICMP error (any type but the queries), an IP broadcast, multicast or unspecified destination and a non-initial fragment; a link-layer multicast or broadcast arrival (Host::receive's link_multicast, carried in the datagram's Envelope to transport input) draws none; admissible_source refuses zero, loopback, broadcast, multicast and Class E sources. The host test asserts each refusal on the originate path the reassembly errors and Port/Protocol Unreachables share.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2",
+      "evidence": [
+        "crates/stacks/ntcp-host/src/icmp_error.rs::fn ipv4_allowed(",
+        "crates/stacks/ntcp-host/src/tests/reassembly.rs::fn error_suppression_is_family_specific()"
+      ]
+    },
+    {
+      "id": "1122-unreachable-codes",
+      "section": "3.2.2.1",
+      "quote": "A host SHOULD generate Destination Unreachable messages with code: 2 (Protocol Unreachable), when the designated transport protocol is not supported; or 3 (Port Unreachable), when the designated transport protocol (e.g., UDP) is unable to demultiplex the datagram but has no protocol mechanism to inform the sender.",
+      "status": "covered",
+      "reason": "A UDP datagram that passes its checksum and address policy but finds no flow draws Port Unreachable (code 3), and a datagram of a protocol the Host does not process draws Protocol Unreachable (code 2), as Linux's __udp4_lib_rcv and ip_protocol_deliver_rcu send them, through Host::queue_unreachable under the section 3.2.2 restrictions and Linux's ICMP rate limits. The native test asserts both codes, the quote and the suppressed cases on an ntcp-native Network.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2.1",
+      "evidence": [
+        "crates/stacks/ntcp-host/src/ingress.rs::pub(crate) fn queue_unreachable(",
+        "crates/adapters/ntcp-native/tests/icmp.rs::fn udp_and_unknown_protocols_draw_unreachables()"
+      ]
+    },
+    {
+      "id": "1122-echo-server",
+      "section": "3.2.2.6",
+      "quote": "Every host MUST implement an ICMP Echo server function that receives Echo Requests and sends corresponding Echo Replies.",
+      "status": "covered",
+      "reason": "Host::echo answers an Echo Request to one of its unicast addresses with an Echo Reply from that address echoing identifier, sequence and data, queued for the Host ICMP output, which ntcp-native drains each drive through its backend and ntcp-socket each egress pass. Echo Replies are not rate limited by default (Linux's icmp_ratemask). The native test asserts exactly one byte-exact reply per request for IPv4 and IPv6.",
+      "target": "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2.6",
+      "evidence": [
+        "crates/stacks/ntcp-host/src/ingress.rs::fn echo(",
+        "crates/adapters/ntcp-native/tests/icmp.rs::fn an_echo_request_draws_exactly_one_reply()"
+      ]
     },
     {
       "id": "1122-reassembly-timeout-range",

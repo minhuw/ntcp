@@ -77,3 +77,15 @@ quote = "A timestamp value MUST follow the rules given in Section 3.2.2.8 for th
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.3.2"
 quote = "It is recommended that the value lie between 60 seconds and 120 seconds."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2"
+quote = "An ICMP error message MUST NOT be sent as the result of receiving: * an ICMP error message, or * a datagram destined to an IP broadcast or IP multicast address, or * a datagram sent as a link-layer broadcast, or * a non-initial fragment, or * a datagram whose source address does not define a single host -- e.g., a zero address, a loopback address, a broadcast address, a multicast address, or a Class E address."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2.1"
+quote = "A host SHOULD generate Destination Unreachable messages with code: 2 (Protocol Unreachable), when the designated transport protocol is not supported; or 3 (Port Unreachable), when the designated transport protocol (e.g., UDP) is unable to demultiplex the datagram but has no protocol mechanism to inform the sender."
+
+[[spec]]
+target = "https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2.6"
+quote = "Every host MUST implement an ICMP Echo server function that receives Echo Requests and sends corresponding Echo Replies."

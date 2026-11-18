@@ -476,9 +476,23 @@ fn invoking_addresses(b: &[u8]) -> Option<IpMetadata> {
     }
 }
 
-// RFC 1122 section 3.2.2:
-//   An ICMP error message MUST NOT be sent as the result of
-//   receiving:
+//= https://www.rfc-editor.org/rfc/rfc1122#section-3.2.2
+//# An ICMP error message MUST NOT be sent as the result of
+//# receiving:
+//#
+//# *    an ICMP error message, or
+//#
+//# *    a datagram destined to an IP broadcast or IP multicast
+//#      address, or
+//#
+//# *    a datagram sent as a link-layer broadcast, or
+//#
+//# *    a non-initial fragment, or
+//#
+//# *    a datagram whose source address does not define a single
+//#      host -- e.g., a zero address, a loopback address, a
+//#      broadcast address, a multicast address, or a Class E
+//#      address.
 // An ICMP error message, a datagram to an IP broadcast or multicast address
 // or sent as a link-layer broadcast, a non-initial fragment, or one whose
 // source is not a single host. An ICMP datagram whose type is missing or
