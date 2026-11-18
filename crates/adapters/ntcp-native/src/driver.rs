@@ -405,24 +405,7 @@ impl<P: PacketIo> Network<P> {
         changes: bool,
         report: &mut DriveReport,
     ) -> Result<bool> {
-        // The shared neighbor table's mapping epoch, which egress resolution
-        // checks its front cache against, and the member's wake: the member
-        // begins only when either moved since it last began, which is what
-        // beginning it would find (`shared::Probe`).
-        if self.member_probe.as_ref().is_some_and(|p| !p.current())
-            && let Some(member) = super::shared::member(&mut self.host)
-        {
-            member.begin();
-            let epoch = member.epoch();
-            if let Some(probe) = &mut self.member_probe {
-                probe.began(epoch);
-            }
-        } else if cfg!(debug_assertions)
-            && let Some(probe) = &self.member_probe
-            && let Some(member) = super::shared::member(&mut self.host)
-        {
-            debug_assert_eq!(member.epoch(), probe.epoch());
-        }
+        self.begin_member();
         // A path change an earlier drive queued reaches the connection
         // before its selection, as in the drive.
         if changes {
@@ -477,6 +460,28 @@ impl<P: PacketIo> Network<P> {
             }
         }
         Ok(more)
+    }
+    // The start of a drive or a push on a member of a shared neighbor
+    // table: the table's mapping epoch, which egress resolution checks its
+    // front cache against, and the member's wake. The member begins only
+    // when either moved since it last began, which is what beginning it
+    // would find (`shared::Probe`); debug builds check the member's epoch
+    // when it does not.
+    fn begin_member(&mut self) {
+        if self.member_probe.as_ref().is_some_and(|p| !p.current())
+            && let Some(member) = super::shared::member(&mut self.host)
+        {
+            member.begin();
+            let epoch = member.epoch();
+            if let Some(probe) = &mut self.member_probe {
+                probe.began(epoch);
+            }
+        } else if cfg!(debug_assertions)
+            && let Some(probe) = &self.member_probe
+            && let Some(member) = super::shared::member(&mut self.host)
+        {
+            debug_assert_eq!(member.epoch(), probe.epoch());
+        }
     }
     // One frame of `core`'s output polled into empty `slot` and tried, and
     // the segments polled again, one at a time, of an aggregate the backend
@@ -550,13 +555,7 @@ impl<P: PacketIo> Network<P> {
         completed: &mut [u8],
         report: &mut DriveReport,
     ) -> Result<()> {
-        if let Some(member) = super::shared::member(&mut self.host) {
-            member.begin();
-            let epoch = member.epoch();
-            if let Some(probe) = &mut self.member_probe {
-                probe.began(epoch);
-            }
-        }
+        self.begin_member();
         self.maintain_connections()?;
         report.more_work |= self.endpoint.on_timeout(now, budget.timers)?;
         let changes = self.host.service_changes(&mut self.endpoint, now)?;
