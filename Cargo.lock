@@ -246,6 +246,7 @@ dependencies = [
  "ntcp-arp",
  "ntcp-ethernet",
  "ntcp-host",
+ "ntcp-icmp",
  "ntcp-io",
  "ntcp-io-af-packet",
  "ntcp-io-tun",

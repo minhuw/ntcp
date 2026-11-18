@@ -787,6 +787,11 @@ impl<P: PacketIo> Network<P> {
             self.service_neighbors(now)?;
             control = self.control_output(now, budget.transmit.div_ceil(2), report)?;
         }
+        // The Host's ICMP messages, queued by this drive's input or by
+        // reassembly expiry, take at most half of what is left, so that
+        // neither they nor data starve the other.
+        let icmp = self.icmp_output(now, (budget.transmit - control).div_ceil(2), false, report)?;
+        let control = control + icmp;
         let mut data = 0;
         // Once the endpoint offers nothing and no slot holds a frame to retry,
         // further polls at this instant cannot transmit anything. A held
@@ -832,8 +837,10 @@ impl<P: PacketIo> Network<P> {
             let idle = result?;
             exhausted = idle || exhausted && was_pending && still_pending;
         }
-        // Requests for next hops data output just began resolving, within
-        // what is left.
+        // ICMP messages within what data left, then requests for next hops
+        // data or ICMP output just began resolving, within what is left.
+        let icmp = self.icmp_output(now, budget.transmit - control - data, true, report)?;
+        let control = control + icmp;
         if self.shared_neighbors {
             self.shared_output(now, budget.transmit - control - data, false, report)?;
         } else if !self.control.is_empty() {
@@ -984,6 +991,109 @@ impl<P: PacketIo> Network<P> {
             member.settled();
         }
         Ok(())
+    }
+    // Up to `limit` of the Host's queued ICMP messages, each through the
+    // backend as one frame per packet (a message beyond the path's size is
+    // fragmented by the Host); returns how many messages were tried. A
+    // message the backend has no room for stays queued for the next drive;
+    // one with no route or path left, or refused, is consumed unsent and
+    // counted by the Host. In the drive's `last` pass, messages left for
+    // want of budget are more work. Then the Host's ICMP storage is charged
+    // again, as it changed with this drive's input and output. With nothing
+    // queued this is one check.
+    fn icmp_output(
+        &mut self,
+        now: Instant,
+        limit: usize,
+        last: bool,
+        report: &mut DriveReport,
+    ) -> Result<usize> {
+        let mut used = 0;
+        while used < limit && self.host.icmp_output_pending() != 0 {
+            used += 1;
+            let Self {
+                host,
+                io,
+                config,
+                icmp_packet,
+                icmp_frame,
+                ..
+            } = self;
+            let (mut sent, mut blocked, mut failure) = (0, false, None);
+            let result = host.icmp_output(now, icmp_packet, |egress, packet| {
+                // An Ethernet frame is padded to its 60-octet minimum.
+                let len = match config.link {
+                    Link::Ip => packet.len(),
+                    Link::Ethernet { .. } => (14 + packet.len()).max(60),
+                };
+                let Some(frame) = icmp_frame.get_mut(..len) else {
+                    return BackendOutcome::NotSubmitted;
+                };
+                let frame = if let Link::Ethernet {
+                    local_mac,
+                    next_hop,
+                } = config.link
+                {
+                    // An ARP-resolved next hop's MAC, which the Host
+                    // resolved before submitting, or the fixed one.
+                    let destination = match (egress.link_layer, next_hop) {
+                        (Some(mac), _) | (None, EthernetNextHop::Fixed(mac)) => mac,
+                        (None, EthernetNextHop::Arp { .. }) => {
+                            return BackendOutcome::NotSubmitted;
+                        }
+                    };
+                    frame[..6].copy_from_slice(&destination);
+                    frame[6..12].copy_from_slice(&local_mac);
+                    let ethertype: u16 = if packet[0] >> 4 == 4 { 0x0800 } else { 0x86dd };
+                    frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
+                    frame[14..14 + packet.len()].copy_from_slice(packet);
+                    frame[14 + packet.len()..].fill(0);
+                    &*frame
+                } else {
+                    frame.copy_from_slice(packet);
+                    &*frame
+                };
+                match io.transmit(frame) {
+                    Ok(TxOutcome::Submitted) => {
+                        sent += 1;
+                        BackendOutcome::Submitted
+                    }
+                    Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
+                        blocked = true;
+                        BackendOutcome::WouldBlock
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        BackendOutcome::Unknown
+                    }
+                }
+            });
+            report.transmitted += sent;
+            self.tx_submitted += sent as u64;
+            if let Some(error) = failure {
+                return Err(Error::Backend(error));
+            }
+            if blocked {
+                report.tx_blocked = true;
+                self.counters.backend_backpressure += 1;
+                break;
+            }
+            // Every queued message waits for its next hop's resolution,
+            // which ARP's wake brings to a later drive. Otherwise it was
+            // sent, or consumed unsent (counted by the Host).
+            if let Ok(None | Some(BackendOutcome::WouldBlock)) = result {
+                break;
+            }
+        }
+        if last && used == limit && self.host.icmp_output_pending() != 0 {
+            report.more_work = true;
+        }
+        let charge = self.host.icmp_memory();
+        if charge != self.icmp_charge {
+            self.icmp_charge = charge;
+            self.endpoint.set_embedding_charge(charge);
+        }
+        Ok(used)
     }
     // Up to `limit` due ARP control frames (replies, requests, probes)
     // through their own slot; returns how many were tried.

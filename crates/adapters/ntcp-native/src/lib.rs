@@ -14,7 +14,7 @@ mod toeplitz;
 mod types;
 pub use config::{EthernetNextHop, Link, NetworkConfig};
 pub use flows::{DEFAULT_FLOW_KEY, FlowOwnership, SharedFlowLimits, SharedFlows};
-pub use ntcp_host::ReassemblyCounters;
+pub use ntcp_host::{IcmpOutputCounters, IcmpRateLimits, ReassemblyCounters};
 pub use shared::{SharedNeighborLimits, SharedNeighbors};
 pub use types::*;
 
@@ -268,6 +268,12 @@ pub struct Network<P: PacketIo> {
     aggregate: Vec<u8>,
     // The one transmit slot of ARP control frames (empty without ARP).
     control: Vec<u8>,
+    // The Host's ICMP output: the packet it writes and the frame that
+    // carries it (both empty while output is off), and the bytes of Host
+    // storage charged to the endpoint (`Endpoint::set_embedding_charge`).
+    icmp_packet: Vec<u8>,
+    icmp_frame: Vec<u8>,
+    icmp_charge: usize,
     rx: Vec<u8>,
     completed: Vec<u8>,
     retained: VecDeque<driver::RetainedInput>,
@@ -780,8 +786,12 @@ impl<P: PacketIo> Network<P> {
             Some((_, _, Some(_))) => 2,
             _ => 1,
         };
-        let (path_limits, mut limits) = ntcp_host::managed_limits(&config.tcp, 1, 1, 1, routes, 0)?;
+        let (path_limits, limits) = ntcp_host::managed_limits(&config.tcp, 1, 1, 1, routes, 0)?;
+        let icmp_output = config.icmp_output();
+        let (path_limits, mut limits) =
+            ntcp_host::managed_icmp_output_limits(path_limits, limits, icmp_output)?;
         limits.reassembly = reassembly;
+        limits.icmp_rate = config.icmp_rate;
         let owners = config
             .tcp
             .max_connections
@@ -809,14 +819,17 @@ impl<P: PacketIo> Network<P> {
             }
         };
         if arp.is_some() && member.is_none() {
-            // One held attempt per output lane; a reply per requester, each
-            // of which the request also adds as an entry.
+            // One held attempt per output lane and per queued ICMP message,
+            // so that held ICMP output never takes a lane's; a reply per
+            // requester, each of which the request also adds as an entry.
             limits.ipv4_neighbors = ntcp_host::NeighborLimits {
                 entries: config
                     .neighbor_entries
                     .checked_add(config.static_neighbors.len())
                     .ok_or(Error::Capacity)?,
-                pending_packets: owners,
+                pending_packets: owners
+                    .checked_add(icmp_output.messages)
+                    .ok_or(Error::Capacity)?,
                 addresses: 1,
                 answers: config.neighbor_entries,
             };
@@ -913,6 +926,10 @@ impl<P: PacketIo> Network<P> {
         if let Some(member) = &flows {
             member.share_buffer_memory(&mut endpoint)?;
         }
+        // The Host's ICMP output, charged as the Endpoint's own storage;
+        // each drive charges it again as messages come and go.
+        let icmp_charge = host.icmp_memory();
+        endpoint.set_embedding_charge(icmp_charge);
         let gso = config.gso(&io);
         endpoint.enable_output_reservations_with_packet_bytes(
             owners,
@@ -951,6 +968,18 @@ impl<P: PacketIo> Network<P> {
             bytes(60)?
         } else {
             Vec::new()
+        };
+        // The Host writes a queued ICMP message's packet into `icmp_packet`:
+        // the message, the largest header and, for a fragmented message,
+        // one fragment of the MTU (`Host::icmp_output`). Each packet goes
+        // out as a frame in `icmp_frame`.
+        let (icmp_packet, icmp_frame) = if icmp_output.messages == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                bytes(icmp_output.message_bytes + 40 + ip_capacity)?,
+                bytes((ip_capacity + config.link.offset()).max(60))?,
+            )
         };
         let mut receive_free = Vec::new();
         receive_free
@@ -1050,6 +1079,9 @@ impl<P: PacketIo> Network<P> {
             segmentation,
             aggregate,
             control,
+            icmp_packet,
+            icmp_frame,
+            icmp_charge,
             // Capture an oversized physical frame safely before the Host rejects it.
             rx: bytes(65575 + 14)?,
             completed: bytes(datagram_capacity)?,
@@ -1213,6 +1245,11 @@ impl<P: PacketIo> Network<P> {
     /// `discarded.assemblies`.
     pub fn reassembly_counters(&self) -> ReassemblyCounters {
         self.host.reassembly_counters()
+    }
+    /// The ICMP messages this Network originated, dropped or rate limited
+    /// (`NetworkConfig::icmp_output_messages`).
+    pub fn icmp_counters(&self) -> IcmpOutputCounters {
+        self.host.icmp_output_counters()
     }
     pub fn failure(&self) -> Option<&io::Error> {
         self.failure.as_ref()

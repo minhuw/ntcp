@@ -13,6 +13,7 @@ ntcp-host = { path = "../../stacks/ntcp-host", version = "0.0.1" }
 ntcp-io = { path = "../../io/ntcp-io", version = "0.0.1" }
 ntcp-ip = { path = "../../stacks/ntcp-ip", version = "0.0.1" }
 ntcp-ip6 = { path = "../../stacks/ntcp-ip6", version = "0.0.1" }
+ntcp-icmp = { path = "../../stacks/ntcp-icmp", version = "0.0.1" }
 ntcp-ethernet = { path = "../../stacks/ntcp-ethernet", version = "0.0.1" }
 ntcp-arp = { path = "../../stacks/ntcp-arp", version = "0.0.1" }
 hmac = { version = "0.12", default-features = false }

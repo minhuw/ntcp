@@ -73,8 +73,9 @@ pub struct NetworkConfig {
     /// Size it for the datagrams whose fragments can arrive interleaved. A
     /// fragment refused for room leaves the rest of its datagram holding a
     /// slot until the timeout, 30 seconds after an IPv4 datagram's first
-    /// fragment and 60 after an IPv6 one's; this Network sends no ICMP, so
-    /// no Time Exceeded follows.
+    /// fragment and 60 after an IPv6 one's; then, if the first fragment
+    /// arrived, a Time Exceeded (code 1) goes to its source, as Linux's
+    /// ip_expire sends it, when ICMP output is on (`icmp_output_messages`).
     /// `Network::reassembly_counters` reports every completion and discard.
     pub reassembly_datagrams: usize,
     /// On a backend that hands its received frames over by reference (DPDK
@@ -91,6 +92,30 @@ pub struct NetworkConfig {
     /// take the pool the device receives into: the NIC would then drop for
     /// want of buffers (`Counters::rx_nombuf`, `rx_missed`).
     pub rx_frame_budget: Option<usize>,
+    /// ICMP messages this Network originates waiting to be sent: Echo
+    /// Replies (RFC 1122 section 3.2.2.6, RFC 4443 section 4.2), Port
+    /// Unreachable for a UDP datagram (this Network has no UDP sockets, so
+    /// every one), Protocol Unreachable for a protocol other than TCP, UDP
+    /// and ICMP (IPv6: Parameter Problem code 1), reassembly Time Exceeded
+    /// and IPv6 header Parameter Problems, as Linux originates them. 64 in
+    /// `new`; 0 originates none, and the Network then answers no ping.
+    ///
+    /// Messages are queued as their packets are received and sent by the
+    /// same drive, after ARP's frames and before TCP's, within half the
+    /// transmit budget that is left, through the backend as TCP frames are:
+    /// one that finds no TX room waits for the next drive, one beyond the
+    /// queue is dropped (`icmp_counters`, `DropReason::IcmpOutputDropped`).
+    /// An Echo Request whose reply would exceed the largest datagram this
+    /// Network takes in (`reassembly_datagrams`) is not answered. The queue's
+    /// slots, about 160 bytes each, are allocated with the Network, and each
+    /// message's octets as it is queued, freed when it leaves; all of it is
+    /// charged to `tcp.max_buffer_bytes` (`buffer_budget` counts the slots).
+    pub icmp_output_messages: usize,
+    /// The rate limits on originated ICMP messages, Linux's (6.12) defaults
+    /// (`IcmpRateLimits`): Echo Replies are not limited; every error shares
+    /// a bucket of 50 refilled at 1000 a second, and each destination has
+    /// its own bucket of 6 refilled at one a second.
+    pub icmp_rate: crate::IcmpRateLimits,
 }
 impl NetworkConfig {
     /// The smallest `tcp.max_buffer_bytes` with which a Network with this
@@ -99,8 +124,9 @@ impl NetworkConfig {
     /// stateless replies, each holding the TCP packet of one IP packet of
     /// the MTU, and each connection's charge at open
     /// (`EndpointConfig::connection_charge`), its scratch segment, first
-    /// ledger entries and timestamp records. None if it overflows.
-    /// `buffer_budget(0, io)` is the reservations alone.
+    /// ledger entries and timestamp records, and the slots of its ICMP
+    /// output queue (`icmp_output_messages`). None if it overflows.
+    /// `buffer_budget(0, io)` is the reservations and those slots alone.
     ///
     /// It is a floor for the cap, not a cap to use: it leaves no room to
     /// write or receive. A connection is charged what it allocates, so its
@@ -138,7 +164,8 @@ impl NetworkConfig {
                 reservations,
                 self.reservation_packet_bytes(),
                 self.gso(io),
-            )?)
+            )?)?
+            .checked_add(self.icmp_output().queue_bytes())
     }
     /// The buffer memory thresholds Linux's tcp_init_mem (net/ipv4/tcp.c)
     /// gives a host whose free buffer memory is `memory_bytes`, as
@@ -222,6 +249,9 @@ impl NetworkConfig {
     ///   Linux's tcp_wmem[2] = 4 MiB with tcp_sndbuf_expand. The 64 KiB
     ///   start (Linux's tcp_wmem[1] is 16 KiB of memory, about 7 KiB of
     ///   payload before expansion) keeps a 64 KiB response in one write;
+    /// - ICMP Echo Replies, Port and Protocol Unreachables and reassembly
+    ///   errors, within Linux's ICMP rate limits (`icmp_output_messages`,
+    ///   `icmp_rate`);
     /// - the internet timer wheel (`tcp.timer_wheel`, `TimerWheel`): a
     ///   microsecond level 0 for pacing and near timers, Linux's 64 buckets
     ///   per level above it, so a timer runs late by under 12.7% of the
@@ -271,6 +301,21 @@ impl NetworkConfig {
             static_neighbors: Vec::new(),
             reassembly_datagrams: 64,
             rx_frame_budget: None,
+            icmp_output_messages: 64,
+            icmp_rate: crate::IcmpRateLimits::default(),
+        }
+    }
+    // The Host's ICMP output: `icmp_output_messages` messages, each as large
+    // as an Echo Reply to the largest datagram taken in (never below a
+    // maximal ICMPv6 error, which the Host requires), with Linux's default
+    // TTL and Hop Limit, 64 (IPDEFTTL, IPV6_DEFAULT_HOPLIMIT).
+    pub(crate) fn icmp_output(&self) -> ntcp_host::IcmpOutputLimits {
+        let header = if self.local_address.is_ipv4() { 20 } else { 40 };
+        ntcp_host::IcmpOutputLimits {
+            messages: self.icmp_output_messages,
+            message_bytes: (self.datagram_capacity().saturating_sub(header))
+                .clamp(ntcp_icmp::ICMPV6_ERROR_LIMIT, usize::from(u16::MAX)),
+            hop_limit: 64,
         }
     }
     // The frame budget F the Network holds received frames within

@@ -53,6 +53,12 @@ pub struct IcmpOutputLimits {
 }
 
 impl IcmpOutputLimits {
+    /// The storage the queue holds with no message in it, allocated with
+    /// the Host: what `Host::icmp_memory` reports when nothing is queued and
+    /// no rate-limited message was sent.
+    pub fn queue_bytes(&self) -> usize {
+        self.messages * (core::mem::size_of::<Option<Queued>>() + core::mem::size_of::<Vec<u8>>())
+    }
     fn validate(&self) -> Result<(), Error> {
         if self.messages != 0
             && (self.hop_limit == 0
@@ -186,9 +192,7 @@ impl IcmpOutput {
     }
     // Bytes of storage held: the fixed queue and the messages in it.
     pub fn memory(&self) -> usize {
-        self.entries.capacity() * core::mem::size_of::<Option<Queued>>()
-            + self.messages.capacity() * core::mem::size_of::<Vec<u8>>()
-            + self.held
+        self.limits.queue_bytes() + self.held
     }
     // Physical slot of the held message that has waited longest, when the
     // queue is full: the one a new message replaces.
