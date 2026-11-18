@@ -470,7 +470,8 @@ fn refused_chains_draw_parameter_problems_with_actual_pointers() {
 
 // RFC 4443 section 2.4(e.3)/(e.4): a link-layer multicast or broadcast
 // arrival draws only the code 2 error for an option whose action is 10;
-// every error shares the Host's token bucket (section 2.4(f)).
+// every error to one destination shares its token bucket (section 2.4(f),
+// Linux's icmpv6_xrlim_allow).
 #[test]
 fn link_layer_multicast_and_the_shared_limiter_suppress_errors() {
     let cfg = config(2);
@@ -492,14 +493,14 @@ fn link_layer_multicast_and_the_shared_limiter_suppress_errors() {
         (2, 42)
     );
 
-    // The default bucket holds ten tokens (one taken above), refilled at
-    // ten per second.
+    // The destination's bucket holds six (one taken above), as Linux's
+    // XRLIM_BURST_FACTOR, refilled at one per interval.
     let mut sent = 0;
     for _ in 0..12 {
         assert!(input(&mut a, 2, &unless).is_err());
         sent += drain(&mut a, 2).len();
     }
-    assert_eq!(sent, 9);
+    assert_eq!(sent, 5);
     let second = cfg.connection.timebase.units_per_second;
     assert!(input(&mut a, 2 + second / 10, &routed).is_err());
     assert_eq!(drain(&mut a, 2 + second / 10).len(), 1);
@@ -804,4 +805,40 @@ fn discarded(a: &mut Side, frame: &[u8]) {
         a.0.receive(a.2, 1, frame, false, &mut out),
         Ok(Received::Discarded)
     ));
+}
+
+// A UDP datagram no flow takes draws Port Unreachable (ICMPv6 type 1 code
+// 4, RFC 4443 section 3.1) quoting it, unless it arrived as a link-layer
+// multicast or broadcast (section 2.4(e.3)).
+#[test]
+fn udp_without_a_flow_draws_port_unreachable() {
+    let cfg = config(2);
+    let (local, remote) = addresses(true);
+    let mut a = side(local, 86, &cfg);
+    let to_us = ip(remote.ip(), local.ip());
+    let datagram = udp(to_us, (remote.port(), 9), &[5; 32]);
+    assert_eq!(
+        input(&mut a, 1, &datagram).unwrap(),
+        ntcp::InputDisposition::Dropped
+    );
+    let sent = drain(&mut a, 1);
+    assert_eq!(sent.len(), 1);
+    let (outer, message) = &sent[0];
+    assert_eq!(*outer, ip(local.ip(), remote.ip()));
+    assert_eq!((message[0], message[1]), (1, 4));
+    assert_eq!(&message[4..8], &[0; 4]);
+    assert_eq!(&message[8..], &datagram[..]);
+    assert_eq!(ntcp_icmp::icmpv6_checksum(*outer, message), Ok(0));
+    assert_eq!(a.0.icmp_output_counters().errors, 1);
+    let mut out = vec![0; 8192];
+    let Ok(Received::Datagram(received)) = a.0.receive(a.2, 2, &datagram, true, &mut out) else {
+        panic!("a whole datagram");
+    };
+    let processed = a.0.process(received, None).unwrap();
+    assert!(processed.link_multicast());
+    let disposition =
+        a.0.input_datagram(&mut a.1, 2, processed, RxPacketMetadata::default(), 0)
+            .unwrap();
+    assert_eq!(disposition, ntcp::InputDisposition::Dropped);
+    assert!(drain(&mut a, 2).is_empty());
 }

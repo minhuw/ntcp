@@ -2,7 +2,7 @@
 // engine-level inputs: targeted cases for every rule, then a seeded
 // reference model with asserted coverage counters.
 use super::*;
-use crate::icmp_error::{ErrorLimiter, ReassemblyError, originate};
+use crate::icmp_error::{RateLimiter, ReassemblyError, build, originate};
 use crate::reassembly::{Arrival, Discard, Input, Piece, Reassembly, ecn_result};
 use std::{collections::BTreeMap, vec};
 
@@ -1261,15 +1261,27 @@ fn scoped_addresses_join_the_arrival_link_to_the_key() {
 
 // ICMP errors: codes and pointers, family-specific suppression, the
 // limiter and quote sizes.
+fn rate_limiter(limits: IcmpRateLimits) -> RateLimiter {
+    RateLimiter::new(limits, SECOND, [7; 16])
+}
+// Limits that refuse nothing: no type is masked.
+fn unlimited() -> IcmpRateLimits {
+    IcmpRateLimits {
+        ipv4_mask: 0,
+        ipv6_mask: [0; 2],
+        ..IcmpRateLimits::default()
+    }
+}
 fn error_for(
-    limiter: &mut ErrorLimiter,
+    limiter: &mut RateLimiter,
     now: Instant,
     error: ReassemblyError,
     arrival: Arrival,
     invoking: &[u8],
 ) -> Option<Vec<u8>> {
-    let mut message = [0; 1500];
-    let sent = originate(limiter, now, error, arrival, invoking, &mut message)?;
+    let (kind, exception) = error.message();
+    let sent = originate(limiter, now, kind, exception, arrival, invoking, |_| 128)?;
+    let message = build(sent, invoking).unwrap();
     let source = if invoking[0] >> 4 == 6 {
         IpAddr::from(v6_source())
     } else {
@@ -1277,19 +1289,13 @@ fn error_for(
     };
     assert_eq!(sent.ip.destination, source);
     assert_eq!(sent.link, arrival.link);
-    Some(message[..sent.len].to_vec())
+    Some(message)
 }
 
 #[test]
 fn reassembly_errors_carry_family_codes_pointers_and_bounded_quotes() {
     let f = fixture();
-    let mut limiter = ErrorLimiter::new(
-        IcmpErrorLimits {
-            burst: 100,
-            per_second: 10,
-        },
-        SECOND,
-    );
+    let mut limiter = rate_limiter(unlimited());
     assert_eq!(
         ReassemblyError::for_discard(true, Discard::Misaligned, 40),
         Some(ReassemblyError::ParameterProblem {
@@ -1379,19 +1385,13 @@ fn reassembly_errors_carry_family_codes_pointers_and_bounded_quotes() {
 #[test]
 fn error_suppression_is_family_specific() {
     let f = fixture();
-    let mut limiter = ErrorLimiter::new(
-        IcmpErrorLimits {
-            burst: 100,
-            per_second: 10,
-        },
-        SECOND,
-    );
+    let mut limiter = rate_limiter(unlimited());
     let time = ReassemblyError::TimeExceeded;
     let problem = ReassemblyError::ParameterProblem {
         code: 0,
         pointer: 4,
     };
-    let send = |l: &mut ErrorLimiter, e, a, b: &[u8]| error_for(l, 0, e, a, b).is_some();
+    let send = |l: &mut RateLimiter, e, a, b: &[u8]| error_for(l, 0, e, a, b).is_some();
     // IPv4 (RFC 1122 section 3.2.2): no error about a non-initial fragment,
     // an ICMP error, a multicast/broadcast destination or link-layer
     // broadcast, or a source that is not one host; queries are errors' peers.
@@ -1499,55 +1499,132 @@ fn error_suppression_is_family_specific() {
     assert!(!send(&mut limiter, problem, f.arrival(false), &v4));
 }
 
+// Linux 6.12's limits (net/ipv4/icmp.c, net/ipv4/inetpeer.c): a
+// destination's bucket holds six messages and gains one a second; the
+// shared bucket of both families holds 50 and each passing message debits
+// it 0 to 2 tokens.
 #[test]
-fn one_limiter_bounds_every_error_in_bursts() {
+fn errors_are_limited_per_destination_and_together() {
     let f = fixture();
-    let mut limiter = ErrorLimiter::new(IcmpErrorLimits::default(), SECOND);
+    let mut limiter = rate_limiter(IcmpRateLimits::default());
     let v4 = frag(false, 1, 0, true, &[0; 8]).encode();
     let v6 = frag(true, 1, 0, true, &[0; 8]).encode();
     let time = ReassemblyError::TimeExceeded;
-    let mut sent = 0;
-    for i in 0..30 {
-        let (invoking, v6) = if i % 2 == 0 {
-            (&v4, false)
-        } else {
-            (&v6, true)
-        };
-        sent += usize::from(error_for(&mut limiter, 0, time, f.arrival(v6), invoking).is_some());
+    for (invoking, v6) in [(&v4, false), (&v6, true)] {
+        let sent = (0..20)
+            .filter(|_| error_for(&mut limiter, 0, time, f.arrival(v6), invoking).is_some())
+            .count();
+        // XRLIM_BURST_FACTOR, per destination.
+        assert_eq!(sent, 6);
     }
-    // RFC 4443 section 2.4(f)'s example bucket: a burst of 10 across both
-    // families, then 10 per second.
-    assert_eq!(sent, 10);
-    assert!(error_for(&mut limiter, SECOND / 10 - 1, time, f.arrival(false), &v4).is_none());
-    assert!(error_for(&mut limiter, SECOND / 10, time, f.arrival(false), &v4).is_some());
-    assert!(error_for(&mut limiter, SECOND / 10, time, f.arrival(false), &v4).is_none());
-    // A long quiet period refills only up to the burst.
-    let mut burst = 0;
-    for _ in 0..20 {
-        burst += usize::from(
-            error_for(&mut limiter, 100 * SECOND, time, f.arrival(true), &v6).is_some(),
-        );
+    assert_eq!((limiter.limited_host, limiter.limited_global), (28, 0));
+    // One more a second (icmp_ratelimit 1000 ms); IPv6 here behind a host
+    // route, whose interval is not shortened.
+    assert!(error_for(&mut limiter, SECOND - 1, time, f.arrival(false), &v4).is_none());
+    assert!(error_for(&mut limiter, SECOND, time, f.arrival(false), &v4).is_some());
+    assert!(error_for(&mut limiter, SECOND, time, f.arrival(false), &v4).is_none());
+    // A route of prefix p < 128 divides an IPv6 destination's interval by
+    // 2^((128 - p) / 32): 16 for a default route.
+    let routed = |l: &mut RateLimiter, now, prefix| {
+        let (kind, exception) = time.message();
+        originate(l, now, kind, exception, f.arrival(true), &v6, |_| prefix).is_some()
+    };
+    let mut fresh = rate_limiter(IcmpRateLimits::default());
+    assert_eq!((0..6).filter(|_| routed(&mut fresh, 0, 0)).count(), 6);
+    assert!(!routed(&mut fresh, SECOND / 16 - 1, 0));
+    assert!(routed(&mut fresh, SECOND / 16, 0));
+    assert!(!routed(&mut fresh, SECOND / 16, 64));
+    assert!(routed(&mut fresh, SECOND / 16 + SECOND / 4, 64));
+}
+
+#[test]
+fn the_shared_bucket_bounds_every_destination_with_random_debits() {
+    let f = fixture();
+    let mut limiter = rate_limiter(IcmpRateLimits::default());
+    let time = ReassemblyError::TimeExceeded;
+    // Distinct sources: each destination's bucket is full.
+    let from = |n: u32| {
+        let mut packet = frag(false, 1, 0, true, &[0; 8]).encode();
+        packet[12..16].copy_from_slice(&(0x0a00_0000 + n).to_be_bytes());
+        packet
+    };
+    let error_for = |l: &mut RateLimiter, now, _, arrival, packet: &[u8]| {
+        let (kind, exception) = time.message();
+        originate(l, now, kind, exception, arrival, packet, |_| 128).map(|_| ())
+    };
+    let burst = (0..200)
+        .filter(|&n| error_for(&mut limiter, 0, time, f.arrival(false), &from(n)).is_some())
+        .count();
+    // A credit of 50, each message taking 0, 1 or 2 tokens (one on average)
+    // while it is positive: never fewer than 25.
+    assert!((25..=120).contains(&burst), "{burst}");
+    assert_eq!(limiter.limited_global, 200 - burst as u64);
+    // The shared bucket refills only 20 ms after its last refill, then with
+    // per_second's share of the time since: 20 ms of 1000 a second.
+    assert!(
+        error_for(
+            &mut limiter,
+            SECOND / 50 - 1,
+            time,
+            f.arrival(false),
+            &from(500)
+        )
+        .is_none()
+    );
+    let refill = (600..700)
+        .filter(|&n| {
+            error_for(&mut limiter, SECOND / 50, time, f.arrival(false), &from(n)).is_some()
+        })
+        .count();
+    assert!((10..=60).contains(&refill), "{refill}");
+    // A quiet second refills only up to the burst.
+    let again = (700..900)
+        .filter(|&n| {
+            error_for(&mut limiter, 100 * SECOND, time, f.arrival(false), &from(n)).is_some()
+        })
+        .count();
+    assert!((25..=120).contains(&again), "{again}");
+    // No rate sends nothing limited.
+    let mut off = rate_limiter(IcmpRateLimits {
+        per_second: 0,
+        ..IcmpRateLimits::default()
+    });
+    assert!(error_for(&mut off, 10 * SECOND, time, f.arrival(false), &from(1)).is_none());
+}
+
+#[test]
+fn rate_masks_choose_the_limited_types() {
+    let limits = IcmpRateLimits::default();
+    let mut limiter = rate_limiter(IcmpRateLimits {
+        per_second: 0,
+        ..limits
+    });
+    let any = IpAddr::from(V4_SOURCE);
+    let mut allowed = |ipv6, kind| limiter.allow(0, ipv6, kind, any, || 128);
+    // Linux's defaults: 0x1818 for ICMPv4 (Destination Unreachable but
+    // Fragmentation Needed, Source Quench, Time Exceeded, Parameter
+    // Problem), every ICMPv6 error but Packet Too Big; Echo Replies never.
+    for kind in [(3, 3), (3, 2), (4, 0), (11, 1), (12, 0)] {
+        assert!(!allowed(false, kind), "{kind:?}");
     }
-    assert_eq!(burst, 10);
-    // Suppressed messages do not spend tokens; a zero burst sends nothing.
-    let mut quiet = ErrorLimiter::new(
-        IcmpErrorLimits {
-            burst: 1,
-            per_second: 1,
-        },
-        SECOND,
-    );
-    let later = frag(false, 1, 8, true, &[0; 8]).encode();
-    assert!(error_for(&mut quiet, 0, time, f.arrival(false), &later).is_none());
-    assert!(error_for(&mut quiet, 0, time, f.arrival(false), &v4).is_some());
-    let mut off = ErrorLimiter::new(
-        IcmpErrorLimits {
-            burst: 0,
-            per_second: 10,
-        },
-        SECOND,
-    );
-    assert!(error_for(&mut off, 10 * SECOND, time, f.arrival(false), &v4).is_none());
+    for kind in [(0, 0), (3, 4), (5, 0), (14, 0), (19, 0)] {
+        assert!(allowed(false, kind), "{kind:?}");
+    }
+    for kind in [(1, 4), (3, 1), (4, 1), (0, 0), (127, 0)] {
+        assert!(!allowed(true, kind), "{kind:?}");
+    }
+    for kind in [(2, 0), (129, 0), (128, 0)] {
+        assert!(allowed(true, kind), "{kind:?}");
+    }
+    // A mask that names Echo Replies limits them.
+    let mut echo = rate_limiter(IcmpRateLimits {
+        per_second: 0,
+        ipv4_mask: 1,
+        ipv6_mask: [0, 1 << 1],
+        ..limits
+    });
+    assert!(!echo.allow(0, false, (0, 0), any, || 128));
+    assert!(!echo.allow(0, true, (129, 0), any, || 128));
 }
 
 // Seeded reference model. Each round interleaves up to three datagrams per

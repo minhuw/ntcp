@@ -893,7 +893,10 @@ impl Host {
     // requires one), the addresses pass the same Incoming policy as TCP, and
     // a connected flow's exact binding takes precedence over an unconnected
     // one. No matching flow, a full queue or an oversized payload drops the
-    // datagram; this Host originates no ICMP Port Unreachable.
+    // datagram; no matching flow also draws a Port Unreachable, after the
+    // checksum, as Linux's __udp4_lib_rcv (net/ipv4/udp.c:2456-2461) and
+    // __udp6_lib_rcv (net/ipv6/udp.c:1029-1033) send it
+    // (`Host::queue_unreachable`).
     // A datagram with an IPv6 link-local address is scoped to its arrival
     // `link` and reaches only a flow of that zone.
     // Record a received UDP datagram's discard.
@@ -925,9 +928,11 @@ impl Host {
     pub(crate) fn input_udp(
         &mut self,
         endpoint: &Endpoint,
-        link: LinkId,
+        now: ntcp::Instant,
+        processed: crate::Processed<'_>,
         packet: &IngressPacket,
     ) -> InputDisposition {
+        let link = processed.context().link;
         let (source, destination) = (packet.ip.source, packet.ip.destination);
         let udp = match ntcp_ip_common::parse_udp(source, destination, packet.payload) {
             Ok(udp) => udp,
@@ -971,7 +976,9 @@ impl Host {
                 })
             })
         else {
-            return self.drop_udp(ntcp::DropReason::NoSocket, packet, ports);
+            let disposition = self.drop_udp(ntcp::DropReason::NoSocket, packet, ports);
+            self.queue_unreachable(now, processed, ntcp_icmp::ErrorMessage::PortUnreachable);
+            return disposition;
         };
         let (depth, stride) = (
             self.udp.limits.receive_datagrams,

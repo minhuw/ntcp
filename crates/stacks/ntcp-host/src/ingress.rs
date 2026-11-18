@@ -8,10 +8,10 @@
 //! policy, ICMP correlation and owner generations are all evaluated on the
 //! complete datagram.
 //!
-//! Messages the Host originates itself (Echo Replies and the reassembly
-//! errors of `icmp_error`) wait in one bounded queue, allocated once, that
-//! the embedding drains through `Host::icmp_output` under current path
-//! authority.
+//! Messages the Host originates itself (Echo Replies and the errors of
+//! `icmp_error`) wait in one bounded queue, its slots allocated once and
+//! each message's octets as it is queued, that the embedding drains through
+//! `Host::icmp_output` under current path authority.
 
 use alloc::vec::Vec;
 use core::net::IpAddr;
@@ -23,7 +23,7 @@ use ntcp_icmp::{EchoKind, ErrorMessage};
 use ntcp_path::{Dscp, LinkId, PathStatus, ScopedAddress, SourceId};
 
 use crate::emitter::{DatagramError, Plan, header_len};
-use crate::icmp_error::{ReassemblyError, originate};
+use crate::icmp_error::{RateLimiter, ReassemblyError, build, originate};
 use crate::ident::IdentifierBackpressure;
 use crate::reassembly::{Arrival, Input, Piece, admissible_source};
 use crate::{BackendOutcome, Error, Host, IcmpDispatch, IcmpOutcome, IngressContext, UdpEgress};
@@ -37,14 +37,16 @@ use crate::{BackendOutcome, Error, Host, IcmpDispatch, IcmpOutcome, IngressConte
 pub struct IcmpOutputLimits {
     /// Messages queued for the drain; later ones are dropped and counted,
     /// except that a message held for an identifier gives way to them
-    /// (`Host::icmp_output`).
+    /// (`Host::icmp_output`). The queue's slots are allocated with the
+    /// Host; each message's octets are allocated, at its length, as it is
+    /// queued and freed as it leaves (`Host::icmp_memory`).
     pub messages: usize,
-    /// Largest ICMP message (header and data) one queue slot holds. At
-    /// least an ICMPv6 error with RFC 4443 section 2.4(c)'s maximal quote,
-    /// so that no originated error is truncated by storage; an Echo Request
-    /// whose reply does not fit is not answered (never truncated, RFC 1122
-    /// section 3.2.2.6, RFC 4443 section 4.2). A message's IPv4 options
-    /// are stored beside its slot, not in it.
+    /// Largest ICMP message (header and data) the queue takes. At least an
+    /// ICMPv6 error with RFC 4443 section 2.4(c)'s maximal quote, so that
+    /// no originated error is truncated by storage; an Echo Request whose
+    /// reply is larger is not answered (never truncated, RFC 1122 section
+    /// 3.2.2.6, RFC 4443 section 4.2). A message's IPv4 options are stored
+    /// beside it, not in it.
     pub message_bytes: usize,
     /// TTL or Hop Limit of originated messages (RFC 1122 section 3.2.1.7).
     pub hop_limit: u8,
@@ -91,7 +93,7 @@ pub fn managed_icmp_output_limits(
 pub struct IcmpOutputCounters {
     /// Echo Replies queued for answered Echo Requests.
     pub echo_replies: u64,
-    /// Reassembly errors queued (after suppression and rate limiting).
+    /// Errors queued (after suppression and rate limiting).
     pub errors: u64,
     /// Messages not queued: the queue was full of messages no drain attempt
     /// had held for an identifier, or the message exceeded a slot.
@@ -108,6 +110,12 @@ pub struct IcmpOutputCounters {
     /// (waiting for an identifier on a DF-clear route, or for neighbor
     /// resolution) displaced by a new message arriving at a full queue.
     pub unsent: u64,
+    /// Messages the rate limits refused (`IcmpRateLimits`): the bucket
+    /// shared by every limited message, Linux's Icmp RateLimitGlobal (its
+    /// ICMP_MIB_RATELIMITGLOBAL), and a destination's own bucket,
+    /// RateLimitHost.
+    pub rate_limited_global: u64,
+    pub rate_limited_host: u64,
 }
 
 /// Disposition of an Echo Request addressed to this Host.
@@ -115,8 +123,9 @@ pub struct IcmpOutputCounters {
 pub enum EchoDisposition {
     /// Its Echo Reply waits in the Host ICMP output queue.
     Queued,
-    /// Not answered: the queue was full, the reply exceeds a queue slot or
-    /// output is disabled.
+    /// Not answered: the queue was full, the reply exceeds
+    /// `IcmpOutputLimits::message_bytes`, the rate limits refused it (only
+    /// when their mask names Echo Replies) or output is disabled.
     Dropped,
     /// Not answered because the reply would take the reversed return route
     /// of the request's IPv4 source route, which the endpoint's address
@@ -146,7 +155,12 @@ struct Queued {
 pub(crate) struct IcmpOutput {
     limits: IcmpOutputLimits,
     entries: Vec<Option<Queued>>,
-    bytes: Vec<u8>,
+    // Each queued message in storage of its own length, allocated as it is
+    // queued and freed as it leaves (Linux's skb per message): the queue
+    // holds the messages it has, not `messages` of the largest.
+    messages: Vec<Vec<u8>>,
+    // The bytes `messages` holds.
+    held: usize,
     head: usize,
     len: usize,
     arrivals: u64,
@@ -159,23 +173,22 @@ impl IcmpOutput {
     }
     pub fn new(limits: IcmpOutputLimits) -> Result<Self, Error> {
         limits.validate()?;
-        let stride = if limits.messages == 0 {
-            0
-        } else {
-            limits.message_bytes
-        };
         Ok(Self {
             limits,
             entries: crate::table(limits.messages, None)?,
-            bytes: crate::table(
-                limits.messages.checked_mul(stride).ok_or(Error::Capacity)?,
-                0u8,
-            )?,
+            messages: crate::table(limits.messages, Vec::new())?,
+            held: 0,
             head: 0,
             len: 0,
             arrivals: 0,
             counters: IcmpOutputCounters::default(),
         })
+    }
+    // Bytes of storage held: the fixed queue and the messages in it.
+    pub fn memory(&self) -> usize {
+        self.entries.capacity() * core::mem::size_of::<Option<Queued>>()
+            + self.messages.capacity() * core::mem::size_of::<Vec<u8>>()
+            + self.held
     }
     // Physical slot of the held message that has waited longest, when the
     // queue is full: the one a new message replaces.
@@ -191,31 +204,25 @@ impl IcmpOutput {
             .min_by_key(|(_, queued)| queued.arrival)
             .map(|(index, _)| index)
     }
-    // Storage for a new message: the next free slot or, when the queue is
-    // full, the slot of the message `push` will displace; None (counted)
-    // when the queue is full and no message is held. The caller writes the
-    // slot only for a message it then pushes.
-    fn free(&mut self) -> Option<&mut [u8]> {
-        let index = if self.len < self.limits.messages {
-            (self.head + self.len) % self.limits.messages
-        } else if let Some(index) = self.displaced() {
-            index
-        } else {
-            self.counters.dropped += 1;
-            return None;
-        };
-        let stride = self.limits.message_bytes;
-        Some(&mut self.bytes[index * stride..][..stride])
+    // Whether a new message can be queued: a free slot or, when the queue
+    // is full, a held message `push` will displace; false (counted) when
+    // the queue is full and no message is held.
+    fn room(&mut self) -> bool {
+        if self.len < self.limits.messages || self.displaced().is_some() {
+            return true;
+        }
+        self.counters.dropped += 1;
+        false
     }
-    // Queue the message written to the slot from `free`. In a full queue it
-    // replaces the displaced held message (counted unsent, and returned)
-    // and moves behind the others, which keep their relative order.
+    // Queue `message`. In a full queue it replaces the displaced held
+    // message (counted unsent, and returned) and moves behind the others,
+    // which keep their relative order.
     #[must_use]
     fn push(
         &mut self,
         ip: IpMetadata,
         link: LinkId,
-        len: usize,
+        message: Vec<u8>,
         options: Option<EncodedIpv4Options>,
         error: Option<ErrorMessage>,
     ) -> Option<IpMetadata> {
@@ -223,7 +230,7 @@ impl IcmpOutput {
         let queued = Queued {
             ip,
             link,
-            len,
+            len: message.len(),
             options,
             error,
             arrival: self.arrivals,
@@ -231,7 +238,9 @@ impl IcmpOutput {
         };
         self.arrivals = self.arrivals.saturating_add(1);
         if self.len < n {
-            self.entries[(self.head + self.len) % n] = Some(queued);
+            let index = (self.head + self.len) % n;
+            self.entries[index] = Some(queued);
+            self.store(index, message);
             self.len += 1;
             return None;
         }
@@ -239,6 +248,7 @@ impl IcmpOutput {
         self.counters.unsent += 1;
         let displaced = self.entries[index].as_ref().map(|q| q.ip);
         self.entries[index] = Some(queued);
+        self.store(index, message);
         let tail = (self.head + n - 1) % n;
         while index != tail {
             let next = (index + 1) % n;
@@ -247,12 +257,15 @@ impl IcmpOutput {
         }
         displaced
     }
-    // Exchange two slots, metadata and bytes.
+    // Put `message` in slot `index`, freeing what it held.
+    fn store(&mut self, index: usize, message: Vec<u8>) {
+        self.held += message.capacity();
+        let old = core::mem::replace(&mut self.messages[index], message);
+        self.held -= old.capacity();
+    }
+    // Exchange two slots.
     fn swap(&mut self, a: usize, b: usize) {
-        let stride = self.limits.message_bytes;
-        let (low, high) = (a.min(b), a.max(b));
-        let (first, second) = self.bytes.split_at_mut(high * stride);
-        first[low * stride..][..stride].swap_with_slice(&mut second[..stride]);
+        self.messages.swap(a, b);
         self.entries.swap(a, b);
     }
     // The oldest message waits for an identifier.
@@ -266,14 +279,14 @@ impl IcmpOutput {
             return None;
         }
         let queued = self.entries[self.head]?;
-        let stride = self.limits.message_bytes;
-        Some((queued, &self.bytes[self.head * stride..][..queued.len]))
+        Some((queued, &self.messages[self.head]))
     }
     fn queued(&self) -> impl Iterator<Item = Queued> + '_ {
         (0..self.len).filter_map(|i| self.entries[(self.head + i) % self.limits.messages])
     }
     fn pop(&mut self) {
         self.entries[self.head] = None;
+        self.store(self.head, Vec::new());
         self.head = (self.head + 1) % self.limits.messages;
         self.len -= 1;
     }
@@ -301,17 +314,14 @@ impl IcmpOutput {
         Some(ip)
     }
     // Move the oldest message behind the others, keeping the relative order
-    // of the rest; storage stays within the fixed slots.
+    // of the rest.
     fn rotate(&mut self) {
         if self.len < 2 {
             return;
         }
         let tail = (self.head + self.len) % self.limits.messages;
         if tail != self.head {
-            let stride = self.limits.message_bytes;
-            self.bytes
-                .copy_within(self.head * stride..(self.head + 1) * stride, tail * stride);
-            self.entries[tail] = self.entries[self.head].take();
+            self.swap(self.head, tail);
         }
         self.head = (self.head + 1) % self.limits.messages;
     }
@@ -336,6 +346,11 @@ pub struct Envelope {
     // Destination processing then leaves the checksum alone, as Linux
     // verifies it once, in ip_rcv_core.
     received: bool,
+    // The link layer addressed the arriving frame (for a reassembled
+    // datagram, its last fragment's) to a multicast or broadcast
+    // destination: no ICMP error answers it (RFC 1122 section 3.2.2,
+    // RFC 4443 section 2.4(e.3)).
+    link_multicast: bool,
 }
 
 impl Envelope {
@@ -347,6 +362,7 @@ impl Envelope {
             reassembled: false,
             fragment_header: false,
             received,
+            link_multicast: false,
         }
     }
     pub const fn context(self) -> IngressContext {
@@ -443,6 +459,11 @@ impl<'a> Processed<'a> {
     /// datagram, or an atomic fragment processed whole.
     pub const fn contained_fragment_header(&self) -> bool {
         self.envelope.envelope.fragment_header
+    }
+    /// The link layer addressed it to a multicast or broadcast destination
+    /// (`Host::receive`'s `link_multicast`).
+    pub const fn link_multicast(&self) -> bool {
+        self.envelope.envelope.link_multicast
     }
     /// The processed header with the datagram's payload.
     pub fn packet(&self) -> crate::IngressPacket<'a> {
@@ -570,7 +591,10 @@ impl Host {
             return Ok(received);
         }
         let whole = Datagram {
-            envelope: Envelope::physical(context, frame.len(), true),
+            envelope: Envelope {
+                link_multicast,
+                ..Envelope::physical(context, frame.len(), true)
+            },
             bytes: frame,
         };
         let piece = match frame.first().ok_or(ntcp_ip::Error::Truncated)? >> 4 {
@@ -619,6 +643,7 @@ impl Host {
             errors,
             icmp_output,
             drops,
+            paths,
             ..
         } = self;
         match reassembly.input(now, arrival, piece) {
@@ -639,6 +664,7 @@ impl Host {
                         reassembled: false,
                         fragment_header: true,
                         received: true,
+                        link_multicast,
                     },
                     bytes: out,
                 }))
@@ -663,6 +689,7 @@ impl Host {
                         reassembled: true,
                         fragment_header: true,
                         received: true,
+                        link_multicast: done.arrival.link_multicast,
                     },
                     bytes: out,
                 }))
@@ -672,7 +699,16 @@ impl Host {
                 // fragment; overlap and every IPv4 discard are silent.
                 let fragment = ntcp_ip6::IPV6_HEADER;
                 if let Some(error) = ReassemblyError::for_discard(ipv6, discard, fragment) {
-                    queue_error(errors, icmp_output, drops, now, error, arrival, frame);
+                    queue_error(
+                        errors,
+                        icmp_output,
+                        drops,
+                        paths,
+                        now,
+                        error,
+                        arrival,
+                        frame,
+                    );
                 }
                 self.drop_fragment(now, discard, frame);
                 Ok(Received::Discarded)
@@ -815,7 +851,10 @@ impl Host {
         let chain = self.receive_chain(now, arrival, frame, true)?;
         let Some(piece) = Piece::ipv6(frame, &chain) else {
             return Ok(Received::Datagram(Datagram {
-                envelope: Envelope::physical(context, frame.len(), true),
+                envelope: Envelope {
+                    link_multicast,
+                    ..Envelope::physical(context, frame.len(), true)
+                },
                 bytes: frame,
             }));
         };
@@ -825,6 +864,7 @@ impl Host {
             errors,
             icmp_output,
             drops,
+            paths,
             ..
         } = self;
         let (len, arrival, reassembled) = match reassembly.input(now, arrival, piece) {
@@ -856,7 +896,16 @@ impl Host {
             }
             Input::Discarded(discard) => {
                 if let Some(error) = ReassemblyError::for_discard(true, discard, fragment) {
-                    queue_error(errors, icmp_output, drops, now, error, arrival, frame);
+                    queue_error(
+                        errors,
+                        icmp_output,
+                        drops,
+                        paths,
+                        now,
+                        error,
+                        arrival,
+                        frame,
+                    );
                 }
                 self.drop_fragment(now, discard, frame);
                 return Ok(Received::Discarded);
@@ -872,6 +921,7 @@ impl Host {
                 reassembled,
                 fragment_header: true,
                 received: true,
+                link_multicast: arrival.link_multicast,
             },
             bytes: out,
         }))
@@ -908,6 +958,7 @@ impl Host {
                 &mut self.errors,
                 &mut self.icmp_output,
                 &mut self.drops,
+                &self.paths,
                 now,
                 error,
                 arrival,
@@ -969,6 +1020,7 @@ impl Host {
                     errors,
                     icmp_output,
                     drops,
+                    paths,
                     now,
                     ReassemblyError::TimeExceeded,
                     expired.arrival,
@@ -1201,7 +1253,7 @@ impl Host {
         self.input_transport(
             endpoint,
             now,
-            processed.context(),
+            processed,
             &packet,
             metadata,
             outgoing_dscp,
@@ -1278,9 +1330,12 @@ impl Host {
             )));
         }
         if packet.payload.first() == Some(&request) {
-            return Ok(IcmpDispatch::Completed(IcmpOutcome::Echo(
-                self.echo(endpoint, processed.context(), &packet)?,
-            )));
+            return Ok(IcmpDispatch::Completed(IcmpOutcome::Echo(self.echo(
+                endpoint,
+                now,
+                processed.context(),
+                &packet,
+            )?)));
         }
         if packet.payload.first() == Some(&reply) {
             // Echo Replies answer only the Host's adjunct probes.
@@ -1322,6 +1377,7 @@ impl Host {
     fn echo(
         &mut self,
         endpoint: &ntcp::Endpoint,
+        now: Instant,
         context: IngressContext,
         packet: &crate::IngressPacket,
     ) -> Result<EchoDisposition, Error> {
@@ -1380,26 +1436,45 @@ impl Host {
             output.counters.dropped += 1;
             return Ok(EchoDisposition::Dropped);
         }
-        let Some(slot) = output.free() else {
+        if !output.room() {
             return Ok(EchoDisposition::Dropped);
-        };
+        }
         let reply = IpMetadata {
             source: packet.ip.destination,
             destination: packet.ip.source,
         };
-        // Encoding cannot fail once the slot is written: the request decoded
-        // under the same address pair and `len` is within a slot.
-        slot[8..len].copy_from_slice(request.data);
+        // Echo Replies are limited only when the mask names their type,
+        // which Linux's does not by default (icmp_reply, icmp.c:421-456;
+        // icmpv6_echo_reply, net/ipv6/icmp.c:790-793).
+        let ipv6 = reply.source.is_ipv6();
+        let kind = (EchoKind::Reply.message_type(ipv6), 0);
+        let paths = &self.paths;
+        if !self.errors.allow(now, ipv6, kind, reply.destination, || {
+            route_prefix(paths, reply, context.link)
+        }) {
+            return Ok(EchoDisposition::Dropped);
+        }
+        let output = &mut self.icmp_output;
+        let mut message = Vec::new();
+        if message.try_reserve_exact(len).is_err() {
+            output.counters.dropped += 1;
+            return Ok(EchoDisposition::Dropped);
+        }
+        message.resize(8, 0);
+        message.extend_from_slice(request.data);
+        // Encoding cannot fail: the request decoded under the same address
+        // pair, and the message is its length.
         let len = ntcp_icmp::encode_echo(
             reply,
             EchoKind::Reply,
             request.identifier,
             request.sequence,
-            slot,
+            &mut message,
             len - 8,
         )?;
+        message.truncate(len);
         output.counters.echo_replies += 1;
-        if let Some(displaced) = output.push(reply, context.link, len, options, None) {
+        if let Some(displaced) = output.push(reply, context.link, message, options, None) {
             drop_icmp_output(
                 &mut self.drops,
                 self.now,
@@ -1473,7 +1548,18 @@ impl Host {
     }
 
     pub fn icmp_output_counters(&self) -> IcmpOutputCounters {
-        self.icmp_output.counters
+        IcmpOutputCounters {
+            rate_limited_global: self.errors.limited_global,
+            rate_limited_host: self.errors.limited_host,
+            ..self.icmp_output.counters
+        }
+    }
+    /// Bytes of storage the Host's ICMP origination holds now: its output
+    /// queue, the messages in it and the rate limits' destination entries
+    /// (`IcmpRateLimits::destinations`). It changes only as messages are
+    /// queued or leave, and as the entries are first allocated.
+    pub fn icmp_memory(&self) -> usize {
+        self.icmp_output.memory() + self.errors.memory()
     }
     /// Messages waiting for `icmp_output`.
     pub fn icmp_output_pending(&self) -> usize {
@@ -1821,6 +1907,48 @@ impl Host {
         })
     }
 
+    // RFC 1122 section 3.2.2.1:
+    //   A host SHOULD generate Destination Unreachable messages with code:
+    //   2 (Protocol Unreachable), when the designated transport protocol
+    //   is not supported; or 3 (Port Unreachable), when the designated
+    //   transport protocol (e.g., UDP) is unable to demultiplex the
+    //   datagram but has no protocol mechanism to inform the sender.
+    // Queue error `kind` about `processed`, a datagram for this Host that no
+    // transport protocol or port took, under the rules every originated
+    // error obeys (`originate`): never about a link-layer multicast or
+    // broadcast, an ICMP error, a non-initial fragment or a source that is
+    // not one host, and within the rate limits. It quotes the datagram as
+    // received or reassembled.
+    pub(crate) fn queue_unreachable(
+        &mut self,
+        now: Instant,
+        processed: Processed<'_>,
+        kind: ErrorMessage,
+    ) {
+        let link = processed.context().link;
+        let Ok(local) = self.source(processed.packet().ip.destination, Some(link)) else {
+            return;
+        };
+        let error = crate::ingress::Originated {
+            kind,
+            multicast_exception: false,
+            arrival: Arrival {
+                link,
+                local,
+                link_multicast: processed.link_multicast(),
+            },
+        };
+        queue_originated(
+            &mut self.errors,
+            &mut self.icmp_output,
+            &mut self.drops,
+            &self.paths,
+            now,
+            error,
+            processed.bytes(),
+        );
+    }
+
     // Queue one ICMP message with its IPv4 options as the Host's own
     // originators do; false when it is dropped (counted).
     #[cfg(test)]
@@ -1837,12 +1965,11 @@ impl Host {
             drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, ip);
             return false;
         }
-        let Some(slot) = output.free() else {
+        if !output.room() {
             drop_icmp_output(&mut self.drops, self.now, DropReason::IcmpOutputDropped, ip);
             return false;
-        };
-        slot[..message.len()].copy_from_slice(message);
-        if let Some(displaced) = output.push(ip, link, message.len(), options, None) {
+        }
+        if let Some(displaced) = output.push(ip, link, message.to_vec(), options, None) {
             drop_icmp_output(
                 &mut self.drops,
                 self.now,
@@ -1856,32 +1983,106 @@ impl Host {
 
 // Queue one originated error (`originate`) when the Host ICMP output is
 // enabled and has room.
+#[allow(clippy::too_many_arguments)]
 fn queue_error(
-    errors: &mut crate::icmp_error::ErrorLimiter,
+    errors: &mut RateLimiter,
     icmp_output: &mut IcmpOutput,
     drops: &mut ntcp::DropRecorder,
+    paths: &ntcp_path::PathService,
     now: Instant,
     error: ReassemblyError,
     arrival: Arrival,
     invoking: &[u8],
 ) {
+    let (kind, multicast_exception) = error.message();
+    let error = Originated {
+        kind,
+        multicast_exception,
+        arrival,
+    };
+    queue_originated(errors, icmp_output, drops, paths, now, error, invoking);
+}
+
+// An error to originate and what it is about.
+#[derive(Clone, Copy)]
+pub(crate) struct Originated {
+    pub kind: ErrorMessage,
+    pub multicast_exception: bool,
+    pub arrival: Arrival,
+}
+
+pub(crate) fn queue_originated(
+    errors: &mut RateLimiter,
+    icmp_output: &mut IcmpOutput,
+    drops: &mut ntcp::DropRecorder,
+    paths: &ntcp_path::PathService,
+    now: Instant,
+    error: Originated,
+    invoking: &[u8],
+) {
     if icmp_output.limits.messages == 0 {
         return;
     }
-    let Some(slot) = icmp_output.free() else {
+    if !icmp_output.room() {
         drops.record(DropReason::IcmpOutputDropped, now, 0, || {
             ntcp::DropSubject::of_ip_packet(invoking)
         });
         return;
-    };
-    if let Some(sent) = originate(errors, now, error, arrival, invoking, slot) {
-        icmp_output.counters.errors += 1;
-        if let Some(displaced) =
-            icmp_output.push(sent.ip, sent.link, sent.len, None, Some(sent.kind))
-        {
-            drop_icmp_output(drops, now, DropReason::IcmpOutputDropped, displaced);
-        }
     }
+    let Originated {
+        kind,
+        multicast_exception,
+        arrival,
+    } = error;
+    let Some(sent) = originate(
+        errors,
+        now,
+        kind,
+        multicast_exception,
+        arrival,
+        invoking,
+        |reply| route_prefix(paths, reply, arrival.link),
+    ) else {
+        return;
+    };
+    let Some(message) = build(sent, invoking) else {
+        icmp_output.counters.dropped += 1;
+        drop_icmp_output(drops, now, DropReason::IcmpOutputDropped, sent.ip);
+        return;
+    };
+    icmp_output.counters.errors += 1;
+    if let Some(displaced) = icmp_output.push(sent.ip, sent.link, message, None, Some(sent.kind)) {
+        drop_icmp_output(drops, now, DropReason::IcmpOutputDropped, displaced);
+    }
+}
+
+// The prefix length of the route a message from `ip.source` to
+// `ip.destination` about a packet that arrived on `link` takes, which
+// shortens an IPv6 destination's rate-limit interval
+// (`RateLimiter::allow`): 128, no shortening, when none is selected.
+pub(crate) fn route_prefix(paths: &ntcp_path::PathService, ip: IpMetadata, link: LinkId) -> u8 {
+    let link_local = matches!(ip.source, IpAddr::V6(v) if v.is_unicast_link_local());
+    let zone = link_local.then_some(link);
+    let Some(source) = paths
+        .sources()
+        .find(|(_, a)| a.address() == ip.source && a.zone() == zone)
+        .map(|(id, _)| id)
+    else {
+        return 128;
+    };
+    let (Ok(destination), Ok(dscp)) = (crate::scoped(ip.destination, Some(link)), Dscp::new(0))
+    else {
+        return 128;
+    };
+    let request = ntcp_path::PathRequest {
+        source,
+        destination,
+        dscp,
+    };
+    paths
+        .resolve(request)
+        .and_then(|resolved| paths.route(resolved.key().route()))
+        .map_or(128, |route| route.destination.length())
 }
 
 // Record ICMP output to `ip` this Host discarded.

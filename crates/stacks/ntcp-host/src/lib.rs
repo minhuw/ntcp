@@ -61,8 +61,8 @@ pub use ledger::{
 #[cfg(not(any(test, feature = "test-support")))]
 use ledger::{Evidence, FragmentPrefix, QuoteKey, QuotedSelector, Selector};
 mod icmp_error;
-use icmp_error::ErrorLimiter;
-pub use icmp_error::IcmpErrorLimits;
+pub use icmp_error::IcmpRateLimits;
+use icmp_error::RateLimiter;
 mod ingress;
 use ingress::IcmpOutput;
 pub use ingress::{
@@ -326,8 +326,9 @@ pub struct Limits {
     pub udp: UdpLimits,
     /// Fragment reassembly; disabled by default.
     pub reassembly: ReassemblyLimits,
-    /// The rate limit shared by every ICMP error this Host originates.
-    pub icmp_errors: IcmpErrorLimits,
+    /// The rate limits on the ICMP messages this Host originates, Linux's
+    /// by default.
+    pub icmp_rate: IcmpRateLimits,
     /// Queue for ICMP messages this Host originates; disabled by default.
     pub icmp_output: IcmpOutputLimits,
     /// Source fragmentation and identifier allocation; nothing is
@@ -426,7 +427,7 @@ pub fn managed_limits(
             ledger,
             udp: UdpLimits::default(),
             reassembly: ReassemblyLimits::default(),
-            icmp_errors: IcmpErrorLimits::default(),
+            icmp_rate: IcmpRateLimits::default(),
             icmp_output: IcmpOutputLimits::default(),
             datagrams: DatagramLimits::default(),
             neighbors: NeighborLimits::default(),
@@ -861,7 +862,7 @@ pub struct Host {
     ledger: Ledger,
     udp: Udp,
     reassembly: Reassembly,
-    errors: ErrorLimiter,
+    errors: RateLimiter,
     icmp_output: IcmpOutput,
     // Destination of datagrams that `input_ip` reassembles: one datagram of
     // the reassembly capacity, empty while reassembly is disabled.
@@ -933,7 +934,8 @@ fn table<T: Clone>(count: usize, value: T) -> Result<Vec<T>, Error> {
 impl Host {
     /// The caller must supply a confidential, unpredictable `lookup_key`
     /// from an initialized CSPRNG: it keys the path cache's hash
-    /// (`PathService::new`).
+    /// (`PathService::new`) and the ICMP rate limits' destination hash and
+    /// random debits (`IcmpRateLimits`).
     pub fn new(
         context: ContextId,
         path_limits: path::Limits,
@@ -980,7 +982,7 @@ impl Host {
             ledger: Ledger::new(limits.ledger)?,
             udp: Udp::new(limits.udp)?,
             reassembly: Reassembly::new(limits.reassembly, timebase.units_per_second)?,
-            errors: ErrorLimiter::new(limits.icmp_errors, timebase.units_per_second),
+            errors: RateLimiter::new(limits.icmp_rate, timebase.units_per_second, lookup_key),
             icmp_output: IcmpOutput::new(limits.icmp_output)?,
             completed: table(
                 [false, true]
@@ -2288,18 +2290,19 @@ impl Host {
         &mut self,
         endpoint: &mut Endpoint,
         now: Instant,
-        context: IngressContext,
+        processed: Processed<'_>,
         packet: &IngressPacket,
         metadata: RxPacketMetadata,
         outgoing_dscp: u8,
         frame: &mut Option<ntcp::RxFrame>,
     ) -> Result<ntcp::InputDisposition, Error> {
+        let context = processed.context();
         self.owned_on_link(context, packet.ip.destination)?;
         if metadata.tcp_segment_size.is_some() && !self.port(context.link)?.receive.gro {
             return Err(Error::Unsupported);
         }
         if packet.protocol == ntcp_ip::PROTOCOL_UDP && metadata.tcp_segment_size.is_none() {
-            return Ok(self.input_udp(endpoint, context.link, packet));
+            return Ok(self.input_udp(endpoint, now, processed, packet));
         }
         if packet.protocol == 6 {
             // Bindings cover every Endpoint slot plus one provisional factory,
@@ -2353,6 +2356,25 @@ impl Host {
                     protocol,
                 },
             );
+            // Linux's ip_protocol_deliver_rcu (net/ipv4/ip_input.c:212-217)
+            // answers with Protocol Unreachable, and ip6_protocol_deliver_rcu
+            // (net/ipv6/ip6_input.c:453-459) with Parameter Problem code 1
+            // at the Next Header that names the protocol: here the base
+            // header's, as no other reaches this point (receive processing
+            // refuses an unrecognized one after extension headers).
+            let invoking = processed.bytes();
+            let kind = match ip.destination {
+                IpAddr::V4(_) => Some(ntcp_icmp::ErrorMessage::ProtocolUnreachable),
+                IpAddr::V6(_) => (invoking.get(6) == Some(&protocol)).then_some(
+                    ntcp_icmp::ErrorMessage::Ipv6ParameterProblem {
+                        code: 1,
+                        pointer: 6,
+                    },
+                ),
+            };
+            if let Some(kind) = kind {
+                self.queue_unreachable(now, processed, kind);
+            }
             Err(Error::Unsupported)
         }
     }
