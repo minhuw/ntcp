@@ -558,3 +558,47 @@ fn ipv6_parameter_problem_codes_and_pointers() {
         Error::Version
     );
 }
+
+#[test]
+fn unreachable_errors_carry_family_types_and_codes() {
+    for v6 in [false, true] {
+        let packets = udp_fragments(v6, 3000, Default::default());
+        let reporter = IpMetadata {
+            source: ip(v6).destination,
+            destination: ip(v6).source,
+        };
+        let mut message = vec![0; 1240];
+        let n = encode_error(
+            reporter,
+            ErrorMessage::PortUnreachable,
+            &packets[0],
+            outer(reporter),
+            &mut message,
+        )
+        .unwrap();
+        // ICMPv4 Destination Unreachable code 3; ICMPv6 type 1 code 4.
+        assert_eq!(&message[..2], if v6 { &[1, 4] } else { &[3, 3] });
+        assert_eq!(&message[4..8], &[0; 4]);
+        assert_eq!(&message[8..n], &packets[0][..n - 8]);
+        let feedback = decode_icmp_quote(&wrap(reporter, &message[..n])).unwrap();
+        assert_eq!(feedback.kind, FeedbackKind::DestinationUnreachable);
+        assert_eq!(
+            ErrorMessage::PortUnreachable.header(v6),
+            Some(if v6 { (1, 4, 0) } else { (3, 3, 0) })
+        );
+        // Protocol Unreachable is IPv4's; IPv6 uses Parameter Problem code 1.
+        let protocol = encode_error(
+            reporter,
+            ErrorMessage::ProtocolUnreachable,
+            &packets[0],
+            outer(reporter),
+            &mut message,
+        );
+        if v6 {
+            assert_eq!(protocol.unwrap_err(), Error::Version);
+        } else {
+            protocol.unwrap();
+            assert_eq!(&message[..2], &[3, 2]);
+        }
+    }
+}

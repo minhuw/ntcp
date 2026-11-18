@@ -503,7 +503,8 @@ pub enum EchoKind {
 }
 
 impl EchoKind {
-    fn message_type(self, ipv6: bool) -> u8 {
+    /// The ICMP type of this message in the family `ipv6` names.
+    pub fn message_type(self, ipv6: bool) -> u8 {
         match (self, ipv6) {
             (Self::Request, false) => 8,
             (Self::Reply, false) => 0,
@@ -577,7 +578,9 @@ pub fn encode_echo(
     Ok(len)
 }
 
-/// ICMP errors a host originates about fragments it could not reassemble.
+/// ICMP errors a host originates about datagrams it received: ones it
+/// could not reassemble or whose headers it refused, and ones no transport
+/// protocol or port of it takes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorMessage {
     /// Fragment reassembly time exceeded: ICMPv4 type 11 code 1 (RFC 792,
@@ -588,6 +591,32 @@ pub enum ErrorMessage {
     /// incomplete header chain in a first fragment. `pointer` is the octet
     /// offset of the problem within the invoking packet.
     Ipv6ParameterProblem { code: u8, pointer: u32 },
+    /// Port Unreachable: ICMPv4 Destination Unreachable code 3 (RFC 792,
+    /// RFC 1122 section 3.2.2.1) or ICMPv6 Destination Unreachable code 4
+    /// (RFC 4443 section 3.1), for a datagram no socket takes.
+    PortUnreachable,
+    /// Protocol Unreachable: ICMPv4 Destination Unreachable code 2 (RFC 792,
+    /// RFC 1122 section 3.2.2.1). IPv6 reports an unrecognized Next Header
+    /// as Parameter Problem code 1 instead (RFC 8200 section 4), so this is
+    /// IPv4 only.
+    ProtocolUnreachable,
+}
+
+impl ErrorMessage {
+    /// The message's ICMP type, code and the 32 bits that follow its
+    /// checksum, in the family `ipv6` names; None for a message the family
+    /// does not define.
+    pub fn header(self, ipv6: bool) -> Option<(u8, u8, u32)> {
+        Some(match (self, ipv6) {
+            (Self::ReassemblyTimeExceeded, false) => (11, 1, 0),
+            (Self::ReassemblyTimeExceeded, true) => (3, 1, 0),
+            (Self::Ipv6ParameterProblem { code, pointer }, true) if code <= 3 => (4, code, pointer),
+            (Self::PortUnreachable, false) => (3, 3, 0),
+            (Self::PortUnreachable, true) => (1, 4, 0),
+            (Self::ProtocolUnreachable, false) => (3, 2, 0),
+            _ => return None,
+        })
+    }
 }
 
 /// An ICMPv6 error carries as much of the invoking packet as fits without
@@ -621,16 +650,10 @@ pub fn encode_error(
 ) -> Result<usize, Error> {
     message_checksum(ip, &[])?;
     let ipv6 = ip.source.is_ipv6();
-    let (kind, code, word) = match error {
-        ErrorMessage::ReassemblyTimeExceeded => (if ipv6 { 3 } else { 11 }, 1, 0),
-        ErrorMessage::Ipv6ParameterProblem { code, pointer } if ipv6 => {
-            if code > 3 {
-                return Err(Error::Invalid);
-            }
-            (4, code, pointer)
-        }
-        ErrorMessage::Ipv6ParameterProblem { .. } => return Err(Error::Version),
-    };
+    let (kind, code, word) = error.header(ipv6).ok_or(match error {
+        ErrorMessage::Ipv6ParameterProblem { .. } if ipv6 => Error::Invalid,
+        _ => Error::Version,
+    })?;
     let (packet, minimum_header) = if ipv6 {
         (IPV6_ERROR_PACKET, 40)
     } else {
