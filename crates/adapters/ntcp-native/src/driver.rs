@@ -949,6 +949,12 @@ impl<P: PacketIo> Network<P> {
         timers: bool,
         report: &mut DriveReport,
     ) -> Result<(usize, bool)> {
+        // Nothing due on the table: no frame to try, only the member's time
+        // to move and its wake to read, which its probe does without the
+        // Host.
+        if let Some(woken) = self.member_probe.as_ref().and_then(|p| p.idle(now)) {
+            return Ok((0, woken));
+        }
         let Self {
             host,
             io,

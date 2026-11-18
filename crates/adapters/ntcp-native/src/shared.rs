@@ -224,8 +224,7 @@ impl SharedNeighbors {
             index,
             link: None,
             generation: table.cache.mapping_epoch(),
-            woken: false,
-            latest: 0,
+            local: Arc::new(Local::default()),
             front: cache,
             reported,
         })
@@ -337,13 +336,44 @@ pub(crate) struct Member {
     // The mapping epoch loaded at the start of the drive, or read later
     // under the lock.
     generation: u64,
-    // A held resolution of this member ended, or it has lost neighbors to
-    // report: settled once by the drive.
-    woken: bool,
-    latest: Instant,
+    // Its wake to settle and its latest time, which its Network's probe
+    // reads too.
+    local: Arc<Local>,
     front: Vec<Front>,
     // Lost neighbors taken from the table, reported without the lock.
     reported: Vec<Ipv4Addr>,
+}
+
+// A member's own state, which its Network reaches without the Host through
+// the member's probe: one thread uses it at a time, the Network's. Aligned
+// apart from the other members', which their own threads write.
+#[derive(Default)]
+#[repr(align(128))]
+struct Local {
+    // A held resolution of this member ended, or it has lost neighbors to
+    // report: settled once by the drive.
+    woken: AtomicBool,
+    // The latest caller time the member saw.
+    latest: AtomicU64,
+}
+
+impl Local {
+    fn woken(&self) -> bool {
+        self.woken.load(Ordering::Relaxed)
+    }
+    fn set_woken(&self, woken: bool) {
+        self.woken.store(woken, Ordering::Relaxed);
+    }
+    fn latest(&self) -> Instant {
+        self.latest.load(Ordering::Relaxed)
+    }
+    // The member's time, moved to `now` when that is later.
+    #[inline]
+    fn advance(&self, now: Instant) -> Instant {
+        let latest = self.latest().max(now);
+        self.latest.store(latest, Ordering::Relaxed);
+        latest
+    }
 }
 
 // A Network's look at its member's wake and at the table's mapping epoch,
@@ -354,6 +384,7 @@ pub(crate) struct Member {
 // change nothing.
 pub(crate) struct Probe {
     shared: Arc<Shared>,
+    local: Arc<Local>,
     index: usize,
     epoch: u64,
 }
@@ -373,6 +404,15 @@ impl Probe {
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
     }
+    // What `Member::housekeep` at `now`, then `Member::woken`, give when
+    // the table has nothing due by the member's time: the same loads and
+    // the same move of its time, then its wake to settle. None when the
+    // table has work due, for the member itself.
+    #[inline]
+    pub(crate) fn idle(&self, now: Instant) -> Option<bool> {
+        let latest = self.local.advance(now);
+        (self.shared.deadline.load(Ordering::Acquire) > latest).then(|| self.local.woken())
+    }
 }
 
 // The member a Network's Host resolves through, when it has one.
@@ -388,11 +428,11 @@ impl Member {
         self.generation = self.shared.generation.load(Ordering::Acquire);
         let wake = &self.shared.wakes[self.index];
         if wake.load(Ordering::Relaxed) && wake.swap(false, Ordering::Acquire) {
-            self.woken = true;
+            self.local.set_woken(true);
         }
     }
     pub(crate) fn woken(&self) -> bool {
-        self.woken
+        self.local.woken()
     }
     // The mapping epoch the member resolves in.
     pub(crate) fn epoch(&self) -> u64 {
@@ -401,12 +441,13 @@ impl Member {
     pub(crate) fn probe(&self) -> Probe {
         Probe {
             shared: self.shared.clone(),
+            local: self.local.clone(),
             index: self.index,
             epoch: self.generation,
         }
     }
     pub(crate) fn settled(&mut self) {
-        self.woken = false;
+        self.local.set_woken(false);
     }
     pub(crate) fn set_wake(&mut self, file: Arc<File>) {
         let mut table = self.shared.lock();
@@ -425,8 +466,8 @@ impl Member {
         timers: bool,
         mut send: impl FnMut(&ntcp_arp::Control<()>) -> ntcp_arp::ControlOutcome,
     ) -> Option<usize> {
-        self.latest = self.latest.max(now);
-        if self.shared.deadline.load(Ordering::Acquire) > self.latest {
+        let latest = self.local.advance(now);
+        if self.shared.deadline.load(Ordering::Acquire) > latest {
             return None;
         }
         let mut table = match self.shared.table.try_lock() {
@@ -434,7 +475,7 @@ impl Member {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return None,
         };
-        let now = table.now(self.latest);
+        let now = table.now(latest);
         if timers {
             let Table { cache, members, .. } = &mut *table;
             cache.service(now, &mut |event| {
@@ -460,7 +501,7 @@ impl Member {
             }
         }
         if timers && table.notify(&self.shared.wakes, self.index) {
-            self.woken = true;
+            self.local.set_woken(true);
         }
         self.generation = table.cache.mapping_epoch();
         self.shared.publish(&table);
@@ -482,12 +523,12 @@ impl Member {
         notify: bool,
         f: impl FnOnce(&mut Table, Instant, usize) -> R,
     ) -> R {
-        self.latest = self.latest.max(now);
+        let latest = self.local.advance(now);
         let mut table = self.shared.lock();
-        let now = table.now(self.latest);
+        let now = table.now(latest);
         let result = f(&mut table, now, self.index);
         if notify && table.notify(&self.shared.wakes, self.index) {
-            self.woken = true;
+            self.local.set_woken(true);
         }
         self.generation = table.cache.mapping_epoch();
         self.shared.publish(&table);
@@ -635,8 +676,8 @@ impl Ipv4NeighborTable for Member {
         held: NeighborHold,
     ) -> HostResult<Option<[u8; 6]>> {
         self.check(link)?;
-        self.latest = self.latest.max(now);
-        if let Some(front) = self.usable(address, self.latest) {
+        let latest = self.local.advance(now);
+        if let Some(front) = self.usable(address, latest) {
             return Ok(Some(front.mac));
         }
         let (resolution, mapping) = self.locked(now, false, |table, now, member| {
@@ -655,7 +696,7 @@ impl Ipv4NeighborTable for Member {
         &mut self,
         filter: &dyn Fn(&NeighborHold) -> bool,
     ) -> Option<(NeighborHold, bool)> {
-        if !self.woken {
+        if !self.local.woken() {
             return None;
         }
         let me = self.index;
@@ -696,7 +737,7 @@ impl Ipv4NeighborTable for Member {
     // The port's timers run in `housekeep`; this reports the neighbors they
     // found unreachable to this member's Host.
     fn service(&mut self, _: Instant, unreachable: &mut dyn FnMut(LinkId, Ipv4Addr)) {
-        let Some(link) = self.link.filter(|_| self.woken) else {
+        let Some(link) = self.link.filter(|_| self.local.woken()) else {
             return;
         };
         {
@@ -714,8 +755,9 @@ impl Ipv4NeighborTable for Member {
     fn next_deadline(&self) -> Option<Instant> {
         let deadline = self.shared.deadline.load(Ordering::Acquire);
         let deadline = (deadline != u64::MAX).then_some(deadline);
-        if self.woken || self.shared.wakes[self.index].load(Ordering::Relaxed) {
-            return Some(deadline.map_or(self.latest, |d| d.min(self.latest)));
+        if self.local.woken() || self.shared.wakes[self.index].load(Ordering::Relaxed) {
+            let latest = self.local.latest();
+            return Some(deadline.map_or(latest, |d| d.min(latest)));
         }
         deadline
     }
@@ -737,12 +779,12 @@ impl Ipv4NeighborTable for Member {
         entropy: Option<&mut Entropy>,
     ) -> HostResult<bool> {
         self.check(link)?;
-        self.latest = self.latest.max(now);
+        let latest = self.local.advance(now);
         let near = self.shared.delay_first_probe;
-        if let Some(front) = self.usable(address, self.latest) {
+        if let Some(front) = self.usable(address, latest) {
             match front.state {
                 ArpState::Permanent => return Ok(false),
-                ArpState::Reachable if self.latest.saturating_add(near) < front.until => {
+                ArpState::Reachable if latest.saturating_add(near) < front.until => {
                     return Ok(true);
                 }
                 _ => {}
