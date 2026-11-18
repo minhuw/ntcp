@@ -5062,6 +5062,28 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.stream_writable(lowat))
     }
 
+    /// Whether a write to connection `id` with `request` is admitted at
+    /// least one octet (`check_write_admission`) and the connection is
+    /// writable (`stream_writable`), in one look: false for a handle that
+    /// is not live, as both are then errors.
+    pub fn writable(
+        &self,
+        id: ConnectionId,
+        lowat: Option<u32>,
+        request: TxTimestampRequest,
+    ) -> Result<bool, EndpointError> {
+        let connection = &self.slot(id)?.connection;
+        let writable = connection.writable(lowat, request);
+        debug_assert_eq!(
+            writable,
+            connection
+                .check_write_admission(lowat, request)
+                .is_ok_and(|room| room != 0)
+                && connection.stream_writable(lowat)
+        );
+        Ok(writable)
+    }
+
     /// Prepare bookkeeping for at most `capacity` bytes before consuming an
     /// external producer. No bytes or timestamp requests are committed here.
     /// Keep exclusive transaction ownership until the corresponding write;

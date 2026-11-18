@@ -2641,10 +2641,7 @@ impl<P: PacketIo> Network<P> {
 // ACKs have freed a third of it; whether memory to store the write is
 // there is not asked.
 fn writable(endpoint: &Endpoint, core: ntcp::ConnectionId, request: TxTimestampRequest) -> bool {
-    endpoint
-        .check_write_admission(core, None, request)
-        .is_ok_and(|n| n != 0)
-        && endpoint.stream_writable(core, None) == Ok(true)
+    endpoint.writable(core, None, request) == Ok(true)
 }
 
 // Whether a writer armed for Writable is owed it: `writable`, and a write

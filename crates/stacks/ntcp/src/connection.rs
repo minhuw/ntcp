@@ -5853,13 +5853,28 @@ impl Connection {
     // waits for memory to come back (`memory_released`).
     #[inline]
     pub(crate) fn stream_writable(&self, lowat: Option<u32>) -> bool {
-        let usage = self.send_usage();
-        let space = self.send_space();
+        self.writable_with(lowat, self.send_usage(), self.send_space())
+    }
+
+    // `stream_writable` with send usage `usage` and send space `space`.
+    #[inline]
+    fn writable_with(&self, lowat: Option<u32>, usage: usize, space: usize) -> bool {
         usage < space
             && space - usage >= usage / 2
             && lowat
                 .filter(|&lowat| lowat != u32::MAX)
                 .is_none_or(|lowat| (self.notsent_bytes() as u64) << 1 < u64::from(lowat))
+    }
+
+    // Whether a write with `request` is admitted at least one octet
+    // (`check_write_admission`) and the connection is writable
+    // (`stream_writable`), the send usage and space computed once.
+    pub(crate) fn writable(&self, lowat: Option<u32>, request: TxTimestampRequest) -> bool {
+        let usage = self.send_usage();
+        let space = self.send_space();
+        self.check_admission(lowat, request, space.saturating_sub(usage))
+            .is_ok_and(|room| room != 0)
+            && self.writable_with(lowat, usage, space)
     }
 
     // Fresh payload a managed connection may newly transmit: C less the
