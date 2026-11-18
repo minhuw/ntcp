@@ -779,6 +779,8 @@ pub struct Endpoint {
     control_turn: bool,
     // The bytes charged against max_buffer_bytes and the pressure state.
     budget: crate::memory::Budget,
+    // Of them, the embedding's (`set_embedding_charge`).
+    embedding_charge: usize,
     // ponytail: conservative FIFO loss retention until eviction; add path-qualified
     // aging only when measured deployment behavior warrants it.
     setup_loss_cache: VecDeque<(IpAddr, IpAddr, Option<ntcp_path::LinkId>)>,
@@ -1015,6 +1017,7 @@ impl Endpoint {
             local_refusals: false,
             control_turn: true,
             budget,
+            embedding_charge: 0,
             ingress: None,
             lent: None,
             receive_memory: crate::memory::ReceiveMemoryEvents::default(),
@@ -6225,6 +6228,18 @@ impl Endpoint {
     }
     pub fn buffer_bytes(&self) -> usize {
         self.budget.charged()
+    }
+
+    /// Charge `bytes` of storage the embedding holds for this endpoint's
+    /// traffic outside it (a Host's ICMP output, for one) against
+    /// `max_buffer_bytes`, in place of what the last call charged. It
+    /// counts in `buffer_bytes`, in the pressure state and in the room every
+    /// allocation of the endpoint is admitted against, as its own storage
+    /// does, and returning it wakes the writers waiting for memory. Nothing
+    /// is refused here: the embedding bounds that storage itself.
+    pub fn set_embedding_charge(&mut self, bytes: usize) {
+        let old = core::mem::replace(&mut self.embedding_charge, bytes);
+        self.recharge(old, bytes);
     }
 
     /// Whether the endpoint is under memory pressure, Linux's

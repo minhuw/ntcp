@@ -763,6 +763,51 @@ fn receive_state(b: &Endpoint, server: ConnectionId) -> (usize, u32, usize) {
     )
 }
 
+// Storage the embedding charges (`set_embedding_charge`) counts as the
+// endpoint's own: in buffer_bytes, against the pressure threshold and the
+// room connections open within, and replacing, not adding to, the last
+// charge.
+#[test]
+fn the_embedding_charge_counts_as_the_endpoints_own() {
+    let open = Connection::open_bytes(usize::from(config().connection.mss)).unwrap();
+    let mut b = Endpoint::new(
+        EndpointConfig {
+            max_buffer_bytes: open + 1000,
+            buffer_pressure_bytes: Some(500),
+            buffer_low_bytes: Some(100),
+            ..config()
+        },
+        [2; 32],
+        0,
+        |_| true,
+    )
+    .unwrap();
+    let base = b.buffer_bytes();
+    b.set_embedding_charge(600);
+    assert_eq!(b.buffer_bytes(), base + 600);
+    assert!(b.memory_pressure());
+    b.set_embedding_charge(1001);
+    assert_eq!(b.buffer_bytes(), base + 1001);
+    assert_eq!(
+        b.connect(
+            0,
+            "192.0.2.1:40000".parse().unwrap(),
+            REMOTE.parse().unwrap()
+        )
+        .unwrap_err(),
+        EndpointError::Connection(Error::NoMemory)
+    );
+    b.set_embedding_charge(50);
+    assert_eq!(b.buffer_bytes(), base + 50);
+    assert!(!b.memory_pressure());
+    b.connect(
+        0,
+        "192.0.2.1:40000".parse().unwrap(),
+        REMOTE.parse().unwrap(),
+    )
+    .unwrap();
+}
+
 // Linux's tcp_grow_window check #1: under memory pressure rcv_ssthresh does
 // not rise, so the window stays as it is while window_clamp (a limit, which
 // DRS raises without memory) may grow; once pressure ends rcv_ssthresh
