@@ -10,8 +10,8 @@ mod ethtool;
 pub use ethtool::{Rss, RssFields, RssFunction};
 
 use ntcp_io::{
-    DeviceCounters, PacketIo, PacketLayer, ReceivedFrame, ReceivedPacket, RxFrame, RxFrameCount,
-    RxFrameVtable, TxOutcome,
+    DeviceCounters, PacketIo, PacketLayer, ReceivedPacket, RxFrame, RxFrameCount, RxFrameVtable,
+    TxOutcome,
 };
 use std::{
     io,
@@ -851,18 +851,24 @@ impl PacketIo for AfXdp {
     // The UMEM frame itself, held until the frame drops (D7: the kernel's
     // XDP_COPY copy remains; holding removes the copy out of the UMEM and
     // the core's heap copy). Its truesize is the frame size.
-    fn receive_frame(&mut self, _scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+    fn receive_frame(
+        &mut self,
+        _scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
         self.service()?;
         match self.receive_held() {
-            Ok(frame) => Ok(frame.map(|frame| ReceivedFrame {
-                metadata: ReceivedPacket {
-                    len: frame.len(),
+            Ok(None) => Ok(None),
+            Ok(Some(held)) => {
+                let len = held.len();
+                *frame = Some(held);
+                Ok(Some(ReceivedPacket {
+                    len,
                     timestamps: Default::default(),
                     tcp_segment_size: None,
                     l4_checksum: Default::default(),
-                },
-                frame,
-            })),
+                }))
+            }
             Err(error) => {
                 if error.kind() == io::ErrorKind::InvalidData {
                     self.poisoned = true;
@@ -1138,11 +1144,13 @@ mod tests {
         let _peer = wakeup_peer(&mut a);
         assert_eq!(a.device_counters(), DeviceCounters::default());
         inject(&mut a, 0, &[5; 70]);
-        let received = a.receive_frame(&mut []).unwrap().unwrap();
-        assert_eq!(received.metadata.len, 70);
-        assert_eq!(received.frame.as_slice(), &[5; 70]);
-        drop(received);
-        assert!(a.receive_frame(&mut []).unwrap().is_none());
+        let mut frame = None;
+        let metadata = a.receive_frame(&mut [], &mut frame).unwrap().unwrap();
+        assert_eq!(metadata.len, 70);
+        assert_eq!(frame.as_ref().unwrap().as_slice(), &[5; 70]);
+        drop(frame.take());
+        assert!(a.receive_frame(&mut [], &mut frame).unwrap().is_none());
+        assert!(frame.is_none());
         assert!(a.frames[0] == Frame::Free && a.free.contains(&0));
     }
 

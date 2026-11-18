@@ -172,14 +172,6 @@ fn transmit_contiguous<P: PacketIo + ?Sized>(
     io.transmit(packet).map_err(TransmitError::Other)
 }
 
-/// A received frame and what the device reported about it; `metadata.len`
-/// is the frame's length.
-#[derive(Debug)]
-pub struct ReceivedFrame {
-    pub frame: RxFrame,
-    pub metadata: ReceivedPacket,
-}
-
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod linux;
@@ -638,12 +630,21 @@ pub trait PacketIo {
     }
 
     // One received packet as a frame the caller keeps, as receive_with_metadata
-    // receives one. A backend that receives into its own memory (a DPDK mbuf,
-    // an AF_XDP UMEM frame) hands that over and ignores scratch. The default,
-    // for every backend that copies, receives into scratch, sized as for
+    // receives one: what the device reported about it (`len` is the frame's
+    // length), the frame itself put in `frame`, which the caller passes
+    // empty and which a call that receives nothing leaves empty. The frame
+    // is written where the caller keeps it, not returned, so that it is not
+    // moved again through every layer between the backend and the caller.
+    // A backend that receives into its own memory (a DPDK mbuf, an AF_XDP
+    // UMEM frame) hands that over and ignores scratch. The default, for
+    // every backend that copies, receives into scratch, sized as for
     // receive, and copies the packet into a heap frame of its length, so the
     // frame's truesize is what it holds.
-    fn receive_frame(&mut self, scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+    fn receive_frame(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
         let Some(metadata) = self.receive_with_metadata(scratch)? else {
             return Ok(None);
         };
@@ -653,10 +654,8 @@ pub trait PacketIo {
                 "backend returned an invalid packet length",
             )
         })?;
-        Ok(Some(ReceivedFrame {
-            frame: RxFrame::copy_from_slice(bytes),
-            metadata,
-        }))
+        *frame = Some(RxFrame::copy_from_slice(bytes));
+        Ok(Some(metadata))
     }
 
     // The frame budget F of a backend that receives into a fixed pool of
@@ -918,21 +917,29 @@ mod tests {
             ..Default::default()
         };
         let mut scratch = [0; 64];
-        let empty = io.receive_frame(&mut scratch).unwrap().unwrap();
-        assert!(empty.frame.is_empty());
-        let received = io.receive_frame(&mut scratch).unwrap().unwrap();
-        assert_eq!(received.frame.as_slice(), &[1, 2, 3]);
-        assert_eq!(received.frame.truesize(), 3);
-        assert_eq!(received.metadata.len, 3);
-        assert_eq!(received.metadata.l4_checksum, RxChecksum::Unknown);
-        assert_ne!(received.frame.as_ptr(), scratch.as_ptr());
-        assert!(io.receive_frame(&mut scratch).unwrap().is_none());
+        let mut frame = None;
+        io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
+        assert!(frame.take().unwrap().is_empty());
+        let metadata = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
+        let received = frame.take().unwrap();
+        assert_eq!(received.as_slice(), &[1, 2, 3]);
+        assert_eq!(received.truesize(), 3);
+        assert_eq!(metadata.len, 3);
+        assert_eq!(metadata.l4_checksum, RxChecksum::Unknown);
+        assert_ne!(received.as_ptr(), scratch.as_ptr());
+        assert!(
+            io.receive_frame(&mut scratch, &mut frame)
+                .unwrap()
+                .is_none()
+        );
+        assert!(frame.is_none());
 
         // A backend reporting more than the scratch holds is refused.
         io.inbound.push(vec![5; 4]);
         io.lie = Some(65);
-        let error = io.receive_frame(&mut scratch).unwrap_err();
+        let error = io.receive_frame(&mut scratch, &mut frame).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(frame.is_none());
     }
 
     #[test]
@@ -1152,7 +1159,7 @@ mod tests {
             io.transmit_packet(&packet, empty),
             Err(TransmitError::InvalidInput)
         ));
-        assert!(io.receive_frame(&mut [0; 16]).unwrap().is_none());
+        assert!(io.receive_frame(&mut [0; 16], &mut None).unwrap().is_none());
         // A copying backend has no frame budget: its consumer copies.
         assert_eq!(io.rx_frame_budget(), None);
         assert_eq!(io.rx_frames_outstanding(), None);

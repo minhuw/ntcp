@@ -6,6 +6,27 @@ use std::{
     net::Ipv4Addr,
 };
 
+// What `receive_frame` put in its frame and returned, together.
+struct Received {
+    frame: ntcp_io::RxFrame,
+    metadata: ntcp_io::ReceivedPacket,
+}
+
+trait ReceiveWhole {
+    fn receive_whole(&mut self, scratch: &mut [u8]) -> std::io::Result<Option<Received>>;
+}
+
+impl<P: PacketIo + ?Sized> ReceiveWhole for P {
+    fn receive_whole(&mut self, scratch: &mut [u8]) -> std::io::Result<Option<Received>> {
+        let mut frame = None;
+        let metadata = self.receive_frame(scratch, &mut frame)?;
+        Ok(metadata.map(|metadata| Received {
+            frame: frame.expect("a received packet's frame"),
+            metadata,
+        }))
+    }
+}
+
 unsafe extern "C" {
     fn ntcp_host_test_cpu() -> i32;
     fn ntcp_host_test_pools(full: *mut u32) -> u32;
@@ -253,7 +274,7 @@ fn port_lifecycle(eal: &'static Eal) {
     );
     let sent = frame(4, 200);
     assert_eq!(main.transmit(&sent).unwrap(), TxOutcome::Submitted);
-    let received = main.receive_frame(&mut out).unwrap().unwrap();
+    let received = main.receive_whole(&mut out).unwrap().unwrap();
     assert_eq!(received.frame.as_slice(), sent.as_slice());
     assert_eq!(received.metadata.len, 200);
     drop(received);
@@ -644,7 +665,7 @@ fn held_frames(eal: &'static Eal) {
     for len in [60, 1514] {
         let sent = frame(len as u8, len);
         assert_eq!(queue.transmit(&sent).unwrap(), TxOutcome::Submitted);
-        let received = queue.receive_frame(&mut scratch).unwrap().unwrap();
+        let received = queue.receive_whole(&mut scratch).unwrap().unwrap();
         assert_eq!(received.frame.as_slice(), sent.as_slice());
         assert_eq!(received.frame.truesize(), 2368);
         frames.push(received.frame);

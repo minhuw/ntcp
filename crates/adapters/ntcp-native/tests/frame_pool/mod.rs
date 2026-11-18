@@ -8,7 +8,7 @@
 // it reports is set by the test.
 #![allow(dead_code)]
 use ntcp_io::{
-    DeviceCounters, PacketIo, PacketLayer, ReceivedFrame, ReceivedPacket, RxFrame, RxFrameVtable,
+    DeviceCounters, PacketIo, PacketLayer, ReceivedPacket, RxFrame, RxFrameVtable,
     TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest, TxCompletion,
     TxOutcome,
 };
@@ -91,11 +91,13 @@ impl Pool {
         self.missed
     }
     /// The next packet `receive` delivers, into a free element and handed
-    /// over as its frame; with none free, packets are taken and dropped.
+    /// over as its frame, put in `frame`; with none free, packets are taken
+    /// and dropped.
     pub fn receive_with(
         &mut self,
         mut receive: impl FnMut(&mut [u8]) -> io::Result<Option<ReceivedPacket>>,
-    ) -> io::Result<Option<ReceivedFrame>> {
+        frame: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
         loop {
             let element = self.shared.free.lock().unwrap().pop();
             let Some(element) = element else {
@@ -122,7 +124,7 @@ impl Pool {
             // SAFETY: the element's packet bytes are initialized and stay
             // unchanged until `release` puts the element back, once, from
             // any thread, with its own reference on the pool.
-            let frame = unsafe {
+            *frame = Some(unsafe {
                 RxFrame::from_raw_parts(
                     data,
                     metadata.len as u32,
@@ -131,8 +133,8 @@ impl Pool {
                     context,
                     0,
                 )
-            };
-            return Ok(Some(ReceivedFrame { frame, metadata }));
+            });
+            return Ok(Some(metadata));
         }
     }
 }
@@ -171,10 +173,14 @@ impl<W: PacketIo> PacketIo for FramePool<W> {
     fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
         self.inner.receive_with_metadata(out)
     }
-    fn receive_frame(&mut self, _scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+    fn receive_frame(
+        &mut self,
+        _scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
         let inner = &mut self.inner;
         self.pool
-            .receive_with(|out| inner.receive_with_metadata(out))
+            .receive_with(|out| inner.receive_with_metadata(out), frame)
     }
     fn rx_frame_budget(&self) -> Option<usize> {
         Some(self.pool.budget())

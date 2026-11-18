@@ -7,8 +7,8 @@ use ntcp_host::{
     NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
-    ClockDomain, PacketLayer, PacketTimestamp, ReceivedFrame, ReceivedPacket, RxChecksum,
-    TcpSegmentationError, TcpSegmentationRequest, TimestampUnit, TxOutcome,
+    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, RxChecksum, TcpSegmentationError,
+    TcpSegmentationRequest, TimestampUnit, TxOutcome,
 };
 
 pub(super) struct PendingFrame {
@@ -1365,16 +1365,19 @@ impl<P: PacketIo> Network<P> {
         threshold: usize,
         arrival: &mut Option<RxFrame>,
     ) -> io::Result<Option<ReceivedPacket>> {
-        // Matched in place: `?` would first move the whole result (a
-        // ReceivedFrame is over 128 bytes, so a memcpy call), on every
-        // receive, the empty ones included.
-        let ReceivedFrame {
-            mut frame,
-            metadata,
-        } = match self.io.receive_frame(rx) {
-            Ok(Some(received)) => received,
+        // Matched in place: `?` would first move the whole result (the
+        // metadata is over 128 bytes, so a memcpy call), on every receive,
+        // the empty ones included. The frame is put in `arrival` itself.
+        let metadata = match self.io.receive_frame(rx, arrival) {
+            Ok(Some(metadata)) => metadata,
             Ok(None) => return Ok(None),
             Err(error) => return Err(error),
+        };
+        let Some(frame) = arrival else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backend returned no frame",
+            ));
         };
         // The backend copied it already (a scatter chain, an attached
         // external buffer), or the budget is spent. Then the connections'
@@ -1398,13 +1401,12 @@ impl<P: PacketIo> Network<P> {
                 self.counters.rx_frames_collapsed += collapsed as u64;
                 out = self.io.rx_frames_outstanding().unwrap_or(0);
                 if out > threshold {
-                    frame = RxFrame::copy_from_slice(&frame);
+                    *frame = RxFrame::copy_from_slice(frame);
                     self.counters.rx_frames_copied += 1;
                 }
             }
             self.frame_slack = threshold.saturating_sub(out);
         }
-        *arrival = Some(frame);
         Ok(Some(metadata))
     }
     // `fragment`: a member of shared flows keyed the packet as a fragment.

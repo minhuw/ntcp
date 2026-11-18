@@ -85,8 +85,12 @@ impl PacketIo for Server {
     ) -> io::Result<Option<ntcp_io::ReceivedPacket>> {
         both!(self, io => io.receive_with_metadata(out))
     }
-    fn receive_frame(&mut self, scratch: &mut [u8]) -> io::Result<Option<ntcp_io::ReceivedFrame>> {
-        both!(self, io => io.receive_frame(scratch))
+    fn receive_frame(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<ntcp_io::RxFrame>,
+    ) -> io::Result<Option<ntcp_io::ReceivedPacket>> {
+        both!(self, io => io.receive_frame(scratch, frame))
     }
     fn rx_frame_budget(&self) -> Option<usize> {
         both!(self, io => io.rx_frame_budget())

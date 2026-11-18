@@ -42,7 +42,7 @@ use crate::{
     AfXdp, Config, Rss, RssFields,
     ethtool::{self, Placement},
 };
-use ntcp_io::{DeviceCounters, PacketIo, PacketLayer, ReceivedFrame, ReceivedPacket, TxOutcome};
+use ntcp_io::{DeviceCounters, PacketIo, PacketLayer, ReceivedPacket, RxFrame, TxOutcome};
 use std::{
     ffi::{CString, c_char, c_int, c_void},
     io,
@@ -723,8 +723,12 @@ impl PacketIo for HostedQueue {
     fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
         self.io.receive_with_metadata(out)
     }
-    fn receive_frame(&mut self, scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
-        self.io.receive_frame(scratch)
+    fn receive_frame(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
+        self.io.receive_frame(scratch, frame)
     }
     fn rx_frame_budget(&self) -> Option<usize> {
         self.io.rx_frame_budget()

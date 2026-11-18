@@ -6,6 +6,27 @@ use ntcp_io::{
 use ntcp_io_dpdk::{Dpdk, MAX_PACKET_LEN};
 use std::ffi::c_void;
 
+// What `receive_frame` put in its frame and returned, together.
+struct Received {
+    frame: ntcp_io::RxFrame,
+    metadata: ntcp_io::ReceivedPacket,
+}
+
+trait ReceiveWhole {
+    fn receive_whole(&mut self, scratch: &mut [u8]) -> std::io::Result<Option<Received>>;
+}
+
+impl<P: PacketIo + ?Sized> ReceiveWhole for P {
+    fn receive_whole(&mut self, scratch: &mut [u8]) -> std::io::Result<Option<Received>> {
+        let mut frame = None;
+        let metadata = self.receive_frame(scratch, &mut frame)?;
+        Ok(metadata.map(|metadata| Received {
+            frame: frame.expect("a received packet's frame"),
+            metadata,
+        }))
+    }
+}
+
 unsafe extern "C" {
     fn ntcp_test_mtu(port: u16) -> i32;
     fn ntcp_test_emsgsize() -> i32;
@@ -401,7 +422,7 @@ unsafe fn frames_by_reference(port: u16, pool: *mut c_void) {
         let mut scratch = vec![0xa5; MAX_PACKET_LEN];
         let mut out = [0; 256];
         let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
-        assert_eq!(io.receive_frame(&mut scratch).unwrap().map(|_| ()), None);
+        assert_eq!(io.receive_whole(&mut scratch).unwrap().map(|_| ()), None);
         // No budget until a host sets one; the frames are mbufs either way.
         assert_eq!(
             (io.rx_frame_budget(), io.rx_frames_outstanding()),
@@ -417,7 +438,7 @@ unsafe fn frames_by_reference(port: u16, pool: *mut c_void) {
             ntcp_test_loopback();
         }
         let copied = io.receive_with_metadata(&mut out).unwrap().unwrap();
-        let held = io.receive_frame(&mut scratch).unwrap().unwrap();
+        let held = io.receive_whole(&mut scratch).unwrap().unwrap();
         assert_eq!(held.frame.as_slice(), &out[..copied.len]);
         assert_eq!(held.metadata, copied);
         assert!(!held.frame.is_heap());
@@ -436,7 +457,7 @@ unsafe fn frames_by_reference(port: u16, pool: *mut c_void) {
         };
         io.enable_rx_timestamps(clock).unwrap();
         ntcp_test_timestamp(77, 1, 0);
-        let held = io.receive_frame(&mut scratch).unwrap().unwrap();
+        let held = io.receive_whole(&mut scratch).unwrap().unwrap();
         assert_eq!(held.frame.as_slice(), &[0x42; 64]);
         assert_eq!(held.metadata.timestamps.hardware.unwrap().value, 77);
         drop(held);
@@ -446,7 +467,7 @@ unsafe fn frames_by_reference(port: u16, pool: *mut c_void) {
         for value in 0..4u8 {
             assert_eq!(io.transmit(&[value; 64]).unwrap(), TxOutcome::Submitted);
             ntcp_test_loopback();
-            frames.push(io.receive_frame(&mut scratch).unwrap().unwrap().frame);
+            frames.push(io.receive_whole(&mut scratch).unwrap().unwrap().frame);
         }
         assert_eq!(io.rx_frames_outstanding(), Some(4));
         assert_eq!(ntcp_test_available(), 1023 - 4);
@@ -465,12 +486,12 @@ unsafe fn frames_by_reference(port: u16, pool: *mut c_void) {
         // extbuf-attached mbuf are copied into heap frames.
         assert_eq!(io.transmit(&[0x33; 129]).unwrap(), TxOutcome::Submitted);
         assert_eq!(ntcp_test_loopback(), 2);
-        let chain = io.receive_frame(&mut scratch).unwrap().unwrap();
+        let chain = io.receive_whole(&mut scratch).unwrap().unwrap();
         assert!(chain.frame.is_heap());
         assert_eq!(chain.frame.as_slice(), &[0x33; 129]);
         assert_eq!((chain.metadata.len, chain.frame.truesize()), (129, 129));
         ntcp_test_external(200);
-        let external = io.receive_frame(&mut scratch).unwrap().unwrap();
+        let external = io.receive_whole(&mut scratch).unwrap().unwrap();
         assert!(external.frame.is_heap());
         assert_eq!(external.frame.as_slice(), &[0x5a; 200]);
         assert_eq!(ntcp_test_external_freed(), 1);

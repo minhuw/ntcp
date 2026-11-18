@@ -5,7 +5,7 @@
 // opens connections to them and accepts theirs.
 mod frame_pool;
 
-use ntcp_io::{PacketIo, PacketLayer, ReceivedFrame, TxOutcome};
+use ntcp_io::{PacketIo, PacketLayer, ReceivedPacket, RxFrame, TxOutcome};
 use ntcp_native::*;
 use std::{
     collections::VecDeque,
@@ -51,29 +51,34 @@ impl PacketIo for Port {
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
         Ok(self.take(out))
     }
-    fn receive_frame(&mut self, scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+    fn receive_frame(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
         let Some(mut pool) = self.pool.take() else {
             let Some(len) = self.take(scratch) else {
                 return Ok(None);
             };
-            return Ok(Some(ReceivedFrame {
-                frame: ntcp_io::RxFrame::copy_from_slice(&scratch[..len]),
-                metadata: ntcp_io::ReceivedPacket {
-                    len,
-                    timestamps: Default::default(),
-                    tcp_segment_size: None,
-                    l4_checksum: Default::default(),
-                },
-            }));
-        };
-        let received = pool.receive_with(|out| {
-            Ok(self.take(out).map(|len| ntcp_io::ReceivedPacket {
+            *frame = Some(RxFrame::copy_from_slice(&scratch[..len]));
+            return Ok(Some(ReceivedPacket {
                 len,
                 timestamps: Default::default(),
                 tcp_segment_size: None,
                 l4_checksum: Default::default(),
-            }))
-        });
+            }));
+        };
+        let received = pool.receive_with(
+            |out| {
+                Ok(self.take(out).map(|len| ReceivedPacket {
+                    len,
+                    timestamps: Default::default(),
+                    tcp_segment_size: None,
+                    l4_checksum: Default::default(),
+                }))
+            },
+            frame,
+        );
         self.pool = Some(pool);
         received
     }

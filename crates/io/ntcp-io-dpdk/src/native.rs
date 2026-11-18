@@ -1,7 +1,7 @@
 use ntcp_io::{
     ClockDescriptor, ClockDomain, DeviceCounters, PacketIo, PacketLayer, PacketTimestamp,
-    PacketTimestamps, ReceivedFrame, ReceivedPacket, RxChecksum, RxFrame, RxFrameCount,
-    RxFrameVtable, TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
+    PacketTimestamps, ReceivedPacket, RxChecksum, RxFrame, RxFrameCount, RxFrameVtable,
+    TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
     TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit, TransmitTime, TxOutcome,
     TxSchedulingCapabilities, TxTimestampRequest,
 };
@@ -740,7 +740,11 @@ impl PacketIo for Dpdk {
     // frame of its length instead, through `scratch`. The frame's
     // truesize is the pool element, 2368 octets at the default geometry
     // (decision Q2).
-    fn receive_frame(&mut self, scratch: &mut [u8]) -> io::Result<Option<ReceivedFrame>> {
+    fn receive_frame(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+    ) -> io::Result<Option<ReceivedPacket>> {
         let Some(packet) = self.next_packet() else {
             return Ok(None);
         };
@@ -773,7 +777,7 @@ impl PacketIo for Dpdk {
                 // until it is freed. Only MBUF_FRAME's release frees it,
                 // once, which is sound on any thread at any later time
                 // (release_mbuf), with the block counting the return.
-                let frame = unsafe {
+                *frame = Some(unsafe {
                     RxFrame::from_raw_parts(
                         NonNull::new(data).expect("an mbuf's data is not null"),
                         u32::from(len),
@@ -782,15 +786,13 @@ impl PacketIo for Dpdk {
                         self.frames.as_ptr().cast(),
                         packet.expose_provenance(),
                     )
-                };
-                Ok(Some(ReceivedFrame { frame, metadata }))
+                });
+                Ok(Some(metadata))
             }
             COPY => {
                 let metadata = self.copy_packet(packet, scratch)?;
-                Ok(Some(ReceivedFrame {
-                    frame: RxFrame::copy_from_slice(&scratch[..metadata.len]),
-                    metadata,
-                }))
+                *frame = Some(RxFrame::copy_from_slice(&scratch[..metadata.len]));
+                Ok(Some(metadata))
             }
             error => Err(io::Error::from_raw_os_error(-error)),
         }
