@@ -428,7 +428,11 @@ struct Router {
     // fits the port's MTU, and how many were.
     options: Option<Vec<u8>>,
     optioned: usize,
+    // Sees every frame on the wire, from member k (Some(k)) or the peer
+    // (None), before the rest of the router: false drops it.
+    tap: Option<Tap>,
 }
+type Tap = Box<dyn FnMut(Option<usize>, &[u8]) -> bool>;
 
 // The port's members, the peer and the wire between them, on one clock.
 struct Lan {
@@ -499,6 +503,11 @@ impl Lan {
         };
     }
     fn toward_peer(&mut self, k: usize, frame: Vec<u8>) {
+        if let Some(tap) = &mut self.router.tap
+            && !tap(Some(k), &frame)
+        {
+            return;
+        }
         if let Some(ip) = l3(&frame) {
             if is_reset(ip) {
                 self.resets[k] += 1;
@@ -534,6 +543,11 @@ impl Lan {
         self.peer.incoming.lock().unwrap().push_back(frame);
     }
     fn toward_port(&mut self, frame: Vec<u8>) {
+        if let Some(tap) = &mut self.router.tap
+            && !tap(None, &frame)
+        {
+            return;
+        }
         if l3(&frame).is_some_and(is_reset) {
             self.peer_resets += 1;
         }
@@ -2471,9 +2485,10 @@ fn syns_for_a_member_that_stops_listening_go_to_members_still_listening() {
 }
 
 // A held flow is its owner's again once the holder's connection is
-// reclaimed: after both ends close, whichever closes first, and when the
-// holder's listener closes with the connection never accepted. A SYN of the
-// flow then reaches its owner, which accepts it.
+// reclaimed and its TIME-WAIT, if the holder closed first, is over: after
+// both ends close, and when the holder's listener closes with the
+// connection never accepted. A SYN of the flow then reaches its owner,
+// which accepts it.
 #[test]
 fn a_held_flow_returns_to_its_owner_when_its_connection_ends() {
     let n = 2;
@@ -2529,12 +2544,28 @@ fn a_held_flow_returns_to_its_owner_when_its_connection_ends() {
                 lan.network(0).close(c).unwrap()
             }
         }
+        let closed = lan.now;
         let done = lan.run(lan.now + 2 * SECOND, |lan| {
             drain(lan.network(0));
             drain(&mut lan.peer.network);
             flows.redirected(1) == 0
         });
-        assert!(done, "{} held", flows.redirected(1));
+        // The holder's TIME-WAIT records keep the flows until they expire.
+        assert_eq!(done, !holder_closes_first, "{} held", flows.redirected(1));
+        if holder_closes_first {
+            assert_eq!(flows.redirected(1), 4);
+            let time_wait = NetworkConfig::new(IpAddr::V4(ADDRESS), 1500)
+                .tcp
+                .connection
+                .time_wait_us;
+            let done = lan.run(closed + time_wait + 2 * SECOND, |lan| {
+                drain(lan.network(0));
+                drain(&mut lan.peer.network);
+                flows.redirected(1) == 0
+            });
+            assert!(done, "{} held", flows.redirected(1));
+            assert!(lan.now >= closed + time_wait);
+        }
         lan.assert_no_resets();
         for &port in &owned {
             let local = SocketAddrV4::new(ADDRESS, LISTEN);
@@ -2591,6 +2622,464 @@ fn a_held_flow_returns_to_its_owner_when_its_connection_ends() {
     echo_all(&mut lan, &mut servers, &mut again, 2 * SECOND);
     assert_eq!(holder(&lan, &servers, owned[0]), Some(1));
     assert_eq!(lan.resets, vec![4, 0]);
+}
+
+// The TCP segment of an IPv4 packet, its flags, sequence and
+// acknowledgment numbers.
+fn segment(ip: &[u8]) -> &[u8] {
+    &ip[header_len(ip)..]
+}
+fn tcp_flags(ip: &[u8]) -> u8 {
+    segment(ip)[13]
+}
+fn seq_of(ip: &[u8]) -> u32 {
+    u32::from_be_bytes(segment(ip)[4..8].try_into().unwrap())
+}
+fn ack_of(ip: &[u8]) -> u32 {
+    u32::from_be_bytes(segment(ip)[8..12].try_into().unwrap())
+}
+fn tcp_payload(ip: &[u8]) -> &[u8] {
+    let tcp = segment(ip);
+    &tcp[usize::from(tcp[12] >> 4) * 4..]
+}
+// A segment's TCP header with its checksum and Timestamps TSval cleared:
+// what two ACKs of one TIME-WAIT share however far apart they leave
+// (Linux's tcp_v4_timewait_ack sends tw_snd_nxt, tw_rcv_nxt, the window
+// and TSecr tw_ts_recent, with a TSval of its clock).
+fn normalized(ip: &[u8]) -> Vec<u8> {
+    let tcp = segment(ip);
+    let mut header = tcp[..usize::from(tcp[12] >> 4) * 4].to_vec();
+    header[16..18].fill(0);
+    let mut at = 20;
+    while at < header.len() {
+        match header[at] {
+            0 => break,
+            1 => at += 1,
+            kind => {
+                let len = usize::from(header[at + 1]).max(2);
+                if kind == 8 {
+                    header[at + 2..at + 6].fill(0);
+                }
+                at += len;
+            }
+        }
+    }
+    header
+}
+const FIN: u8 = 0x01;
+const SYN: u8 = 0x02;
+const RST: u8 = 0x04;
+const ACK: u8 = 0x10;
+
+// Frames on the wire of one TIME-WAIT case, from member k (Some(k)) or the
+// peer (None), and whether each was dropped.
+type WireLog = Arc<Mutex<Vec<(Option<usize>, Vec<u8>, bool)>>>;
+
+// One connection from the peer, accepted by `holder`, closes with the
+// holder closing first, so that the holder's record of it stays in
+// TIME-WAIT, and the holder's final ACK is lost. When `redirected`, member
+// 0 alone listens and the flow is member 1's, whose SYN it redirected to
+// member 0; otherwise member 1 listens and holds its own flow, the control.
+// Linux keeps the timewait socket in the established hash its connection
+// had (inet_twsk_hashdance), so every later segment of the tuple reaches
+// it, wherever its SYN was taken: tcp_timewait_state_process acknowledges
+// the peer's retransmitted FIN (an out-of-window segment, TCP_TW_ACK) and
+// a stale ACK (out of window or PAWS-rejected, TCP_TW_ACK under the
+// out-of-window rate limit), as the lost final ACK was, and decides on a
+// reopening SYN (TCP_TW_SYN). Nothing of the tuple is reset.
+fn time_wait_case(redirected: bool, reuse: bool, dispatch: Dispatch) {
+    let steering = match dispatch {
+        Dispatch::Queue0 => "one queue",
+        _ => "rss",
+    };
+    let what = format!("redirected {redirected} reuse {reuse} {steering}");
+    let n = 2;
+    let (flows, stations) = hash_members(n, INBOX, |config| {
+        config.tcp.reuse_time_wait = reuse;
+        config.tcp.connection.time_wait_us = 2 * SECOND;
+    });
+    let mut lan = Lan::new(stations, dispatch, Some(flows.clone()));
+    let holder = usize::from(!redirected);
+    let mut servers: Vec<Option<Echo>> = vec![None, None];
+    servers[holder] = Some(Echo::new(lan.network(holder)));
+    let port = peer_ports_of(&flows, 1, 1)[0];
+    let local = SocketAddrV4::new(ADDRESS, LISTEN);
+    let remote = SocketAddrV4::new(PEER, port);
+    let mut clients = vec![open_from(&mut lan, port, 0, 2 * MSS)];
+    echo_all(&mut lan, &mut servers, &mut clients, 5 * SECOND);
+    assert_eq!(flows.redirected(1), usize::from(redirected), "{what}");
+    assert_eq!(flows.owner(local, remote), Some(holder), "{what}");
+    let accepted = servers[holder].as_ref().unwrap().connections[0].0;
+
+    let log = WireLog::default();
+    let drop_next_ack = Arc::new(AtomicUsize::new(0));
+    // While set, the port's segments do not reach the peer.
+    let cut = Arc::new(AtomicUsize::new(0));
+    lan.router.tap = Some(Box::new({
+        let (log, drop_next_ack, cut) = (log.clone(), drop_next_ack.clone(), cut.clone());
+        move |from, frame| {
+            let Some(ip) = l3(frame).filter(|ip| ports(ip).is_some()) else {
+                return true;
+            };
+            let dropped = from.is_some() && cut.load(Ordering::Relaxed) != 0
+                || from == Some(holder)
+                    && tcp_flags(ip) == ACK
+                    && tcp_payload(ip).is_empty()
+                    && drop_next_ack
+                        .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok();
+            log.lock().unwrap().push((from, frame.to_vec(), dropped));
+            !dropped
+        }
+    }));
+    let run = |lan: &mut Lan, us: u64| {
+        let until = lan.now + us;
+        lan.run(until, |lan| {
+            drain(lan.network(0));
+            drain(lan.network(1));
+            drain(&mut lan.peer.network);
+            false
+        });
+    };
+    // The holder's FIN, acknowledged by the peer.
+    lan.network(holder).close(accepted).unwrap();
+    run(&mut lan, 100_000);
+    let stale_ack = {
+        let log = log.lock().unwrap();
+        let (_, fin, _) = log
+            .iter()
+            .find(|(from, f, _)| *from == Some(holder) && tcp_flags(l3(f).unwrap()) & FIN != 0)
+            .unwrap_or_else(|| panic!("{what}: the holder's FIN"))
+            .clone();
+        let fin_end = seq_of(l3(&fin).unwrap()).wrapping_add(1);
+        let (_, ack, _) = log
+            .iter()
+            .find(|(from, f, _)| {
+                let ip = l3(f).unwrap();
+                from.is_none() && tcp_flags(ip) == ACK && ack_of(ip) == fin_end
+            })
+            .unwrap_or_else(|| panic!("{what}: the peer's ACK of the holder's FIN"))
+            .clone();
+        ack
+    };
+
+    // The peer's FIN puts the holder in TIME-WAIT; its ACK is lost, and the
+    // peer, in LAST-ACK, sends its FIN again.
+    drop_next_ack.store(1, Ordering::Relaxed);
+    lan.peer.network.close(clients[0].connection).unwrap();
+    run(&mut lan, 1_500_000);
+    let log_now: Vec<_> = log.lock().unwrap().clone();
+    let at = log_now
+        .iter()
+        .position(|(from, _, dropped)| *dropped && *from == Some(holder))
+        .unwrap_or_else(|| panic!("{what}: the holder's final ACK"));
+    let final_ack = l3(&log_now[at].1).unwrap().to_vec();
+    let peer_fins: Vec<usize> = (0..log_now.len())
+        .filter(|&i| log_now[i].0.is_none() && tcp_flags(l3(&log_now[i].1).unwrap()) & FIN != 0)
+        .collect();
+    assert!(peer_fins.len() >= 2, "{what}: the peer sends its FIN again");
+    let resent = peer_fins[1];
+    assert!(resent > at, "{what}");
+    let answers: Vec<(Option<usize>, Vec<u8>)> = log_now[resent + 1..]
+        .iter()
+        .filter(|(from, _, _)| from.is_some())
+        .map(|(from, f, _)| (*from, l3(f).unwrap().to_vec()))
+        .collect();
+    assert_eq!(
+        lan.resets,
+        vec![0; n],
+        "{what}: resets of the retransmitted FIN"
+    );
+    assert!(
+        !answers.is_empty(),
+        "{what}: the retransmitted FIN is answered"
+    );
+    for (from, answer) in &answers {
+        assert_eq!(*from, Some(holder), "{what}");
+        assert_eq!(
+            normalized(answer),
+            normalized(&final_ack),
+            "{what}: the TIME-WAIT ACK repeats the lost one"
+        );
+    }
+    // The peer has its ACK: its connection is over, without a reset.
+    assert_eq!(lan.peer_resets, 0, "{what}");
+    assert!(
+        lan.peer
+            .network
+            .connection_info(clients[0].connection)
+            .is_ok_and(|i| i.state == State::Closed)
+            || lan
+                .peer
+                .network
+                .connection_info(clients[0].connection)
+                .is_err(),
+        "{what}: the peer's LAST-ACK ends"
+    );
+
+    // A stale ACK, the peer's ACK of the holder's FIN again: older than
+    // RCV.NXT and, its TSval older than the FIN's, PAWS-rejected, so Linux
+    // acknowledges it (the first out-of-window ACK of this TIME-WAIT). The
+    // peer, CLOSED, would reset that ACK, which ends TIME-WAIT, and so the
+    // answers to it and to the SYN below are cut off.
+    cut.store(1, Ordering::Relaxed);
+    let before = log.lock().unwrap().len();
+    lan.toward_port(stale_ack.clone());
+    run(&mut lan, 50_000);
+    let answers: Vec<(Option<usize>, Vec<u8>)> = log.lock().unwrap()[before + 1..]
+        .iter()
+        .filter(|(from, _, _)| from.is_some())
+        .map(|(from, f, _)| (*from, l3(f).unwrap().to_vec()))
+        .collect();
+    assert_eq!(lan.resets, vec![0; n], "{what}: resets of a stale ACK");
+    let flags: Vec<_> = answers.iter().map(|(f, a)| (*f, tcp_flags(a))).collect();
+    assert_eq!(
+        answers.len(),
+        1,
+        "{what}: the stale ACK is answered once: {flags:?}"
+    );
+    assert_eq!(answers[0].0, Some(holder), "{what}");
+    assert_eq!(normalized(&answers[0].1), normalized(&final_ack), "{what}");
+
+    // A SYN of the tuple, with a sequence number past the old incarnation's:
+    // reopened by the holder (reuse_time_wait, Linux's TCP_TW_SYN), or
+    // otherwise acknowledged by its record (RFC 9293 section 3.10.7.4).
+    let rcv_nxt = ack_of(&final_ack);
+    let syn_seq = rcv_nxt.wrapping_add(1_000_000);
+    let before = log.lock().unwrap().len();
+    lan.toward_port(tcp_frame(remote, local, syn_seq, 0, SYN));
+    run(&mut lan, 50_000);
+    let answers: Vec<(Option<usize>, Vec<u8>)> = log.lock().unwrap()[before + 1..]
+        .iter()
+        .filter(|(from, _, _)| from.is_some())
+        .map(|(from, f, _)| (*from, l3(f).unwrap().to_vec()))
+        .collect();
+    assert_eq!(lan.resets, vec![0; n], "{what}: resets of a reopening SYN");
+    let (from, answer) = answers
+        .first()
+        .unwrap_or_else(|| panic!("{what}: the reopening SYN is answered"));
+    assert_eq!(*from, Some(holder), "{what}");
+    if reuse {
+        assert_eq!(tcp_flags(answer), SYN | ACK, "{what}");
+        assert_eq!(ack_of(answer), syn_seq.wrapping_add(1), "{what}");
+    } else {
+        assert_eq!(normalized(answer), normalized(&final_ack), "{what}");
+    }
+    assert_eq!(flows.owner(local, remote), Some(holder), "{what}");
+    cut.store(0, Ordering::Relaxed);
+
+    // The record expires, or the reopened connection, which the peer resets
+    // (it has none), ends: the flow is its owner's again.
+    let done = lan.run(lan.now + 5 * SECOND, |lan| {
+        drain(lan.network(0));
+        drain(lan.network(1));
+        drain(&mut lan.peer.network);
+        flows.redirected(1) == 0
+    });
+    assert!(done, "{what}: {} held", flows.redirected(1));
+    assert_eq!(flows.owner(local, remote), Some(1), "{what}");
+    assert_eq!(lan.resets, vec![0; n], "{what}");
+    for k in 0..n {
+        let drops = &lan.network(k).counters().drops;
+        assert_eq!(drops[DropReason::TcpFlags], 0, "{what}: member {k}");
+        assert_eq!(drops[DropReason::NoSocket], 0, "{what}: member {k}");
+    }
+    let log = log.lock().unwrap();
+    assert!(
+        log.iter()
+            .all(|(from, f, _)| from.is_none() || tcp_flags(l3(f).unwrap()) & RST == 0),
+        "{what}"
+    );
+}
+
+#[test]
+fn a_held_flows_time_wait_answers_its_segments_as_an_unshared_ones() {
+    for reuse in [false, true] {
+        time_wait_case(false, reuse, Dispatch::rss(2));
+        for dispatch in [Dispatch::rss(2), Dispatch::Queue0] {
+            time_wait_case(true, reuse, dispatch);
+        }
+    }
+}
+
+// A held flow in TIME-WAIT counts toward `redirected_flows` while its
+// record lasts, as its connection did: a SYN of another flow beyond the
+// bound is dropped, and taken once the record expires, when its peer sends
+// it again. TIME-WAIT bounds how long a closed flow is held.
+#[test]
+fn held_time_wait_flows_count_toward_the_bound_until_they_expire() {
+    let n = 2;
+    let ownership = FlowOwnership::Hash {
+        key: DEFAULT_FLOW_KEY.to_vec(),
+        table: round_robin(n, TABLE),
+    };
+    let limits = SharedFlowLimits {
+        redirected_flows: 1,
+        ..limits(n, INBOX)
+    };
+    let flows = SharedFlows::new(ownership, limits).unwrap();
+    let table = neighbors(n);
+    let time_wait = 2 * SECOND;
+    let stations = (0..n)
+        .map(|k| {
+            let mut config = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
+            config.tcp.connection.time_wait_us = time_wait;
+            join(&flows, &table, k, config)
+        })
+        .collect();
+    let mut lan = Lan::new(stations, Dispatch::rss(n), Some(flows.clone()));
+    let mut servers: Vec<Option<Echo>> = vec![Some(Echo::new(lan.network(0))), None];
+    let owned = peer_ports_of(&flows, 1, 2);
+    let mut first = vec![open_from(&mut lan, owned[0], 0, MSS)];
+    echo_all(&mut lan, &mut servers, &mut first, 5 * SECOND);
+    let accepted = servers[0].as_ref().unwrap().connections[0].0;
+    lan.network(0).close(accepted).unwrap();
+    let until = lan.now + 100_000;
+    lan.run(until, |lan| {
+        drain(lan.network(0));
+        drain(&mut lan.peer.network);
+        false
+    });
+    lan.peer.network.close(first[0].connection).unwrap();
+    let until = lan.now + 100_000;
+    lan.run(until, |lan| {
+        drain(lan.network(0));
+        drain(&mut lan.peer.network);
+        false
+    });
+    let time_wait_began = lan.now;
+    assert_eq!(flows.redirected(1), 1, "the holder's record holds the flow");
+    let mut second = vec![open_from(&mut lan, owned[1], 1, MSS)];
+    let until = lan.now + 500_000;
+    lan.run(until, |lan| {
+        servers[0].as_mut().unwrap().serve(lan.network(0));
+        drain(lan.network(0));
+        false
+    });
+    assert_eq!(lan.network(1).counters().redirects_dropped, 1);
+    echo_all(&mut lan, &mut servers, &mut second, time_wait + 5 * SECOND);
+    assert!(lan.now > time_wait_began + time_wait / 2);
+    assert_eq!(holder(&lan, &servers, owned[1]), Some(0));
+    assert_eq!(flows.redirected(1), 1);
+    lan.assert_no_resets();
+}
+
+// The holder's TIME-WAIT connection, which its application has not yet
+// released, gives its tuple to a SYN that reopens it (reuse_time_wait), as
+// a Linux timewait socket gives way to the listener's new request: the new
+// connection holds the flow, and the old one's release leaves it held, so
+// that the handshake's ACK reaches it.
+#[test]
+fn a_reopened_held_flow_stays_with_the_connection_that_reopened_it() {
+    reopen_case(false);
+    reopen_case(true);
+}
+fn reopen_case(redirected: bool) {
+    let n = 2;
+    let (flows, stations) = hash_members(n, INBOX, |config| config.tcp.reuse_time_wait = true);
+    let mut lan = Lan::new(stations, Dispatch::rss(n), Some(flows.clone()));
+    let h = usize::from(!redirected);
+    let mut servers: Vec<Option<Echo>> = vec![None, None];
+    servers[h] = Some(Echo::new(lan.network(h)));
+    let port = peer_ports_of(&flows, 1, 1)[0];
+    let local = SocketAddrV4::new(ADDRESS, LISTEN);
+    let remote = SocketAddrV4::new(PEER, port);
+    let mut clients = vec![open_from(&mut lan, port, 0, MSS)];
+    echo_all(&mut lan, &mut servers, &mut clients, 5 * SECOND);
+    let accepted = servers[h].as_ref().unwrap().connections[0].0;
+    let log = WireLog::default();
+    let cut = Arc::new(AtomicUsize::new(0));
+    lan.router.tap = Some(Box::new({
+        let (log, cut) = (log.clone(), cut.clone());
+        move |from, frame| {
+            let dropped = from.is_some() && cut.load(Ordering::Relaxed) != 0;
+            if l3(frame).is_some_and(|ip| ports(ip).is_some()) {
+                log.lock().unwrap().push((from, frame.to_vec(), dropped));
+            }
+            !dropped
+        }
+    }));
+    // Both close, the holder first; its application keeps the connection,
+    // in TIME-WAIT, unreleased: it drains no events.
+    lan.network(h).close(accepted).unwrap();
+    let until = lan.now + 100_000;
+    lan.run(until, |lan| {
+        drain(&mut lan.peer.network);
+        false
+    });
+    lan.peer.network.close(clients[0].connection).unwrap();
+    let until = lan.now + 100_000;
+    lan.run(until, |lan| {
+        drain(&mut lan.peer.network);
+        false
+    });
+    let info = lan.network(h).connection_info(accepted).unwrap();
+    assert_eq!(info.state, State::TimeWait);
+    let peer_fin = log
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(from, f, _)| from.is_none() && tcp_flags(l3(f).unwrap()) & FIN != 0)
+        .map(|(_, f, _)| seq_of(l3(f).unwrap()))
+        .unwrap();
+    // A fresh SYN reopens the tuple. The peer, which has no connection of
+    // it, would reset the SYN-ACK: the port's segments are cut off.
+    cut.store(1, Ordering::Relaxed);
+    let syn_seq = peer_fin.wrapping_add(1_000_000);
+    let before = log.lock().unwrap().len();
+    lan.toward_port(tcp_frame(remote, local, syn_seq, 0, SYN));
+    // A handoff waits for the holder's next drive.
+    let answered = |log: &WireLog| {
+        log.lock().unwrap()[before..]
+            .iter()
+            .any(|(from, f, _)| from.is_some() && tcp_flags(l3(f).unwrap()) & SYN != 0)
+    };
+    let until = lan.now + 100_000;
+    lan.run(until, |_| answered(&log));
+    let seen: Vec<(Option<usize>, Vec<u8>)> = log.lock().unwrap()[before..]
+        .iter()
+        .map(|(from, f, _)| (*from, l3(f).unwrap().to_vec()))
+        .collect();
+    let syn_ack = seen
+        .iter()
+        .find(|(from, ip)| *from == Some(h) && tcp_flags(ip) == SYN | ACK)
+        .map(|(_, ip)| seq_of(ip))
+        .unwrap_or_else(|| {
+            let flags: Vec<_> = seen
+                .iter()
+                .map(|(from, ip)| (*from, tcp_flags(ip)))
+                .collect();
+            panic!("redirected {redirected}: the holder answers the reopening SYN: {flags:?}")
+        });
+    // The application releases the old connection.
+    let until = lan.now + 10_000;
+    lan.run(until, |lan| {
+        drain(lan.network(h));
+        false
+    });
+    assert!(
+        lan.network(h)
+            .connection_info(accepted)
+            .is_ok_and(|i| i.state == State::Closed)
+    );
+    assert_eq!(flows.owner(local, remote), Some(h));
+    lan.toward_port(tcp_frame(
+        remote,
+        local,
+        syn_seq.wrapping_add(1),
+        syn_ack.wrapping_add(1),
+        ACK,
+    ));
+    let done = lan.run(lan.now + 100_000, |lan| {
+        let server = servers[h].as_mut().unwrap();
+        server.serve(lan.network(h));
+        server.connections.len() == 2
+    });
+    assert!(done, "the reopened connection is accepted");
+    assert_eq!(lan.resets, vec![0; n]);
+    assert_eq!(lan.network(1).counters().drops[DropReason::TcpFlags], 0);
+    assert_eq!(flows.owner(local, remote), Some(h));
 }
 
 // Of a share's flows at most `redirected_flows` are held elsewhere at once:

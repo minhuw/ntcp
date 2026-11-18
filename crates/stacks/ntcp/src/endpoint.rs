@@ -3330,6 +3330,19 @@ impl Endpoint {
         self.lookup(tuple).is_some()
     }
 
+    /// The deadline of the TIME-WAIT record of `tuple`, kept for a released
+    /// connection the endpoint reclaimed: it ends then, unless a segment
+    /// restarts its timer first. None once it has ended, or while a
+    /// connection has the tuple. For state an adapter keeps per tuple as
+    /// long as its record lasts, as Linux keeps a timewait socket in its
+    /// connection's established hash until inet_twsk_kill.
+    pub fn time_wait_deadline(&self, tuple: ScopedTuple) -> Option<Instant> {
+        match self.lookup(tuple)? {
+            Target::TimeWait(index) => Some(self.time_wait.record(index).deadline),
+            Target::Connection(_) => None,
+        }
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc6056#section-3.4
     //# To protect against this, the secret key should be of a reasonable
     //# length.  Key lengths of 128 bits should be adequate.

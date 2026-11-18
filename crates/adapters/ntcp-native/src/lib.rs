@@ -22,13 +22,60 @@ use ntcp::{AddressValidation, Endpoint, EndpointError, Tuple};
 use ntcp_host::{Host, IngressContext, path};
 use ntcp_io::PacketIo;
 use std::{
-    collections::{HashMap, VecDeque},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, VecDeque},
     io,
     net::{SocketAddr, SocketAddrV4},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+// The flows a member of shared flows holds for other members' shares whose
+// connections were reclaimed into TIME-WAIT records, by flow key: a flow
+// stays the member's while its record lasts, as Linux's timewait socket
+// keeps its connection's place in the established hash, and a connection
+// that reopens the tuple takes it over. Each is due once, at its record's
+// deadline as last seen, when the record is looked at again
+// (`Network::maintain_time_wait_flows`). No more than the member holds.
+#[derive(Default)]
+struct TimeWaitFlows {
+    held: HashMap<u64, flows::Held>,
+    due: BinaryHeap<Reverse<(Instant, u64)>>,
+}
+
+impl TimeWaitFlows {
+    // The flow a reclaimed connection held, which its TIME-WAIT record of
+    // `tuple` holds now; false if it has none, or no room is left to note it.
+    fn reclaimed(
+        &mut self,
+        endpoint: &Endpoint,
+        now: Instant,
+        tuple: ntcp::ScopedTuple,
+        held: flows::Held,
+    ) -> bool {
+        let key = held.key();
+        debug_assert!(!self.held.contains_key(&key));
+        match endpoint.time_wait_deadline(tuple) {
+            Some(deadline)
+                if deadline > now
+                    && self.held.try_reserve(1).is_ok()
+                    && self.due.try_reserve(1).is_ok() =>
+            {
+                self.held.insert(key, held);
+                self.due.push(Reverse((deadline, key)));
+                true
+            }
+            _ => false,
+        }
+    }
+    fn holds(&self, held: flows::Held) -> bool {
+        !self.held.is_empty() && self.held.contains_key(&held.key())
+    }
+    fn next_due(&self) -> Option<Instant> {
+        self.due.peek().map(|&Reverse((due, _))| due)
+    }
+}
 
 struct Connection {
     core: ntcp::ConnectionId,
@@ -202,6 +249,8 @@ pub struct Network<P: PacketIo> {
     // their listeners.
     held_flows: Vec<Option<(ntcp::ConnectionId, flows::Held)>>,
     holding: usize,
+    // The held flows whose connections left TIME-WAIT records.
+    time_wait_flows: TimeWaitFlows,
     tx_cursor: usize,
     // How the backend completes frames (`PacketIo::tx_completion`), for
     // autocorking, and where its transmission stands: drives begun
@@ -616,10 +665,14 @@ impl<P: PacketIo> Network<P> {
     /// on the port, chosen among them by the flow's hash as Linux's
     /// SO_REUSEPORT group chooses among its listening sockets, rather than
     /// being reset. That member holds the flow, every member handing it
-    /// its segments, until its connection is reclaimed (after a reset's
-    /// TIME-WAIT, if it sent one, but not after the TIME-WAIT of a close,
-    /// whose stray segments the owner answers as a host that kept none);
-    /// one that leaves releases all it held. A member's share has at most
+    /// its segments, until its connection is reclaimed and the TIME-WAIT
+    /// record a close leaves of it is over: as Linux's timewait socket
+    /// keeps its connection's place in the established hash, the record
+    /// answers the flow's retransmitted FIN, stale segments and reopening
+    /// SYNs, and a connection that reopens the tuple holds the flow on. A
+    /// record that a RST ends early holds it until its deadline still,
+    /// segments meanwhile reaching the holder as segments of no connection.
+    /// One that leaves releases all it held. A member's share has at most
     /// `SharedFlowLimits::redirected_flows` flows held at once: a SYN
     /// beyond that is dropped (`Counters::redirects_dropped`), as a full
     /// listen queue drops one, and comes again from its peer. Only when
@@ -988,6 +1041,7 @@ impl<P: PacketIo> Network<P> {
             inlet,
             held_flows,
             holding: 0,
+            time_wait_flows: TimeWaitFlows::default(),
             tx_cursor: 0,
             tx_completion,
             tx_epoch: 1,

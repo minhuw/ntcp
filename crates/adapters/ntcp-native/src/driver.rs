@@ -509,6 +509,7 @@ impl<P: PacketIo> Network<P> {
             .next_deadline()
             .into_iter()
             .chain(self.host.next_reassembly_deadline())
+            .chain(self.time_wait_flows.next_due())
             .min();
         if !self.control.is_empty()
             && let Some(at) = self.host.next_neighbor_deadline()
@@ -1373,23 +1374,88 @@ impl<P: PacketIo> Network<P> {
         let result = take(self);
         let after = self.endpoint.scoped_connection_id(tuple);
         let flows = self.flows.as_ref().expect("a member of shared flows");
-        if let Some(held) = flows.held(local, remote) {
+        // A flow a TIME-WAIT record holds stays the record's until it is
+        // due, when a connection that reopened the tuple takes it over
+        // (`maintain_time_wait_flows`).
+        if let Some(held) = flows.held(local, remote)
+            && !self.time_wait_flows.holds(held)
+        {
             match (before, after) {
-                (None, Some(core)) => {
-                    // An earlier connection of the endpoint's slot, reclaimed
-                    // in this drive, is not yet looked at.
-                    if let Some((_, earlier)) = self.held_flows[core.index()].replace((core, held))
+                (None, Some(core)) => self.hold(core, held),
+                // A TIME-WAIT connection not yet released gave its tuple to
+                // the one this SYN reopened, which holds the flow now.
+                (Some(old), Some(core)) if old != core => {
+                    if let Some(entry) = self.held_flows.get_mut(old.index())
+                        && entry.is_some_and(|(id, _)| id == old)
                     {
-                        flows.release(earlier);
-                    } else {
-                        self.holding += 1;
+                        *entry = None;
+                        self.holding -= 1;
                     }
+                    self.hold(core, held);
                 }
-                (_, None) => flows.release(held),
+                (None, None) => flows.release(held),
                 _ => {}
             }
         }
         result
+    }
+    // Connection `core` of the endpoint holds `held`, until it is reclaimed.
+    fn hold(&mut self, core: ntcp::ConnectionId, held: flows::Held) {
+        // An earlier connection of the endpoint's slot, reclaimed in this
+        // drive, is not yet looked at: unless `core` reopened its tuple and
+        // holds its flow now.
+        match self.held_flows[core.index()].replace((core, held)) {
+            Some((_, earlier)) if earlier != held => self.reclaimed_flow(earlier),
+            Some(_) => {}
+            None => self.holding += 1,
+        }
+    }
+    // The flow a reclaimed connection held is its owner's again, unless the
+    // connection left a TIME-WAIT record, which holds it while it lasts, so
+    // that the flow's later segments still reach it: Linux's timewait socket
+    // takes its connection's place in the established hash
+    // (inet_twsk_hashdance), and answers the retransmitted FIN its final
+    // ACK was lost for. Without room to note it, the record is left to
+    // segments that reach this member, as when TIME-WAIT overflows.
+    fn reclaimed_flow(&mut self, held: flows::Held) {
+        let tuple = self.held_tuple(held);
+        if !self
+            .time_wait_flows
+            .reclaimed(&self.endpoint, self.now, tuple, held)
+        {
+            self.flows.as_ref().unwrap().release(held);
+        }
+    }
+    fn held_tuple(&self, held: flows::Held) -> ntcp::ScopedTuple {
+        let (local, remote) = self.flows.as_ref().unwrap().tuple(held);
+        self.scoped(Tuple {
+            local: local.into(),
+            remote: remote.into(),
+        })
+    }
+    // The flows of TIME-WAIT records that are due. One whose record's timer
+    // restarted is due again at the new deadline; one whose tuple a
+    // connection reopened is that connection's; any other, its record over
+    // (expired, or ended by a RST), is its owner's again.
+    fn maintain_time_wait_flows(&mut self) {
+        while let Some(due) = self.time_wait_flows.next_due()
+            && due <= self.now
+        {
+            let Reverse((_, key)) = self.time_wait_flows.due.pop().unwrap();
+            let held = self.time_wait_flows.held[&key];
+            let tuple = self.held_tuple(held);
+            if let Some(deadline) = self.endpoint.time_wait_deadline(tuple)
+                && deadline > self.now
+            {
+                self.time_wait_flows.due.push(Reverse((deadline, key)));
+                continue;
+            }
+            self.time_wait_flows.held.remove(&key);
+            match self.endpoint.scoped_connection_id(tuple) {
+                Some(core) => self.hold(core, held),
+                None => self.flows.as_ref().unwrap().release(held),
+            }
+        }
     }
     // A packet another member of shared flows handed over, taken in as one
     // this queue received: as it arrived, through `input` (a fragment is
@@ -2272,8 +2338,24 @@ impl<P: PacketIo> Network<P> {
                     && entry.is_some_and(|(id, _)| id == core)
                 {
                     let (_, held) = entry.take().unwrap();
-                    self.flows.as_ref().unwrap().release(held);
                     self.holding -= 1;
+                    // `reclaimed_flow`, on the fields it reads: `gone`
+                    // borrows the endpoint.
+                    let flows = self.flows.as_ref().unwrap();
+                    let (local, remote) = flows.tuple(held);
+                    let tuple = scoped_tuple(
+                        Tuple {
+                            local: local.into(),
+                            remote: remote.into(),
+                        },
+                        self.ingress.link(),
+                    );
+                    if !self
+                        .time_wait_flows
+                        .reclaimed(&self.endpoint, self.now, tuple, held)
+                    {
+                        flows.release(held);
+                    }
                 }
                 if let Some(index) =
                     self.core_slots
@@ -2303,16 +2385,21 @@ impl<P: PacketIo> Network<P> {
                 self.ports.give(port, binding);
             }
             if self.holding != 0 {
-                for entry in &mut self.held_flows {
-                    if entry.is_some_and(|(id, _)| !self.endpoint.connection_exists(id)) {
-                        let (_, held) = entry.take().unwrap();
-                        self.flows.as_ref().unwrap().release(held);
+                for index in 0..self.held_flows.len() {
+                    if let Some((id, held)) = self.held_flows[index]
+                        && !self.endpoint.connection_exists(id)
+                    {
+                        self.held_flows[index] = None;
                         self.holding -= 1;
+                        self.reclaimed_flow(held);
                     }
                 }
             }
         }
         self.reclaimed = reclaimed;
+        if !self.time_wait_flows.due.is_empty() {
+            self.maintain_time_wait_flows();
+        }
         Ok(())
     }
 }

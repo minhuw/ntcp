@@ -22,7 +22,9 @@
 // does likewise: it hands it to a listening member and records the flow as
 // that member's in its share's table of redirected flows, which every
 // member consults, while the table holds any, for the segments of its
-// flows. The holder removes the record once the connection is reclaimed.
+// flows. The holder removes the record once the connection is reclaimed
+// and its TIME-WAIT, if it has one, is over: Linux's timewait socket takes
+// its connection's place in the established hash until it is killed.
 use crate::{
     Error, Result,
     inbox::{Handed, Inbox},
@@ -110,7 +112,11 @@ pub struct SharedFlowLimits {
     /// Flows of each member's share that other members may hold at once,
     /// having taken their SYNs when it did not listen on their port (unless
     /// ownership is `FlowOwnership::ByAddress`, where every member listens
-    /// on its own address). A SYN beyond that is dropped, as a listener
+    /// on its own address). A flow is held while its connection lasts and
+    /// then while its TIME-WAIT record does (`NetworkConfig::tcp`'s
+    /// `connection.time_wait_us` at most, unless a segment restarts it), so
+    /// that the record answers the flow's later segments as Linux's
+    /// timewait socket does. A SYN beyond that is dropped, as a listener
     /// with a full queue drops one, rather than reset by a member that
     /// does not listen (`Counters::redirects_dropped`), and its peer sends
     /// it again.
@@ -627,7 +633,8 @@ impl SharedFlows {
     /// address; under `FlowOwnership::Hash` and `FlowOwnership::TaggedPorts`,
     /// None unless the members' address is `local`'s. A flow whose SYN its
     /// owner handed to a listening member, not listening on its port
-    /// itself, is that member's until its connection is gone.
+    /// itself, is that member's until its connection and its TIME-WAIT
+    /// record, if it leaves one, are gone.
     pub fn owner(&self, local: SocketAddrV4, remote: SocketAddrV4) -> Option<usize> {
         self.shared
             .flow(local, remote, None)
@@ -884,6 +891,14 @@ pub(crate) struct Held {
     key: u64,
 }
 
+impl Held {
+    /// The flow's remote address, remote port and local port, which name it
+    /// among the flows of the holder's address.
+    pub(crate) fn key(self) -> u64 {
+        self.key
+    }
+}
+
 const ICMP: u8 = 1;
 const TCP: u8 = 6;
 // SYN, and SYN with ACK or RST, of a TCP header's flags.
@@ -1087,7 +1102,8 @@ impl Member {
     }
     /// The listening member that takes the SYN of the flow between `local`
     /// and `remote`, one this member owns but that is `unheard`, and holds
-    /// the flow until its connection is gone (`release`). Among the
+    /// the flow until its connection and TIME-WAIT record are gone
+    /// (`release`). Among the
     /// listeners on the port, a member once per listener, the flow's hash
     /// picks one as Linux's reuseport_select_sock does (`reciprocal_scale`
     /// over the group's sockets), so that each takes a like share. A flow
@@ -1131,6 +1147,16 @@ impl Member {
             owner,
             key: flow_key(local, remote),
         })
+    }
+    /// The local and remote address of `held`, a flow of this member's
+    /// address (`flow_key`).
+    pub(crate) fn tuple(&self, held: Held) -> (SocketAddrV4, SocketAddrV4) {
+        let local = SocketAddrV4::new(self.address, held.key as u16);
+        let remote = SocketAddrV4::new(
+            Ipv4Addr::from((held.key >> 32) as u32),
+            (held.key >> 16) as u16,
+        );
+        (local, remote)
     }
     /// This member no longer holds `held`: its later segments are its
     /// owner's again.
