@@ -50,7 +50,7 @@ T10_CLOSURES = {
     "request-cache-spurious": (
         "4.2.1",
         '3. If the SYN-ACK has a Fast Open option with a cookie, the client replaces the cookie and other information as described in the "Client Cookie Handling" section (Section 4.1.3). Otherwise, if the SYN-ACK is first seen and not a (spurious) retransmission, the client MAY remove the server information from the cookie cache. If the SYN-ACK is a spurious retransmission, the client does nothing to the cookie cache for the reasons below.',
-        "crates/stacks/ntcp/src/endpoint.rs::fn refresh(",
+        "crates/stacks/ntcp/src/endpoint.rs::fn refresh_walk(",
         "crates/stacks/ntcp/src/fast_open_evidence_tests.rs::fn spurious_synacks_cannot_revert_parallel_cookie_mss_or_extend_lifetimes()",
     ),
     "protected-switch": (
@@ -72,7 +72,7 @@ T2_CLOSURES = {
     "ignore-invalid-and-nonsyn": (
         "4.1.1",
         "Options with invalid Length values or without the SYN flag set MUST be ignored.",
-        "crates/stacks/ntcp/src/wire.rs::fn read_options(",
+        "crates/stacks/ntcp/src/wire.rs::fn walk_options(",
         "crates/stacks/ntcp/src/fast_open_tests.rs::fn malformed_fast_open_preserves_timestamp_validation_and_ordinary_stream()",
     ),
 }
@@ -82,7 +82,7 @@ T3_CLOSURES = {
     "server-iw": (
         "4.2.2",
         "If the FastOpened flag is set, the server MUST follow [RFC5681] (based on [RFC3390]) to set the initial congestion window for sending more data packets.",
-        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_receive_path(",
+        "crates/stacks/ntcp/src/connection.rs::pub(crate) fn passive_with_path(",
         "crates/stacks/ntcp/src/connection_early_response_tests.rs::fn early_response_rfc5681_controller_matrix_and_ordinary_controls()",
     ),
 }
