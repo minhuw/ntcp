@@ -6232,30 +6232,6 @@ impl Endpoint {
             .min()
     }
 
-    /// Connection `id`'s part of `next_deadline`: its slot's next timer
-    /// (the connection's timers and the retry of a wait for memory; none
-    /// while its output is reserved) and the pacing of its reservation
-    /// when no attempt of it is outstanding. None for a handle that is not
-    /// live. Selecting, accepting and refusing `id`'s output
-    /// (`poll_reserved_transmit_for` and what follows from it) moves only
-    /// this earlier among the timers `next_deadline` covers; listener
-    /// cleanup it does on the way only ends other connections' timers.
-    pub fn connection_deadline(&self, id: ConnectionId) -> Option<Instant> {
-        let slot = self.retained_slot(id).ok()?;
-        let timer = self.deadlines.get(id.slot);
-        let pacing = self
-            .reservation_of(Some(id))
-            .filter(|&index| self.unattempted_reservations.contains(index))
-            .and_then(|index| {
-                let r = self.reservations[index].current.as_ref()?;
-                slot.connection
-                    .reserved_pacing_deadline(self.now, r.departure.as_ref()?)
-            });
-        match (timer, pacing) {
-            (Some(timer), Some(pacing)) => Some(timer.min(pacing)),
-            (timer, pacing) => timer.or(pacing),
-        }
-    }
     pub fn has_pending_output(&self) -> bool {
         self.free_reservations != self.reservations.len()
             || !self.output.is_empty()
