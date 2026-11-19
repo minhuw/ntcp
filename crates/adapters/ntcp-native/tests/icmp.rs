@@ -290,6 +290,9 @@ fn an_echo_reply_waits_for_its_next_hop() {
     let (destination, _, arp) = ntcp_arp::parse_frame(&sent[0]).unwrap();
     assert_eq!(destination, [0xff; 6]);
     assert_eq!(arp.target_ip, Ipv4Addr::from(REMOTE));
+    // The reply waits for the resolution, whose next request is the
+    // network's next deadline.
+    assert_eq!(s.network.next_deadline(), Some(s.now + SECOND));
     let answer = ntcp_arp::Arp {
         operation: ntcp_arp::Operation::Reply,
         sender_mac: REMOTE_MAC,
@@ -416,6 +419,25 @@ fn errors_to_many_destinations_share_a_bucket() {
     let datagrams = (0..30u8).map(|n| udp_from([10, 2, 0, n], 9, b"x"));
     let refill = s.exchange(datagrams.collect()).len();
     assert!((10..=30).contains(&refill), "{refill}");
+}
+
+// Messages a drive leaves for want of transmit budget are more work, which
+// the next drive sends: the network's next deadline does not tell them.
+#[test]
+fn messages_left_for_want_of_budget_are_more_work() {
+    let mut s = Station::new(IpAddr::V4(LOCAL.into()), |_| {});
+    let requests = (0..3).map(|n| ipv4_from(REMOTE, 1, &echo(false, 1, n, b"ping")));
+    s.incoming.borrow_mut().extend(requests);
+    s.now += 100;
+    let report = s
+        .network
+        .drive(s.now, WorkBudget::new(32, 1, 32, 32))
+        .unwrap();
+    assert_eq!(report.transmitted, 1);
+    assert!(report.more_work);
+    assert_eq!(s.network.next_deadline(), None);
+    assert_eq!(s.outgoing.borrow_mut().drain(..).count(), 1);
+    assert_eq!(s.drive().len(), 2);
 }
 
 // A full queue drops what does not fit, counted, and the queued messages

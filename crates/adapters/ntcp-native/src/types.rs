@@ -324,17 +324,9 @@ pub struct PushReport {
     pub more: bool,
     /// Drive before sleeping, as for `DriveReport::more_work`: `more`, a
     /// frame waiting for backend room, or output autocorking held, which
-    /// the next drive sends (`Network::push`).
+    /// the next drive sends (`Network::push`). Otherwise sleep no later
+    /// than `Network::next_deadline`, asked after the push.
     pub more_work: bool,
-    /// The earliest deadline the push can have armed or moved earlier, not
-    /// the network's: its connection's next timer, on a link that resolves
-    /// next hops also the neighbor tables' next deadline, and the network's
-    /// (as `DriveReport::next_deadline`) when the push applied queued path
-    /// changes; `now` when autocorking held output. None: none of them has
-    /// a deadline. Sleep no later than the earliest of this, those of the
-    /// other pushes since the last drive, and that drive's
-    /// `DriveReport::next_deadline` (`Network::push`).
-    pub next_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -343,9 +335,10 @@ pub struct DriveReport {
     pub transmitted: usize,
     pub discarded: usize,
     pub reclaimed: usize,
+    /// Drive again before sleeping. Otherwise sleep no later than
+    /// `Network::next_deadline`, asked after the drive.
     pub more_work: bool,
     pub tx_blocked: bool,
-    pub next_deadline: Option<Instant>,
     /// Whether `drain_events` has something to give as the drive returns:
     /// an event queued for it, raised by this drive or by any earlier call
     /// and not yet drained. False guarantees that `drain_events`, called

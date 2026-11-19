@@ -481,7 +481,7 @@ impl Lan {
             };
             let report = member.network.drive(self.now, BUDGET).unwrap();
             busy |= report.more_work;
-            next = next.min(report.next_deadline.unwrap_or(u64::MAX));
+            next = next.min(member.network.next_deadline().unwrap_or(u64::MAX));
             let sent = member.sent();
             busy |= !sent.is_empty();
             for frame in sent {
@@ -490,7 +490,7 @@ impl Lan {
         }
         let report = self.peer.network.drive(self.now, BUDGET).unwrap();
         busy |= report.more_work;
-        next = next.min(report.next_deadline.unwrap_or(u64::MAX));
+        next = next.min(self.peer.network.next_deadline().unwrap_or(u64::MAX));
         let sent = self.peer.sent();
         busy |= !sent.is_empty();
         for frame in sent {
@@ -2129,7 +2129,7 @@ fn blocked_members_are_woken_by_another_members_handoffs() {
                         if busy {
                             continue;
                         }
-                        let timeout = report.next_deadline.map_or(-1, |at| {
+                        let timeout = network.next_deadline().map_or(-1, |at| {
                             let ms = at.saturating_sub(clock()).div_ceil(1000);
                             ms.min(i32::MAX as u64) as i32
                         });

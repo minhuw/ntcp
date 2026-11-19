@@ -58,8 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let at = now();
         let report = network.drive(at, budget)?;
         if !report.more_work && report.received == 0 && report.transmitted == 0 {
-            let wait = report
-                .next_deadline
+            let wait = network
+                .next_deadline()
                 .map(|d| d.saturating_sub(at))
                 .unwrap_or(1000)
                 .min(1000);

@@ -335,8 +335,9 @@ fn lengths(frames: &[Vec<u8>]) -> Vec<usize> {
 }
 
 // A write's push sends all of it that the windows allow, at once, and only
-// what the connection has: a second push finds nothing. Its deadline is
-// the network's, the one a drive at the same instant reports.
+// what the connection has: a second push finds nothing and moves no
+// deadline. The network's deadline after it is the one a drive at the same
+// instant finds.
 #[test]
 fn a_push_sends_the_whole_write_and_a_second_push_nothing() {
     let mut net = Net::new(false);
@@ -347,63 +348,65 @@ fn a_push_sends_the_whole_write_and_a_second_push_nothing() {
     assert_eq!(lengths(&sent), [1448, 1448, 1448, 1448, 1448, 1448, 1312]);
     assert_eq!(report.transmitted, 7);
     assert!(!report.tx_blocked && !report.more && !report.more_work);
-    let deadline = report.next_deadline;
-    assert!(deadline.is_some());
+    let deadline = net.server.next_deadline();
+    assert!(deadline.is_some_and(|at| at > net.now));
     let again = net.push(id);
     assert_eq!(again.transmitted, 0);
     assert!(net.sent().is_empty());
-    assert_eq!(again.next_deadline, deadline);
+    assert_eq!(net.server.next_deadline(), deadline);
     let drive = net
         .server
         .drive(net.now, WorkBudget::new(0, 0, 0, 0))
         .unwrap();
-    assert_eq!(drive.next_deadline, deadline);
+    assert!(!drive.more_work);
+    assert_eq!(net.server.next_deadline(), deadline);
     assert_eq!(net.read(id), data(10_000));
 }
 
-// A push reports what it armed, not the network's next deadline: a write
-// pushed on an idle connection arms its retransmission timer, which the
-// last drive's deadline did not have; it is the network's next deadline
-// then, as a drive right after reports.
+// A write pushed on an idle connection arms its retransmission timer, which
+// the network had no deadline for: the network's next deadline after the
+// push is that timer, as after a drive right after it.
 #[test]
-fn a_push_reports_the_retransmission_timer_it_arms_on_an_idle_connection() {
+fn a_push_on_an_idle_connection_arms_the_networks_next_deadline() {
     let mut net = Net::configured(false, |config| config.tcp.connection.tlp = false);
     let id = net.connect(true);
     let idle = net.server.drive(net.now, BUDGET).unwrap();
-    assert_eq!(idle.next_deadline, None);
+    assert!(!idle.more_work);
+    assert_eq!(net.server.next_deadline(), None);
     net.write(id, 100);
+    // Written, not pushed: the next drive sends it, so a drive is due now.
+    assert_eq!(net.server.next_deadline(), Some(net.now));
     let report = net.push(id);
     assert_eq!(report.transmitted, 1);
-    let rto = report.next_deadline.unwrap();
+    assert!(!report.more_work);
+    let rto = net.server.next_deadline().unwrap();
     assert!(rto > net.now);
     let drive = net
         .server
         .drive(net.now, WorkBudget::new(0, 0, 0, 0))
         .unwrap();
-    assert_eq!(drive.next_deadline, Some(rto));
+    assert!(!drive.more_work);
+    assert_eq!(net.server.next_deadline(), Some(rto));
 }
 
-// Another connection's earlier timer, which the last drive reported, is
-// not in a push's deadline: the caller sleeps no later than the earliest
-// of both.
+// Another connection's earlier timer stays the network's next deadline
+// after a push arms a later one.
 #[test]
-fn a_push_leaves_other_connections_timers_to_the_last_drives_deadline() {
+fn a_push_keeps_other_connections_earlier_timers_in_the_next_deadline() {
     let mut net = Net::configured(false, |config| config.tcp.connection.tlp = false);
     let first = net.connect(true);
     let second = net.connect(true);
     net.write(first, 100);
-    let drive = net.server.drive(net.now, FLUSH).unwrap();
-    let earlier = drive.next_deadline.unwrap();
+    net.server.drive(net.now, FLUSH).unwrap();
+    let earlier = net.server.next_deadline().unwrap();
     net.write(second, 100);
     let report = net.push(second);
     assert_eq!(report.transmitted, 1);
-    let own = report.next_deadline.unwrap();
-    assert!(earlier < own);
-    let drive = net
-        .server
+    assert_eq!(net.server.next_deadline(), Some(earlier));
+    net.server
         .drive(net.now, WorkBudget::new(0, 0, 0, 0))
         .unwrap();
-    assert_eq!(drive.next_deadline, Some(earlier));
+    assert_eq!(net.server.next_deadline(), Some(earlier));
 }
 
 // Minshall's Nagle (c148): with Nagle on, a write of two full segments and
@@ -801,7 +804,8 @@ fn autocorking_holds_small_writes_while_a_data_frame_is_in_the_device() {
     let report = net.push(id);
     assert_eq!(report.transmitted, 0);
     assert!(report.more_work && !report.more && !report.tx_blocked);
-    assert_eq!(report.next_deadline, Some(net.now));
+    // The held output is the next drive's: a drive is due now.
+    assert_eq!(net.server.next_deadline(), Some(net.now));
     net.write(id, 24);
     let report = net.push(id);
     assert_eq!(report.transmitted, 0);

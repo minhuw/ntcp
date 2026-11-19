@@ -189,13 +189,13 @@ fn stations_resolve_each_other_and_exchange_data_both_ways() {
     );
     assert_eq!(report.transmitted, 1);
     assert!(!report.more_work && !report.tx_blocked);
-    assert_eq!(report.next_deadline, Some(10 + SECOND));
+    assert_eq!(a.network.next_deadline(), Some(10 + SECOND));
     // Waiting neither spins nor reports backpressure.
     for now in [20, 1000, 500_000] {
         let report = a.drive(now);
         assert_eq!(report.transmitted, 0);
         assert!(!report.more_work && !report.tx_blocked);
-        assert_eq!(report.next_deadline, Some(10 + SECOND));
+        assert_eq!(a.network.next_deadline(), Some(10 + SECOND));
         assert!(a.sent().is_empty());
     }
     // B answers with its MAC, unicast; the reply releases the SYN to it.
@@ -293,7 +293,7 @@ fn a_push_to_an_unresolved_next_hop_holds_its_frame_and_asks() {
     assert_eq!(sent.len(), 1);
     assert_eq!(report.transmitted, 1);
     assert!(!report.more_work && !report.tx_blocked);
-    assert_eq!(report.next_deadline, Some(10 + SECOND));
+    assert_eq!(a.network.next_deadline(), Some(10 + SECOND));
     // The held frame keeps the connection's output reserved.
     let report = a.network.push(client, 20).unwrap();
     assert_eq!(report.transmitted, 0);
@@ -312,11 +312,11 @@ fn a_push_to_an_unresolved_next_hop_holds_its_frame_and_asks() {
 }
 
 // A push whose next hop's entry went STALE starts DELAY, as Linux's
-// neigh_event_send does on the entry's first use, and reports DELAY's end:
-// the push's connection arms nothing earlier (an RTO floor of 30 s, no
-// loss probes), and the last drive's deadline had none of it.
+// neigh_event_send does on the entry's first use, and DELAY's end is the
+// network's next deadline: the push's connection arms nothing earlier (an
+// RTO floor of 30 s, no loss probes), and the last drive's had none of it.
 #[test]
-fn a_push_to_a_stale_next_hop_reports_the_delay_it_starts() {
+fn a_push_to_a_stale_next_hop_starts_delay_in_the_next_deadline() {
     let mut slow = config(IP_A, MAC_A, None);
     slow.tcp.connection.rto_min_us = 30 * SECOND;
     slow.tcp.connection.tlp = false;
@@ -330,16 +330,20 @@ fn a_push_to_a_stale_next_hop_reports_the_delay_it_starts() {
     // Idle beyond any ReachableTime: the entry is STALE, with no timer.
     run(&mut a, &mut b, &mut now, 50, SECOND);
     now += 10;
-    let idle = a.drive(now);
-    assert!(idle.next_deadline.is_none_or(|at| at > now + 6 * SECOND));
+    a.drive(now);
+    assert!(
+        a.network
+            .next_deadline()
+            .is_none_or(|at| at > now + 6 * SECOND)
+    );
     a.network
         .try_write(client, b"stale", WriteOptions::default())
         .unwrap();
     let report = a.network.push(client, now).unwrap();
     assert_eq!(report.transmitted, 1);
-    assert_eq!(report.next_deadline, Some(now + 5 * SECOND));
-    let drive = a.network.drive(now, WorkBudget::new(0, 0, 0, 0)).unwrap();
-    assert_eq!(drive.next_deadline, Some(now + 5 * SECOND));
+    assert_eq!(a.network.next_deadline(), Some(now + 5 * SECOND));
+    a.network.drive(now, WorkBudget::new(0, 0, 0, 0)).unwrap();
+    assert_eq!(a.network.next_deadline(), Some(now + 5 * SECOND));
 }
 
 #[test]
@@ -361,7 +365,7 @@ fn a_silent_peer_fails_resolution_and_the_syn_is_never_sent() {
         let sent = a.sent();
         assert!(ipv4(&sent).is_empty());
         requests.extend(arps(&sent).into_iter().map(|r| (now, r)));
-        now = report.next_deadline.unwrap();
+        now = a.network.next_deadline().unwrap();
     }
     // Three broadcast requests one second apart, then failure a second
     // after the last.
@@ -380,7 +384,7 @@ fn a_silent_peer_fails_resolution_and_the_syn_is_never_sent() {
     // The SYN was withdrawn unsubmitted: TCP retries on its own clock, no
     // earlier than its RTO, resolving again.
     assert!(!report.more_work && !report.tx_blocked);
-    let retry = report.next_deadline.unwrap();
+    let retry = a.network.next_deadline().unwrap();
     assert!(retry >= now + SECOND, "{retry}");
     assert_eq!(
         a.network.connection_info(client).unwrap().state,
@@ -397,12 +401,12 @@ fn a_silent_peer_fails_resolution_and_the_syn_is_never_sent() {
     let (mut frames, mut drives) = (0, 0);
     let mut now = retry;
     while now < 60 * SECOND {
-        let report = a.drive(now);
+        a.drive(now);
         drives += 1;
         let sent = a.sent();
         assert!(ipv4(&sent).is_empty());
         frames += sent.len();
-        now = report.next_deadline.unwrap().max(now + 1);
+        now = a.network.next_deadline().unwrap().max(now + 1);
     }
     assert!(
         frames <= 60 && drives <= 120,

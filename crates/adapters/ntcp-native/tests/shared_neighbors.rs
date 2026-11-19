@@ -563,7 +563,7 @@ fn a_silent_next_hop_fails_every_members_held_syn_without_busy_loops() {
             let sent = member.sent();
             assert!(ipv4(&sent).is_empty());
             requests.extend(arps(&sent).into_iter().map(|r| (now, r)));
-            next = next.min(report.next_deadline.unwrap());
+            next = next.min(member.network.next_deadline().unwrap());
         }
         now = next;
     }
@@ -585,7 +585,7 @@ fn a_silent_next_hop_fails_every_members_held_syn_without_busy_loops() {
         let report = member.drive(now);
         assert!(member.sent().is_empty());
         assert!(!report.more_work && !report.tx_blocked, "member {k}");
-        let retry = report.next_deadline.unwrap();
+        let retry = member.network.next_deadline().unwrap();
         assert!(retry >= now + SECOND, "member {k}: {retry}");
         assert_eq!(
             member.network.connection_info(clients[k]).unwrap().state,
@@ -600,12 +600,12 @@ fn a_silent_next_hop_fails_every_members_held_syn_without_busy_loops() {
     while now < 60 * SECOND {
         let mut next = u64::MAX;
         for member in &mut members {
-            let report = member.drive(now);
+            member.drive(now);
             drives += 1;
             let sent = member.sent();
             assert!(ipv4(&sent).is_empty());
             frames += sent.len();
-            next = next.min(report.next_deadline.unwrap().max(now + 1));
+            next = next.min(member.network.next_deadline().unwrap().max(now + 1));
         }
         now = next;
     }
@@ -764,15 +764,15 @@ fn a_member_skips_housekeeping_while_another_holds_the_table() {
         .try_write(client, b"while held", WriteOptions::default())
         .unwrap();
     let started = std::time::Instant::now();
-    let report = b[0].drive(now);
+    b[0].drive(now);
     assert!(started.elapsed() < Duration::from_secs(5), "B waited for A");
     let sent = b[0].sent();
     assert!(arps(&sent).is_empty());
     let data = ipv4(&sent);
     assert_eq!(data.len(), 1);
     assert_eq!(data[0][..6], PEER_MAC);
-    // The reply is still due: B's drive reports it.
-    assert!(report.next_deadline.is_some_and(|at| at <= now));
+    // The reply is still due: B's next deadline is now.
+    assert!(b[0].network.next_deadline().is_some_and(|at| at <= now));
     release.send(()).unwrap();
     driven_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     let from_a: Vec<_> = a_outgoing.lock().unwrap().drain(..).collect();

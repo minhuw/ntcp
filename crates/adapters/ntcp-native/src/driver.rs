@@ -110,6 +110,11 @@ impl<P: PacketIo> Network<P> {
     /// (`WorkBudget::receive`): run between a `try_read` and the next
     /// `drain_events`, it adds no arrival to what the read left.
     ///
+    /// A drive that reports `more_work` wants another drive before the
+    /// embedding sleeps; otherwise the embedding may sleep until
+    /// `next_deadline`, which it asks for after its last drive or push,
+    /// as it is about to sleep. A drive does not compute it.
+    ///
     /// A drive never fails for what passes: a backend without TX room, a
     /// connection's output held for it (its calls take effect meanwhile), an
     /// unresolved or unreachable next hop, a full neighbor or path table,
@@ -213,26 +218,17 @@ impl<P: PacketIo> Network<P> {
     /// should_autocork`). The held output stays queued and the next drive
     /// sends it, together with what later writes add, whatever the device's
     /// completion state: so a push that holds sends nothing and reports
-    /// `more_work` with `next_deadline` now, and the caller drives before
-    /// it sleeps. The first push after `set_nodelay(true)` does not hold,
-    /// as Linux pushes inside setsockopt(TCP_NODELAY), nor does one after
-    /// `shutdown_write`, whose FIN Linux pushes at once.
-    /// `Counters::autocorked` counts holds.
+    /// `more_work`, and the caller drives before it sleeps. The first push
+    /// after `set_nodelay(true)` does not hold, as Linux pushes inside
+    /// setsockopt(TCP_NODELAY), nor does one after `shutdown_write`, whose
+    /// FIN Linux pushes at once. `Counters::autocorked` counts holds.
     ///
-    /// A push can arm timers the last drive's `next_deadline` did not
-    /// cover: its connection's (retransmission, loss probe, persist,
-    /// pacing), and, on a link that resolves next hops, its next hop's (the
-    /// first use of a STALE entry starts DELAY, as Linux's neigh_event_send;
-    /// resolving a new one schedules its requests). Its `next_deadline` is
-    /// the earliest of those, not the network's: an embedding that sleeps
-    /// until a deadline sleeps no later than the earliest of its last
-    /// drive's `next_deadline` and those of its pushes since, and drives
-    /// first when a push reports `more_work`. No other timer moves earlier
-    /// in a push; one it ends or moves later (a timer its output stopped)
-    /// can leave that earliest before the network's next deadline, which
-    /// only wakes the embedding early. A push that applies queued path
-    /// changes (`Host::output_changes_pending`), which reach other
-    /// connections, reports the network's next deadline, as `drive` does.
+    /// A push can arm timers (its connection's retransmission, loss probe,
+    /// persist and pacing; on a link that resolves next hops, its next
+    /// hop's: the first use of a STALE entry starts DELAY, as Linux's
+    /// neigh_event_send, and resolving a new one schedules its requests).
+    /// It does not report them: `next_deadline`, asked after the push,
+    /// covers them with every other deadline of the network.
     ///
     /// Errors as `drive`'s: `Stopped`, nothing done; `TimeWentBackwards`,
     /// nothing done and the network runs on; `InvalidHandle` for a
@@ -252,12 +248,9 @@ impl<P: PacketIo> Network<P> {
             }
             Err(error) => return Err(error),
         }
-        // The network's deadline before the push, which the reported one
-        // must bound with it (debug builds).
-        let before = cfg!(debug_assertions).then(|| self.next_deadline());
         let mut report = DriveReport::default();
         let changes = self.host.output_changes_pending();
-        let result = match self.autocork(id, core, now) {
+        let result = match self.autocork(id, core) {
             Ok(Some(held)) => return Ok(held),
             Ok(None) => self.push_inner(core, now, changes, &mut report),
             Err(error) => Err(error),
@@ -274,43 +267,62 @@ impl<P: PacketIo> Network<P> {
                 return Err(self.stop_with_cause(other));
             }
         };
-        let next_deadline = if changes {
-            self.next_deadline()
-        } else {
-            self.push_deadline(core)
-        };
-        if let Some(before) = before {
-            let bound = before.into_iter().chain(next_deadline).min();
-            let after = self.next_deadline();
-            debug_assert!(
-                after.is_none_or(|after| bound.is_some_and(|bound| bound <= after)),
-                "push moved a deadline it does not report: {before:?} {next_deadline:?} {after:?}"
-            );
-        }
         Ok(PushReport {
             transmitted: report.transmitted,
             tx_blocked: report.tx_blocked || self.tx_pending != 0,
             more,
             more_work: more || self.tx_pending != 0,
-            next_deadline,
         })
     }
-    // The earliest deadline a push of `core` can have armed or moved
-    // earlier: the connection's (`Endpoint::connection_deadline`), and on
-    // a link that resolves next hops the neighbor tables', which its
-    // resolution can start (`Host::resolve_neighbor`) and, on a member of
-    // a shared table, its look at the member's wake can bring forward.
-    // Both are read, not computed: the endpoint's from its deadline heap,
-    // the tables' from their cached deadline.
-    fn push_deadline(&self, core: ntcp::ConnectionId) -> Option<Instant> {
-        let own = self.endpoint.connection_deadline(core);
-        if self.control.is_empty() {
-            return own;
+    /// The instant by which the network next has work for a drive, for an
+    /// embedding about to sleep: the earliest of the endpoint's timers
+    /// (its deadline heap and TIME-WAIT wheel, which hold every
+    /// connection timer and the retry of a wait for memory, and the pacing
+    /// of each reservation not yet attempted), reassembly expiry, the
+    /// TIME-WAIT records of flows this member of shared flows holds, and,
+    /// on a link that resolves next hops, the neighbor tables' next timer
+    /// or queued reply (on a member of a shared table, the table's, or at
+    /// once when the member has a wake it has not settled). When a drive
+    /// now would transmit, the network's current time instead: output
+    /// queued and not sent (writes not pushed, output autocorking held), a
+    /// frame waiting for backend room, or input retained while its
+    /// connection's output was reserved. None: nothing is due, and only
+    /// input, the member's wake or a call can give the network work.
+    ///
+    /// Ask after the last drive or push, before sleeping: the value holds
+    /// until the next input, drive, push or other call on the network (a
+    /// write, a connect, a close), and on a member of shared flows or of
+    /// a shared neighbor table until another member hands it work, which
+    /// wakes it. After a drive that reported no `more_work` it is the
+    /// deadline that drive found. It does not replace `more_work`: a drive
+    /// that used its whole receive budget, or left ICMP messages for want
+    /// of transmit budget, reports `more_work` and wants another drive
+    /// whatever this says. It reads the deadlines the network keeps (a
+    /// heap's first entry, the wheel's next slot, cached table deadlines)
+    /// and walks only the reservations not yet attempted, so it is cheap
+    /// enough to ask before every sleep, but not free: an embedding that
+    /// busy-polls and never sleeps need not ask. A stopped network has
+    /// none.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        if self.stopped {
+            return None;
         }
-        match (own, self.host.next_neighbor_deadline()) {
-            (Some(own), Some(neighbor)) => Some(own.min(neighbor)),
-            (own, neighbor) => own.or(neighbor),
+        if self.work_pending() {
+            return Some(self.now);
         }
+        self.timer_deadline()
+    }
+    // Whether a drive at the network's time would have work its state
+    // shows: output to poll or a frame to retry (as each drive's end
+    // tells it in `more_work`; a frame held for its next hop waits for
+    // the resolution's wake, not a poll), or retained input to replay.
+    fn work_pending(&self) -> bool {
+        !self.retained.is_empty()
+            || if self.tx_held == 0 {
+                self.endpoint.has_pending_output()
+            } else {
+                self.tx_pending != 0 || self.endpoint.has_queued_output()
+            }
     }
     // Where the backend's transmission stands, for a frame submitted now
     // (`Connection::tx_mark`): the drive epoch for a NextPoll device, the
@@ -339,12 +351,7 @@ impl<P: PacketIo> Network<P> {
     // device still has a data frame of the connection (its sk_wmem_alloc
     // test), and TCP's half holds (`Endpoint::should_autocork`). The hold
     // counts once, until the connection's next data frame is submitted.
-    fn autocork(
-        &mut self,
-        id: ConnId,
-        core: ntcp::ConnectionId,
-        now: Instant,
-    ) -> Result<Option<PushReport>> {
+    fn autocork(&mut self, id: ConnId, core: ntcp::ConnectionId) -> Result<Option<PushReport>> {
         let completion = self.tx_completion;
         if completion == ntcp_io::TxCompletion::Synchronous {
             return Ok(None);
@@ -392,7 +399,6 @@ impl<P: PacketIo> Network<P> {
             tx_blocked: self.tx_pending != 0,
             more: false,
             more_work: true,
-            next_deadline: Some(now),
         }))
     }
     // The push's transmit loop for `core`; true when it ended at the frame
@@ -506,9 +512,10 @@ impl<P: PacketIo> Network<P> {
             }
         }
     }
-    // The earliest instant the network has work: the endpoint's timers,
-    // reassembly expiry and, on a resolving link, its neighbor timers.
-    fn next_deadline(&self) -> Option<Instant> {
+    // The earliest instant the network has timed work: the endpoint's
+    // timers, reassembly expiry, held TIME-WAIT flows and, on a resolving
+    // link, its neighbor timers.
+    fn timer_deadline(&self) -> Option<Instant> {
         let deadline = self
             .endpoint
             .next_deadline()
@@ -876,7 +883,6 @@ impl<P: PacketIo> Network<P> {
         self.collect_core_events();
         self.maintain_connections()?;
         self.host.collect(&self.endpoint)?;
-        report.next_deadline = self.next_deadline();
         self.check_live();
         debug_assert_eq!(
             self.tx_pending,
@@ -900,6 +906,17 @@ impl<P: PacketIo> Network<P> {
             self.tx_pending != 0 || self.endpoint.has_queued_output()
         } {
             report.more_work = true;
+        }
+        // `next_deadline` is the deadline drives reported until it was
+        // asked for instead (`timer_deadline`, which this drive found)
+        // whenever the drive reports no more work: work it would report
+        // at once is more work. The deadline of a member of a shared
+        // neighbor table can move meanwhile (another member's wake).
+        if cfg!(debug_assertions) && !report.more_work {
+            debug_assert!(!self.work_pending());
+            if !self.shared_neighbors {
+                debug_assert_eq!(self.next_deadline(), self.timer_deadline());
+            }
         }
         Ok(())
     }

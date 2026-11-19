@@ -106,8 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This portable demonstration polls a TUN. Performance-oriented
         // embeddings choose their own readiness source or busy-poll policy.
         if report.received == 0 && report.transmitted == 0 && !batch.more {
-            let wait = report
-                .next_deadline
+            let wait = network
+                .next_deadline()
                 .map(|d| d.saturating_sub(now))
                 .unwrap_or(1000)
                 .min(1000);
