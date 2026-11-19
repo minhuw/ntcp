@@ -346,7 +346,9 @@ fn abi_table_null_counts_vectors_variadics_and_host_clock() {
     assert_eq!(errno(), ENOSYS);
     assert_eq!(n, 36);
     assert!(info.iter().all(|b| *b == 0xa5));
-    assert_eq!(get_buffer(fd, SO_RCVBUF), 65535);
+    // Linux's sk_rcvbuf for the Baseline profile's 65535-byte window: twice
+    // the window at the default scaling ratio (__tcp_space_from_win).
+    assert_eq!(get_buffer(fd, SO_RCVBUF), 131070);
     unsafe {
         assert_eq!(
             getsockopt(fd, IPPROTO_TCP, TCP_INFO, ptr::null_mut(), &mut n),
