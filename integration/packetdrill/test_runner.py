@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import hashlib
 import json
@@ -25,6 +26,23 @@ def mock_backend(test):
                     ('ntcp-socket', hashlib.sha256(plugin.read_bytes()).hexdigest()))
     patcher.start()
     test.addCleanup(patcher.stop)
+
+
+@contextlib.contextmanager
+def fixture_temporary_directory():
+    # The isolated fixture hides /tmp (run.fixture_command refuses runtime
+    # artifacts there), so the mock checkout lives under the ignored
+    # workbench/. A fresh worktree has none: create it, and remove it again
+    # if this test created it.
+    workbench = HERE.parent.parent / 'workbench'
+    created = not workbench.exists()
+    workbench.mkdir(exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(dir=workbench) as temporary:
+            yield temporary
+    finally:
+        if created:
+            workbench.rmdir()
 
 
 BASIC17 = (
@@ -1086,7 +1104,7 @@ class FileFixtureChecks(unittest.TestCase):
 
     def test_main_fixture_invocation_and_isolation_failure_reporting(self):
         mock_backend(self)
-        with tempfile.TemporaryDirectory(dir=HERE.parent.parent / 'workbench') as temporary:
+        with fixture_temporary_directory() as temporary:
             checkout = Path(temporary).resolve()
             (checkout / PIN['tcp_tests']).parent.mkdir(parents=True)
             (checkout / PIN['tcp_tests']).symlink_to(self.directory)
@@ -1383,7 +1401,7 @@ class PublishedSelectionChecks(unittest.TestCase):
             if name.startswith('tcp_info/'):
                 self.assertTrue(entry['embedded_tcp_info'])
                 self.assertNotIn('blocked_reasons', entry)
-        with tempfile.TemporaryDirectory(dir=HERE.parent.parent / 'workbench') as temporary:
+        with fixture_temporary_directory() as temporary:
             checkout = Path(temporary)
             (checkout / PIN['tcp_tests']).parent.mkdir(parents=True)
             (checkout / PIN['tcp_tests']).symlink_to(self.directory.resolve(), target_is_directory=True)
