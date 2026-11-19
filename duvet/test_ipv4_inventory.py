@@ -209,7 +209,11 @@ class Ipv4Inventory(unittest.TestCase):
 
 class HistoricalPublication(unittest.TestCase):
     def setUp(self):
-        (ROOT / "workbench").mkdir(exist_ok=True)
+        workbench = ROOT / "workbench"
+        if not workbench.exists():
+            workbench.mkdir()
+            # Cleanups run last-registered first: this one after the temporary directory's.
+            self.addCleanup(workbench.rmdir)
         temporary = tempfile.TemporaryDirectory(dir=ROOT / "workbench")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

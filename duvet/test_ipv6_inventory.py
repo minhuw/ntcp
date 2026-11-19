@@ -125,7 +125,11 @@ class Ipv6Inventory(unittest.TestCase):
         self.assertIn("jumbograms", ledger(8200)["scope"])
 
     def temporary_root(self):
-        (ROOT / "workbench").mkdir(exist_ok=True)
+        workbench = ROOT / "workbench"
+        if not workbench.exists():
+            workbench.mkdir()
+            # Cleanups run last-registered first: this one after the temporary directories'.
+            self.addCleanup(workbench.rmdir)
         temporary = tempfile.TemporaryDirectory(dir=ROOT / "workbench")
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
