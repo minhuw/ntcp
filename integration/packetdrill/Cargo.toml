@@ -7,7 +7,9 @@ publish = false
 license = "GPL-2.0-or-later"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# The plugin only: nothing links an rlib of it, and cargo runs no LTO on a crate that
+# builds one besides the cdylib.
+crate-type = ["cdylib"]
 
 [features]
 default = []

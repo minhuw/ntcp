@@ -5,6 +5,13 @@ resolver = "3"
 [workspace.package]
 rust-version = "1.99"
 
+# One codegen unit and fat LTO, so the hot paths inline across the stack's crates (ntcp,
+# ntcp-host, ntcp-native, ntcp-io). Cargo runs no LTO on a crate that builds an rlib
+# besides a cdylib: see ntcp-socket's [lib].
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
 # The packetdrill plugin (`--profile packetdrill`): optimized, since an unoptimized
 # build segments a large send too slowly for the scripts' packet timing, with the debug
 # cross-checks and overflow checks kept on.

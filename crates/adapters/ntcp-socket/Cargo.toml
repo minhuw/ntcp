@@ -6,6 +6,10 @@ rust-version.workspace = true
 license = "MIT AND GPL-2.0-or-later"
 
 [lib]
+# The cdylib is the preload, the rlib is what ntcp-packetdrill links. Cargo runs no LTO on
+# a crate that builds both, so build the release preload as a cdylib alone, which gets
+# the release profile's fat LTO:
+#   cargo rustc --release -p ntcp-socket --lib --crate-type cdylib
 crate-type = ["rlib", "cdylib"]
 
 [features]
