@@ -2335,15 +2335,18 @@ fn client_policy_control_and_native_peer_override_preserve_deferred_open() {
         },
         0
     );
+    // The SYN takes the whole write: its data space is the offered MSS
+    // (1460) less the 40-byte option space, as Linux's tcp_send_syn_data
+    // (upstream fastopen/client/cookie-less-sendto.pkt: 1000 B, SYN 0:1000).
     let data = [7u8; 1000];
     assert_eq!(
         unsafe { ntcp_socket::write(first, data.as_ptr().cast(), data.len()) },
-        496
+        1000
     );
     let bytes = call(&adapter, 15, 0, 0, vec![], BYTES).unwrap().bytes;
     let (ip, tcp) = parse_frame(&bytes).unwrap();
     let syn = ntcp::wire::parse(ip, tcp).unwrap();
-    assert_eq!(syn.payload.len(), 496);
+    assert_eq!(syn.payload.len(), 1000);
     assert!(syn.options.fast_open.is_none());
     let next = call(&adapter, 1, 0, SOCK_NONBLOCK, vec![], 0)
         .unwrap()
