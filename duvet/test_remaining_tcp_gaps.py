@@ -68,7 +68,7 @@ OBLIGATIONS = (
         ),
         "reason_fragments": (
             "queries and validates the real backend MTU", "enables PMTUD with or without PAWS",
-            "dispatches checksummed ICMP PTB", "live tuple/sequence/exact-packet validation",
+            "dispatches checksummed ICMP PTB", "live tuple and send-window sequence validation",
             "timestamp negotiation, IPv4 DF", "bounded IPv4/IPv6 repairs",
             "receiver/ACK byte progress", "rejected feedback", "committed-output retention",
             "ICMP-blackhole R1 fallback with ordinary congestion response",
