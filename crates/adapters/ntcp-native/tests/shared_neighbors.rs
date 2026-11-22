@@ -9,7 +9,11 @@ use std::{
     collections::VecDeque,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -477,9 +481,11 @@ fn members_on_separate_threads_exchange_data_with_a_peer() {
     let listener = peer.network.listen(80, 4).unwrap();
     let incoming: Vec<Queue> = (0..MEMBERS).map(|_| Queue::default()).collect();
     let payload = |k: usize| -> Vec<u8> { (0..20_000).map(|i| (i * (k + 3)) as u8).collect() };
+    let remaining = Arc::new(AtomicUsize::new(MEMBERS));
     let workers: Vec<_> = (0..MEMBERS)
         .map(|k| {
             let shared = shared.clone();
+            let remaining = remaining.clone();
             let port = Station::port(&incoming[k], &peer.incoming);
             thread::spawn(move || -> Vec<u8> {
                 let config = config(member_ip(k), PORT_MAC);
@@ -489,8 +495,14 @@ fn members_on_separate_threads_exchange_data_with_a_peer() {
                 let data = payload(k);
                 let client = network.connect(SocketAddr::new(PEER.into(), 80)).unwrap();
                 let (mut sent, mut echoed) = (0, Vec::new());
+                let mut done = false;
                 let mut out = [0; 4096];
-                while echoed.len() < data.len() && start.elapsed() < Duration::from_secs(30) {
+                // Keep every queue driving until every member finishes: the
+                // port steers ARP to member 1, so exiting early would leave
+                // peer ARP requests for slower members unread.
+                while remaining.load(Ordering::Acquire) > 0
+                    && start.elapsed() < Duration::from_secs(30)
+                {
                     network.drive(clock(), BUDGET).unwrap();
                     if sent < data.len()
                         && let Ok(receipt) =
@@ -500,6 +512,10 @@ fn members_on_separate_threads_exchange_data_with_a_peer() {
                     }
                     if let Ok(ReadOutcome::Data { len, .. }) = network.try_read(client, &mut out) {
                         echoed.extend_from_slice(&out[..len]);
+                    }
+                    if !done && echoed.len() >= data.len() {
+                        done = true;
+                        remaining.fetch_sub(1, Ordering::Release);
                     }
                     thread::sleep(Duration::from_micros(100));
                 }
