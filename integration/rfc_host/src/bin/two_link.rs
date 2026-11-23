@@ -151,17 +151,22 @@ impl Network {
         std::fs::File::open("/dev/urandom")?.read_exact(&mut lookup_key)?;
         let (paths, mut limits) =
             ntcp_host::managed_limits(config, 2, 1, 1, 1, 1).map_err(host_error)?;
-        // One read pass's worth of concurrent datagrams, one largest
-        // datagram's bytes (an IPv6 first fragment also stores its Fragment
-        // header) and descriptors for it in 8-octet fragments.
-        limits.reassembly = ntcp_host::ReassemblyLimits {
+        // One read pass's worth of concurrent datagrams, and the charge of
+        // one largest datagram in 8-octet fragments: its octets (an IPv6
+        // first fragment also stores its Fragment header) and enough
+        // descriptors.
+        let mut reassembly = ntcp_host::ReassemblyLimits {
             assemblies: BUDGET,
             fragments: IPV6_DATAGRAM.div_ceil(8),
-            buffered_bytes: IPV6_DATAGRAM + 8,
+            buffered_bytes: 0,
             ipv4_datagram: IPV4_DATAGRAM,
             ipv6_datagram: IPV6_DATAGRAM,
             ipv4_timeout_seconds: 60,
         };
+        reassembly.buffered_bytes = reassembly
+            .datagram_charge(IPV6_DATAGRAM, true)
+            .max(reassembly.datagram_charge(IPV4_DATAGRAM, false));
+        limits.reassembly = reassembly;
         let mut host = Host::new(
             path::ContextId::new(u64::from_ne_bytes(identity)),
             paths,

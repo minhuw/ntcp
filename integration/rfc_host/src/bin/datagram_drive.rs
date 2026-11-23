@@ -296,14 +296,18 @@ impl Network {
             },
         )
         .map_err(host_error)?;
-        limits.reassembly = ntcp_host::ReassemblyLimits {
+        let mut reassembly = ntcp_host::ReassemblyLimits {
             assemblies: BUDGET,
             fragments: IPV4_DATAGRAM.div_ceil(8),
-            buffered_bytes: IPV6_DATAGRAM + 8,
+            buffered_bytes: 0,
             ipv4_datagram: IPV4_DATAGRAM,
             ipv6_datagram: IPV6_DATAGRAM,
             ipv4_timeout_seconds: 60,
         };
+        reassembly.buffered_bytes = reassembly
+            .datagram_charge(IPV6_DATAGRAM, true)
+            .max(reassembly.datagram_charge(IPV4_DATAGRAM, false));
+        limits.reassembly = reassembly;
         let mut host = Host::new(
             path::ContextId::new(u64::from_ne_bytes(identity)),
             paths,
