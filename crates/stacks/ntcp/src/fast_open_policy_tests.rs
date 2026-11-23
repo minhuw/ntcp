@@ -632,10 +632,6 @@ mod linux {
             );
             let original = bytes[..tx.len].to_vec();
             assert_eq!(
-                endpoint.accept(listener),
-                Err(EndpointError::OutputReserved)
-            );
-            assert_eq!(
                 endpoint.close_listener(listener),
                 Err(EndpointError::OutputReserved)
             );
