@@ -21,7 +21,7 @@ use crate::{
         Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple, State, Tuple,
     },
     rx_timestamp::RxTimestamps,
-    schedule::{Deadlines, ReadyQueue},
+    schedule::{ConnectionTimers, ReadyQueue},
     seq::Seq,
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
 };
@@ -726,7 +726,7 @@ pub struct Endpoint {
     // MemoryCounters::ledger_split_refusals, taken from connections at
     // their refresh and reclaim.
     ledger_split_refusals: u64,
-    deadlines: Deadlines,
+    deadlines: ConnectionTimers,
     // The owner's timer wheel geometry: how far ahead a timer may be set.
     timer_wheel: crate::TimerWheelGeometry,
     // The owner's timer wheel: TIME-WAIT records' timers.
@@ -977,7 +977,7 @@ impl Endpoint {
                 una.resize(count, 0);
                 una
             },
-            deadlines: Deadlines::new(count).map_err(|_| Error::NoMemory)?,
+            deadlines: ConnectionTimers::new(count).map_err(|_| Error::NoMemory)?,
             timer_wheel: config.timer_wheel_geometry()?,
             wheel: {
                 let mut wheel = crate::wheel::Wheel::new(config.timer_wheel_geometry()?)
@@ -3133,11 +3133,13 @@ impl Endpoint {
     //# route arrives in a later segment, the later definition SHOULD
     //# override the earlier one (SHLD-24).
     fn save_ipv4_options(slot: &mut Slot, options: Ipv4Options, route: Option<SourceRoute>) {
-        slot.received_ipv4_options = Some(options);
         if !slot.explicit_route && route.is_some() {
             slot.ipv4_options.source_route = route;
+            Self::sync_ip_header_len(slot);
+        } else if slot.received_ipv4_options.is_none() {
+            Self::sync_ip_header_len(slot);
         }
-        Self::sync_ip_header_len(slot);
+        slot.received_ipv4_options = Some(options);
     }
 
     fn sync_ip_header_len(slot: &mut Slot) {
@@ -11075,5 +11077,89 @@ mod memory_wait_tests {
         exchange(&mut a, &mut b, retry);
         assert_eq!(b.read(server, &mut [0; 16]), Ok(9));
         assert!(a.buffer_bytes() <= a.config.max_buffer_bytes);
+    }
+
+    #[test]
+    fn save_ipv4_options_tracks_first_repeat_route_change_and_explicit_route() {
+        use core::net::Ipv4Addr;
+
+        let (mut a, mut b, listener) = endpoints();
+        let (client, _) = connect(&mut a, &mut b, listener, 40010);
+
+        let route1 = SourceRoute::new(&[Ipv4Addr::new(198, 51, 100, 1)], false).unwrap();
+        let route2 = SourceRoute::new(
+            &[
+                Ipv4Addr::new(198, 51, 100, 2),
+                Ipv4Addr::new(198, 51, 100, 3),
+            ],
+            false,
+        )
+        .unwrap();
+        let opts1 = Ipv4Options::parse(&[200, 4, 1, 2], false).unwrap();
+        let opts2 = Ipv4Options::parse(&[200, 4, 3, 4], false).unwrap();
+        let empty = Ipv4Options::default();
+
+        // First save without a route still syncs header len and stores options.
+        {
+            let slot = a.slot_mut(client).unwrap();
+            slot.received_ipv4_options = None;
+            slot.ipv4_options.record_route_slots = Some(1);
+            Endpoint::save_ipv4_options(slot, opts1, None);
+            assert_eq!(slot.received_ipv4_options, Some(opts1));
+            // 20 base + 8 padded (3 + 4 = 7 -> 8).
+            assert_eq!(slot.connection.ip_header_len(), 28);
+            slot.ipv4_options.record_route_slots = None;
+            Endpoint::sync_ip_header_len(slot);
+            assert_eq!(slot.connection.ip_header_len(), 20);
+        }
+
+        // First route arrival installs route1 and syncs header len (20 + 8 = 28).
+        {
+            let slot = a.slot_mut(client).unwrap();
+            Endpoint::save_ipv4_options(slot, opts1, Some(route1));
+            assert_eq!(slot.ipv4_options.source_route, Some(route1));
+            assert_eq!(slot.received_ipv4_options, Some(opts1));
+            assert_eq!(slot.connection.ip_header_len(), 28);
+        }
+
+        // Repeat save with the same route keeps route and header len intact.
+        {
+            let slot = a.slot_mut(client).unwrap();
+            Endpoint::save_ipv4_options(slot, opts2, Some(route1));
+            assert_eq!(slot.ipv4_options.source_route, Some(route1));
+            assert_eq!(slot.received_ipv4_options, Some(opts2));
+            assert_eq!(slot.connection.ip_header_len(), 28);
+        }
+
+        // Repeat save without route keeps existing route and skips redundant resync.
+        {
+            let slot = a.slot_mut(client).unwrap();
+            Endpoint::save_ipv4_options(slot, empty, None);
+            assert_eq!(slot.ipv4_options.source_route, Some(route1));
+            assert_eq!(slot.received_ipv4_options, Some(empty));
+            assert_eq!(slot.connection.ip_header_len(), 28);
+        }
+
+        // Route change to a 2-hop source route updates route and syncs header len (20 + 12 = 32).
+        {
+            let slot = a.slot_mut(client).unwrap();
+            Endpoint::save_ipv4_options(slot, opts1, Some(route2));
+            assert_eq!(slot.ipv4_options.source_route, Some(route2));
+            assert_eq!(slot.received_ipv4_options, Some(opts1));
+            assert_eq!(slot.connection.ip_header_len(), 32);
+        }
+
+        // With explicit_route set, an incoming route must not override the configured route.
+        {
+            let slot = a.slot_mut(client).unwrap();
+            slot.explicit_route = true;
+            slot.ipv4_options.source_route = Some(route1);
+            Endpoint::sync_ip_header_len(slot);
+            assert_eq!(slot.connection.ip_header_len(), 28);
+            Endpoint::save_ipv4_options(slot, opts2, Some(route2));
+            assert_eq!(slot.ipv4_options.source_route, Some(route1));
+            assert_eq!(slot.received_ipv4_options, Some(opts2));
+            assert_eq!(slot.connection.ip_header_len(), 28);
+        }
     }
 }

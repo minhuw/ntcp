@@ -118,7 +118,17 @@ impl TimestampGranularity {
     }
 
     pub(crate) fn tick_in(self, now: Instant, timebase: CallerTimebase) -> u64 {
-        now / timebase.ticks_from_us(self.tick_us())
+        match timebase.units_per_second {
+            1_000_000 => match self {
+                Self::Microseconds => now,
+                Self::Milliseconds => now / 1_000,
+            },
+            1_000_000_000 => match self {
+                Self::Microseconds => now / 1_000,
+                Self::Milliseconds => now / 1_000_000,
+            },
+            _ => now / timebase.ticks_from_us(self.tick_us()),
+        }
     }
 
     #[cfg(test)]
@@ -898,6 +908,11 @@ struct DeferredSyn {
 
 pub(crate) struct Connection {
     pub(crate) managed_path: Option<crate::PreparedPath>,
+    // The immutable snapshot's packet budget, updated on a path rebind.
+    managed_packet_budget: u32,
+    // The usable space rounds the send limit down to a whole send quantum.
+    // Both can change independently (autotuning, negotiation and path MTU).
+    send_space_cache: core::cell::Cell<(usize, usize, usize)>,
     pub(crate) managed_results: crate::endpoint::ManagedResults,
     tuple: Tuple,
     // The link scoping `tuple`; set by the Endpoint before insertion.
@@ -1372,7 +1387,11 @@ impl Connection {
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
         let ack_ato = config.ack_timeout_floor();
         let connection = Self {
+            managed_packet_budget: managed_path.as_ref().map_or(u32::MAX, |path| {
+                path.snapshot.ip_packet_budget().unwrap_or(0)
+            }),
             managed_path,
+            send_space_cache: core::cell::Cell::new((0, 0, 0)),
             managed_results: crate::endpoint::ManagedResults::default(),
             tuple,
             zone: None,
@@ -2416,6 +2435,7 @@ impl Connection {
     //# complication, before sending a TLP loss probe retransmission, the
     //# sender should attempt to wait long enough that the receiver has sent
     //# any delayed ACKs that it is withholding.
+    #[cfg(test)]
     fn schedule_tlp(&mut self) {
         self.arm_tlp(self.tlp_arm_packets());
         self.select_loss_timer();
@@ -3655,16 +3675,13 @@ impl Connection {
                 // expired older flight's RTO (PTO wins capped ties otherwise).
                 self.tlp_deadline = None;
             } else {
-                self.schedule_tlp();
+                self.arm_tlp(self.tlp_arm_packets());
             }
         }
-        if d.syn && finished && self.early_response_eligible() {
+        if withdrawn || d.syn && finished && self.early_response_eligible() {
             self.arm_work();
         } else {
             self.select_loss_timer();
-        }
-        if withdrawn {
-            self.arm_work();
         }
         Ok(withdrawn)
     }
@@ -3707,16 +3724,18 @@ impl Connection {
                         .saturating_sub(u32::from(self.ip_header_len)) as usize,
                 )
             });
-        local.min(self.managed_path.as_ref().map_or(usize::MAX, |path| {
-            self.managed_ip_budget(path)
-                .saturating_sub(u32::from(self.ip_header_len)) as usize
-        }))
+        local.min(
+            self.managed_ip_budget()
+                .saturating_sub(u32::from(self.ip_header_len)) as usize,
+        )
     }
 
     fn managed_payload_mss(&self) -> usize {
-        self.managed_path.as_ref().map_or(usize::MAX, |path| {
-            self.managed_ip_budget(path)
-                .saturating_sub(u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 })
+        self.managed_path.as_ref().map_or(usize::MAX, |_| {
+            self.managed_ip_budget()
+                .saturating_sub(
+                    u32::from(self.ip_header_len) + 20 + if self.timestamps { 12 } else { 0 },
+                )
                 .max(1) as usize
         })
     }
@@ -3725,9 +3744,9 @@ impl Connection {
     // IPv6 connection keeps every complete packet within the IPv6 minimum
     // link MTU, whose payload ceiling `send_ip_payload_limit` states only
     // for the base header: an SR route's Segment Routing Header counts too.
-    fn managed_ip_budget(&self, path: &crate::PreparedPath) -> u32 {
-        let budget = path.snapshot.ip_packet_budget().unwrap_or(0);
-        if self.pmtud.is_none() && !self.tuple.local.is_ipv4() {
+    fn managed_ip_budget(&self) -> u32 {
+        let budget = self.managed_packet_budget;
+        if self.pmtud.is_none() && !self.tuple.local.is_ipv4() && self.managed_path.is_some() {
             budget.min(min_mtu(false))
         } else {
             budget
@@ -3817,6 +3836,7 @@ impl Connection {
             self.managed_results.receipt = None;
             self.managed_results.confirmed = None;
         }
+        self.managed_packet_budget = path.snapshot.ip_packet_budget().unwrap_or(0);
         self.managed_path = Some(path);
         // A replacement route may add, change or drop a Segment Routing
         // Header: every later packet is sized for the new path's header.
@@ -4424,6 +4444,7 @@ impl Connection {
         self.arm_work();
     }
 
+    #[inline]
     pub(crate) fn update_time(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
         // The instant is processed once, as tcp_mstamp_refresh takes the
@@ -4434,6 +4455,11 @@ impl Connection {
             debug_assert!(!self.timestamps_stale(now));
             return Ok(());
         }
+        self.advance_checked_time(now);
+        Ok(())
+    }
+
+    fn advance_checked_time(&mut self, now: Instant) {
         self.transport_ticks = self.transport_ticks_at(now);
         if self.timestamps_stale(now) {
             self.sample = None;
@@ -4451,7 +4477,6 @@ impl Connection {
             }
         }
         self.now = now;
-        Ok(())
     }
 
     // Whether the RTT sample or the last timestamp sent is too old at `now`
@@ -5196,27 +5221,29 @@ impl Connection {
     //# As stated in [RFC1122], a TCP implementation MUST NOT close a connection
     //# merely because it seems to be stuck in the ZWP or persist condition.
     fn user_deadline(&self) -> Option<Instant> {
-        if !self.user_timer_needed() {
-            return None;
-        }
-        if self.synchronized()
-            && self.snd_wnd == 0
-            && (self.send.len() != 0
+        let since = if self.handshake_pending() {
+            self.progress_at
+        } else {
+            if !self.synchronized() {
+                return None;
+            }
+            let pending = self.send.len() != 0
                 || self.flight() != 0
-                || self.shutdown && self.fin_sequence.is_none())
-        {
-            // Persist backoff is not evidence of peer failure. Only start the
-            // liveness timeout once a probe has actually gone unanswered.
-            return self
-                .persist_unanswered_since
-                .map(|sent| sent.saturating_add(self.user_timeout()));
-        }
-        if self.synchronized() && self.snd_wnd != 0 && self.flight() > self.snd_wnd {
-            return self
-                .shrink_unanswered_since
-                .map(|sent| sent.saturating_add(self.user_timeout()));
-        }
-        Some(self.progress_at.saturating_add(self.user_timeout()))
+                || self.shutdown && self.fin_sequence.is_none();
+            if !pending && self.state != State::FinWait2 {
+                return None;
+            }
+            if self.snd_wnd == 0 && pending {
+                // Persist backoff is not evidence of peer failure. Only start the
+                // liveness timeout once a probe has actually gone unanswered.
+                self.persist_unanswered_since?
+            } else if self.flight() > self.snd_wnd {
+                self.shrink_unanswered_since?
+            } else {
+                self.progress_at
+            }
+        };
+        Some(since.saturating_add(self.user_timeout()))
     }
 
     // Explicit application resource policy is separate from transport R2 liveness
@@ -5255,14 +5282,24 @@ impl Connection {
     //# are lost.
     // Returns tlp_arm_packets(), unchanged by the rest of this work, for a
     // caller that arms the PTO next.
-    fn arm_work(&mut self) -> Option<u32> {
+    fn arm_work(&mut self) {
+        self.arm_work_with_probe(false);
+    }
+
+    fn arm_work_with_probe(&mut self, restart_probe: bool) {
         self.resolve_probe_response();
         let early_response = self.early_response_eligible();
         if !self.synchronized() && !early_response {
             self.select_loss_timer();
-            return None;
+            return;
         }
-        let probe_packets = self.tlp_arm_packets();
+        // With no probe armed or pending and no request to start one,
+        // eligibility cannot change this pass's timers.
+        let probe_packets = if restart_probe || self.tlp_deadline.is_some() || self.tlp_pending {
+            self.tlp_arm_packets()
+        } else {
+            None
+        };
         if probe_packets.is_none() {
             self.tlp_deadline = None;
             self.tlp_pending = false;
@@ -5365,8 +5402,10 @@ impl Connection {
             self.keepalive_deadline = None;
             self.keepalive_pending = false;
         }
+        if restart_probe {
+            self.arm_tlp(probe_packets);
+        }
         self.select_loss_timer();
-        probe_packets
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
@@ -5807,7 +5846,15 @@ impl Connection {
         if self.managed_path.is_none() {
             return self.config.send_capacity;
         }
-        rounded_send_space(self.config.send_capacity, self.send_quantum())
+        let capacity = self.config.send_capacity;
+        let quantum = self.send_quantum();
+        let (previous_capacity, previous_quantum, space) = self.send_space_cache.get();
+        if capacity == previous_capacity && quantum == previous_quantum {
+            return space;
+        }
+        let space = rounded_send_space(capacity, quantum);
+        self.send_space_cache.set((capacity, quantum, space));
+        space
     }
 
     // Send usage, what writes are admitted against and what
@@ -6410,12 +6457,15 @@ impl Connection {
 
     // A read made room: ACK now if the window it opens is worth an update.
     fn read_window_update(&mut self) {
+        if self.receive.eof() || self.ack_pending && self.ack_deadline.is_none() {
+            return;
+        }
         // Only credit that an ordinary ACK can actually offer is useful: the
         // free space may exceed the wire cap, or be below a scale unit.
         let shift = if self.scaling { self.local_scale } else { 0 };
         let credit = (u32::from(self.advertised_window(false)) << shift)
             .saturating_sub(self.receive_window());
-        if !self.receive.eof() && credit >= self.read_window_threshold() {
+        if credit >= self.read_window_threshold() {
             self.immediate_ack();
         }
     }
@@ -6571,7 +6621,11 @@ impl Connection {
     // segments is offered window_clamp less exactly its unread bytes.
     fn win_from_space(&self, space: usize) -> usize {
         let (len, truesize) = self.rcv_scaling;
-        (space as u64 * u64::from(len) / u64::from(truesize)) as usize
+        if len == truesize || space == 0 {
+            space
+        } else {
+            (space as u64 * u64::from(len) / u64::from(truesize)) as usize
+        }
     }
 
     // Linux's tcp_space: the window the receive memory not yet used backs,
@@ -8415,11 +8469,7 @@ impl Connection {
         if advancing && self.more && !self.cork && (!self.config.nagle || !self.minshall_check()) {
             self.release_corked();
         }
-        let probe_packets = self.arm_work();
-        if advancing {
-            self.arm_tlp(probe_packets);
-            self.select_loss_timer();
-        }
+        self.arm_work_with_probe(advancing);
         Ok(())
     }
 
@@ -9901,10 +9951,11 @@ impl Connection {
     // whose deferral a selection would record. Each of these is set by a
     // change, never by time alone.
     pub(crate) fn output_idle(&self) -> bool {
-        self.pending_rst.is_none()
+        !self.ack_pending
+            && self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize
+            && self.pending_rst.is_none()
             && !self.challenge_ack_pending
             && !self.syn_pending
-            && !self.ack_pending
             && !self.probe_pending
             && !self.keepalive_pending
             && !self.tlp_pending
@@ -9914,7 +9965,6 @@ impl Connection {
             && self.prr.is_none()
             && self.sack_post_rto.is_none()
             && self.ptb_idle()
-            && self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize
             && !(self.shutdown && self.fin_sequence.is_none())
             && self
                 .pmtud
@@ -11617,12 +11667,10 @@ impl Connection {
         if timestamp_cost > timestamp_credit {
             return Err(Error::TimestampBudgetExceeded);
         }
-        let options = {
-            let mut bytes = [0; 40];
-            let written = wire::write_options(&options, &mut bytes);
-            debug_assert_eq!(written, option_len);
-            bytes
-        };
+        let mut encoded_options = [0; 40];
+        let written = wire::write_options(&options, &mut encoded_options);
+        debug_assert_eq!(written, option_len);
+        let options = &encoded_options[..written];
         let mut wire_header = header;
         if let Some(s) = &mut segmentation {
             s.terminal_flags = flags;
@@ -11644,7 +11692,7 @@ impl Connection {
             wire::encode_shared_with(
                 ip,
                 wire_header,
-                &options[..option_len],
+                options,
                 shared.as_deref().unwrap(),
                 out,
                 partial,
@@ -11654,7 +11702,7 @@ impl Connection {
             wire::encode_with(
                 ip,
                 wire_header,
-                &options[..option_len],
+                options,
                 match &gso {
                     Some(buffer) if segmentation.is_some() => &buffer.payload[..wire_count],
                     _ => &self.scratch[..wire_count],
@@ -11751,7 +11799,7 @@ impl Connection {
                     selected_at: now,
                 })
             });
-        self.last_departure = reserve.then_some(Departure {
+        self.last_departure = reserve.then(|| Departure {
             initial_burst,
             data_ack,
             defer_push: self.repair_undo.is_some()
@@ -11779,9 +11827,13 @@ impl Connection {
                 && (self.rto_deadline.is_none() || retransmitted || tlp),
             rto_head: seq == self.snd_una,
             prior_rto_deadline: self.rto_deadline.or_else(|| {
-                self.rack
-                    .head_transmission(self.snd_una)
-                    .map(|(_, sent)| sent.saturating_add(self.rto()))
+                if seq == self.snd_una {
+                    None // The head restarts its timer at physical departure.
+                } else {
+                    self.rack
+                        .head_transmission(self.snd_una)
+                        .map(|(_, sent)| sent.saturating_add(self.rto()))
+                }
             }),
             tlp: (fresh_data || new_fin) && !tlp,
             loss_probe: tlp,
@@ -12295,11 +12347,7 @@ impl Connection {
                 self.pacing_enabled() && !initial_burst && !probe && !tlp && !retransmit,
             );
         }
-        let probe_packets = self.arm_work();
-        if (fresh_data || new_fin) && !tlp {
-            self.arm_tlp(probe_packets);
-            self.select_loss_timer();
-        }
+        self.arm_work_with_probe((fresh_data || new_fin) && !tlp);
         if count != 0
             && !syn
             && !keepalive
@@ -12459,37 +12507,35 @@ impl Connection {
         });
         // At most one extra wakeup even if no data remains: timeout consumes
         // eligibility and refresh rechecks admission, so idle cannot busy-loop.
-        [
-            if self.config.pacing.is_some() {
-                // At Instant::MAX debt still blocks admission, but its saturated
-                // deadline cannot be serviced; do not rearm an already-due timer.
-                self.general_pacing_deadline(self.now)
-                    .filter(|&deadline| deadline > self.now)
-            } else {
-                self.pacing_deadline
-            },
-            timestamp_wakeup,
-            self.timestamp_ambiguous.then_some(self.now),
-            self.pmtud
-                .as_ref()
-                // Unlike pacing, tick consumes even a saturated due deadline.
-                // Input may advance now before Endpoint services that timer.
-                .and_then(|p| p.next_deadline()),
-            self.loss_timer.map(|(_, deadline)| deadline),
-            self.ecn_pause,
-            self.ack_deadline,
-            self.sws_deadline,
-            self.cork_deadline,
-            self.time_wait_deadline,
-            self.keepalive_deadline,
-            self.user_deadline(),
-            self.application_deadline(),
-            self.local_resource.and_then(|r| r.retry_at),
-        ]
-        .iter()
-        .flatten()
-        .min()
-        .copied()
+        let mut earliest = self.loss_timer.map(|(_, at)| at);
+        let mut include = |timer| {
+            if let Some(at) = timer {
+                earliest = Some(earliest.map_or(at, |first| first.min(at)));
+            }
+        };
+        include(if self.config.pacing.is_some() {
+            // At Instant::MAX debt still blocks admission, but its saturated
+            // deadline cannot be serviced; do not rearm an already-due timer.
+            self.general_pacing_deadline(self.now)
+                .filter(|&deadline| deadline > self.now)
+        } else {
+            self.pacing_deadline
+        });
+        include(timestamp_wakeup);
+        include(self.timestamp_ambiguous.then_some(self.now));
+        // Unlike pacing, tick consumes even a saturated due deadline.
+        // Input may advance now before Endpoint services that timer.
+        include(self.pmtud.as_ref().and_then(|p| p.next_deadline()));
+        include(self.ecn_pause);
+        include(self.ack_deadline);
+        include(self.sws_deadline);
+        include(self.cork_deadline);
+        include(self.time_wait_deadline);
+        include(self.keepalive_deadline);
+        include(self.user_deadline());
+        include(self.application_deadline());
+        include(self.local_resource.and_then(|r| r.retry_at));
+        earliest
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8

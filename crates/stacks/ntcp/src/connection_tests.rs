@@ -20554,6 +20554,151 @@ fn update_time_processes_each_instant_once() {
     assert_eq!(a.update_time(boundary), Err(Error::TimeWentBackwards));
 }
 
+#[test]
+fn timestamp_granularity_tick_in_matches_general_division() {
+    let instants = [
+        0u64,
+        1,
+        999,
+        1_000,
+        1_001,
+        999_999,
+        1_000_000,
+        1_000_001,
+        123_456_789_012,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    for units in [1_000_000u64, 1_000_000_000, 2_000_000, 1_000_000_001] {
+        let timebase = CallerTimebase {
+            units_per_second: units,
+            ..CallerTimebase::default()
+        };
+        for granularity in [
+            TimestampGranularity::Milliseconds,
+            TimestampGranularity::Microseconds,
+        ] {
+            let divisor = timebase.ticks_from_us(granularity.tick_us());
+            for &now in &instants {
+                assert_eq!(granularity.tick_in(now, timebase), now / divisor);
+            }
+        }
+    }
+}
+
+#[test]
+fn user_deadline_matches_reference_across_states_and_window_conditions() {
+    fn reference_user_deadline(c: &Connection) -> Option<Instant> {
+        if !c.user_timer_needed() {
+            return None;
+        }
+        if c.synchronized()
+            && c.snd_wnd == 0
+            && (c.send.len() != 0 || c.flight() != 0 || c.shutdown && c.fin_sequence.is_none())
+        {
+            return c
+                .persist_unanswered_since
+                .map(|sent| sent.saturating_add(c.user_timeout()));
+        }
+        if c.synchronized() && c.snd_wnd != 0 && c.flight() > c.snd_wnd {
+            return c
+                .shrink_unanswered_since
+                .map(|sent| sent.saturating_add(c.user_timeout()));
+        }
+        Some(c.progress_at.saturating_add(c.user_timeout()))
+    }
+
+    let cfg = config(256, 64);
+    let (mut a, _) = pair(cfg, 100);
+    a.progress_at = 1_000;
+    let states = [
+        State::SynSent,
+        State::SynReceived,
+        State::Established,
+        State::FinWait1,
+        State::FinWait2,
+        State::CloseWait,
+        State::Closing,
+        State::LastAck,
+        State::TimeWait,
+        State::Closed,
+    ];
+    for state in states {
+        for handshake_complete in [false, true] {
+            for pending in [false, true] {
+                for snd_wnd in [0u32, 4, 128] {
+                    for flight in [0u32, 16] {
+                        for persist_since in [None, Some(2_000)] {
+                            for shrink_since in [None, Some(3_000)] {
+                                a.state = state;
+                                a.handshake_complete = handshake_complete;
+                                a.snd_wnd = snd_wnd;
+                                a.snd_una = Seq(100);
+                                a.snd_nxt = Seq(100 + flight);
+                                a.shutdown = pending && flight == 0;
+                                a.fin_sequence = None;
+                                a.persist_unanswered_since = persist_since;
+                                a.shrink_unanswered_since = shrink_since;
+                                assert_eq!(
+                                    a.user_deadline(),
+                                    reference_user_deadline(&a),
+                                    "state={state:?} hs={handshake_complete} pending={pending} wnd={snd_wnd} flight={flight} persist={persist_since:?} shrink={shrink_since:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn read_window_update_handles_eof_and_ack_pending_states() {
+    let (mut a, mut b) = pair(config(256, 64), 100);
+    // Fill b's receive buffer so reading opens enough window credit to trigger an ACK.
+    a.write(&[7; 256]).unwrap();
+    for _ in 0..4 {
+        deliver(&mut a, &mut b, 200);
+    }
+    deliver(&mut b, &mut a, 200);
+    assert!(!b.ack_pending);
+    assert_eq!(b.ack_deadline, None);
+
+    // 1. With immediate ACK already pending (`ack_pending && ack_deadline.is_none()`),
+    // read_window_update returns early and preserves immediate ACK state.
+    b.immediate_ack();
+    let mut buf = [0; 64];
+    assert_eq!(b.read(&mut buf), Ok(64));
+    assert!(b.ack_pending);
+    assert_eq!(b.ack_deadline, None);
+
+    // 2. With a delayed ACK (`ack_pending && ack_deadline.is_some()`), a large read
+    // must still promote it to an immediate ACK (`ack_deadline == None`).
+    b.ack_pending = true;
+    b.ack_deadline = Some(50_000);
+    assert_eq!(b.read(&mut [0; 192]), Ok(192));
+    assert!(b.ack_pending);
+    assert_eq!(b.ack_deadline, None);
+
+    // 3. After EOF is received, read_window_update returns early and does not arm an ACK.
+    deliver(&mut b, &mut a, 300);
+    a.write(&[9; 128]).unwrap();
+    a.shutdown().unwrap();
+    let mut out = vec![0; 65535];
+    while let Some(len) = a.transmit(400, &mut out).unwrap() {
+        let segment = wire::parse(ip(a.tuple()), &out[..len]).unwrap();
+        b.input(400, &segment).unwrap();
+    }
+    assert!(b.receive.eof());
+    deliver(&mut b, &mut a, 400);
+    assert!(!b.ack_pending);
+    assert_eq!(b.ack_deadline, None);
+    assert_eq!(b.read(&mut [0; 128]), Ok(128));
+    assert!(!b.ack_pending);
+    assert_eq!(b.ack_deadline, None);
+}
+
 // The right edge the window rule may offer: `clamp` bytes past the read
 // point. The receive ring that once backed every offered edge, and whose
 // right edge the tests compared with it, went in n0bw stage 1; in these
