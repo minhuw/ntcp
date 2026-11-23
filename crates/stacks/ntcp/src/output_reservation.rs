@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::{EndpointError, Error, Instant, Transmit, wire};
+use crate::{EndpointError, Error, Instant, Transmit, seq::Seq, wire};
 
 // Only physical-departure work; sequence, recovery and PRR charges stay selected.
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,6 +44,19 @@ pub(crate) struct Departure {
     pub interval: Option<u128>,
     pub initial_burst: bool,
     pub legacy_rate: Option<(u64, u32)>,
+}
+
+impl Departure {
+    pub(crate) fn submitted_range(&self, offset: usize, count: usize) -> (Seq, Seq) {
+        if self.segmentation.is_some() || self.deferred_fresh {
+            let start = Seq(self.start).wrapping_add(u32::from(self.syn) + offset as u32);
+            (start, start.wrapping_add(count as u32))
+        } else {
+            let start = Seq(self.start);
+            let length = self.payload as u32 + u32::from(self.syn) + u32::from(self.fin);
+            (start, start.wrapping_add(length))
+        }
+    }
 }
 
 /// Opt-in bounds for immutable fresh-data reservations, not wire packet sizes.
@@ -139,7 +152,8 @@ pub(crate) struct OutputReservation {
 }
 
 pub(crate) struct ReservedOutput {
-    pub emitted_packet: Transmit,
+    // Only suffix repair and segmentation can change the current packet.
+    pub emitted_packet: Option<Transmit>,
     pub packet: Transmit,
     pub attempt: Option<TransmitAttempt>,
     // Set together with `attempt`, which then names this group.
@@ -162,6 +176,12 @@ pub(crate) struct ReservedOutput {
     pub zone: Option<ntcp_path::LinkId>,
     // A stateless reply already counted as undeliverable.
     pub undeliverable: bool,
+}
+
+impl ReservedOutput {
+    pub(crate) fn emitted(&self) -> &Transmit {
+        self.emitted_packet.as_ref().unwrap_or(&self.packet)
+    }
 }
 
 impl OutputReservation {
@@ -232,7 +252,7 @@ impl OutputReservation {
         });
         self.shared_option_len = n - 20;
         self.current = Some(ReservedOutput {
-            emitted_packet: *packet,
+            emitted_packet: None,
             packet: *packet,
             attempt: Some(attempt),
             group: None,
@@ -327,7 +347,7 @@ impl OutputReservation {
             ecn: if count == 0 { 0 } else { r.packet.ecn },
             ..r.packet
         };
-        r.emitted_packet = packet;
+        r.emitted_packet = Some(packet);
         Ok(packet)
     }
 
@@ -335,7 +355,7 @@ impl OutputReservation {
         self.clear();
         self.bytes[..packet.len].copy_from_slice(&bytes[..packet.len]);
         self.current = Some(ReservedOutput {
-            emitted_packet: *packet,
+            emitted_packet: None,
             packet: *packet,
             attempt: Some(attempt),
             group: None,
@@ -505,7 +525,7 @@ impl OutputReservation {
             ecn: if count == 0 { 0 } else { r.packet.ecn },
             ..r.packet
         };
-        r.emitted_packet = packet;
+        r.emitted_packet = Some(packet);
         Ok(packet)
     }
 }

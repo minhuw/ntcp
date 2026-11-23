@@ -6869,7 +6869,8 @@ impl Endpoint {
         r.emitted_bytes = group.bytes;
         r.emitted_sacks = 0;
         r.group = None;
-        self.complete_reserved_accept(index, Some(departure), finished);
+        r.departure = Some(departure);
+        self.complete_reserved_accept(index, finished);
         Ok(true)
     }
 
@@ -7159,6 +7160,25 @@ impl Endpoint {
         self.polled(polled)
     }
 
+    /// Select a reservation, leaving its packet metadata in place for
+    /// `transmit_attempt_packet_ref`. A supplied owner restricts the poll
+    /// to that connection, otherwise every output lane is eligible.
+    pub fn poll_transmit_attempt(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        budget: usize,
+        owner: Option<ConnectionId>,
+    ) -> Result<(bool, Option<crate::TransmitAttempt>), EndpointError> {
+        let result = if let Some(id) = owner {
+            self.retained_slot(id)?;
+            self.poll_reserved_selected(now, out, budget, Some(id), None, None)?
+        } else {
+            self.poll_reserved_any(now, out, budget, None)?
+        };
+        Ok((result.more_work, result.attempt))
+    }
+
     pub(crate) fn poll_reserved_any(
         &mut self,
         now: Instant,
@@ -7228,11 +7248,11 @@ impl Endpoint {
             && let Ok((poll, _)) = &mut result
         {
             poll.packet = Some(
-                self.reservations[attempt.reservation]
+                *self.reservations[attempt.reservation]
                     .current
                     .as_ref()
                     .unwrap()
-                    .emitted_packet,
+                    .emitted(),
             );
         }
         result
@@ -7341,7 +7361,7 @@ impl Endpoint {
                 self.reservations[index]
                     .current
                     .as_ref()
-                    .map(|r| r.emitted_packet)
+                    .map(|r| *r.emitted())
             );
             return Ok(Polled {
                 more_work: true,
@@ -7350,6 +7370,33 @@ impl Endpoint {
         }
         // Reserve identity before selection: exhaustion must not consume output.
         let attempt = self.reservations[index].token()?;
+        // A synchronous push polls its owner again after accepting a frame.
+        // If the ready entry is idle, consume it here, with the same clock
+        // checks and timer update as an empty selection. A closed connection
+        // or listener cleanup still needs the full poll for reclamation.
+        if let Some(id) = selected
+            && self.cleanup.is_empty()
+            && shared.is_none()
+            && let Some(slot) = self.slots.get(id.slot).and_then(Option::as_ref)
+            && self.id(id.slot) == id
+            && (!self.output.contains(id.slot)
+                || slot.connection.state() != State::Closed && slot.connection.output_idle())
+        {
+            self.clock(now)?;
+            if self.output.contains(id.slot) {
+                self.output.remove(id.slot);
+                let slot = self.slots[id.slot].as_ref().unwrap();
+                if let Err(error) = slot.connection.check_time(now) {
+                    self.output.push(id.slot);
+                    return Err(error.into());
+                }
+                self.deadlines.set(id.slot, slot.deadline());
+            }
+            return Ok(Polled {
+                more_work: self.has_pending_output(),
+                attempt: None,
+            });
+        }
         let capacity = out.len().min(self.reservations[index].bytes.len());
         // Move the preallocated payload backing temporarily to avoid aliasing
         // the endpoint during selection; restore it on every result, no allocation.
@@ -7426,7 +7473,10 @@ impl Endpoint {
                     let first = packet
                         .tx_timestamp
                         .map(|token| token.part(0, s.segment_payload_len));
-                    r.emitted_packet.tx_timestamp = first;
+                    r.emitted_packet = Some(Transmit {
+                        tx_timestamp: first,
+                        ..r.packet
+                    });
                 }
                 self.refresh(id.slot);
             }
@@ -7514,47 +7564,36 @@ impl Endpoint {
             self.retained_slot(id)?.connection.check_time(now)?;
         }
         self.check_clock(now)?;
-        let (mut departure, offset, count, finished) = (
-            r.departure,
-            r.offset,
-            if r.repaired {
-                r.emitted_bytes
-            } else {
-                r.departure.map_or(0, |d| d.payload)
-            },
-            r.finished,
-        );
+        let finished = r.finished;
         let mut withdrawn = false;
-        if let Some(id) = connection
-            && let Some(d) = &mut departure
-        {
-            let owner = &mut self.retained_slot_mut(id)?.connection;
-            withdrawn = if preflighted {
-                owner.accept_validated_output(now, d, offset, count, finished)?
-            } else {
-                owner.accept_reserved_output(now, d, offset, count, finished)?
-            };
+        if let Some(id) = connection {
+            self.retained_slot(id)?;
+            let owner = &mut self.slots[id.slot].as_mut().unwrap().connection;
+            let r = self.reservations[index].current.as_mut().unwrap();
+            if let Some(d) = &mut r.departure {
+                let count = if r.repaired {
+                    r.emitted_bytes
+                } else {
+                    d.payload
+                };
+                withdrawn = if preflighted {
+                    owner.accept_validated_output(now, d, r.offset, count, finished)?
+                } else {
+                    owner.accept_reserved_output(now, d, r.offset, count, finished)?
+                };
+            }
         }
-        // Checked above.
         self.clock(now)?;
-        // A withdrawn suffix was never submitted: release the reservation so
-        // the owner reselects that work under its current admission.
-        self.complete_reserved_accept(index, departure, finished || withdrawn);
+        self.complete_reserved_accept(index, finished || withdrawn);
         Ok(true)
     }
 
-    fn complete_reserved_accept(
-        &mut self,
-        index: usize,
-        departure: Option<crate::output_reservation::Departure>,
-        finished: bool,
-    ) {
+    fn complete_reserved_accept(&mut self, index: usize, finished: bool) {
         let r = self.reservations[index].current.as_mut().unwrap();
         let connection = r.packet.connection;
         if finished {
             self.clear_reservation(index);
         } else {
-            r.departure = departure;
             r.offset += r.emitted_bytes;
             r.sacks += r.emitted_sacks;
             self.set_reservation_attempt(index, None);
@@ -8083,7 +8122,8 @@ impl Endpoint {
             // every ready connection.
             let next = match selected {
                 Some(Some(id)) => {
-                    let next = (self.output.contains(id.slot)
+                    let next = (id.slot < self.slots.len()
+                        && self.output.contains(id.slot)
                         && self.id(id.slot) == id
                         && !self.is_output_reserved(id))
                     .then_some(id.slot);
@@ -11335,5 +11375,196 @@ mod memory_wait_tests {
         a.stop_memory_wait(waiter.slot);
         assert!(!a.memory_waiters.contains(waiter.slot));
         assert_eq!(retry_at(&a, waiter), None);
+    }
+}
+
+#[cfg(test)]
+mod reserved_poll_tests {
+    use super::*;
+    use core::net::SocketAddr;
+
+    fn pair_connected(port: u16) -> (Endpoint, Endpoint, ConnectionId, ConnectionId) {
+        let mut a = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(EndpointConfig::default(), [2; 32], 0, |_| true).unwrap();
+        let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+        let local: SocketAddr = SocketAddr::new("192.0.2.1".parse().unwrap(), port);
+        let listener = b.listen(remote, 8).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        let mut out = [0u8; 2048];
+        loop {
+            let mut moved = false;
+            while let Some(p) = a.poll_transmit(1, &mut out, 16).unwrap().packet {
+                b.input(1, p.ip, &out[..p.len]).unwrap();
+                moved = true;
+            }
+            while let Some(p) = b.poll_transmit(1, &mut out, 16).unwrap().packet {
+                a.input(1, p.ip, &out[..p.len]).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        let server = b.accept(listener).unwrap();
+        (a, b, client, server)
+    }
+
+    #[test]
+    fn reserved_poll_out_of_bounds_connection_id_does_not_panic() {
+        let (mut a, _b, _client, _server) = pair_connected(41000);
+        a.enable_output_reservations().unwrap();
+        let oob = ConnectionId {
+            slot: 999_999,
+            generation: 1,
+        };
+        let mut out = [0u8; 2048];
+
+        assert_eq!(
+            a.poll_reserved_transmit_for(2, oob, &mut out, 8),
+            Err(EndpointError::InvalidHandle)
+        );
+        assert_eq!(
+            a.poll_transmit_attempt(2, &mut out, 8, Some(oob)),
+            Err(EndpointError::InvalidHandle)
+        );
+        // Directly exercise poll_reserved_selected with an out-of-bounds id:
+        // must bypass the idle fast path without panicking and return no attempt.
+        let polled = a
+            .poll_reserved_selected(2, &mut out, 8, Some(oob), None, None)
+            .unwrap();
+        assert!(polled.attempt.is_none());
+    }
+
+    #[test]
+    fn reserved_poll_idle_fast_path_handles_idle_closed_and_backward_time() {
+        let (mut a, _b, client, _server) = pair_connected(41001);
+        a.enable_output_reservations().unwrap();
+        a.set_keepalive(client, Some(crate::KeepaliveConfig::default()))
+            .unwrap();
+        let mut out = [0u8; 2048];
+
+        // 1) Idle connection queued in output is consumed cleanly, updates deadlines, and returns None.
+        assert!(a.slot(client).unwrap().connection.output_idle());
+        let expected_deadline = a.slot(client).unwrap().deadline();
+        assert!(expected_deadline.is_some());
+        a.output.push(client.slot);
+        a.deadlines.set(client.slot, None);
+        assert_eq!(a.deadlines.first(), None);
+        let (more_work, attempt) = a
+            .poll_transmit_attempt(5, &mut out, 8, Some(client))
+            .unwrap();
+        assert!(!more_work);
+        assert!(attempt.is_none());
+        assert!(!a.output.contains(client.slot));
+        assert_eq!(
+            a.deadlines.first(),
+            expected_deadline.map(|at| (at, client.slot))
+        );
+
+        // 2) Backward per-connection clock re-pushes slot to output and returns TimeWentBackwards.
+        a.slot_mut(client).unwrap().connection.timeout(100).unwrap();
+        a.output.push(client.slot);
+        assert_eq!(
+            a.poll_transmit_attempt(50, &mut out, 8, Some(client)),
+            Err(Error::TimeWentBackwards.into())
+        );
+        assert!(a.output.contains(client.slot));
+        // Advancing endpoint time to 100 succeeds and drains the idle entry.
+        let (_, attempt) = a
+            .poll_transmit_attempt(100, &mut out, 8, Some(client))
+            .unwrap();
+        assert!(attempt.is_none());
+        assert!(!a.output.contains(client.slot));
+
+        // 3) State::Closed connection does NOT take the idle fast path and still enters reclamation.
+        a.abort(client).unwrap();
+        // Drain the pending RST so the slot is Closed with no reset_pending.
+        let (_, rst_attempt) = a
+            .poll_transmit_attempt(101, &mut out, 8, Some(client))
+            .unwrap();
+        if let Some(token) = rst_attempt {
+            assert!(a.accept_transmit(101, token).unwrap());
+        }
+        assert_eq!(a.state(client), Ok(State::Closed));
+        let reclaimed_before = a.reclaimed();
+        {
+            let slot = a.slots[client.slot].as_mut().unwrap();
+            slot.released = true;
+            slot.closed_output_drained = false;
+        }
+        a.output.push(client.slot);
+        let polled = a
+            .poll_reserved_selected(102, &mut out, 8, Some(client), None, None)
+            .unwrap();
+        assert!(polled.attempt.is_none());
+        assert!(a.slots[client.slot].is_none());
+        assert_eq!(a.reclaimed(), reclaimed_before + 1);
+    }
+
+    #[test]
+    fn poll_transmit_attempt_and_packet_ref_match_poll_reserved_transmit_with_gso_timestamps() {
+        let (mut a1, _b1, c1, _s1) = pair_connected(41002);
+        let (mut a2, _b2, c2, _s2) = pair_connected(41002);
+        let limits = crate::GsoLimits {
+            max_bytes: 8192,
+            max_segments: 4,
+        };
+        a1.enable_output_reservations_with_gso(1, limits).unwrap();
+        a2.enable_output_reservations_with_gso(1, limits).unwrap();
+        a1.set_tx_timestamp_capacity(c1, 8).unwrap();
+        a2.set_tx_timestamp_capacity(c2, 8).unwrap();
+
+        let payload = [0x5Au8; 4096];
+        let request = TxTimestampRequest {
+            cookie: 99,
+            scheduled: false,
+            software_transmit: true,
+            hardware_transmit: false,
+            acknowledged: false,
+        };
+        let n1 = a1
+            .write_with_timestamp(c1, &payload, false, false, None, request)
+            .unwrap();
+        let n2 = a2
+            .write_with_timestamp(c2, &payload, false, false, None, request)
+            .unwrap();
+        assert_eq!(n1, payload.len());
+        assert_eq!(n2, payload.len());
+
+        let mut out1 = [0u8; 2048];
+        let mut out2 = [0u8; 2048];
+        let mut segments = 0usize;
+        let mut covered = 0u64;
+        loop {
+            let (poll1, att1) = a1.poll_reserved_transmit(10, &mut out1, 16).unwrap();
+            let (more2, att2) = a2.poll_transmit_attempt(10, &mut out2, 16, None).unwrap();
+            assert_eq!(poll1.more_work, more2);
+            match (att1, att2) {
+                (Some(t1), Some(t2)) => {
+                    let pkt1 = poll1.packet.unwrap();
+                    let pkt2 = *a2.transmit_attempt_packet_ref(t2).unwrap();
+                    assert_eq!(pkt1, pkt2);
+                    assert_eq!(&out1[..pkt1.len], &out2[..pkt2.len]);
+                    if let Some(ts) = pkt2.tx_timestamp {
+                        let range = ts.stream_range();
+                        assert_eq!(range.start, covered);
+                        assert!(range.end > range.start);
+                        covered = range.end;
+                    }
+                    assert!(a1.accept_transmit(10, t1).unwrap());
+                    assert!(a2.accept_transmit(10, t2).unwrap());
+                    segments += 1;
+                }
+                (None, None) => break,
+                other => panic!(
+                    "mismatch between poll_reserved_transmit and poll_transmit_attempt: {other:?}"
+                ),
+            }
+        }
+        assert!(
+            segments >= 2,
+            "expected GSO burst of at least 2 segments, got {segments}"
+        );
+        assert_eq!(covered, payload.len() as u64);
     }
 }

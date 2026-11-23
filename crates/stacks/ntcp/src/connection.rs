@@ -3904,16 +3904,7 @@ impl Connection {
         count: usize,
         receipt: crate::PhysicalReceipt,
     ) {
-        let (start, end) = if departure.segmentation.is_some() || departure.deferred_fresh {
-            let start = Seq(departure.start).wrapping_add(u32::from(departure.syn) + offset as u32);
-            (start, start.wrapping_add(count as u32))
-        } else {
-            let start = Seq(departure.start);
-            let length =
-                departure.payload as u32 + u32::from(departure.syn) + u32::from(departure.fin);
-            (start, start.wrapping_add(length))
-        };
-        self.certify_range((start, end), receipt);
+        self.certify_range(departure.submitted_range(offset, count), receipt);
     }
 
     pub(crate) fn certify_range(

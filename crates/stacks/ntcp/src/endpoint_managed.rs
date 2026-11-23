@@ -199,6 +199,12 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.managed_results.unpublished())
     }
 
+    /// Whether the provider has any connection progress to collect.
+    #[inline]
+    pub fn progress_pending(&self) -> bool {
+        !self.progress.is_empty()
+    }
+
     /// The next live connection whose SND.UNA moved, or that came to hold
     /// a result to take, since this last gave it: what a provider learns
     /// from acknowledgments and results without polling every owner. When
@@ -290,23 +296,27 @@ impl Endpoint {
         });
         // The exact physical packet this attempt submits, read before
         // acceptance advances or clears the reservation.
-        let physical = self.reservations[attempt.reservation]
-            .current
-            .as_ref()
+        let physical = self
+            .reservations
+            .get(attempt.reservation)
+            .and_then(|slot| slot.current.as_ref())
             .filter(|r| r.attempt == Some(attempt))
             .and_then(|r| {
-                let d = r.departure?;
-                let count = if r.repaired { r.emitted_bytes } else { d.payload };
-                Some((r.packet.connection?, d, r.offset, count))
+                let d = r.departure.as_ref()?;
+                let count = if r.repaired {
+                    r.emitted_bytes
+                } else {
+                    d.payload
+                };
+                Some((r.packet.connection?, d.submitted_range(r.offset, count)))
             });
         if !self.accept_transmit(now, attempt)? {
             return Ok(false);
         }
-        if let Some((id, departure, offset, count)) = physical
+        if let Some((id, range)) = physical
             && let Ok(slot) = self.retained_slot_mut(id)
         {
-            slot.connection
-                .certify_submission(&departure, offset, count, receipt);
+            slot.connection.certify_range(range, receipt);
         }
         if let Some((id, start, intent)) = probe
             && let Ok(slot) = self.retained_slot_mut(id)
@@ -914,6 +924,7 @@ impl Endpoint {
             forwarding_destination: slot
                 .ipv4_options
                 .source_route
+                .as_ref()
                 .and_then(|route| route.hops().first().copied())
                 .map(IpAddr::V4)
                 .unwrap_or(connection.tuple().remote.ip()),
@@ -1004,12 +1015,20 @@ impl Endpoint {
     /// Metadata for exactly the currently selected physical segment, including
     /// software-GSO and repaired suffixes, rather than aggregate byte length.
     pub fn transmit_attempt_packet(&self, attempt: crate::TransmitAttempt) -> Option<Transmit> {
+        self.transmit_attempt_packet_ref(attempt).copied()
+    }
+
+    /// Borrow the current physical segment metadata for a live attempt.
+    pub fn transmit_attempt_packet_ref(
+        &self,
+        attempt: crate::TransmitAttempt,
+    ) -> Option<&Transmit> {
         let r = self
             .reservations
             .get(attempt.reservation)?
             .current
             .as_ref()?;
-        (r.attempt == Some(attempt)).then_some(r.emitted_packet)
+        (r.attempt == Some(attempt)).then(|| r.emitted())
     }
 
     /// The link scoping exactly the currently selected attempt's packet,
