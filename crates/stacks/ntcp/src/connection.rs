@@ -3899,22 +3899,31 @@ impl Connection {
     /// DF-clear IPv4 packet stays ineligible.
     pub(crate) fn certify_submission(
         &mut self,
-        d: &Departure,
+        departure: &Departure,
         offset: usize,
         count: usize,
+        receipt: crate::PhysicalReceipt,
+    ) {
+        let (start, end) = if departure.segmentation.is_some() || departure.deferred_fresh {
+            let start = Seq(departure.start).wrapping_add(u32::from(departure.syn) + offset as u32);
+            (start, start.wrapping_add(count as u32))
+        } else {
+            let start = Seq(departure.start);
+            let length =
+                departure.payload as u32 + u32::from(departure.syn) + u32::from(departure.fin);
+            (start, start.wrapping_add(length))
+        };
+        self.certify_range((start, end), receipt);
+    }
+
+    pub(crate) fn certify_range(
+        &mut self,
+        (start, end): (Seq, Seq),
         receipt: crate::PhysicalReceipt,
     ) {
         let unfragmented = receipt.dont_fragment || !self.tuple.local.is_ipv4();
         let Some(p) = &mut self.pmtud else {
             return;
-        };
-        let (start, end) = if d.segmentation.is_some() || d.deferred_fresh {
-            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
-            (start, start.wrapping_add(count as u32))
-        } else {
-            let start = Seq(d.start);
-            let length = d.payload as u32 + u32::from(d.syn) + u32::from(d.fin);
-            (start, start.wrapping_add(length))
         };
         p.certify(start, end, receipt.ip_packet_len, unfragmented);
     }
@@ -5442,6 +5451,7 @@ impl Connection {
         self.queue_write(data, push, false, false, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_with_options(
         &mut self,
         data: &[u8],
@@ -5451,6 +5461,7 @@ impl Connection {
         self.write_with_options_and_notsent_lowat(data, more, end_of_record, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_with_options_and_notsent_lowat(
         &mut self,
         data: &[u8],
@@ -5461,6 +5472,7 @@ impl Connection {
         self.queue_write(data, !more && !data.is_empty(), more, end_of_record, lowat)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_with_timestamp(
         &mut self,
         data: &[u8],
@@ -6000,6 +6012,16 @@ impl Connection {
         max_charge: usize,
         timestamp: Option<TxTimestampRequest>,
     ) -> Result<Option<usize>, Error> {
+        let accepted = self.write_prefix(bytes, lowat, timestamp)?;
+        Ok(self.grow_send_prefix(accepted, max_charge))
+    }
+
+    pub(crate) fn write_prefix(
+        &self,
+        bytes: usize,
+        lowat: Option<u32>,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> Result<usize, Error> {
         if self.shutdown
             || !matches!(
                 self.state,
@@ -6009,16 +6031,25 @@ impl Connection {
             return Err(Error::InvalidState);
         }
         if bytes == 0 {
-            return Ok(None);
+            return Ok(0);
         }
         if let Some(request) = timestamp {
             self.tx_timestamps.admit(request)?;
         }
         // What the write would take with memory to grow: a refused write
         // tries again.
-        let accepted = bytes.min(self.admission_room(lowat, self.send_space_remaining()));
+        Ok(bytes.min(self.admission_room(lowat, self.send_space_remaining())))
+    }
+
+    pub(crate) fn send_storage_fits(&self, accepted: usize) -> bool {
+        let live = self.send.len() + accepted;
+        live <= self.send.allocation_capacity()
+            && self.ledger_growth(live).0 <= self.ledger_capacity()
+    }
+
+    pub(crate) fn grow_send_prefix(&mut self, accepted: usize, max_charge: usize) -> Option<usize> {
         if accepted == 0 {
-            return Ok(None);
+            return None;
         }
         let live = self.send.len().saturating_add(accepted);
         let Err(wanted) = self.grow_send_storage(live, max_charge) else {
@@ -6026,7 +6057,7 @@ impl Connection {
             // wait ends as with one, and the room beyond the allocated
             // storage it was held to is writable.
             self.memory_released();
-            return Ok(None);
+            return None;
         };
         // As tcp_sendmsg copies skb by skb until sk_wmem_schedule refuses,
         // grow for the longest prefix the budget takes, halving the bytes
@@ -6049,7 +6080,7 @@ impl Connection {
             part /= 2;
         }
         self.throttle_send();
-        Ok(Some(wanted))
+        Some(wanted)
     }
 
     // What the next write needs added to the charge to take any byte: none
@@ -6109,9 +6140,8 @@ impl Connection {
     // ledgers' headroom beyond the entries those bytes need is taken only
     // if the budget and the allocator grant it.
     fn grow_send_storage(&mut self, live: usize, max_charge: usize) -> Result<(), usize> {
-        let held = self.send.len().saturating_add(self.allocated_send_room());
         match self.grow_send_storage_to(live, max_charge) {
-            Err(_) if live <= held => Ok(()),
+            Err(_) if live <= self.send.len().saturating_add(self.allocated_send_room()) => Ok(()),
             result => result,
         }
     }
@@ -6246,9 +6276,48 @@ impl Connection {
         if !self.send_memory_waiting {
             self.prepare_send_metadata(input_len, lowat, usize::MAX, None)?;
         }
+        let room = self.send_admission_room(lowat);
+        self.enqueue_prepared(data, shared, push, more, end_of_record, room)
+    }
+
+    // The endpoint has already checked the connection state, timestamp
+    // capacity and storage growth against its memory budget.
+    pub(crate) fn write_prepared(
+        &mut self,
+        data: &[u8],
+        push: bool,
+        more: bool,
+        end_of_record: bool,
+        room: usize,
+        request: Option<TxTimestampRequest>,
+    ) -> Result<usize, Error> {
+        if data.is_empty() {
+            self.send_issued = true;
+            if push {
+                self.send.mark_push();
+            }
+            return Ok(0);
+        }
+        let count = self.enqueue_prepared(data, None, push, more, end_of_record, room)?;
+        if let Some(request) = request {
+            let target = self.acknowledged + self.send.len() as u64 - 1;
+            self.tx_timestamps.insert(request, target);
+        }
+        Ok(count)
+    }
+
+    fn enqueue_prepared(
+        &mut self,
+        data: &[u8],
+        shared: Option<crate::Payload>,
+        push: bool,
+        more: bool,
+        end_of_record: bool,
+        room: usize,
+    ) -> Result<usize, Error> {
+        let input_len = shared.as_ref().map_or(data.len(), crate::Payload::len);
         let application_idle = !self.application_timer_needed();
         let idle = !self.user_timer_needed();
-        let room = self.send_admission_room(lowat);
         let count = if let Some(payload) = shared {
             self.send
                 .write_shared(payload.slice(0..input_len.min(room)).unwrap())

@@ -4675,23 +4675,46 @@ impl Endpoint {
         len: usize,
         lowat: Option<u32>,
         timestamp: Option<TxTimestampRequest>,
-    ) -> Result<(), EndpointError> {
+    ) -> Result<usize, EndpointError> {
         self.reserved_call(id)?;
-        let connection = &self.slot(id)?.connection;
+        let slot = self.slot_mut(id)?;
+        let connection = &mut slot.connection;
+        let accepted = connection.write_prefix(len, lowat, timestamp)?;
+        // A write into the existing ring and ledgers has no allocation to
+        // charge. Only consult the shared budget when storage can grow.
+        if accepted == 0 || connection.send_storage_fits(accepted) {
+            if accepted != 0 {
+                connection.memory_released();
+            }
+            if !connection.send_memory_throttled() {
+                if slot.memory_retry.is_some() {
+                    self.stop_memory_wait(id.slot);
+                } else {
+                    debug_assert!(!self.memory_waiters.contains(id.slot));
+                }
+            }
+            return Ok(accepted);
+        }
+        self.prepare_write_growth(id, accepted, lowat)
+    }
+
+    fn prepare_write_growth(
+        &mut self,
+        id: ConnectionId,
+        accepted: usize,
+        lowat: Option<u32>,
+    ) -> Result<usize, EndpointError> {
+        let connection = &self.slots[id.slot].as_ref().unwrap().connection;
         let own_charge = connection.buffer_charge();
         let available = self
             .send_growth_room(connection, own_charge)
             .saturating_add(own_charge);
         let before = self.budget.allocated();
-        let refused = self
-            .slot_mut(id)?
-            .connection
-            .prepare_send_storage(len, lowat, available, timestamp);
-        // Charged even when refused: a send ring that grew before the other
-        // failed keeps its storage.
-        let charge = self.slot(id)?.connection.buffer_charge();
+        let connection = &mut self.slots[id.slot].as_mut().unwrap().connection;
+        let refused = connection.grow_send_prefix(accepted, available);
+        let charge = connection.buffer_charge();
         self.recharge(own_charge, charge);
-        if let Some(wanted) = refused? {
+        if let Some(wanted) = refused {
             // As __sk_mem_raise_allocated, the allocation tried enters
             // pressure if it passes the threshold, refused or not, and a
             // suppressed send allocation moderates the send limit.
@@ -4702,10 +4725,14 @@ impl Endpoint {
                 self.slot_mut(id)?.connection.moderate_send();
             }
             self.memory_throttled(id.slot);
-        } else if !self.slot(id)?.connection.send_memory_throttled() {
-            self.stop_memory_wait(id.slot);
+            return Ok(self
+                .slot(id)?
+                .connection
+                .send_admission_room(lowat)
+                .min(accepted));
         }
-        Ok(())
+        self.stop_memory_wait(id.slot);
+        Ok(accepted)
     }
 
     // What `connection`, charged `charge`, may add to the budget for its send
@@ -4877,10 +4904,14 @@ impl Endpoint {
 
     // The connection at `index` waits for memory no more.
     fn stop_memory_wait(&mut self, index: usize) {
-        self.memory_waiters.remove(index);
         if let Some(slot) = self.slots[index].as_mut() {
+            if slot.memory_retry.is_none() {
+                debug_assert!(!self.memory_waiters.contains(index));
+                return;
+            }
             slot.memory_retry = None;
         }
+        self.memory_waiters.remove(index);
         if self.memory_waiters.is_empty() {
             self.budget.set_waiting(false);
         }
@@ -4953,10 +4984,7 @@ impl Endpoint {
     }
 
     pub fn write(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
-        self.prepare_write_metadata(id, bytes.len(), None, None)?;
-        let count = self.slot_mut(id)?.connection.write(bytes)?;
-        self.refresh(id.slot);
-        Ok(count)
+        self.write_with_push(id, bytes, true)
     }
     pub fn write_with_push(
         &mut self,
@@ -4964,10 +4992,7 @@ impl Endpoint {
         bytes: &[u8],
         push: bool,
     ) -> Result<usize, EndpointError> {
-        self.prepare_write_metadata(id, bytes.len(), None, None)?;
-        let count = self.slot_mut(id)?.connection.write_with_push(bytes, push)?;
-        self.refresh(id.slot);
-        Ok(count)
+        self.write_copy(id, bytes, push, false, false, None, None)
     }
     /// Queue accepted bytes with per-write corking and a local coalescing boundary.
     /// EOR is not TCP framing; the boundary is at the end of the accepted prefix.
@@ -4978,13 +5003,7 @@ impl Endpoint {
         more: bool,
         end_of_record: bool,
     ) -> Result<usize, EndpointError> {
-        self.prepare_write_metadata(id, bytes.len(), None, None)?;
-        let count = self
-            .slot_mut(id)?
-            .connection
-            .write_with_options(bytes, more, end_of_record)?;
-        self.refresh(id.slot);
-        Ok(count)
+        self.write_with_options_and_notsent_lowat(id, bytes, more, end_of_record, None)
     }
 
     // Finite LOWAT caps accepted bytes at LOWAT minus actual unsent bytes.
@@ -4997,13 +5016,15 @@ impl Endpoint {
         end_of_record: bool,
         lowat: Option<u32>,
     ) -> Result<usize, EndpointError> {
-        self.prepare_write_metadata(id, bytes.len(), lowat, None)?;
-        let count = self
-            .slot_mut(id)?
-            .connection
-            .write_with_options_and_notsent_lowat(bytes, more, end_of_record, lowat)?;
-        self.refresh(id.slot);
-        Ok(count)
+        self.write_copy(
+            id,
+            bytes,
+            !more && !bytes.is_empty(),
+            more,
+            end_of_record,
+            lowat,
+            None,
+        )
     }
 
     pub fn send_progress(&self, id: ConnectionId) -> Result<SendProgress, EndpointError> {
@@ -5155,14 +5176,34 @@ impl Endpoint {
         lowat: Option<u32>,
         request: TxTimestampRequest,
     ) -> Result<usize, EndpointError> {
-        self.prepare_write_metadata(id, bytes.len(), lowat, Some(request))?;
-        let count = self.slot_mut(id)?.connection.write_with_timestamp(
+        self.write_copy(
+            id,
             bytes,
+            !more && !bytes.is_empty(),
             more,
             end_of_record,
             lowat,
-            request,
-        )?;
+            Some(request),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_copy(
+        &mut self,
+        id: ConnectionId,
+        bytes: &[u8],
+        push: bool,
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+        request: Option<TxTimestampRequest>,
+    ) -> Result<usize, EndpointError> {
+        let room = self.prepare_write_metadata(id, bytes.len(), lowat, request)?;
+        let count = self.slots[id.slot]
+            .as_mut()
+            .unwrap()
+            .connection
+            .write_prepared(bytes, push, more, end_of_record, room, request)?;
         self.refresh(id.slot);
         Ok(count)
     }
@@ -11161,5 +11202,138 @@ mod memory_wait_tests {
             assert_eq!(slot.received_ipv4_options, Some(opts2));
             assert_eq!(slot.connection.ip_header_len(), 28);
         }
+    }
+
+    #[test]
+    fn write_memory_refusal_keeps_queue_empty_and_registers_waiter() {
+        let (mut a, mut b, listener) = endpoints();
+        let (client, _) = connect(&mut a, &mut b, listener, 40011);
+        let before_charge = a.buffer_bytes();
+        a.config.max_buffer_bytes = before_charge;
+
+        assert_eq!(a.write(client, b"hello"), Err(Error::WouldBlock.into()));
+        assert_eq!(a.send_progress(client).unwrap().queued_end, 0);
+        assert_eq!(a.buffer_bytes(), before_charge);
+        assert!(a.memory_waiters.contains(client.slot));
+        assert!(retry_at(&a, client).is_some());
+        assert!(a.slot(client).unwrap().connection.send_memory_throttled());
+    }
+
+    #[test]
+    fn write_partial_memory_grants_exact_prefix_and_registers_waiter() {
+        let (mut a, mut b, listener) = endpoints();
+        let (client, _) = connect(&mut a, &mut b, listener, 40012);
+        assert_eq!(a.write(client, &[1; 9]), Ok(9));
+        let room = held(&a, client);
+        assert!(room > 0);
+        a.config.max_buffer_bytes = a.buffer_bytes();
+
+        let data = long_data();
+        assert!(data.len() > room);
+        assert_eq!(a.write(client, &data), Ok(room));
+        assert_eq!(
+            a.send_progress(client).unwrap().queued_end,
+            (9 + room) as u64
+        );
+        assert!(a.memory_waiters.contains(client.slot));
+        assert!(retry_at(&a, client).is_some());
+        assert_eq!(a.write(client, b"x"), Err(Error::WouldBlock.into()));
+        assert_eq!(
+            a.send_progress(client).unwrap().queued_end,
+            (9 + room) as u64
+        );
+        assert!(a.memory_waiters.contains(client.slot));
+    }
+
+    #[test]
+    fn zero_length_write_under_memory_pressure_succeeds_without_charging_or_stalling() {
+        let (mut a, mut b, listener) = endpoints();
+        let (client, _) = connect(&mut a, &mut b, listener, 40013);
+        let before_charge = a.buffer_bytes();
+        a.config.max_buffer_bytes = before_charge;
+
+        assert_eq!(a.write(client, b""), Ok(0));
+        assert_eq!(a.write_with_options(client, b"", false, true), Ok(0));
+        assert_eq!(a.buffer_bytes(), before_charge);
+        assert_eq!(a.memory_throttled_writes(), 0);
+        assert!(a.memory_waiters.is_empty());
+        assert_eq!(retry_at(&a, client), None);
+    }
+
+    #[test]
+    fn write_with_timestamp_admission_refusal_and_acceptance() {
+        let (mut a, mut b, listener) = endpoints();
+        let (client, _) = connect(&mut a, &mut b, listener, 40014);
+        a.set_tx_timestamp_capacity(client, 1).unwrap();
+        let request = TxTimestampRequest {
+            cookie: 42,
+            scheduled: true,
+            software_transmit: false,
+            hardware_transmit: false,
+            acknowledged: false,
+        };
+
+        assert_eq!(
+            a.write_with_timestamp(client, b"abcd", false, false, None, request),
+            Ok(4)
+        );
+        assert_eq!(a.send_progress(client).unwrap().queued_end, 4);
+        // Second timestamped write exceeds capacity=1: refused without mutating send queue.
+        assert_eq!(
+            a.write_with_timestamp(client, b"efgh", false, false, None, request),
+            Err(Error::WouldBlock.into())
+        );
+        assert_eq!(a.send_progress(client).unwrap().queued_end, 4);
+        // Zero-length timestamped write does not charge a timestamp slot.
+        assert_eq!(
+            a.write_with_timestamp(client, b"", false, false, None, request),
+            Ok(0)
+        );
+        assert_eq!(a.send_progress(client).unwrap().queued_end, 4);
+        // Draining the scheduled timestamp event frees capacity for another write.
+        let mut out = [0u8; 2048];
+        let _ = a.poll_transmit(1, &mut out, 2048).unwrap();
+        let event = a.next_tx_timestamp(client).unwrap().unwrap();
+        assert_eq!(event.cookie, 42);
+        assert_eq!(
+            a.write_with_timestamp(client, b"ef", false, false, None, request),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn throttled_memory_waiter_wakes_on_free_and_stop_memory_wait_clears_waiter() {
+        let (mut a, mut b, listener) = endpoints();
+        let (waiter, _) = connect(&mut a, &mut b, listener, 40015);
+        let (other, _) = connect(&mut a, &mut b, listener, 40016);
+        a.set_rx_timestamp_capacity(other, 1024).unwrap();
+        writable(&mut a, waiter);
+        a.config.max_buffer_bytes = a.buffer_bytes();
+
+        // Calling stop_memory_wait on an unflagged slot hits the fast path safely.
+        a.stop_memory_wait(waiter.slot);
+        assert!(a.memory_waiters.is_empty());
+
+        // Refused write registers waiter and retry deadline.
+        assert_eq!(a.write(waiter, &[7; 9]), Err(Error::WouldBlock.into()));
+        assert!(a.memory_waiters.contains(waiter.slot));
+        assert!(retry_at(&a, waiter).is_some());
+
+        // Releasing memory on another connection wakes the waiter and clears retry state.
+        a.set_rx_timestamp_capacity(other, 0).unwrap();
+        assert!(a.memory_waiters.is_empty());
+        assert_eq!(retry_at(&a, waiter), None);
+        assert!(writable(&mut a, waiter));
+        assert_eq!(a.write(waiter, &[7; 9]), Ok(9));
+
+        // Re-throttle and verify explicit stop_memory_wait clears both queue and retry timer.
+        a.config.max_buffer_bytes = a.buffer_bytes();
+        let room = held(&a, waiter);
+        assert_eq!(a.write(waiter, &long_data()), Ok(room));
+        assert!(a.memory_waiters.contains(waiter.slot));
+        assert!(retry_at(&a, waiter).is_some());
+        a.stop_memory_wait(waiter.slot);
+        assert!(!a.memory_waiters.contains(waiter.slot));
+        assert_eq!(retry_at(&a, waiter), None);
     }
 }
