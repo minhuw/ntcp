@@ -201,6 +201,13 @@ impl Ipv4Options {
     //# outside the possible range. For example, erroneous option lengths
     //# have been observed to put some IP implementations into infinite loops.
     pub fn parse(bytes: &[u8], source_routes_enabled: bool) -> Result<Self, Ipv4OptionsError> {
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        Self::parse_options(bytes, source_routes_enabled)
+    }
+
+    fn parse_options(bytes: &[u8], source_routes_enabled: bool) -> Result<Self, Ipv4OptionsError> {
         use Ipv4OptionsError::*;
         if bytes.len() > 40 {
             return Err(Capacity);
@@ -605,6 +612,12 @@ impl OutgoingIpv4Options {
     ) -> Result<(Ipv4Addr, usize), Ipv4OptionsError> {
         if !unicast(source) || !unicast(final_destination) {
             return Err(Ipv4OptionsError::InvalidAddress);
+        }
+        if self.source_route.is_none()
+            && self.record_route_slots.is_none()
+            && self.timestamp.is_none()
+        {
+            return Ok((final_destination, 0));
         }
         let mut bytes = [0u8; 40];
         let (destination, route_len, len) = self.initialize(final_destination, &mut bytes)?;

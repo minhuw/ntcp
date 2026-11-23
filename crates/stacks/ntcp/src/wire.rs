@@ -120,23 +120,11 @@ fn checked_length(ip: IpMetadata, len: usize) -> Result<u32, WireError> {
 //# If a segment contains an odd number of header and text octets, alignment can be achieved
 //# by padding the last octet with zeros on its right to form a 16-bit word for checksum
 //# purposes. The pad is not transmitted as part of the segment.
-// Returns the sum folded to 16 bits. Two 16-bit words at a time go into a
-// 64-bit accumulator that cannot overflow for any slice, folded once at the
-// end: a carry out of a word's position is the same end-around carry (2^16
-// is congruent to 1 modulo 2^16 - 1), and a nonzero sum never folds to 0.
+// Add the folded sum of a slice to the folded sum of its prefix.
 fn add_words(sum: u32, bytes: &[u8]) -> u32 {
-    let mut wide = u64::from(sum);
-    let (pairs, rest) = bytes.as_chunks::<4>();
-    for &pair in pairs {
-        wide += u64::from(u32::from_be_bytes(pair));
-    }
-    let mut last = [0; 4];
-    last[..rest.len()].copy_from_slice(rest);
-    wide += u64::from(u32::from_be_bytes(last));
-    while wide >> 16 != 0 {
-        wide = (wide & 0xffff) + (wide >> 16);
-    }
-    wide as u32
+    debug_assert!(sum <= 0xffff);
+    let sum = sum + u32::from(!ntcp_ip_common::checksum(bytes));
+    (sum & 0xffff) + (sum >> 16)
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
@@ -154,20 +142,20 @@ pub fn checksum(ip: IpMetadata, segment: &[u8]) -> Result<u16, WireError> {
 //# The checksum also covers a pseudo-header (Figure 2) conceptually prefixed to the TCP
 //# header. The pseudo-header is 96 bits for IPv4 and 320 bits for IPv6.
 fn pseudo_header_sum(ip: IpMetadata, len: u32) -> Result<u32, WireError> {
-    let mut sum = match (ip.source, ip.destination) {
+    let addresses = match (ip.source, ip.destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            add_words(add_words(0, &source.octets()), &destination.octets())
+            u64::from(u32::from(source)) + u64::from(u32::from(destination))
         }
-        (IpAddr::V6(source), IpAddr::V6(destination)) => {
-            add_words(add_words(0, &source.octets()), &destination.octets())
-        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => u64::from(add_words(
+            add_words(0, &source.octets()),
+            &destination.octets(),
+        )),
         _ => return Err(WireError::AddressFamily),
     };
-    // Each pseudo-header chunk is even-sized, so none needs virtual zero
-    // padding. The extra IPv4 length word is zero.
-    sum = add_words(sum, &len.to_be_bytes());
-    sum = add_words(sum, &[0, 6]);
-    Ok(sum)
+    let sum = addresses + u64::from(len) + 6;
+    let sum = (sum & 0xffff) + (sum >> 16);
+    let sum = (sum & 0xffff) + (sum >> 16);
+    Ok(((sum & 0xffff) + (sum >> 16)) as u32)
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.2
@@ -340,10 +328,14 @@ fn walk_options(mut bytes: &[u8], outgoing: bool) -> Result<Options, WireError> 
 // (RFC 7323 Appendix A): read that layout directly, as Linux's
 // tcp_fast_parse_options does (tcp_parse_aligned_timestamp), and walk
 // anything else. The walk reads the same bytes into the same Options.
+#[inline]
+fn aligned_timestamp(options: &[u8]) -> bool {
+    options.len() == 12 && options.starts_with(&[1, 1, 8, 10])
+}
+
 fn read_options(bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
-    if let Some((&[1, 1, 8, 10], ts)) = bytes.split_first_chunk::<4>()
-        && let Ok(ts) = <&[u8; 8]>::try_from(ts)
-    {
+    if aligned_timestamp(bytes) {
+        let ts = &bytes[4..];
         return Ok(Options {
             timestamps: Some((
                 u32::from_be_bytes(ts[..4].try_into().unwrap()),
@@ -489,6 +481,27 @@ pub fn encode(
     encode_with(ip, header, options, payload, out, false)
 }
 
+fn validate_output_options(flags: u8, options: &[u8]) -> Result<(), WireError> {
+    if options.len() > 40 {
+        return Err(WireError::TooLong);
+    }
+    let parsed_options = read_options(options, true)?;
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.2
+    //# This field may be sent in the initial connection request (i.e., in
+    //# segments with the SYN control bit set) and MUST NOT be sent in other
+    //# segments (MUST-65).
+    // RFC 2018 section 2: "It MUST NOT be sent on non-SYN segments."
+    if flags & SYN == 0
+        && (parsed_options.mss.is_some()
+            || parsed_options.window_scale.is_some()
+            || parsed_options.sack_permitted
+            || parsed_options.fast_open.is_some())
+    {
+        return Err(WireError::InvalidOption);
+    }
+    Ok(())
+}
+
 /// `encode`, or with `partial` for a device that completes the checksum
 /// (`ConnectionConfig::tcp_checksum_offload`): the checksum field then
 /// holds the pseudo-header sum, as Linux's __tcp_v4_send_check and
@@ -502,22 +515,10 @@ pub(crate) fn encode_with(
     out: &mut [u8],
     partial: bool,
 ) -> Result<usize, WireError> {
-    if options.len() > 40 {
-        return Err(WireError::TooLong);
-    }
-    let parsed_options = read_options(options, true)?;
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.2
-    //# This field may be sent in the initial connection request (i.e., in
-    //# segments with the SYN control bit set) and MUST NOT be sent in other
-    //# segments (MUST-65).
-    // RFC 2018 section 2: "It MUST NOT be sent on non-SYN segments."
-    if header.flags & SYN == 0
-        && (parsed_options.mss.is_some()
-            || parsed_options.window_scale.is_some()
-            || parsed_options.sack_permitted
-            || parsed_options.fast_open.is_some())
-    {
-        return Err(WireError::InvalidOption);
+    // An empty option list and the aligned Timestamp layout are valid on
+    // every segment. Other layouts need the full option and SYN checks.
+    if !options.is_empty() && !aligned_timestamp(options) {
+        validate_output_options(header.flags, options)?;
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# The number of 32-bit words in the TCP header. This indicates where the data begins.
@@ -526,14 +527,15 @@ pub(crate) fn encode_with(
     let len = header_len
         .checked_add(payload.len())
         .ok_or(WireError::TooLong)?;
-    checked_length(ip, len)?;
+    let tcp_len = checked_length(ip, len)?;
     if out.len() < len {
         return Err(WireError::OutputTooSmall);
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# The content of the header beyond the End of Option List Option MUST
     //# be header padding of zeros (MUST-69).
-    out[..header_len].fill(0);
+    out[16..18].fill(0);
+    out[20 + options.len()..header_len].fill(0);
     out[0..2].copy_from_slice(&header.source_port.to_be_bytes());
     out[2..4].copy_from_slice(&header.destination_port.to_be_bytes());
     out[4..8].copy_from_slice(&header.sequence.to_be_bytes());
@@ -553,10 +555,11 @@ pub(crate) fn encode_with(
     //# (MUST-2) and the receiver MUST check it (MUST-3).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# While computing the checksum, the checksum field itself is replaced with zeros.
+    let pseudo = pseudo_header_sum(ip, tcp_len)?;
     let sum = if partial {
-        partial_checksum(ip, len)?
+        pseudo as u16
     } else {
-        checksum(ip, &out[..len])?
+        !(add_words(pseudo, &out[..len]) as u16)
     };
     out[16..18].copy_from_slice(&sum.to_be_bytes());
     Ok(len)
@@ -1859,6 +1862,93 @@ mod tests {
                 Err(WireError::TooLong)
             );
             assert_eq!(out, [0xa5; 80]);
+        }
+    }
+
+    #[test]
+    fn encode_overwrites_dirty_buffer_and_pads_options() {
+        let payload = b"hello-tcp";
+        let aligned_ts = [1, 1, 8, 10, 0, 0, 1, 2, 0, 0, 3, 4];
+        let cases: &[(&[u8], u8)] = &[
+            (&[], ACK),
+            (&[1], ACK),
+            (&[1, 1], ACK),
+            (&[1, 1, 1], ACK),
+            (&aligned_ts, ACK),
+            (&[8, 10, 0, 0, 1, 2, 0, 0, 3, 4], ACK),
+            (&[2, 4, 5, 180], SYN),
+        ];
+        for ip in ips() {
+            for &(opts, flags) in cases {
+                let mut hdr = header();
+                hdr.flags = flags;
+                hdr.urgent_pointer = 0;
+
+                let mut out = [0xffu8; 96];
+                let len = encode(ip, hdr, opts, payload, &mut out).unwrap();
+                let header_len = 20 + opts.len().div_ceil(4) * 4;
+                assert_eq!(len, header_len + payload.len());
+                assert_eq!(out[12], ((header_len / 4) as u8) << 4);
+                assert_eq!(&out[18..20], &[0, 0]);
+                assert!(out[20 + opts.len()..header_len].iter().all(|&b| b == 0));
+                assert_eq!(checksum(ip, &out[..len]).unwrap(), 0);
+                let parsed = parse(ip, &out[..len]).unwrap();
+                assert_eq!(parsed.header, hdr);
+                assert_eq!(parsed.payload, payload);
+            }
+        }
+    }
+
+    #[test]
+    fn option_fast_paths_match_walk_and_output_validation() {
+        let aligned_ts = [
+            1u8, 1, 8, 10, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+        ];
+        let unaligned_ts = [
+            8u8, 10, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 1, 1,
+        ];
+        let mss = [2u8, 4, 5, 180];
+        let bad_ts = [1u8, 1, 8, 9, 0, 0, 0, 1, 0, 0, 0, 2];
+
+        for &opts in &[
+            &[][..],
+            &aligned_ts[..],
+            &unaligned_ts[..],
+            &mss[..],
+            &bad_ts[..],
+        ] {
+            for outgoing in [false, true] {
+                assert_eq!(read_options(opts, outgoing), walk_options(opts, outgoing));
+            }
+        }
+
+        for flags in [0, ACK, SYN, SYN | ACK] {
+            assert_eq!(validate_output_options(flags, &[]), Ok(()));
+            assert_eq!(validate_output_options(flags, &aligned_ts), Ok(()));
+            assert_eq!(validate_output_options(flags, &unaligned_ts), Ok(()));
+            assert_eq!(
+                validate_output_options(flags, &bad_ts),
+                Err(WireError::InvalidOption)
+            );
+            let expected_mss = if flags & SYN != 0 {
+                Ok(())
+            } else {
+                Err(WireError::InvalidOption)
+            };
+            assert_eq!(validate_output_options(flags, &mss), expected_mss);
+        }
+
+        // Verify encode_with exercises the same rejection for MSS on non-SYN and acceptance on SYN.
+        for ip in ips() {
+            let mut out = [0u8; 64];
+            let mut hdr = header();
+            hdr.flags = ACK;
+            assert_eq!(
+                encode(ip, hdr, &mss, &[], &mut out),
+                Err(WireError::InvalidOption)
+            );
+            hdr.flags = SYN;
+            assert!(encode(ip, hdr, &mss, &[], &mut out).is_ok());
         }
     }
 }

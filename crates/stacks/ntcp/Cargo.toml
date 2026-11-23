@@ -16,6 +16,7 @@ packet-test-controls = []
 tfo-linux-cookie = ["dep:subtle"]
 
 [dependencies]
+ntcp-ip-common = { version = "0.0.1", path = "../ntcp-ip-common" }
 ntcp-path = { path = "../ntcp-path", version = "0.0.1" }
 ntcp-buffer = { path = "../../net/ntcp-buffer", version = "0.0.1" }
 hmac = { version = "0.12", default-features = false }
@@ -33,4 +34,3 @@ ntcp-io = { version = "0.0.1", path = "../../io/ntcp-io" }
 ntcp-io-tun = { version = "0.0.1", path = "../../io/ntcp-io-tun" }
 ntcp-ip6 = { version = "0.0.1", path = "../ntcp-ip6" }
 ntcp-icmp = { version = "0.0.1", path = "../ntcp-icmp" }
-ntcp-ip-common = { version = "0.0.1", path = "../ntcp-ip-common" }

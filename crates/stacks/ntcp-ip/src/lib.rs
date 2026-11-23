@@ -198,7 +198,7 @@ fn bounds(
     if flags & 0x8000 != 0 {
         return Err(Error::Invalid);
     }
-    if checksum && self::checksum(&b[..header]) != 0 {
+    if checksum && header_checksum(&b[..header]) != 0 {
         return Err(Error::Checksum);
     }
     // Destination packets and ICMP quotes may both have an expired TTL.
@@ -212,6 +212,16 @@ fn bounds(
             offset: (flags & 0x1fff) * 8,
         },
     ))
+}
+
+// With just the base header, checksum a fixed array so its five word
+// loads and end-around carries need no loop or tail handling.
+#[inline]
+fn header_checksum(header: &[u8]) -> u16 {
+    match <&[u8; IP_HEADER]>::try_from(header) {
+        Ok(base) => checksum(base),
+        Err(_) => checksum(header),
+    }
 }
 
 /// Fragmentation fields of one IPv4 header (RFC 791 section 3.1).
@@ -659,9 +669,10 @@ fn encode_present(
     if hop_limit == 0 || dscp > 63 || ecn > 3 {
         return Err(Error::Invalid);
     }
-    packet.copy_within(IP_HEADER..IP_HEADER + present, header_len);
+    if option_len != 0 {
+        packet.copy_within(IP_HEADER..IP_HEADER + present, header_len);
+    }
     let header = &mut packet[..header_len];
-    header.fill(0);
     header[0] = 0x40 | (header_len / 4) as u8;
     header[IP_HEADER..].copy_from_slice(&options[..option_len]);
     header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
@@ -675,7 +686,8 @@ fn encode_present(
     //= https://www.rfc-editor.org/rfc/rfc3168#section-5.3
     //= reason=IPv4 example sets DF for all packets; ECN/DSCP matrix explicitly asserts DF and no fragment offset, including both ECT codepoints.
     //# ECN-capable packets MAY have the DF (Don't Fragment) bit set.
-    header[6] = 0x40; // DF: this codec never fragments.
+    header[4..8].copy_from_slice(&[0, 0, 0x40, 0]); // ID = 0; DF: this codec never fragments.
+    header[10..12].fill(0);
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2
     //# Time to Live (TTL):  The TTL value used to send TCP segments MUST be
@@ -690,7 +702,7 @@ fn encode_present(
     header[9] = protocol;
     header[12..16].copy_from_slice(&source.octets());
     header[16..20].copy_from_slice(&destination.octets());
-    let sum = checksum(header);
+    let sum = header_checksum(header);
     header[10..12].copy_from_slice(&sum.to_be_bytes());
     Ok(stored_len)
 }
@@ -785,4 +797,78 @@ fn quote(
         b[9],
         fragmentation,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_present_overwrites_dirty_buffer_across_option_lengths() {
+        let source = Ipv4Addr::new(192, 0, 2, 10);
+        let destination = Ipv4Addr::new(198, 51, 100, 20);
+        let payload = b"dirty-buffer-payload-check-12345";
+        let header = Header {
+            ip: IpMetadata {
+                source: source.into(),
+                destination: destination.into(),
+            },
+            hop_limit: 53,
+            dscp: 46,
+            ecn: 2,
+            ipv4_options: OutgoingIpv4Options::default(),
+        };
+
+        for opt_len in (0..=40).step_by(4) {
+            let mut carried = [0x5au8; 40];
+            if opt_len >= 4 {
+                carried[0] = 200;
+                carried[1] = opt_len as u8;
+            }
+            let encoded_opts =
+                EncodedIpv4Options::new(None, destination, &carried[..opt_len]).unwrap();
+            assert_eq!(encoded_opts.as_bytes().len(), opt_len);
+
+            let mut packet = [0xffu8; 128];
+            packet[IP_HEADER..IP_HEADER + payload.len()].copy_from_slice(payload);
+            let len = encode_datagram_with_options(
+                &mut packet,
+                header,
+                &encoded_opts,
+                PROTOCOL_TCP,
+                payload.len(),
+            )
+            .unwrap();
+            let header_len = IP_HEADER + opt_len;
+            assert_eq!(len, header_len + payload.len());
+            assert_eq!(packet[0], 0x40 | (header_len / 4) as u8);
+            assert_eq!(packet[1], (46 << 2) | 2);
+            assert_eq!(&packet[4..8], &[0, 0, 0x40, 0]);
+            assert_eq!(packet[8], 53);
+            assert_eq!(packet[9], PROTOCOL_TCP);
+            assert_eq!(checksum(&packet[..header_len]), 0);
+            assert_eq!(&packet[IP_HEADER..header_len], &carried[..opt_len]);
+            assert_eq!(&packet[header_len..len], payload);
+
+            let parsed = parse_fragment(&packet[..len], false).unwrap();
+            assert_eq!(parsed.ip, header.ip);
+            assert_eq!(parsed.traffic_class, (46 << 2) | 2);
+            assert_eq!(parsed.hop_limit, 53);
+            assert_eq!(parsed.protocol, PROTOCOL_TCP);
+            assert_eq!(parsed.fragmentation.identification, 0);
+            assert!(parsed.fragmentation.dont_fragment);
+            assert!(!parsed.fragmentation.more_fragments);
+            assert_eq!(parsed.fragmentation.offset, 0);
+            assert_eq!(parsed.payload, payload);
+        }
+
+        // Also exercise the option_len == 0 direct encode_datagram path on a dirty buffer.
+        let mut packet = [0xffu8; 128];
+        packet[IP_HEADER..IP_HEADER + payload.len()].copy_from_slice(payload);
+        let len = encode_datagram(&mut packet, header, PROTOCOL_TCP, payload.len(), 0).unwrap();
+        assert_eq!(len, IP_HEADER + payload.len());
+        assert_eq!(&packet[4..8], &[0, 0, 0x40, 0]);
+        assert_eq!(checksum(&packet[..IP_HEADER]), 0);
+        assert_eq!(&packet[IP_HEADER..len], payload);
+    }
 }

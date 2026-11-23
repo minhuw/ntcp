@@ -20,27 +20,55 @@ pub enum Error {
     Quote,
 }
 
-// Two words at a time go into a 64-bit sum, which cannot overflow for any
-// slice, folded once at the end: a carry out of a word's position is the
-// end-around carry (2^16 is congruent to 1 modulo 2^16 - 1), and a nonzero
-// sum never folds to zero. An odd final octet is padded with zero.
+// Two words at a time go into a 64-bit sum, folded at the end of each
+// block. A carry out of a word's position is the end-around carry
+// (2^16 is congruent to 1 modulo 2^16 - 1), and a nonzero sum never folds
+// to zero. An odd final octet is padded with zero.
 //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
 //# The checksum field is the 16 bit one's complement of the one's complement
 //# sum of all 16 bit words in the header. For purposes of computing the
 //# checksum, the value of the checksum field is zero.
+#[inline]
 pub fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u64;
-    let (pairs, rest) = bytes.as_chunks::<4>();
-    for &pair in pairs {
-        sum += u64::from(u32::from_be_bytes(pair));
+    // Even a slice larger than the IPv6 jumbogram limit has a bounded sum.
+    const BLOCK: usize = 1 << 30;
+    if bytes.len() <= BLOCK {
+        return checksum_block(bytes);
     }
-    let mut last = [0; 4];
-    last[..rest.len()].copy_from_slice(rest);
-    sum += u64::from(u32::from_be_bytes(last));
-    while sum >> 16 != 0 {
+    checksum_chunked(bytes, BLOCK)
+}
+
+#[cold]
+fn checksum_chunked(bytes: &[u8], block_size: usize) -> u16 {
+    debug_assert!(block_size > 0 && block_size.is_multiple_of(2));
+    let mut sum = 0u32;
+    for block in bytes.chunks(block_size) {
+        sum += u32::from(!checksum_block(block));
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+#[inline]
+fn checksum_block(bytes: &[u8]) -> u16 {
+    // Add in native byte order. Swapping every word swaps the two bytes
+    // of the final folded sum, so one conversion suffices for the packet.
+    let (pairs, rest) = bytes.as_chunks::<4>();
+    let mut wide = 0u64;
+    for &pair in pairs {
+        wide += u64::from(u32::from_ne_bytes(pair));
+    }
+    let tail = match rest {
+        [a, b, c] => [*a, *b, *c, 0],
+        [a, b] => [*a, *b, 0, 0],
+        [a] => [*a, 0, 0, 0],
+        _ => [0; 4],
+    };
+    wide += u64::from(u32::from_ne_bytes(tail));
+    let (half, carry) = (wide as u32).overflowing_add((wide >> 32) as u32);
+    let half = half + u32::from(carry);
+    let sum = (half & 0xffff) + (half >> 16);
+    !u16::from_be(((sum & 0xffff) + (sum >> 16)) as u16)
 }
 
 pub const PROTOCOL_TCP: u8 = 6;
@@ -167,7 +195,7 @@ pub fn parse_udp(source: IpAddr, destination: IpAddr, payload: &[u8]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::checksum;
+    use super::{checksum, checksum_chunked};
 
     // RFC 1071's sum of 16-bit words, folded after every word.
     fn reference(bytes: &[u8]) -> u16 {
@@ -200,6 +228,40 @@ mod tests {
             let ones = [0xff; 65536];
             assert_eq!(checksum(&ones[..len]), reference(&ones[..len]));
             assert_eq!(checksum(&[0; 64][..len.min(64)]), 0xffff);
+        }
+    }
+
+    #[test]
+    fn chunked_checksum_matches_reference() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut bytes = [0u8; 257];
+        for byte in &mut bytes {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        for block_size in [2, 4, 6, 8, 12, 16, 64] {
+            for len in [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128,
+                129, 255, 256, 257,
+            ] {
+                let slice = &bytes[..len];
+                assert_eq!(checksum_chunked(slice, block_size), reference(slice));
+            }
+            // All-ones chunks force 0xFFFF + 0xFFFF carry wraparound on every step,
+            // including odd-length trailing chunks.
+            let ones = [0xffu8; 131];
+            for len in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 63, 64, 65, 130, 131] {
+                assert_eq!(
+                    checksum_chunked(&ones[..len], block_size),
+                    reference(&ones[..len])
+                );
+            }
+            let zeros = [0u8; 65];
+            for len in [0, 1, 4, 17, 65] {
+                assert_eq!(checksum_chunked(&zeros[..len], block_size), 0xffff);
+            }
         }
     }
 }
