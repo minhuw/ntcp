@@ -2335,3 +2335,154 @@ fn reassembled_neighbor_discovery_is_refused_by_its_fragment_provenance() {
         Err(Error::Codec(ntcp_ip::Error::FragmentationUnsupported))
     );
 }
+
+// `Host::receive_processed` must agree with `Host::receive` followed by
+// `Host::process` on result/error, counters, and drop reasons across whole
+// IPv4 packets (with and without options), header/policy errors, short
+// frames, fragments, and IPv6 fallback.
+#[test]
+fn receive_processed_matches_receive_and_process() {
+    let cfg = config(2);
+    let (local4, remote4) = addresses(false);
+    let (local6, remote6) = addresses(true);
+    let to_us4 = ip(remote4.ip(), local4.ip());
+    let to_us6 = ip(remote6.ip(), local6.ip());
+    let base4 = echo(to_us4, 1, 1, &[0xab; 40]);
+
+    let make_pair = |v6: bool, interpretation: bool, source_routes: bool, ipv4_enabled: bool| {
+        let local = if v6 { local6 } else { local4 };
+        let mut a = side(local, 91, &cfg, OUTPUT);
+        let mut b = side(local, 91, &cfg, OUTPUT);
+        for s in [&mut a, &mut b] {
+            s.0.ports[0].as_mut().unwrap().receive.ipv4 = if ipv4_enabled {
+                Ipv4Receive::Enabled {
+                    interpretation,
+                    source_routes,
+                }
+            } else {
+                Ipv4Receive::Disabled
+            };
+        }
+        (a, b)
+    };
+
+    let check_step = |a: &mut Side, b: &mut Side, now: u64, frame: &[u8], with_clock: bool| {
+        let mut out_a = vec![0; 8192];
+        let mut out_b = vec![0; 8192];
+        let mut clock_a = Samples::default();
+        let mut clock_b = Samples::default();
+        let ref_res = match a.0.receive(a.2, now, frame, false, &mut out_a) {
+            Ok(Received::Datagram(datagram)) => a
+                .0
+                .process(
+                    datagram,
+                    with_clock.then_some(&mut clock_a as &mut dyn ntcp::Ipv4TimestampProvider),
+                )
+                .map(|p| Some((p.envelope(), p.bytes().to_vec()))),
+            Ok(_) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let fast_res = b
+            .0
+            .receive_processed(
+                b.2,
+                now,
+                frame,
+                false,
+                &mut out_b,
+                with_clock.then_some(&mut clock_b as &mut dyn ntcp::Ipv4TimestampProvider),
+            )
+            .map(|opt| opt.map(|p| (p.envelope(), p.bytes().to_vec())));
+        assert_eq!(fast_res, ref_res);
+        if let (Err(e_fast), Err(e_ref)) = (&fast_res, &ref_res) {
+            assert_eq!(drop_reason(e_fast), drop_reason(e_ref));
+        }
+        assert_eq!(clock_b.calls, clock_a.calls);
+        assert_eq!(b.0.ipv4_header_errors(), a.0.ipv4_header_errors());
+        assert_eq!(b.0.reassembly_counters(), a.0.reassembly_counters());
+        assert_eq!(b.0.icmp_output_counters(), a.0.icmp_output_counters());
+        assert_eq!(b.0.drop_counts(), a.0.drop_counts());
+    };
+
+    // Complete IPv4: plain, RR, TS, LSRR, SSRR, with timestamps Some and None.
+    let (lsrr, _, _) = routes(false, &[HOP_A, HOP_B], None);
+    let (ssrr, _, _) = routes(true, &[HOP_A, HOP_B], None);
+    let ts_overflow = [68, 12, 13, 0xf0, 0, 0, 0, 1, 0, 0, 0, 2];
+    let option_frames = [
+        base4.clone(),
+        with_ipv4_options(&base4, &RR),
+        with_ipv4_options(&base4, &TS),
+        with_ipv4_options(&base4, &lsrr),
+        with_ipv4_options(&base4, &ssrr),
+        with_ipv4_options(&base4, &ts_overflow),
+    ];
+    for frame in &option_frames {
+        for with_clock in [false, true] {
+            let (mut a, mut b) = make_pair(false, true, true, true);
+            check_step(&mut a, &mut b, 10, frame, with_clock);
+        }
+    }
+
+    // Error cases on IPv4 port: oversized, bad checksum, IHL < 5, total_len != frame_len,
+    // reserved flag bit set, unowned destination, short 7- and 8-byte frames.
+    let mut bad_csum = base4.clone();
+    bad_csum[10] ^= 0xff;
+    let mut bad_ihl = base4.clone();
+    bad_ihl[0] = 0x44;
+    let mut bad_total = base4.clone();
+    bad_total[3] = bad_total[3].wrapping_add(4);
+    let mut reserved_bit = base4.clone();
+    reserved_bit[6] |= 0x80;
+    super::dispatch::seal_ipv4(&mut reserved_bit);
+    let unowned = echo(
+        ip(remote4.ip(), IpAddr::V4(core::net::Ipv4Addr::new(192, 0, 2, 99))),
+        1,
+        1,
+        &[1; 16],
+    );
+    let oversized = echo(to_us4, 1, 2, &[0x55; 1600]);
+    let short7 = base4[..7].to_vec();
+    let short8 = base4[..8].to_vec();
+
+    for frame in [
+        &oversized,
+        &bad_csum,
+        &bad_ihl,
+        &bad_total,
+        &reserved_bit,
+        &unowned,
+        &short7,
+        &short8,
+    ] {
+        let (mut a, mut b) = make_pair(false, true, true, true);
+        check_step(&mut a, &mut b, 20, frame, true);
+    }
+
+    // IPv4-disabled port.
+    {
+        let (mut a, mut b) = make_pair(false, false, false, false);
+        check_step(&mut a, &mut b, 30, &base4, false);
+    }
+
+    // IPv4 fragments: hold first, complete on second.
+    {
+        let (mut a, mut b) = make_pair(false, false, false, true);
+        let frags = fragments(&base4, 42, 24);
+        assert!(frags.len() >= 2);
+        for (i, frag) in frags.iter().enumerate() {
+            check_step(&mut a, &mut b, 40 + i as u64, frag, false);
+        }
+    }
+
+    // IPv6 fallback: whole datagram and fragments.
+    {
+        let (mut a, mut b) = make_pair(true, false, false, true);
+        let base6 = echo(to_us6, 1, 1, &[0xcd; 40]);
+        check_step(&mut a, &mut b, 50, &base6, false);
+        let frags6 = fragments(&base6, 77, 24);
+        assert!(frags6.len() >= 2);
+        for (i, frag) in frags6.iter().enumerate() {
+            check_step(&mut a, &mut b, 60 + i as u64, frag, false);
+        }
+    }
+}

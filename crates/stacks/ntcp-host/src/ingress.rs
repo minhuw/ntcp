@@ -609,11 +609,7 @@ impl Host {
                 // before reassembly (RFC 1122 section 3.2.1.8). The header
                 // checksum is verified here, once for each arriving packet
                 // (RFC 1122 section 3.2.1.2, cited at ntcp_ip::ipv4_bounds).
-                let Some(source_routes) = capabilities.ipv4.source_routes() else {
-                    return Err(self.version_refused(now, frame, DropReason::UnhandledProto));
-                };
-                let packet = ntcp_ip::parse_fragment(frame, source_routes)
-                    .inspect_err(|&error| self.count_header_error(frame, error))?;
+                let packet = self.receive_ipv4(now, frame, capabilities.ipv4)?;
                 if packet.fragmentation.is_complete() {
                     return Ok(Received::Datagram(whole));
                 }
@@ -747,6 +743,68 @@ impl Host {
         self.drops.record(reason, now, frame.len(), subject);
         for _ in 0..self.reassembly.take_abandoned() {
             self.drops.record(reason, now, 0, subject);
+        }
+    }
+
+    fn receive_ipv4<'a>(
+        &mut self,
+        now: Instant,
+        frame: &'a [u8],
+        capability: crate::Ipv4Receive,
+    ) -> Result<ntcp_ip::FragmentPacket<'a>, Error> {
+        let Some(source_routes) = capability.source_routes() else {
+            return Err(self.version_refused(now, frame, DropReason::UnhandledProto));
+        };
+        Ok(ntcp_ip::parse_fragment(frame, source_routes)
+            .inspect_err(|&error| self.count_header_error(frame, error))?)
+    }
+
+    /// Receive and process a datagram on this host in one pass. A complete
+    /// physical IPv4 packet carries its validated header into destination
+    /// processing. Fragments and neighbor traffic use the receive service.
+    ///
+    /// Returns `Ok(None)` when the frame was consumed internally (for example,
+    /// a buffered fragment or neighbor-discovery/non-datagram control frame)
+    /// and there is no datagram to dispatch.
+    pub fn receive_processed<'a>(
+        &mut self,
+        context: IngressContext,
+        now: Instant,
+        frame: &'a [u8],
+        link_multicast: bool,
+        out: &'a mut [u8],
+        timestamps: Option<&mut dyn Ipv4TimestampProvider>,
+    ) -> Result<Option<Processed<'a>>, Error> {
+        if frame
+            .get(..8)
+            .is_some_and(|h| h[0] >> 4 == 4 && u16::from_be_bytes([h[6], h[7]]) & !0x4000 == 0)
+        {
+            let capabilities = self.port(context.link)?.receive;
+            if frame.len() > capabilities.max_ip_packet {
+                return Err(Error::Unsupported);
+            }
+            let packet = self.receive_ipv4(now, frame, capabilities.ipv4)?;
+            let datagram = Datagram {
+                envelope: Envelope {
+                    link_multicast,
+                    ..Envelope::physical(context, frame.len(), true)
+                },
+                bytes: frame,
+            };
+            let packet = crate::IngressPacket {
+                ip: packet.ip,
+                traffic_class: packet.traffic_class,
+                protocol: packet.protocol,
+                options: packet.ipv4_options,
+                payload: packet.payload,
+            };
+            let clock = timestamps.map_or(Clock::Asserted(None), Clock::Provider);
+            let processed = self.process_header(datagram, packet, capabilities.ipv4, clock)?;
+            return processed.map(Some).ok_or(ntcp_ip::Error::Options.into());
+        }
+        match self.receive(context, now, frame, link_multicast, out)? {
+            Received::Datagram(datagram) => self.process(datagram, timestamps).map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -1137,10 +1195,20 @@ impl Host {
         datagram: Datagram<'a>,
         clock: Clock<'_>,
     ) -> Result<Option<Processed<'a>>, Error> {
-        let mut packet = self.parse_datagram(datagram)?;
+        let packet = self.parse_datagram(datagram)?;
+        let capability = self.port(datagram.context().link)?.receive.ipv4;
+        self.process_header(datagram, packet, capability, clock)
+    }
+
+    fn process_header<'a>(
+        &self,
+        datagram: Datagram<'a>,
+        mut packet: crate::IngressPacket<'a>,
+        capability: crate::Ipv4Receive,
+        clock: Clock<'_>,
+    ) -> Result<Option<Processed<'a>>, Error> {
         self.owned_in_context(datagram.context(), packet.ip.destination)?;
-        let interpretation = self.port(datagram.context().link)?.receive.ipv4.interpretation();
-        if let (true, IpAddr::V4(local)) = (interpretation, packet.ip.destination)
+        if let (true, IpAddr::V4(local)) = (capability.interpretation(), packet.ip.destination)
             && !packet.options.is_empty()
         {
             let recorded = match clock {

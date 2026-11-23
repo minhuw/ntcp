@@ -1243,6 +1243,11 @@ impl Member {
     pub(crate) fn redirects(&self) -> bool {
         self.shared.registers()
     }
+    // A group provisioned for a single worker cannot redirect or hand off
+    // any flow. Its member still registers addresses and listening ports.
+    pub(crate) fn can_hand_off(&self) -> bool {
+        self.shared.slots.len() > 1
+    }
     pub(crate) fn inlet(&self) -> Inlet {
         Inlet {
             shared: self.shared.clone(),

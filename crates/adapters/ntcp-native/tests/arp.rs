@@ -706,3 +706,182 @@ fn held_records_of_aborted_connections_do_not_block_later_resolution() {
     run(&mut a, &mut b, &mut now, 20, 1000);
     assert_eq!(read_all(&mut b, server), b"after");
 }
+
+// Across 2..=4 tx slots (`max_connections` 1..=3): when slots hold a mix of
+// held (unresolved ARP) and pending (`WouldBlock`) frames, retries rotate
+// without starving any connection; when all slots are free, reusing the hot
+// slot preserves packet order on the wire.
+#[test]
+fn tx_cursor_rotates_pending_and_held_slots_without_starvation_and_keeps_free_order() {
+    struct BlockingPort {
+        incoming: Queue,
+        outgoing: Queue,
+        block_every: Rc<std::cell::Cell<Option<usize>>>,
+        attempts: std::cell::Cell<usize>,
+    }
+    impl PacketIo for BlockingPort {
+        fn layer(&self) -> PacketLayer {
+            PacketLayer::Ethernet
+        }
+        fn max_packet_len(&self) -> Option<usize> {
+            Some(1514)
+        }
+        fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
+            let Some(frame) = self.incoming.borrow_mut().pop_front() else {
+                return Ok(None);
+            };
+            out[..frame.len()].copy_from_slice(&frame);
+            Ok(Some(frame.len()))
+        }
+        fn transmit(&mut self, frame: &[u8]) -> io::Result<TxOutcome> {
+            let n = self.attempts.get();
+            self.attempts.set(n + 1);
+            if let Some(period) = self.block_every.get()
+                && (period == 0 || n.is_multiple_of(period))
+            {
+                return Ok(TxOutcome::WouldBlock);
+            }
+            self.outgoing.borrow_mut().push_back(frame.to_vec());
+            Ok(TxOutcome::Submitted)
+        }
+    }
+
+    for max_connections in 1..=3usize {
+        // 1. Pending + held mix with intermittent WouldBlock and budget 1.
+        let mut cfg_a = config(IP_A, MAC_A, None);
+        cfg_a.tcp.max_connections = max_connections;
+        let incoming_a = Queue::default();
+        let outgoing_a = Queue::default();
+        let block_every = Rc::new(std::cell::Cell::new(None));
+        let port_a = BlockingPort {
+            incoming: incoming_a.clone(),
+            outgoing: outgoing_a.clone(),
+            block_every: block_every.clone(),
+            attempts: std::cell::Cell::new(0),
+        };
+        let mut net_a = Network::new(cfg_a, port_a, [7; 32], 0).unwrap();
+        let mut cfg_b = config(IP_B, MAC_B, None);
+        cfg_b.tcp.max_connections = 4;
+        let mut b = Station::new(cfg_b);
+        let listener = b.network.listen(80, 4).unwrap();
+
+        let live_count = if max_connections == 1 {
+            1
+        } else {
+            max_connections - 1
+        };
+        let mut clients = Vec::new();
+        for _ in 0..live_count {
+            clients.push(net_a.connect(SocketAddr::new(IP_B.into(), 80)).unwrap());
+        }
+        let mut servers = Vec::new();
+        let mut now = 1;
+        for _ in 0..40 {
+            net_a.drive(now, BUDGET).unwrap();
+            b.deliver(&outgoing_a.borrow_mut().drain(..).collect::<Vec<_>>());
+            b.drive(now);
+            incoming_a.borrow_mut().extend(b.sent());
+            let mut evs = [Event::NetworkStopped; 16];
+            let _ = b.network.drain_events(&mut evs);
+            while let Ok(accepted) = b.network.accept(listener) {
+                servers.push(accepted);
+            }
+            let _ = net_a.drain_events(&mut evs);
+            now += 1000;
+            if servers.len() == live_count {
+                break;
+            }
+        }
+        assert_eq!(
+            servers.len(),
+            live_count,
+            "max_connections={max_connections}"
+        );
+
+        // Occupy one slot with a held SYN to an unresolved neighbor when
+        // slots >= 3 (max_connections >= 2).
+        if max_connections >= 2 {
+            let silent = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 99).into(), 80);
+            net_a.connect(silent).unwrap();
+        }
+
+        // Write distinct payloads to every live connection, then drive with
+        // alternating WouldBlock (`block_every = Some(2)`) and transmit
+        // budget 1 so retries must rotate without starving any connection.
+        let expected: Vec<Vec<u8>> = (0..live_count)
+            .map(|i| vec![(0x41 + i) as u8; 3000])
+            .collect();
+        for (&client, data) in clients.iter().zip(&expected) {
+            let n = net_a
+                .try_write(client, data, WriteOptions::default())
+                .unwrap();
+            assert_eq!(n.accepted, data.len());
+        }
+        block_every.set(Some(2));
+        let mut received: Vec<Vec<u8>> = vec![Vec::new(); live_count];
+        for _ in 0..400 {
+            net_a.drive(now, WorkBudget::new(32, 1, 32, 32)).unwrap();
+            b.deliver(&outgoing_a.borrow_mut().drain(..).collect::<Vec<_>>());
+            b.drive(now);
+            incoming_a.borrow_mut().extend(b.sent());
+            for (srv, buf) in servers.iter().zip(&mut received) {
+                buf.extend(read_all(&mut b, *srv));
+            }
+            now += 1000;
+            if received
+                .iter()
+                .zip(&expected)
+                .all(|(got, want)| got.len() == want.len())
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            received, expected,
+            "starvation or corruption for max_connections={max_connections}"
+        );
+
+        // 2. All slots free (no WouldBlock, resolved neighbor): verify wire
+        //    packet order is strictly in TCP sequence order.
+        block_every.set(None);
+        let burst: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
+        let n = net_a
+            .try_write(clients[0], &burst, WriteOptions::default())
+            .unwrap();
+        assert_eq!(n.accepted, burst.len());
+        let mut wire_seqs = Vec::new();
+        let mut got_burst = Vec::new();
+        for _ in 0..64 {
+            net_a.drive(now, BUDGET).unwrap();
+            let sent: Vec<Vec<u8>> = outgoing_a.borrow_mut().drain(..).collect();
+            for frame in &sent {
+                if frame.len() >= 54 && frame[12..14] == [0x08, 0x00] && frame[23] == 6 {
+                    let ihl = usize::from(frame[14] & 0x0f) * 4;
+                    let total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+                    let tcp = &frame[14 + ihl..14 + total];
+                    let data_off = usize::from(tcp[12] >> 4) * 4;
+                    if tcp.len() > data_off {
+                        wire_seqs.push(u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]));
+                    }
+                }
+            }
+            b.deliver(&sent);
+            b.drive(now);
+            incoming_a.borrow_mut().extend(b.sent());
+            got_burst.extend(read_all(&mut b, servers[0]));
+            now += 1000;
+            if got_burst.len() == burst.len() {
+                break;
+            }
+        }
+        assert_eq!(got_burst, burst);
+        assert!(wire_seqs.len() >= 4, "expected multi-segment burst");
+        for pair in wire_seqs.windows(2) {
+            assert!(
+                pair[1].wrapping_sub(pair[0]) < (1 << 31) && pair[1] != pair[0],
+                "out-of-order wire seqs for max_connections={max_connections}: {wire_seqs:?}"
+            );
+        }
+        let _ = listener;
+    }
+}

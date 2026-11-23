@@ -3137,3 +3137,85 @@ fn syns_beyond_the_held_flows_bound_are_dropped_and_taken_when_sent_again() {
     assert_eq!(held.iter().filter(|&&k| k == 0).count(), 2, "{held:?}");
     assert_eq!(held.iter().filter(|&&k| k == 1).count(), 2, "{held:?}");
 }
+
+// A single-slot SharedFlows group cannot hand off (`can_hand_off == false`),
+// so it takes the direct local path; SYN, reassembled SYN, fragment trains,
+// and ICMP quoting a flow must behave identically to a no-flows port.
+#[test]
+fn single_slot_flows_matches_no_flows_for_syn_fragments_and_icmp() {
+    let make_lan = |with_flows: bool, adjust: fn(&mut NetworkConfig)| -> Lan {
+        if with_flows {
+            let (flows, stations) = hash_members(1, INBOX, adjust);
+            Lan::new(stations, Dispatch::Queue0, Some(flows))
+        } else {
+            let mut cfg = config(ADDRESS, PORT_MAC, MEMBER_CONNECTIONS);
+            adjust(&mut cfg);
+            let station = Station::build(|port| Network::new(cfg, port, SECRET, 0)).unwrap();
+            Lan::new(vec![station], Dispatch::Queue0, None)
+        }
+    };
+
+    let run_echo = |mut lan: Lan, connections: usize, len: usize| {
+        let mut server = Echo::new(lan.network(0));
+        let mut clients: Vec<Client> = (0..connections)
+            .map(|i| {
+                let c = lan
+                    .peer
+                    .network
+                    .connect(SocketAddr::new(ADDRESS.into(), LISTEN))
+                    .unwrap();
+                Client::new(c, payload(i, len))
+            })
+            .collect();
+        let done = lan.run(5 * SECOND, |lan| {
+            server.serve(lan.network(0));
+            for client in &mut clients {
+                client.pump(&mut lan.peer.network);
+            }
+            clients.iter().all(Client::done)
+        });
+        assert!(done);
+        assert_echoed(&clients);
+        lan.assert_no_resets();
+        assert_eq!(lan.handoffs(), (0, 0, 0));
+        (
+            server.connections.len(),
+            lan.network(0).counters(),
+            lan.network(0).reassembly_counters(),
+        )
+    };
+
+    // 1. Plain SYN + data echo.
+    let (plain_no, c_no, _) = run_echo(make_lan(false, |_| {}), 4, 4 * MSS);
+    let (plain_one, c_one, _) = run_echo(make_lan(true, |_| {}), 4, 4 * MSS);
+    assert_eq!(plain_one, plain_no);
+    assert_eq!(plain_one, 4);
+    assert_eq!(c_one.discarded, c_no.discarded);
+
+    // 2. Reassembled SYN (limit 36 fragments even a 40-byte SYN+IP header)
+    //    and a data fragment train.
+    let run_frags = |with_flows: bool| {
+        let mut lan = make_lan(with_flows, |cfg| {
+            cfg.reassembly_datagrams = 2 * BUDGET.transmit;
+        });
+        lan.router.fragment = Some(36);
+        let (accepted, _, reasm) = run_echo(lan, 2, 2 * MSS);
+        assert!(reasm.completed > 0);
+        (accepted, reasm)
+    };
+    let (frag_no, r_no) = run_frags(false);
+    let (frag_one, r_one) = run_frags(true);
+    assert_eq!(frag_one, frag_no);
+    assert_eq!(frag_one, 2);
+    assert_eq!(r_one.completed, r_no.completed);
+    assert_eq!(r_one.held, r_no.held);
+
+    // 3. ICMP Fragmentation Needed quoting an active flow.
+    let run_icmp = |with_flows: bool| {
+        let mut lan = make_lan(with_flows, with_pmtud);
+        icmp_case(&mut lan);
+        assert_eq!(lan.handoffs(), (0, 0, 0));
+        lan.router.drops.len()
+    };
+    assert_eq!(run_icmp(true), run_icmp(false));
+}

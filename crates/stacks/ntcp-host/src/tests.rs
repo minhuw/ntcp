@@ -1303,3 +1303,68 @@ fn revoked_source_pauses_held_output_and_only_live_registered_generation_can_res
     assert!(endpoint.accept_transmit(2, attempt).unwrap());
     assert_eq!(host.paths().path_pins(context.stamp().path()).unwrap(), 0);
 }
+
+#[test]
+fn lease_count_matches_scan_across_acquire_release_and_reclaim() {
+    let cfg = config(4);
+    let (local, remote) = addresses(false);
+    let mut a = managed(local, 91, cfg.clone());
+    let mut b = managed_limited(remote, 92, cfg.clone(), false, None, None, |mut p, mut l| {
+        p.clients += 4;
+        l.output_leases = 4;
+        (p, l, 4)
+    });
+    let check_count = |host: &Host, expected: usize| {
+        let scanned = host.leases.iter().flatten().count();
+        assert_eq!(scanned, expected);
+        assert_eq!(host.lease_count(), expected);
+    };
+    check_count(&b.0, 0);
+
+    // Trigger two connectionless RSTs from `b` (no listener on `remote`).
+    let local2 = SocketAddr::new(local.ip(), local.port() + 1);
+    a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+        .unwrap();
+    let syn1 = emit(&mut a.0, &mut a.1, 1).unwrap();
+    a.1.connect_with_path_provider(2, local2, remote, options(&cfg, 0), &mut a.0)
+        .unwrap();
+    let syn2 = emit(&mut a.0, &mut a.1, 3).unwrap();
+    input(&mut b.0, &mut b.1, b.2, 4, &syn1, 0);
+    input(&mut b.0, &mut b.1, b.2, 5, &syn2, 0);
+
+    // Acquire lease 1.
+    let (attempt1, packet1, frame1) = selected(&mut b.1, 6).unwrap();
+    assert!(packet1.connection.is_none());
+    let ctx1 = b.0.egress_context(&mut b.1, attempt1).unwrap();
+    check_count(&b.0, 1);
+
+    // Re-querying egress_context for the same attempt updates in place without
+    // double-counting live leases.
+    let ctx1_again = b.0.egress_context(&mut b.1, attempt1).unwrap();
+    assert_eq!(ctx1_again.client(), ctx1.client());
+    check_count(&b.0, 1);
+
+    // Submit attempt 1 without collecting yet: its lease stays occupied until
+    // collection, while the stateless lane is free to select attempt 2.
+    let ticket1 = b.0.submission_ticket(&mut b.1, ctx1_again).unwrap();
+    b.0.submit(&mut b.1, 7, ticket1, ctx1_again, &frame1, 0, |_| {
+        BackendOutcome::Submitted
+    })
+    .unwrap();
+    check_count(&b.0, 1);
+
+    // Acquire lease 2 while stale lease 1 is still uncollected.
+    let (attempt2, packet2, _frame2) = selected(&mut b.1, 8).unwrap();
+    assert!(packet2.connection.is_none());
+    let _ctx2 = b.0.egress_context(&mut b.1, attempt2).unwrap();
+    check_count(&b.0, 2);
+
+    // Collect reclaims lease 1 (submitted) while keeping live lease 2.
+    b.0.collect(&b.1).unwrap();
+    check_count(&b.0, 1);
+
+    // Reclaim lease 2 via reject_unsubmitted + collect.
+    assert!(b.1.reject_unsubmitted(attempt2).unwrap());
+    b.0.collect(&b.1).unwrap();
+    check_count(&b.0, 0);
+}

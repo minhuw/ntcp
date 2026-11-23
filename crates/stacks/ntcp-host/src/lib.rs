@@ -859,6 +859,7 @@ pub struct Host {
     // client taken from the service's queue to.
     holders: Vec<Holder>,
     leases: Vec<Option<Lease>>,
+    live_leases: usize,
     ledger: Ledger,
     udp: Udp,
     reassembly: Reassembly,
@@ -979,6 +980,7 @@ impl Host {
             collect_visits: 0,
             holders: table(path_limits.clients, Holder::None)?,
             leases: table(limits.output_leases, None)?,
+            live_leases: 0,
             ledger: Ledger::new(limits.ledger)?,
             udp: Udp::new(limits.udp)?,
             reassembly: Reassembly::new(limits.reassembly, timebase.units_per_second)?,
@@ -1226,7 +1228,8 @@ impl Host {
         self.bindings.iter().flatten().count()
     }
     pub fn lease_count(&self) -> usize {
-        self.leases.iter().flatten().count()
+        debug_assert_eq!(self.live_leases, self.leases.iter().flatten().count());
+        self.live_leases
     }
 
     pub fn register_link(
@@ -1510,7 +1513,7 @@ impl Host {
         current: ManagedRoute,
     ) -> Result<(), Error> {
         let binding = self.bindings[index].as_ref().unwrap();
-        let mut client = binding.prepared.client;
+        let client = binding.prepared.client;
         if current.client != client {
             return Err(Error::InvalidContext);
         }
@@ -1523,6 +1526,18 @@ impl Host {
             debug_assert_eq!(self.paths.is_dirty(client), Ok(false));
             return Ok(());
         }
+        self.refresh_changed_route(endpoint, owner, index, current)
+    }
+
+    fn refresh_changed_route(
+        &mut self,
+        endpoint: &mut Endpoint,
+        owner: ConnectionId,
+        index: usize,
+        current: ManagedRoute,
+    ) -> Result<(), Error> {
+        let binding = self.bindings[index].as_ref().unwrap();
+        let mut client = binding.prepared.client;
         if let Some(port) = self.current_checks(endpoint, owner, &binding.prepared, &current)? {
             let stamp = binding.prepared.snapshot.stamp();
             self.paths.acknowledge(client, stamp)?;
@@ -1578,8 +1593,8 @@ impl Host {
 
     // `binding`'s egress decision, if it still holds for the connection's
     // route `current`.
-    fn held_dst(&self, binding: &Binding, current: &ManagedRoute) -> Option<Dst> {
-        let dst = binding.dst?;
+    fn held_dst<'a>(&self, binding: &'a Binding, current: &ManagedRoute) -> Option<&'a Dst> {
+        let dst = binding.dst.as_ref()?;
         let stamp = self.paths.stamp(binding.prepared.client).ok()?;
         (dst.holds(&binding.prepared, stamp, current)
             && self.ports[dst.port]
@@ -1701,12 +1716,30 @@ impl Host {
     //= https://www.rfc-editor.org/rfc/rfc8201#section-5.2
     //= reason=A correlated router PTB quoting a Host UDP datagram publishes the decrease to the shared path, and Host::service_changes then applies it to every TCP connection bound to that path (budget only, no repair) on the next native or tun_echo service pass, before any TCP output. Dual-family Host tests and the tun_echo and isolated namespace udp-quoted cases verify it.
     //# Note: even if the Packet Too Big message contains an Original Packet Header that refers to a UDP packet, the TCP layer must be notified if any of its connections use the given path.
+    #[inline]
     pub fn service_changes(
         &mut self,
         endpoint: &mut Endpoint,
         now: Instant,
     ) -> Result<ServiceReport, Error> {
         self.collect(endpoint)?;
+        if !self.reassembly.holds()
+            && !self.adjunct.enabled()
+            && !self.output_changes_pending()
+            && !endpoint.progress_pending()
+        {
+            debug_assert!(self.holders_listed());
+            return Ok(ServiceReport::default());
+        }
+        self.service_changes_pass(endpoint, now)
+    }
+
+    #[inline(never)]
+    fn service_changes_pass(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+    ) -> Result<ServiceReport, Error> {
         // Each pass runs only when its producer left it work: an assembly
         // held, an adjunct path table, a binding listed.
         if self.reassembly.holds() {
@@ -1914,7 +1947,7 @@ impl Host {
         // With no connection reclaimed since the last collection, no output
         // lease held and no ledger work due, a collection frees nothing.
         if endpoint.reclaimed() == self.reclaimed
-            && self.leases.iter().all(Option::is_none)
+            && self.lease_count() == 0
             && !self.ledger.due(self.now)
         {
             return self.check_endpoint(endpoint);
@@ -1966,6 +1999,7 @@ impl Host {
                 .as_ref()
                 .is_some_and(|l| endpoint.transmit_attempt_packet(l.attempt).is_none())
             {
+                self.live_leases -= 1;
                 self.paths.release(lease.take().unwrap().prepared.client)?;
             }
         }
@@ -2951,6 +2985,7 @@ impl Host {
         let packet = endpoint
             .transmit_attempt_packet(attempt)
             .ok_or(Error::Obsolete)?;
+        let destination = wire_destination(&packet);
         // A connection's packets carry its scoped identity; a stateless reply
         // to a link-local peer carries the arrival link of the input that
         // caused it. Either leaves only on that link.
@@ -2995,7 +3030,7 @@ impl Host {
                 zone,
                 Dscp::new(packet.dscp)?,
             )?;
-            let via = scoped(wire_destination(packet), zone)?;
+            let via = scoped(destination, zone)?;
             let prepared = if snapshot.status() != PathStatus::Valid
                 || snapshot.key().request() != request
                 || !self.forwards_via(snapshot.key(), via)
@@ -3026,7 +3061,6 @@ impl Host {
                 .iter()
                 .position(Option::is_none)
                 .ok_or(Error::Capacity)?;
-            let destination = wire_destination(packet);
             let request = self.request(
                 packet.ip.source,
                 packet.ip.destination,
@@ -3039,6 +3073,7 @@ impl Host {
             let (client, snapshot) = self.paths.acquire_resolved(request, via, resolved)?;
             let prepared = PreparedPath { client, snapshot };
             self.leases[index] = Some(Lease { attempt, prepared });
+            self.live_leases += 1;
             Record::Lease(index)
         };
         let binding = match record {
@@ -3054,20 +3089,17 @@ impl Host {
         // destination its route names now, the packet's own: the Endpoint
         // takes no input for a connection while its output is reserved, so
         // no later return route changes it under a selected packet.
-        let checked = route.is_some_and(|r| r.forwarding_destination == wire_destination(packet));
+        let checked = route.is_some_and(|r| r.forwarding_destination == destination);
         debug_assert!(
             !checked
-                || scoped(wire_destination(packet), zone)
+                || scoped(destination, zone)
                     .is_ok_and(|via| self.forwards_via(binding.snapshot.key(), via))
         );
         if packet.dscp != binding.snapshot.key().dscp().value()
             || packet.ip.source != binding.snapshot.key().source_address().address()
             || packet.ip.destination != binding.snapshot.key().destination().address()
             || (!checked
-                && !self.forwards_via(
-                    binding.snapshot.key(),
-                    scoped(wire_destination(packet), zone)?,
-                ))
+                && !self.forwards_via(binding.snapshot.key(), scoped(destination, zone)?))
         {
             return Err(Error::Obsolete);
         }
@@ -3364,19 +3396,8 @@ impl Host {
     ) -> Result<EgressContext, Error> {
         self.check_endpoint(endpoint)?;
         let packet = endpoint
-            .transmit_attempt_packet(context.attempt)
+            .transmit_attempt_packet_ref(context.attempt)
             .ok_or(Error::Obsolete)?;
-        self.validate_attempt(endpoint, context, &packet, frame, shared_payload_len)
-    }
-    // `validate_egress` of the attempt's current `packet`.
-    fn validate_attempt(
-        &mut self,
-        endpoint: &mut Endpoint,
-        context: EgressContext,
-        packet: &Transmit,
-        frame: &[u8],
-        shared_payload_len: usize,
-    ) -> Result<EgressContext, Error> {
         // `egress_context` granted the authority; it holds while the path
         // is unchanged. Every change of a path's selection, budget or
         // validity gives it a new stamp, and a rebind or release retires the
@@ -3385,7 +3406,8 @@ impl Host {
         // output again for the current path; a stateless reply is dropped.
         let Some(snapshot) = self.granted(&context) else {
             if let Some(owner) = packet.connection {
-                self.authorized_refresh(endpoint, owner, packet)?;
+                let obsolete = *packet;
+                self.authorized_refresh(endpoint, owner, &obsolete)?;
             }
             return Err(Error::Obsolete);
         };
@@ -3450,7 +3472,7 @@ impl Host {
     ) -> Result<SubmissionTicket, Error> {
         self.check_endpoint(endpoint)?;
         let packet = endpoint
-            .transmit_attempt_packet(context.attempt)
+            .transmit_attempt_packet_ref(context.attempt)
             .ok_or(Error::Obsolete)?;
         if packet.connection.is_some() {
             return Ok(SubmissionTicket { ticket: None });
@@ -3496,7 +3518,7 @@ impl Host {
         shared_payload_len: usize,
         submit: impl FnOnce(EgressContext) -> BackendOutcome,
     ) -> Result<Submission, Refused> {
-        let packet = endpoint.transmit_attempt_packet(context.attempt);
+        let packet = endpoint.transmit_attempt_packet_ref(context.attempt);
         let ticketed = match ticket.ticket {
             Some(ticket) => self
                 .ledger
@@ -3505,16 +3527,14 @@ impl Host {
                 .is_some_and(|p| p.attempt == Some(context.attempt)),
             None => packet.is_some_and(|p| p.connection.is_some()),
         };
-        let Some(packet) = packet.filter(|_| ticketed) else {
+        if packet.is_none() || !ticketed {
             return Err(Refused {
                 error: Error::Obsolete,
                 ticket,
             });
-        };
+        }
         let prepared = (|| {
-            self.check_endpoint(endpoint)?;
-            let live =
-                self.validate_attempt(endpoint, context, &packet, frame, shared_payload_len)?;
+            let live = self.validate_egress(endpoint, context, frame, shared_payload_len)?;
             if !endpoint.preflight_accept_transmit(now, context.attempt)? {
                 return Err(Error::Obsolete);
             }
@@ -3907,10 +3927,11 @@ pub(crate) fn scoped(address: IpAddr, zone: Option<LinkId>) -> Result<ScopedAddr
     Ok(ScopedAddress::new(address, zone.filter(|_| link_local))?)
 }
 
-fn wire_destination(packet: Transmit) -> IpAddr {
+fn wire_destination(packet: &Transmit) -> IpAddr {
     packet
         .ipv4_options
         .source_route
+        .as_ref()
         .and_then(|r| r.hops().first().copied())
         .map(IpAddr::V4)
         .unwrap_or(packet.ip.destination)

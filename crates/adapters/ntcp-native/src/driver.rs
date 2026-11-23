@@ -715,7 +715,9 @@ impl<P: PacketIo> Network<P> {
             // arrived.
             let mut fragment = false;
             let mut syn = None;
-            if let Some(flows) = &self.flows {
+            if self.inlet.is_some()
+                && let Some(flows) = &self.flows
+            {
                 let key = flows::key(frame);
                 fragment = matches!(key, flows::Key::Fragment { .. });
                 let route = flows.elsewhere(key);
@@ -819,11 +821,6 @@ impl<P: PacketIo> Network<P> {
             }
             data += 1;
             let index = self.tx_cursor;
-            self.tx_cursor = if index + 1 == self.tx.len() {
-                0
-            } else {
-                index + 1
-            };
             // An endpoint with nothing pending (every reservation free, so no
             // slot holds a frame; no output queued, no stateless reply, no
             // listener cleanup) gives a poll at its clock, `now`, nothing to
@@ -859,6 +856,15 @@ impl<P: PacketIo> Network<P> {
             self.tx_pending -= usize::from(was_pending && !was_held);
             self.tx_held += usize::from(still_held);
             self.tx_held -= usize::from(was_held);
+            // Rotate among outstanding frames for retry fairness. With every
+            // slot free, reuse the hot frame buffer until a send blocks.
+            if self.tx_pending != 0 || self.tx_held != 0 {
+                self.tx_cursor = if index + 1 == self.tx.len() {
+                    0
+                } else {
+                    index + 1
+                };
+            }
             // A settled retry may release output, so poll again after it.
             let idle = result?;
             exhausted = idle || exhausted && was_pending && still_pending;
@@ -969,6 +975,7 @@ impl<P: PacketIo> Network<P> {
     // read through the same lookup of the member. A member that finds the
     // table held skips it: the holder is doing the work, or the next drive
     // of any member will.
+    #[inline]
     fn shared_output(
         &mut self,
         now: Instant,
@@ -982,6 +989,17 @@ impl<P: PacketIo> Network<P> {
         if let Some(woken) = self.member_probe.as_ref().and_then(|p| p.idle(now)) {
             return Ok((0, woken));
         }
+        self.shared_housekeeping(now, limit, timers, report)
+    }
+
+    #[inline(never)]
+    fn shared_housekeeping(
+        &mut self,
+        now: Instant,
+        limit: usize,
+        timers: bool,
+        report: &mut DriveReport,
+    ) -> Result<(usize, bool)> {
         let Self {
             host,
             io,
@@ -1437,6 +1455,19 @@ impl<P: PacketIo> Network<P> {
         held: &mut Option<RxFrame>,
     ) -> Result<()> {
         let metadata = self.receive_metadata(packet);
+        if !fragment {
+            if let Some(processed) = self.host.receive_processed(
+                self.ingress,
+                self.now,
+                frame,
+                false,
+                completed,
+                None,
+            )? {
+                self.dispatch_processed(processed, metadata, held)?;
+            }
+            return Ok(());
+        }
         let received = self
             .host
             .receive(self.ingress, self.now, frame, false, completed)?;
@@ -1446,7 +1477,7 @@ impl<P: PacketIo> Network<P> {
         // A member of shared flows that completes a datagram on a fragment
         // hands it to the member that owns its flow. Its fragments were
         // keyed by their addresses alone; it is keyed once, here.
-        if fragment && let Some(flows) = &self.flows {
+        if let Some(flows) = &self.flows {
             let key = flows::key(datagram.bytes());
             let route = flows.elsewhere(key);
             if let Some(owner) = route.to {
@@ -1793,6 +1824,15 @@ impl<P: PacketIo> Network<P> {
         held: &mut Option<RxFrame>,
     ) -> Result<()> {
         let processed = self.host.process(datagram, None)?;
+        self.dispatch_processed(processed, metadata, held)
+    }
+
+    fn dispatch_processed(
+        &mut self,
+        processed: Processed<'_>,
+        metadata: ntcp::RxPacketMetadata,
+        held: &mut Option<RxFrame>,
+    ) -> Result<()> {
         // `process` found the destination owned on the Host's one link,
         // which is what `decode_datagram` would check again.
         debug_assert!(self.host.decode_datagram(processed).is_ok());
@@ -1936,13 +1976,8 @@ impl<P: PacketIo> Network<P> {
                 40
             };
             let out = &mut slot.bytes[offset + header..];
-            let polled = match owner {
-                None => self.endpoint.poll_reserved_transmit(self.now, out, 1),
-                Some(id) => self
-                    .endpoint
-                    .poll_reserved_transmit_for(self.now, id, out, 1),
-            };
-            let (poll, attempt) = match polled {
+            let polled = self.endpoint.poll_transmit_attempt(self.now, out, 1, owner);
+            let (more_work, attempt) = match polled {
                 Ok(result) => result,
                 Err(EndpointError::OutputReserved) => {
                     report.tx_blocked = true;
@@ -1961,23 +1996,26 @@ impl<P: PacketIo> Network<P> {
             // resolving link the poll's view, taken before its packet may
             // be held, is left to the drive's final account.
             let more_work = if self.tx_held == 0 {
-                poll.more_work
+                more_work
             } else {
                 self.tx_pending != 0 || self.endpoint.has_queued_output()
             };
-            if poll.packet.is_none() || self.control.is_empty() {
+            if attempt.is_none() || self.control.is_empty() {
                 report.more_work |= more_work;
             }
-            let Some(packet) = poll.packet else {
+            let Some(attempt) = attempt else {
                 return Ok(Some(owner.is_none() && !more_work));
             };
+            let packet = self
+                .endpoint
+                .transmit_attempt_packet_ref(attempt)
+                .ok_or(Error::InvalidHandle)?;
             // Read before the IP header is written around the segment.
             let data = packet.len > usize::from(out[12] >> 4) * 4;
-            let attempt = attempt.ok_or(Error::InvalidHandle)?;
             let ip_len = if packet.ip.source.is_ipv4() {
-                ntcp_ip::encode(&mut slot.bytes[offset..], packet, 0)
+                ntcp_ip::encode(&mut slot.bytes[offset..], *packet, 0)
             } else {
-                ntcp_ip6::encode(&mut slot.bytes[offset..], packet)
+                ntcp_ip6::encode(&mut slot.bytes[offset..], *packet)
             }
             .map_err(|e| Error::Host(e.into()))?;
             if let Link::Ethernet {

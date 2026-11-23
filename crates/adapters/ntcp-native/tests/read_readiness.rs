@@ -459,3 +459,45 @@ fn a_closed_due_comes_before_the_readable_a_read_queued() {
     assert!(report.more);
     assert_eq!(next_drain(&mut pair.server), [Event::Readable(server)]);
 }
+
+// After `try_read` returns `WouldBlock` (marking the connection drained),
+// arriving data produces `Readable`, and after draining again an arriving
+// FIN produces `Readable` followed by EOF.
+#[test]
+fn drained_flag_rearms_for_data_and_fin() {
+    let mut pair = Pair::new();
+    let (client, server) = pair.connected();
+    drain(&mut pair.server);
+
+    // Reading an empty receive buffer returns WouldBlock and marks drained.
+    assert!(matches!(
+        read(&mut pair.server, server, 64),
+        Err(Error::WouldBlock(_))
+    ));
+    assert!(next_drain(&mut pair.server).is_empty());
+
+    // Incoming data after WouldBlock produces Readable.
+    pair.client
+        .try_write(client, &[7; 128], WriteOptions::default())
+        .unwrap();
+    pair.steps(3);
+    assert_eq!(readables(&next_drain(&mut pair.server), server), 1);
+    assert!(matches!(
+        read(&mut pair.server, server, 128),
+        Ok(ReadOutcome::Data { len: 128, .. })
+    ));
+
+    // Drain back to WouldBlock, then peer sends FIN -> Readable -> EOF.
+    assert!(matches!(
+        read(&mut pair.server, server, 64),
+        Err(Error::WouldBlock(_))
+    ));
+    assert!(next_drain(&mut pair.server).is_empty());
+    pair.client.close(client).unwrap();
+    pair.steps(3);
+    assert_eq!(readables(&next_drain(&mut pair.server), server), 1);
+    assert!(matches!(
+        read(&mut pair.server, server, 64),
+        Ok(ReadOutcome::Eof)
+    ));
+}

@@ -1209,3 +1209,179 @@ fn a_connection_keeps_a_reachable_neighbor_until_its_entry_changes() {
     assert_eq!(a.0.neighbor_cached(context, owner), None);
     assert!(a.0.resolve_neighbor(context, owner, expiry).is_err());
 }
+
+// A `service_changes` pass with only endpoint progress queued (no reassembly,
+// adjunct, or dirty output work) still confirms the neighbor and publishes
+// probe results; a subsequent idle pass returns default and changes nothing.
+#[test]
+fn service_changes_runs_progress_only_pass_and_skips_idle_pass() {
+    let cfg = config(2);
+    let (local, remote) = addresses(true);
+    let mut a = on_link_side(&cfg, local);
+    let mut b = managed(remote, 45, cfg.clone());
+    let link = a.2.link();
+    let listener = b.1.listen(remote, 1).unwrap();
+    let id =
+        a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+            .unwrap();
+    let IpAddr::V6(target) = remote.ip() else {
+        panic!()
+    };
+    let IpAddr::V6(own_address) = local.ip() else {
+        panic!()
+    };
+    let mut held = None;
+    assert!(emit_resolved(&mut a, 1, &mut held).is_none());
+    let (_, _, _, ticket) = output(&mut a.0, link, 1).unwrap();
+    a.0.complete_neighbor_output(ticket, BackendOutcome::Submitted, 1)
+        .unwrap();
+    let na = NeighborAdvertisement {
+        router: false,
+        solicited: true,
+        override_: true,
+        target,
+        target_link_layer: Some(PEER),
+    };
+    let mut answer = [0; 32];
+    let len = ntcp_icmp::encode_advertisement(
+        ntcp::IpMetadata {
+            source: remote.ip(),
+            destination: local.ip(),
+        },
+        na,
+        &mut answer,
+    )
+    .unwrap();
+    let frame = packet(target, own_address, 255, &answer[..len], false);
+    assert_eq!(input(&mut a.0, link, 2, &frame), Ok(true));
+
+    // Complete handshake.
+    let mut now = 10;
+    for _ in 0..32 {
+        now += 10;
+        let mut work = false;
+        if let Some((_, pkt)) = emit_resolved(&mut a, now, &mut held) {
+            b.0.input_ip(
+                &mut b.1,
+                b.2,
+                now + 1,
+                &pkt,
+                RxPacketMetadata::default(),
+                0,
+                None,
+            )
+            .unwrap();
+            work = true;
+        }
+        if let Some(pkt) = emit(&mut b.0, &mut b.1, now + 2) {
+            a.0.input_ip(
+                &mut a.1,
+                a.2,
+                now + 3,
+                &pkt,
+                RxPacketMetadata::default(),
+                0,
+                None,
+            )
+            .unwrap();
+            work = true;
+        }
+        if !work {
+            break;
+        }
+    }
+    assert_eq!(a.1.state(id), Ok(State::Established));
+    assert!(b.1.accept(listener).is_ok());
+
+    // Lower the shared path MTU to 1280 and apply it, then advance past the
+    // hold and neighbor ReachableTime so the next large write emits a probe
+    // and the neighbor is STALE.
+    let path = a.0.binding(id).unwrap().snapshot.path();
+    a.0.trusted_decrease(now, path, 1280).unwrap();
+    a.0.service_changes(&mut a.1, now).unwrap();
+    let hold = a.0.paths().path_snapshot(path).unwrap().retry_not_before();
+    now = now.max(hold) + 601 * SECOND;
+    a.0.service_neighbors(now);
+    assert_eq!(
+        a.0.neighbor(link, target).map(|n| n.0),
+        Some(NeighborState::Stale)
+    );
+    while a.1.next_deadline().is_some_and(|d| d <= now) {
+        a.1.on_timeout(now, 32).unwrap();
+    }
+    a.0.service_changes(&mut a.1, now).unwrap();
+    a.1.write(id, &[9; 6000]).unwrap();
+
+    // Emit the probe (moves neighbor from STALE to DELAY) and have `b` ACK it.
+    let (_, probe) = emit_resolved(&mut a, now, &mut held).expect("probe segment");
+    assert!(probe.len() > 1280);
+    assert_eq!(
+        a.0.neighbor(link, target).map(|n| n.0),
+        Some(NeighborState::Delay)
+    );
+    b.0.input_ip(
+        &mut b.1,
+        b.2,
+        now + 1,
+        &probe,
+        RxPacketMetadata::default(),
+        0,
+        None,
+    )
+    .unwrap();
+    let ack = emit(&mut b.0, &mut b.1, now + 2).expect("probe ack");
+
+    // Feed the ACK directly to the Endpoint so `Host::take_progress` has NOT
+    // run yet; only `endpoint.progress_pending()` signals pending work.
+    let parsed = ntcp_ip6::parse(&ack).unwrap();
+    a.1.input_with_path_provider(
+        now + 3,
+        link,
+        parsed.ip,
+        parsed.traffic_class,
+        ntcp::Ipv4Options::default(),
+        parsed.payload,
+        RxPacketMetadata::default(),
+        0,
+        &mut a.0,
+    )
+    .unwrap();
+    assert!(!a.0.reassembly.holds());
+    assert!(!a.0.adjunct.enabled());
+    assert!(!a.0.output_changes_pending());
+    assert!(a.1.progress_pending());
+
+    // Progress-only pass: confirms the neighbor and publishes the probe raise.
+    let report = a.0.service_changes(&mut a.1, now + 4).unwrap();
+    assert_eq!((report.raised, report.failed), (1, 0));
+    assert_eq!(
+        a.0.neighbor(link, target).map(|n| n.0),
+        Some(NeighborState::Reachable)
+    );
+    let raised =
+        a.0.paths()
+            .path_snapshot(path)
+            .unwrap()
+            .learned_mtu()
+            .unwrap();
+    assert!(raised > 1280);
+
+    // Drain any dirty refresh produced by raising the shared estimate.
+    let _ = a.0.service_changes(&mut a.1, now + 5).unwrap();
+    assert!(!a.0.reassembly.holds());
+    assert!(!a.0.adjunct.enabled());
+    assert!(!a.0.output_changes_pending());
+    assert!(!a.1.progress_pending());
+
+    // Idle pass: takes the early return, reports default, and changes nothing.
+    let idle = a.0.service_changes(&mut a.1, now + 6).unwrap();
+    assert_eq!(idle, ServiceReport::default());
+    assert_eq!(
+        a.0.neighbor(link, target).map(|n| n.0),
+        Some(NeighborState::Reachable)
+    );
+    assert_eq!(
+        a.0.paths().path_snapshot(path).unwrap().learned_mtu(),
+        Some(raised)
+    );
+}

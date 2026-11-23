@@ -769,7 +769,10 @@ impl<P: PacketIo> Network<P> {
             }
             None => None,
         };
-        let inlet = flows.as_ref().map(flows::Member::inlet);
+        let inlet = flows
+            .as_ref()
+            .filter(|m| m.can_hand_off())
+            .map(flows::Member::inlet);
         let mut held_flows = Vec::new();
         if flows.as_ref().is_some_and(flows::Member::redirects) {
             held_flows
@@ -2093,6 +2096,7 @@ impl<P: PacketIo> Network<P> {
         let len = match result {
             Ok(n) => n,
             Err(EndpointError::Connection(ntcp::Error::WouldBlock)) => {
+                *drained = state == State::Established && available == 0;
                 return Err(Error::WouldBlock(BlockReason::Receive));
             }
             Err(EndpointError::Connection(ntcp::Error::InvalidState))
