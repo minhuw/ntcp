@@ -314,6 +314,7 @@ pub(crate) struct Rack {
     fack: Option<Seq>,
     min_rtt: Option<u64>,
     min_rtt_buckets: [Option<(u64, u64)>; 4],
+    min_rtt_epoch: u64,
     rtt: u64,
     reordering_seen: bool,
     pub(crate) reordering: u32,
@@ -441,6 +442,7 @@ impl Rack {
             fack: None,
             min_rtt: None,
             min_rtt_buckets: [None; 4],
+            min_rtt_epoch: 0,
             rtt: 0,
             reordering_seen: false,
             reordering: 3,
@@ -580,7 +582,7 @@ impl Rack {
         // use a full sample deque only if exact expiration becomes necessary.
         // Like Linux tcp_update_rtt_min, aging happens on accepted samples,
         // not on timers: idle time alone does not erase the ambiguity guard.
-        let epoch = now / self.timebase.ticks_from_us(MIN_RTT_BUCKET);
+        let epoch = self.timebase.us_from_ticks(now) / MIN_RTT_BUCKET;
         let bucket = &mut self.min_rtt_buckets[(epoch % 4) as usize];
         *bucket = Some((
             epoch,
@@ -588,13 +590,29 @@ impl Rack {
                 .filter(|old| old.0 == epoch)
                 .map_or(rtt, |old| old.1.min(rtt)),
         ));
-        self.min_rtt = self
-            .min_rtt_buckets
-            .iter()
-            .flatten()
-            .filter(|&&(time, _)| time <= epoch && epoch - time < 4)
-            .map(|&(_, value)| value)
-            .min();
+        // No other bucket enters or leaves the window within this epoch.
+        self.min_rtt = if epoch == self.min_rtt_epoch {
+            Some(self.min_rtt.map_or(rtt, |old| old.min(rtt)))
+        } else {
+            self.min_rtt_epoch = epoch;
+            self.min_rtt_buckets
+                .iter()
+                .flatten()
+                .filter(|&&(time, _)| time <= epoch && epoch - time < 4)
+                .map(|&(_, value)| value)
+                .min()
+        };
+        #[cfg(debug_assertions)]
+        {
+            let recomputed = self
+                .min_rtt_buckets
+                .iter()
+                .flatten()
+                .filter(|&&(time, _)| time <= epoch && epoch - time < 4)
+                .map(|&(_, value)| value)
+                .min();
+            debug_assert_eq!(self.min_rtt, recomputed);
+        }
         if self.latest.is_none() {
             self.rtt = rtt;
         }
@@ -686,6 +704,11 @@ impl Rack {
         let target = seq.distance_from(base);
         if target >= 1 << 31 {
             return 0;
+        }
+        let last = self.intervals.len() - 1;
+        let tail = &self.intervals[last];
+        if target >= tail.start.distance_from(base) {
+            return last + usize::from(target >= tail.end.distance_from(base));
         }
         let (mut low, mut high) = (0, self.intervals.len());
         while low < high {
@@ -1133,16 +1156,21 @@ impl Rack {
         {
             return false;
         }
+        let matches = |r: &Interval| {
+            !r.departure_committed
+                && r.sent == selection.selected
+                && r.transmission_start == selection.start
+                && r.transmission_end == selection.end
+                && r.retransmitted == selection.retransmit
+        };
         let mut covered = start;
         let (first, last) = self.overlapping(start, end);
+        if last == first + 1 {
+            let r = &self.intervals[first];
+            return !r.start.after(start) && !end.after(r.end) && matches(r);
+        }
         for r in self.intervals.range(first, last) {
-            if r.start.after(covered)
-                || r.departure_committed
-                || r.sent != selection.selected
-                || r.transmission_start != selection.start
-                || r.transmission_end != selection.end
-                || r.retransmitted != selection.retransmit
-            {
+            if r.start.after(covered) || !matches(r) {
                 return false;
             }
             covered = if r.end.after(end) { end } else { r.end };
@@ -1267,19 +1295,23 @@ impl Rack {
             && (first == 0 || self.intervals[first - 1].stats_flag(DELIVERY_END))
             && (r.stats_flag(DELIVERY_END) || last == self.intervals.len())
         {
-            // Its own sums, and its own unit once it ends one.
-            let alone = |s: &Self| {
-                let r = &s.intervals[first];
-                let mut tally = s.item(r);
+            // A whole interval keeps its length, SACK/loss state and original
+            // packet counts. Only its transmission length and its delivery
+            // unit can change. The preceding unit already ends at the edge.
+            let unit = |r: &Interval| {
+                let mut counts = Counts::default();
                 if r.stats_flag(DELIVERY_END) {
-                    Run::EMPTY.unit(r).add_to(&mut tally.units);
+                    Run::EMPTY.unit(r).add_to(&mut counts);
                 }
-                tally
+                counts
             };
-            let before = alone(self);
-            commit(self);
-            let after = alone(self);
-            self.tally.apply(before, after);
+            let short_before = u32::from(self.short(r));
+            let unit_before = unit(r);
+            let r = &mut self.intervals[first];
+            Self::depart(r, selection, start, end, now);
+            self.tally.units.apply(unit_before, unit(r));
+            self.tally.short = self.tally.short - short_before
+                + u32::from(end.distance_from(start) < self.short_mss);
         } else {
             self.retally(from, last, commit);
         }
@@ -1685,7 +1717,10 @@ impl Rack {
         // for a request answered, takes them all: nothing to look up,
         // split or count (tcp_clean_rtx_queue taking the whole queue).
         if scoreboard.ranges().is_empty()
-            && self.intervals.last().is_some_and(|r| !r.end.after(ack))
+            && self
+                .intervals
+                .last()
+                .map_or_else(|| self.valid(), |r| !r.end.after(ack))
         {
             self.dirty_len = 0;
             self.rescan = false;

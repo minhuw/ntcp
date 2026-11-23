@@ -965,3 +965,61 @@ fn administrative_target_clipped_by_user_or_peer_mss_reports_transport() {
 
 #[path = "connection_send_space_tests.rs"]
 mod send_space;
+
+#[test]
+fn pmtud_no_probe_room_under_loss_recovery_preserves_admin_deferral() {
+    use crate::AdministrativeDeferral::LossRecovery;
+    for ipv4 in [true, false] {
+        let mut out = vec![0; 2048];
+        // Case 1: admin_target == Some, no probe room (unsent <= 3 * mss), in loss recovery.
+        // The probe_room shortcut must not mask LossRecovery deferral for an admin target.
+        let (mut a, mut b, mut service, _) = managed_pair(ipv4, 1_000_000);
+        admin_setup(&mut a, &mut b, &mut service);
+        a.write(&[8; 9000]).unwrap();
+        let flight: Vec<_> = (0..6).map(|_| packet(&mut a, ADMIN_HOLD - 1)).collect();
+        // Leave less than 3 * mss unsent so probe_room is false.
+        let unsent = a.send.len() - a.snd_nxt.distance_from(a.send_base) as usize;
+        assert!(
+            unsent <= a.mss * 3,
+            "expected no probe room, unsent={unsent} mss={}",
+            a.mss
+        );
+        for bytes in &flight[1..] {
+            b.input(ADMIN_HOLD + 2, &wire::parse(ip(a.tuple), bytes).unwrap())
+                .unwrap();
+            deliver(&mut b, &mut a, ADMIN_HOLD + 2);
+            while a.transmit(ADMIN_HOLD + 2, &mut out).unwrap().is_some() {}
+        }
+        assert!(a.congestion.in_recovery());
+        assert_eq!(
+            a.administrative_search(),
+            pending(Some(LossRecovery)),
+            "ipv4={ipv4}"
+        );
+        assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+
+        // Case 2: admin_target == None, no probe room, in loss recovery.
+        // Discovery is gated off cleanly and no probe is emitted.
+        let (mut a, mut b, mut service, _) = managed_pair(ipv4, 1_000_000);
+        decrease(&mut a, &mut service, 1300, ADMIN_HOLD);
+        a.write(&[7; 1000]).unwrap();
+        exchange(&mut a, &mut b, ADMIN_HOLD - 1);
+        assert_eq!(a.pmtud.as_ref().unwrap().administrative_target(), None);
+        a.write(&[8; 9000]).unwrap();
+        let flight: Vec<_> = (0..6).map(|_| packet(&mut a, ADMIN_HOLD - 1)).collect();
+        let unsent = a.send.len() - a.snd_nxt.distance_from(a.send_base) as usize;
+        assert!(
+            unsent <= a.mss * 3,
+            "expected no probe room, unsent={unsent} mss={}",
+            a.mss
+        );
+        for bytes in &flight[1..] {
+            b.input(ADMIN_HOLD + 2, &wire::parse(ip(a.tuple), bytes).unwrap())
+                .unwrap();
+            deliver(&mut b, &mut a, ADMIN_HOLD + 2);
+            while a.transmit(ADMIN_HOLD + 2, &mut out).unwrap().is_some() {}
+        }
+        assert!(a.congestion.in_recovery());
+        assert!(a.pmtud.as_ref().unwrap().probe.is_none());
+    }
+}

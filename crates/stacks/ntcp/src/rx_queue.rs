@@ -811,20 +811,22 @@ impl RxQueue {
     }
 
     pub(crate) fn read(&mut self, out: &mut [u8]) -> usize {
-        let count = self.copy_front(out);
+        let count = out.len().min(self.readable);
         if count == 0 {
             return 0;
         }
         // Each frame read to its end is released (Linux
         // tcp_eat_recv_skb); a partly read one keeps its whole charge.
-        let mut left = count;
-        while left != 0 {
+        let mut remaining = &mut out[..count];
+        while !remaining.is_empty() {
             let front = self.inorder.front_mut().unwrap();
-            if front.len() > left {
-                front.advance(left);
+            let copied = remaining.len().min(front.len());
+            remaining[..copied].copy_from_slice(&front[..copied]);
+            if copied < front.len() {
+                front.advance(copied);
                 break;
             }
-            left -= front.len();
+            remaining = &mut remaining[copied..];
             let frame = self.inorder.pop_front().unwrap();
             self.release(frame);
         }
@@ -2111,6 +2113,100 @@ mod tests {
             .collect();
         assert_eq!(stream, b"PPPXXabXcXQQ");
         assert_eq!(queue.runs.iter().collect::<Vec<_>>(), [(&5, &17)]);
+        queue.debug_check();
+    }
+
+    #[test]
+    fn single_pass_read_handles_multi_frame_partial_zero_and_oversized_out() {
+        let start = Seq(100);
+        let limit = Seq(1000);
+        let mut queue = RxQueue::new(start);
+
+        // Zero-length frame insert does not enqueue data or corrupt reads.
+        let zero = queue.insert(
+            start,
+            RxPayload::Borrowed(b""),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(zero.new_bytes, 0);
+        let mut out = [0u8; 32];
+        assert_eq!(queue.read(&mut out), 0);
+
+        // Multiple frames: borrowed, owned heap, borrowed.
+        queue.insert(
+            start,
+            RxPayload::Borrowed(b"abcd"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        queue.insert(
+            start.wrapping_add(4),
+            RxPayload::Owned(heap_frame(b"EFGHIJ", 64)),
+            false,
+            true,
+            limit,
+            |_, _| {},
+        );
+        queue.insert(
+            start.wrapping_add(10),
+            RxPayload::Borrowed(b"klm"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        // Zero-length inserts (borrowed and owned) leave queued frames untouched.
+        queue.insert(
+            start.wrapping_add(13),
+            RxPayload::Borrowed(b""),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        queue.insert(
+            start.wrapping_add(13),
+            RxPayload::Owned(heap_frame(b"", 0)),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(queue.readable(), 13);
+
+        // Zero-length output slice is a no-op.
+        assert_eq!(queue.read(&mut []), 0);
+        assert_eq!(queue.readable(), 13);
+
+        // Partial read of first frame.
+        let mut peek = [0u8; 32];
+        assert_eq!(queue.peek(&mut peek[..2]), 2);
+        assert_eq!(queue.read(&mut out[..2]), 2);
+        assert_eq!(&out[..2], b"ab");
+        assert_eq!(&peek[..2], &out[..2]);
+        assert_eq!(queue.readable(), 11);
+        queue.debug_check();
+
+        // Multi-frame read spanning remainder of frame 1 + partial frame 2.
+        assert_eq!(queue.peek(&mut peek[..5]), 5);
+        assert_eq!(queue.read(&mut out[..5]), 5);
+        assert_eq!(&out[..5], b"cdEFG");
+        assert_eq!(&peek[..5], &out[..5]);
+        assert_eq!(queue.readable(), 6);
+        queue.debug_check();
+
+        // Oversized output slice (out.len() > readable) drains remaining frames cleanly.
+        assert_eq!(queue.peek(&mut peek), 6);
+        assert_eq!(queue.read(&mut out), 6);
+        assert_eq!(&out[..6], b"HIJklm");
+        assert_eq!(&peek[..6], &out[..6]);
+        assert_eq!(queue.readable(), 0);
+        assert_eq!((queue.storage_less_spare(), queue.rmem()), (0, 0));
         queue.debug_check();
     }
 }

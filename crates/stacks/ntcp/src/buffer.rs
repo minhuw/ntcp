@@ -52,6 +52,9 @@ pub(crate) struct SendBuffer {
     // rest of the queue holds one needs no pass over it, as Linux keeps PSH
     // on the skb.
     last_push: u64,
+    // Number of bytes ending at last_push known to contain just that PUSH. Collapsing
+    // a packet already marked on its last byte leaves these bytes intact.
+    single_push_len: usize,
     // The same for EOR: a selection past it needs no pass over its marks to
     // find its record's end, as Linux keeps EOR on the skb.
     last_eor: u64,
@@ -73,6 +76,7 @@ impl SendBuffer {
             shared: VecDeque::new(),
             shared_output: None,
             last_push: u64::MAX,
+            single_push_len: 0,
             last_eor: u64::MAX,
         })
     }
@@ -89,6 +93,7 @@ impl SendBuffer {
             shared: VecDeque::new(),
             shared_output: None,
             last_push: u64::MAX,
+            single_push_len: 0,
             last_eor: u64::MAX,
         }
     }
@@ -212,7 +217,7 @@ impl SendBuffer {
     pub(crate) fn mark_push(&mut self) {
         if let Some(last) = self.marks.back_mut() {
             *last |= 1;
-            self.last_push = self.head.wrapping_add(self.marks.len() as u64 - 1);
+            self.note_push(self.marks.len() - 1);
         }
     }
 
@@ -226,8 +231,15 @@ impl SendBuffer {
 
     // Records a PUSH mark at `offset`, where none is past the last one.
     fn note_push(&mut self, offset: usize) {
-        if self.push_offset().is_none_or(|last| last < offset) {
-            self.last_push = self.head.wrapping_add(offset as u64);
+        match self.push_offset() {
+            Some(last) if offset < last => {
+                self.single_push_len = self.single_push_len.min(last - offset);
+            }
+            Some(last) if offset == last => {}
+            previous => {
+                self.single_push_len = previous.map_or(offset + 1, |last| offset - last);
+                self.last_push = self.head.wrapping_add(offset as u64);
+            }
         }
     }
 
@@ -238,6 +250,7 @@ impl SendBuffer {
             .iter()
             .rposition(|mark| mark & 1 != 0)
             .map_or(u64::MAX, |offset| self.head.wrapping_add(offset as u64));
+        self.single_push_len = 1;
     }
 
     // Whether a byte of the range carries PUSH. Only a range ending past the
@@ -287,6 +300,9 @@ impl SendBuffer {
     }
 
     pub(crate) fn collapse_push(&mut self, offset: usize, count: usize) {
+        if count <= self.single_push_len && self.push_offset() == Some(offset + count - 1) {
+            return;
+        }
         for part in self.mark_slices_mut(offset, count) {
             for mark in part {
                 *mark &= !1;
@@ -563,6 +579,22 @@ impl SendBuffer {
             }
         }
         Ok(())
+    }
+
+    // Borrow a scalar payload directly when the selected bytes all come
+    // from one slice of the ring. Shared spans overlay the ring's bytes.
+    pub(crate) fn contiguous(&self, offset: usize, limit: usize) -> Option<&[u8]> {
+        if !self.shared.is_empty() {
+            return None;
+        }
+        let count = self.record_len(offset, limit);
+        let (front, back) = self.data.as_slices();
+        if offset < front.len() {
+            front.get(offset..offset + count)
+        } else {
+            let start = offset - front.len();
+            back.get(start..start + count)
+        }
     }
 
     pub(crate) fn copy(&self, offset: usize, out: &mut [u8]) -> usize {
@@ -880,6 +912,17 @@ mod tests {
                     .iter()
                     .eq(tail[..record].iter().map(|byte| &byte.0))
             );
+            match send.contiguous(offset, limit) {
+                Some(slice) => assert_eq!(slice, &out[..record]),
+                None => {
+                    let (front, back) = send.data.as_slices();
+                    assert!(
+                        offset < front.len() && offset + record > front.len()
+                            || offset >= front.len() && offset - front.len() + record > back.len(),
+                        "contiguous returned None without spanning ring wrap"
+                    );
+                }
+            }
         }
     }
 
@@ -1229,5 +1272,82 @@ mod tests {
         assert_eq!(send.copy(0, &mut out), 64);
         assert_eq!(&out[..14], b"\x01\x01\x01\x01abcdefghij");
         assert!(send.pushed(13, 1) && !send.pushed(0, 13));
+    }
+
+    #[test]
+    fn collapse_push_early_return_and_contiguous_ring_wrap_and_shared() {
+        let mut send = SendBuffer::new(16).unwrap();
+        // Single PUSH at index 5 -> single_push_len == 6.
+        assert_eq!(send.write(b"abcdef"), 6);
+        send.mark_push();
+        assert_eq!(send.single_push_len, 6);
+        // count == single_push_len takes the early return without altering marks.
+        send.collapse_push(0, 6);
+        assert!(send.pushed(5, 1) && !send.pushed(0, 5));
+
+        // Adding an earlier PUSH via finish_send narrows single_push_len to 5 - 2 = 3.
+        send.finish_send(2, true, false);
+        assert_eq!(send.single_push_len, 3);
+        // count == 3 (indices 3..=5) early-returns and leaves earlier PUSH at 2 intact.
+        send.collapse_push(3, 3);
+        assert!(send.pushed(2, 1) && send.pushed(5, 1) && !send.pushed(3, 2));
+        // count == 4 (indices 2..=5) > single_push_len clears the earlier PUSH at 2.
+        send.collapse_push(2, 4);
+        assert!(!send.pushed(0, 5) && send.pushed(5, 1));
+
+        // After acknowledge keeping last_push, collapse_push still preserves correctness.
+        send.acknowledge(3).unwrap(); // remaining: "def" with PUSH at index 2
+        send.finish_send(0, true, false); // PUSH at 0 and 2 -> single_push_len = 2
+        send.collapse_push(1, 2); // early return on 1..=2
+        assert!(send.pushed(0, 1) && send.pushed(2, 1));
+        send.collapse_push(0, 3); // clears PUSH at 0
+        assert!(!send.pushed(0, 2) && send.pushed(2, 1));
+
+        // After truncate drops last_push, find_last_push resets single_push_len = 1.
+        send.finish_send(0, true, false);
+        send.truncate(2); // remaining: "de" with PUSH at 0
+        assert_eq!(send.single_push_len, 1);
+        send.collapse_push(0, 1);
+        assert!(send.pushed(0, 1) && !send.pushed(1, 1));
+
+        // After release + grow, single_push_len works cleanly for new writes.
+        send.acknowledge(2).unwrap();
+        send.release();
+        send.grow(16).unwrap();
+
+        // Force a ring wrap: write 12, ack 10, write 10 -> front has 6 bytes, back has 6 bytes
+        // (exact split depends on VecDeque capacity, so verify wrap explicitly).
+        assert_eq!(send.write(b"0123456789ab"), 12);
+        send.acknowledge(10).unwrap();
+        assert_eq!(send.write(b"ABCDEFGHIJ"), 10);
+        let (front, back) = send.data.as_slices();
+        assert!(
+            !front.is_empty() && !back.is_empty(),
+            "expected wrapped ring"
+        );
+        let (front_len, back_len, first_byte) = (front.len(), back.len(), front[0]);
+        let mut out = [0; 16];
+        // Front-only slice returns Some matching copy.
+        let front_slice = send.contiguous(0, front_len).unwrap();
+        let n = send.copy(0, &mut out[..front_len]);
+        assert_eq!(front_slice, &out[..n]);
+        // Back-only slice returns Some matching copy.
+        let back_slice = send.contiguous(front_len, back_len).unwrap();
+        let n = send.copy(front_len, &mut out[..back_len]);
+        assert_eq!(back_slice, &out[..n]);
+        // Selection spanning front..back returns None, while copy still succeeds.
+        assert!(send.contiguous(front_len - 1, 2).is_none());
+        assert_eq!(send.copy(front_len - 1, &mut out[..2]), 2);
+        // EOR inside the front slice limits contiguous to the record end.
+        send.finish_send(0, false, true);
+        assert_eq!(send.contiguous(0, send.len()), Some(&[first_byte][..]));
+
+        // Non-empty shared payloads must make contiguous return None.
+        send.set_shared_output(Some(4));
+        let payload = Payload::from_vec(alloc::vec![b'Z'; 4]);
+        send.prepare_shared(&payload, usize::MAX).unwrap();
+        assert_eq!(send.write_shared(payload), 4);
+        assert!(send.contiguous(0, 1).is_none());
+        assert!(send.contiguous(send.len() - 4, 4).is_none());
     }
 }

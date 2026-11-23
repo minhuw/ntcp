@@ -9985,6 +9985,7 @@ impl Connection {
             return Ok(None); // Owner must service the timer first.
         }
         let mut segmentation = None;
+        let mut direct_payload = None;
         // Plan entirely before encode. Even timer/clock/accounting changes
         // are committed only once the adapter has sufficient output space.
         let reset = self.pending_rst;
@@ -10910,7 +10911,16 @@ impl Connection {
             // leave, the blocking precondition is recorded.
             let admin_target = self.pmtud.as_ref().and_then(|p| p.administrative_target());
             let mut admin_deferral = None;
-            let candidate = self.pmtud.as_ref().and_then(|p| {
+            // A probe needs its payload and three trailing segments. When
+            // the queue or window cannot hold the trailing data, only an
+            // administrative search has a deferral reason to record.
+            let trailing = self.mss.checked_mul(3);
+            let probe_room = trailing.is_some_and(|n| usable.min(unsent) > n);
+            let discovery = self
+                .pmtud
+                .as_ref()
+                .filter(|_| admin_target.is_some() || probe_room);
+            let candidate = discovery.and_then(|p| {
                 let target = if let Some(path) = &self.managed_path {
                     if p.discovery_disabled() {
                         admin_deferral = Some(crate::pmtud::AdministrativeDeferral::DiscoveryDisabled);
@@ -11015,7 +11025,7 @@ impl Connection {
                 let payload = size
                     .checked_sub(u32::from(self.ip_header_len) + 20 + option_len as u32)?
                     as usize;
-                let trailing = self.mss.checked_mul(3)?;
+                let trailing = trailing?;
                 let needed = payload.checked_add(trailing)?;
                 let paced = self.config.pacing.is_none_or(|p| {
                     let burst = p.max_burst_segments * self.mss as u32;
@@ -11310,7 +11320,11 @@ impl Connection {
                 && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)
                 && self.send.pushed(offset, unsent);
             if segmentation.is_none() {
-                count = self.send.copy(offset, &mut self.scratch[..count]);
+                direct_payload = self.send.contiguous(offset, count);
+                count = match direct_payload {
+                    Some(bytes) => bytes.len(),
+                    None => self.send.copy(offset, &mut self.scratch[..count]),
+                };
             } else {
                 // The reservation's payload, whose first segment is encoded
                 // from it below: copied from the send buffer once.
@@ -11705,7 +11719,7 @@ impl Connection {
                 options,
                 match &gso {
                     Some(buffer) if segmentation.is_some() => &buffer.payload[..wire_count],
-                    _ => &self.scratch[..wire_count],
+                    _ => &direct_payload.unwrap_or(&self.scratch)[..wire_count],
                 },
                 out,
                 partial,

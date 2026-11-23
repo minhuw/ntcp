@@ -1894,3 +1894,187 @@ fn split_bound_entries_are_where_refusal_begins() {
         assert!(!bound.refuses(entries - 1));
     }
 }
+
+#[test]
+fn min_rtt_incremental_matches_full_recompute() {
+    for units_per_second in [1_000_000_u64, 1_000_000_000_u64] {
+        let timebase = CallerTimebase {
+            units_per_second,
+            ..CallerTimebase::default()
+        };
+        let mut rack = Rack::with_timebase(16, timebase).unwrap();
+        let bucket_ticks = timebase.ticks_from_us(MIN_RTT_BUCKET);
+        let mut state = 0x243f_6a88_85a3_08d3_u64 ^ units_per_second;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        };
+        let mut now = 0_u64;
+        for step in 0..400 {
+            let delta = match next() % 8 {
+                0 => 0,                                  // identical timestamp
+                1 => bucket_ticks / 4,                   // within same epoch
+                2 => bucket_ticks,                       // +1 epoch
+                3 => bucket_ticks * 2,                   // +2 epochs
+                4 => bucket_ticks * 4,                   // +4 epochs (window expires)
+                5 => bucket_ticks * 9 + next() % 10_000, // large jump
+                6 => {
+                    // backwards timestamp (earlier epoch or same epoch)
+                    now = now.saturating_sub(bucket_ticks * (1 + next() % 3));
+                    0
+                }
+                _ => next() % (bucket_ticks / 2 + 1),
+            };
+            now = now.saturating_add(delta);
+            let rtt = 1 + next() % 50_000;
+            rack.sample(rtt, now);
+            let epoch = timebase.us_from_ticks(now) / MIN_RTT_BUCKET;
+            let expected = rack
+                .min_rtt_buckets
+                .iter()
+                .flatten()
+                .filter(|&&(time, _)| time <= epoch && epoch - time < 4)
+                .map(|&(_, value)| value)
+                .min();
+            assert_eq!(
+                rack.min_rtt(),
+                expected,
+                "units={units_per_second} step={step} now={now} epoch={epoch}"
+            );
+        }
+    }
+}
+
+#[test]
+fn locate_tail_shortcut_matches_binary_search() {
+    let reference_locate = |rack: &Rack, seq: Seq| -> usize {
+        let Some(base) = rack.intervals.first().map(|r| r.start) else {
+            return 0;
+        };
+        let target = seq.distance_from(base);
+        if target >= 1 << 31 {
+            return 0;
+        }
+        let (mut low, mut high) = (0, rack.intervals.len());
+        while low < high {
+            let mid = (low + high) / 2;
+            if rack.intervals[mid].end.distance_from(base) <= target {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        low
+    };
+
+    // Empty ledger.
+    let mut rack = Rack::with_capacity(16).unwrap();
+    for probe in [Seq(0), Seq(1), Seq(u32::MAX)] {
+        assert_eq!(rack.locate(probe), 0);
+    }
+
+    // 1-element and multi-element ledgers across u32 wraparound.
+    let base = Seq(u32::MAX - 250);
+    let spans = [(0_u32, 100_u32), (100, 200), (200, 350), (400, 520)];
+    for count in [1, 2, 4] {
+        rack = Rack::with_capacity(16).unwrap();
+        for (idx, &(s, e)) in spans[..count].iter().enumerate() {
+            rack.transmit(
+                base.wrapping_add(s),
+                base.wrapping_add(e),
+                10 + idx as u64,
+                false,
+            );
+        }
+        let mut probes = alloc::vec![
+            Seq(base.0.wrapping_sub(100)),
+            Seq(base.0.wrapping_sub(1)),
+            base.wrapping_add(spans[count - 1].1 + 1),
+            base.wrapping_add(spans[count - 1].1 + 500),
+        ];
+        for &(s, e) in &spans[..count] {
+            probes.push(base.wrapping_add(s.saturating_sub(1)));
+            probes.push(base.wrapping_add(s));
+            probes.push(base.wrapping_add((s + e) / 2));
+            probes.push(base.wrapping_add(e - 1));
+            probes.push(base.wrapping_add(e));
+        }
+        for seq in probes {
+            assert_eq!(
+                rack.locate(seq),
+                reference_locate(&rack, seq),
+                "count={count} seq={seq:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn single_interval_departure_fast_path_and_empty_clean_ack() {
+    let mut rack = Rack::with_capacity(16).unwrap();
+    let mut scoreboard = Scoreboard::new();
+
+    // Empty valid ledger takes the clean-on-ACK fast path cleanly.
+    let empty_ack = rack.acknowledge(
+        Seq(100),
+        Seq(100),
+        &mut scoreboard,
+        5,
+        None,
+        None,
+        1000,
+        false,
+    );
+    assert_eq!(empty_ack, 0);
+
+    // Seed short_mss = 1000 so a 500-byte transmission is short and 1000-byte is not.
+    assert!(!rack.has_short_transmission(1000));
+    rack.transmit(Seq(100), Seq(600), 10, false);
+    let sel1 = rack.departure_selection().unwrap();
+    // Single-interval validate_departure covered shortcut: boundaries and mismatches.
+    assert!(rack.validate_departure(sel1, Seq(100), Seq(600), 10));
+    assert!(rack.validate_departure(sel1, Seq(200), Seq(500), 12));
+    assert!(!rack.validate_departure(sel1, Seq(99), Seq(600), 10));
+    assert!(!rack.validate_departure(sel1, Seq(100), Seq(601), 10));
+    assert!(!rack.validate_departure(sel1, Seq(100), Seq(600), 9));
+    // Commit single short interval via fast path.
+    assert!(rack.commit_departure(sel1, Seq(100), Seq(600), 11));
+    assert!(!rack.validate_departure(sel1, Seq(100), Seq(600), 11));
+    assert!(rack.has_short_transmission(1000));
+    assert_eq!(rack.diagnostic_packet_counts().unacked, 1);
+
+    // Add a full-sized second interval; commit via fast path (non-short).
+    rack.transmit(Seq(600), Seq(1600), 20, false);
+    let sel2 = rack.departure_selection().unwrap();
+    assert!(rack.commit_departure(sel2, Seq(600), Seq(1600), 20));
+    assert_eq!(rack.tally.short, 1);
+    assert_eq!(rack.diagnostic_packet_counts().unacked, 2);
+
+    // Retransmit the first interval as a whole interval (DELIVERY_END stays true,
+    // DIAGNOSTIC_LOST flips true -> false, DIAGNOSTIC_RETRY flips false -> true).
+    rack.mark_head_lost();
+    assert!(!rack.has_short_transmission(400));
+    assert!(rack.has_short_transmission(600)); // 500 < 600 so 1 short
+    rack.transmit(Seq(100), Seq(600), 30, true);
+    let retry1 = rack.departure_selection().unwrap();
+    assert!(rack.commit_departure(retry1, Seq(100), Seq(600), 31));
+    assert_eq!(rack.tally.short, 1);
+    assert_eq!(rack.diagnostic_packet_counts().retransmitted, 1);
+    assert_eq!(rack.diagnostic_packet_counts().unacked, 2);
+
+    // Retransmit both intervals as one larger selection [100, 1600) (transmission_len = 1500,
+    // not short under short_mss = 1000), then commit only the first interval [100, 600)
+    // (len = 500 < 1000): takes the fast path and flips tally.short 0 -> 1.
+    assert!(rack.has_short_transmission(1000));
+    rack.transmit(Seq(100), Seq(1600), 40, true);
+    assert_eq!(rack.tally.short, 0);
+    let retry_both = rack.departure_selection().unwrap();
+    assert!(rack.commit_departure(retry_both, Seq(100), Seq(600), 41));
+    assert_eq!(rack.tally.short, 1);
+    assert!(rack.commit_departure(retry_both, Seq(600), Seq(1600), 42));
+    assert_eq!(rack.tally.short, 1);
+    assert_eq!(rack.diagnostic_packet_counts().unacked, 2);
+    assert_eq!(rack.diagnostic_packet_counts().retransmitted, 2);
+}
