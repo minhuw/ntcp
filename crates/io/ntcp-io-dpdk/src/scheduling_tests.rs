@@ -51,6 +51,38 @@ unsafe fn rx_checksum_verdicts(io: &mut Dpdk) {
         assert_eq!(verdict(io, kind as u32), expected);
     }
     io.rx_checksum = false;
+
+    // Enabling RX checksum with unread burst leftovers must discard plain
+    // views so leftovers fall back cleanly to `receive_meta` and read L4
+    // checksum verdicts; setting a budget while enabled must keep views off.
+    io.set_rx_frame_budget(Some(100));
+    assert!(io.rx_views.is_some());
+    for kind in 0..4u32 {
+        unsafe { ntcp_test_l4_checksum(kind) };
+    }
+    let mut scratch = [0xa5; 128];
+    let mut frame = None;
+    let first = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
+    assert_eq!(first.l4_checksum, RxChecksum::Unknown);
+    assert_eq!(frame.take().unwrap().as_slice(), &[0x42; 64]);
+    // PRIVATE fixture only: mirror `enable_rx_checksum`'s state transition.
+    io.rx_views = None;
+    io.rx_checksum = true;
+    for expected in [RxChecksum::Good, RxChecksum::Bad, RxChecksum::Unknown] {
+        let mut frame = None;
+        let pkt = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
+        assert_eq!(pkt.l4_checksum, expected);
+        assert_eq!(frame.take().unwrap().as_slice(), &[0x42; 64]);
+    }
+    io.set_rx_frame_budget(Some(100));
+    assert!(io.rx_views.is_none());
+    unsafe { ntcp_test_l4_checksum(1) };
+    let mut frame = None;
+    let after = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
+    assert_eq!(after.l4_checksum, RxChecksum::Good);
+    drop(frame);
+    io.rx_checksum = false;
+    io.set_rx_frame_budget(None);
     assert_eq!(unsafe { ntcp_test_available() }, 1023);
 }
 

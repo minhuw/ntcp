@@ -14,8 +14,9 @@
 #include <rte_ring.h>
 
 static struct rte_ring *rx, *tx;
-static struct rte_mempool *pool;
+static struct rte_mempool *pool, *other_pool;
 static struct rte_mbuf *held[1023];
+static struct rte_mbuf *shared_ref_mbuf;
 static unsigned held_count;
 static uint16_t port;
 
@@ -130,6 +131,57 @@ void ntcp_test_corrupt(void) {
     m->pkt_len = 7; // Valid allocation/chain, inconsistent packet metadata.
     assert(rte_ring_enqueue(rx, m) == 0);
 }
+void ntcp_test_corrupt_bounds(void) {
+    struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+    assert(m);
+    uint16_t over = (uint16_t)(m->buf_len - m->data_off + 1);
+    m->data_len = over;
+    m->pkt_len = over; // data_len == pkt_len, but data_off + data_len > buf_len.
+    assert(rte_ring_enqueue(rx, m) == 0);
+}
+void ntcp_test_corrupt_next(void) {
+    struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+    struct rte_mbuf *extra = rte_pktmbuf_alloc(pool);
+    assert(m && extra);
+    assert(rte_pktmbuf_append(m, 64));
+    assert(rte_pktmbuf_append(extra, 16));
+    m->next = extra; // nb_segs stays 1, violating single-segment invariant.
+    assert(rte_ring_enqueue(rx, m) == 0);
+}
+void ntcp_test_shared_ref(uint8_t fill, unsigned length) {
+    assert(!shared_ref_mbuf);
+    struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+    assert(m);
+    void *bytes = rte_pktmbuf_append(m, (uint16_t)length);
+    assert(bytes);
+    memset(bytes, fill, length);
+    rte_mbuf_refcnt_update(m, 1);
+    assert(rte_mbuf_refcnt_read(m) == 2);
+    shared_ref_mbuf = m;
+    assert(rte_ring_enqueue(rx, m) == 0);
+}
+unsigned ntcp_test_release_shared_ref(void) {
+    assert(shared_ref_mbuf);
+    unsigned refcnt = rte_mbuf_refcnt_read(shared_ref_mbuf);
+    rte_pktmbuf_free(shared_ref_mbuf);
+    shared_ref_mbuf = NULL;
+    return refcnt;
+}
+void ntcp_test_other_pool(uint8_t fill, unsigned length) {
+    if (!other_pool) {
+        other_pool = rte_pktmbuf_pool_create("ntcp_other_pool", 63, 0, 0, 256, SOCKET_ID_ANY);
+        assert(other_pool);
+    }
+    struct rte_mbuf *m = rte_pktmbuf_alloc(other_pool);
+    assert(m);
+    void *bytes = rte_pktmbuf_append(m, (uint16_t)length);
+    assert(bytes);
+    memset(bytes, fill, length);
+    assert(rte_ring_enqueue(rx, m) == 0);
+}
+unsigned ntcp_test_other_pool_available(void) {
+    return other_pool ? rte_mempool_avail_count(other_pool) : 0;
+}
 void ntcp_test_hold(unsigned leave) {
     while (rte_mempool_avail_count(pool) > leave) {
         held[held_count] = rte_pktmbuf_alloc(pool);
@@ -142,6 +194,10 @@ void ntcp_test_release(void) {
 }
 void ntcp_test_finish(void) {
     ntcp_test_release();
+    if (shared_ref_mbuf) {
+        rte_pktmbuf_free(shared_ref_mbuf);
+        shared_ref_mbuf = NULL;
+    }
     struct rte_mbuf *m;
     while (rte_ring_dequeue(tx, (void **)&m) == 0) rte_pktmbuf_free(m);
     while (rte_ring_dequeue(rx, (void **)&m) == 0) rte_pktmbuf_free(m);
@@ -151,6 +207,11 @@ void ntcp_test_finish(void) {
     rte_ring_free(rx);
     rte_ring_free(tx);
     rte_mempool_free(pool);
+    if (other_pool) {
+        assert(rte_mempool_avail_count(other_pool) == 63);
+        rte_mempool_free(other_pool);
+        other_pool = NULL;
+    }
     assert(rte_eal_cleanup() == 0);
 }
 

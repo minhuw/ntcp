@@ -18,18 +18,29 @@ int ntcp_dpdk_rx_timestamp_lookup(int *offset, uint64_t *flag);
 int ntcp_dpdk_rx_timestamp_status(uint16_t port, uint16_t queue,
                                    int *supported, int *enabled);
 struct rte_mbuf;
+struct ntcp_rx_view {
+    void *data;
+    uint16_t length;
+};
 uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
-                                  struct rte_mbuf **packets, uint16_t count);
+                                 struct rte_mbuf **packets, uint16_t count,
+                                 const void *pool, struct ntcp_rx_view *views);
 void ntcp_dpdk_packet_free(void *packet);
+void ntcp_dpdk_frame_free(void *packet);
 int ntcp_dpdk_rx_checksum_check(uint16_t port, uint16_t queue);
 int ntcp_dpdk_receive(void *packet, uint8_t *out,
                       size_t capacity, size_t *length, int timestamp_offset,
                       uint64_t timestamp_flag, uint64_t *timestamp, int *timestamp_valid,
                       int l4_checksum, int *l4_status);
+struct ntcp_rx_meta {
+    void *data;
+    uint64_t timestamp;
+    int timestamp_valid, l4_status;
+    uint16_t length;
+};
 int ntcp_dpdk_receive_meta(void *packet, const void *pool, int timestamp_offset,
-                           uint64_t timestamp_flag, uint64_t *timestamp,
-                           int *timestamp_valid, int l4_checksum, int *l4_status,
-                           void **data, uint16_t *length);
+                           uint64_t timestamp_flag, int l4_checksum,
+                           struct ntcp_rx_meta *out);
 void ntcp_dpdk_pool_geometry(const void *pool, uint32_t *element, uint32_t *cache,
                              uint32_t *size);
 int ntcp_dpdk_tx_checksum_check(uint16_t port, uint16_t queue);

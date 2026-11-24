@@ -661,6 +661,39 @@ fn held_frames(eal: &'static Eal) {
     );
     assert_eq!((size, object), (4095, 2368));
     let mut scratch = vec![0; 4096];
+    // Multi-burst (>8 packets) HostedQueue equivalence: views-on `receive_frame`
+    // matches `receive_with_metadata` in bytes and metadata and returns all mbufs.
+    let burst: Vec<Vec<u8>> = (0..12u8)
+        .map(|i| frame(i + 1, 60 + usize::from(i) * 100))
+        .collect();
+    let mut by_view = Vec::new();
+    for sent in &burst {
+        assert_eq!(queue.transmit(sent).unwrap(), TxOutcome::Submitted);
+    }
+    let mut held_burst = Vec::new();
+    for _ in 0..burst.len() {
+        let received = queue.receive_whole(&mut scratch).unwrap().unwrap();
+        assert!(!received.frame.is_heap());
+        assert_eq!(received.frame.truesize(), 2368);
+        by_view.push((received.frame.as_slice().to_vec(), received.metadata));
+        held_burst.push(received.frame);
+    }
+    assert_eq!(queue.receive_whole(&mut scratch).unwrap().map(|_| ()), None);
+    assert_eq!(queue.rx_frames_outstanding(), Some(burst.len()));
+    drop(held_burst);
+    assert_eq!(queue.rx_frames_outstanding(), Some(0));
+
+    let mut by_copy = Vec::new();
+    for sent in &burst {
+        assert_eq!(queue.transmit(sent).unwrap(), TxOutcome::Submitted);
+    }
+    for _ in 0..burst.len() {
+        let meta = queue.receive_with_metadata(&mut scratch).unwrap().unwrap();
+        by_copy.push((scratch[..meta.len].to_vec(), meta));
+    }
+    assert_eq!(queue.receive_with_metadata(&mut scratch).unwrap(), None);
+    assert_eq!(by_view, by_copy);
+
     let mut frames = Vec::new();
     for len in [60, 1514] {
         let sent = frame(len as u8, len);

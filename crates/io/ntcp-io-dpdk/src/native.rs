@@ -39,6 +39,23 @@ pub(crate) struct TsoConfig {
     max_descriptors: u16,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RxView {
+    data: *mut u8,
+    length: u16,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct RxMeta {
+    data: *mut u8,
+    timestamp: u64,
+    timestamp_valid: i32,
+    l4_status: i32,
+    length: u16,
+}
+
 unsafe extern "C" {
     fn ntcp_dpdk_tso_check(port: u16, queue: u16, pool: *mut c_void, config: *mut TsoConfig)
     -> i32;
@@ -64,9 +81,16 @@ unsafe extern "C" {
         supported: *mut i32,
         enabled: *mut i32,
     ) -> i32;
-    fn ntcp_dpdk_receive_burst(port: u16, queue: u16, packets: *mut *mut c_void, count: u16)
-    -> u16;
+    fn ntcp_dpdk_receive_burst(
+        port: u16,
+        queue: u16,
+        packets: *mut *mut c_void,
+        count: u16,
+        pool: *const c_void,
+        views: *mut RxView,
+    ) -> u16;
     fn ntcp_dpdk_packet_free(packet: *mut c_void);
+    fn ntcp_dpdk_frame_free(packet: *mut c_void);
     fn ntcp_dpdk_rx_checksum_check(port: u16, queue: u16) -> i32;
     fn ntcp_dpdk_tx_checksum_check(port: u16, queue: u16) -> i32;
     fn ntcp_dpdk_receive_meta(
@@ -74,12 +98,8 @@ unsafe extern "C" {
         pool: *const c_void,
         timestamp_offset: i32,
         timestamp_flag: u64,
-        timestamp: *mut u64,
-        timestamp_valid: *mut i32,
         l4_checksum: i32,
-        l4_status: *mut i32,
-        data: *mut *mut u8,
-        length: *mut u16,
+        out: *mut RxMeta,
     ) -> i32;
     fn ntcp_dpdk_pool_geometry(
         pool: *const c_void,
@@ -137,11 +157,13 @@ static MBUF_FRAME: RxFrameVtable = RxFrameVtable {
 // with `Box::into_raw`, and `token` the exposed address of an mbuf of the
 // adapter's pool that the adapter handed over and nothing else frees.
 unsafe fn release_mbuf(context: *mut (), token: usize) {
-    // SAFETY: rte_pktmbuf_free is MT-safe on any thread (a thread without
-    // an lcore puts straight into the pool's ring), and the pool is kept
-    // while any of its mbufs is out (PortInner::drop, ntcp_dpdk_pool_free;
-    // a borrowing host keeps it as from_borrowed requires).
-    unsafe { ntcp_dpdk_packet_free(ptr::with_exposed_provenance_mut(token)) };
+    // SAFETY: the validated direct, single-segment, refcnt-1 mbuf stayed
+    // exclusively in this frame (`direct_frame` + `receive_check`). Returning
+    // it to its pool via `ntcp_dpdk_frame_free` (`rte_mbuf_raw_free`) is
+    // MT-safe on any thread, and the pool is kept while any of its mbufs is
+    // out (PortInner::drop, ntcp_dpdk_pool_free; a borrowing host keeps it as
+    // from_borrowed requires).
+    unsafe { ntcp_dpdk_frame_free(ptr::with_exposed_provenance_mut(token)) };
     let count = context.cast::<RxFrameCount>();
     // SAFETY: the block lives until the last of the adapter and its
     // frames frees it, which this frame's release decides here.
@@ -161,6 +183,7 @@ pub struct Dpdk {
     tx_queue: u16,
     pool: NonNull<c_void>,
     rx_packets: [*mut c_void; RX_BURST_LEN],
+    rx_views: Option<[RxView; RX_BURST_LEN]>,
     rx_next: usize,
     rx_count: usize,
     tso: Option<TsoConfig>,
@@ -299,6 +322,7 @@ impl Dpdk {
             tx_queue,
             pool,
             rx_packets: [ptr::null_mut(); RX_BURST_LEN],
+            rx_views: None,
             rx_next: 0,
             rx_count: 0,
             tso: None,
@@ -325,29 +349,37 @@ impl Dpdk {
     /// over by reference either way.
     pub fn set_rx_frame_budget(&mut self, budget: Option<usize>) {
         self.rx_frame_budget = budget;
+        self.rx_views = (budget.is_some() && self.rx_timestamp.is_none() && !self.rx_checksum)
+            .then(|| [RxView::default(); RX_BURST_LEN]);
     }
 
     // The next received mbuf chain, from the prefetched burst or a new one.
-    fn next_packet(&mut self) -> Option<*mut c_void> {
+    fn next_packet(&mut self) -> Option<usize> {
         if self.rx_next == self.rx_count {
             self.rx_next = 0;
-            // SAFETY: the live queue is exclusively borrowed, and the array can
-            // hold the requested burst. Each returned mbuf transfers to us.
+            // SAFETY: the live queue is exclusively borrowed, `self.pool` is
+            // live, and the packet array (and optional view array) can hold
+            // the requested burst. Each returned mbuf transfers to us.
             self.rx_count = unsafe {
                 ntcp_dpdk_receive_burst(
                     self.port,
                     self.rx_queue,
                     self.rx_packets.as_mut_ptr(),
                     RX_BURST_LEN as u16,
+                    self.pool.as_ptr(),
+                    self.rx_views
+                        .as_mut()
+                        .map_or(ptr::null_mut(), |views| views.as_mut_ptr()),
                 )
             } as usize;
             if self.rx_count == 0 {
                 return None;
             }
         }
-        let packet = std::mem::replace(&mut self.rx_packets[self.rx_next], ptr::null_mut());
+        // Only the unread suffix owns mbufs. The next burst overwrites the prefix.
+        let index = self.rx_next;
         self.rx_next += 1;
-        Some(packet)
+        Some(index)
     }
 
     // `packet` copied into `out` and freed, as receive_with_metadata
@@ -441,6 +473,7 @@ impl Dpdk {
     pub fn enable_rx_checksum(&mut self) -> io::Result<()> {
         // SAFETY: the borrowed port/queue remain live and unchanged.
         unsafe { rx_checksum_check(self.port, self.rx_queue) }?;
+        self.rx_views = None;
         self.rx_checksum = true;
         Ok(())
     }
@@ -549,6 +582,7 @@ impl Dpdk {
         if result < 0 {
             return Err(io::Error::from_raw_os_error(-result));
         }
+        self.rx_views = None;
         self.rx_timestamp = Some(TimestampConfig {
             clock,
             offset,
@@ -678,10 +712,9 @@ impl PacketIo for Dpdk {
         }
     }
 
-    // The PMD frees a copied mbuf only in a later rte_eth_tx_burst (mlx5
-    // asks for a completion every 32 packets), so no per-frame completion
-    // is known: a frame counts as in the device until the owner's next
-    // drive (TxCompletion::NextPoll).
+    // rte_eth_tx_burst reports descriptor admission. There is no ordered
+    // per-frame completion here, including for a PMD that immediately
+    // releases the mbuf after copying its contents to a device ring.
     fn tx_completion(&self) -> ntcp_io::TxCompletion {
         ntcp_io::TxCompletion::NextPoll
     }
@@ -727,10 +760,10 @@ impl PacketIo for Dpdk {
     }
 
     fn receive_with_metadata(&mut self, out: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
-        let Some(packet) = self.next_packet() else {
+        let Some(index) = self.next_packet() else {
             return Ok(None);
         };
-        self.copy_packet(packet, out).map(Some)
+        self.copy_packet(self.rx_packets[index], out).map(Some)
     }
 
     // The mbuf itself, held until the frame drops, when it is one segment
@@ -745,57 +778,83 @@ impl PacketIo for Dpdk {
         scratch: &mut [u8],
         frame: &mut Option<RxFrame>,
     ) -> io::Result<Option<ReceivedPacket>> {
-        let Some(packet) = self.next_packet() else {
+        let Some(index) = self.next_packet() else {
             return Ok(None);
         };
-        let (mut timestamp, mut valid, mut l4) = (0, 0, 0);
-        let (mut data, mut len) = (ptr::null_mut(), 0);
-        let config = self.rx_timestamp;
-        // SAFETY: this owned mbuf chain is freed by the shim on error and
-        // stays ours otherwise; outputs are writable, and the cached
-        // offset/flag were validated.
-        match unsafe {
-            ntcp_dpdk_receive_meta(
-                packet,
-                self.pool.as_ptr(),
-                config.map_or(-1, |c| c.offset),
-                config.map_or(0, |c| c.flag),
-                &mut timestamp,
-                &mut valid,
-                i32::from(self.rx_checksum),
-                &mut l4,
-                &mut data,
-                &mut len,
+        let packet = self.rx_packets[index];
+        // Enabling timestamp or checksum extraction discards the plain
+        // views, so prefetched packets use the settings current at delivery.
+        let view = self
+            .rx_views
+            .as_ref()
+            .map(|views| views[index])
+            .unwrap_or_default();
+        let (data, length, metadata) = if let Some(data) = NonNull::new(view.data) {
+            debug_assert!(
+                self.rx_timestamp.is_none() && !self.rx_checksum,
+                "RX views must be disabled when RX timestamps or checksum offload are enabled"
+            );
+            (
+                data,
+                view.length,
+                self.metadata(usize::from(view.length), 0, 0, 0),
             )
-        } {
-            1 => {
-                let metadata = self.metadata(usize::from(len), timestamp, valid, l4);
-                self.frames_taken += 1;
-                // SAFETY: the shim validated one segment of len bytes
-                // inside a direct mbuf of the adapter's pool, which the
-                // device has finished writing and nothing writes again
-                // until it is freed. Only MBUF_FRAME's release frees it,
-                // once, which is sound on any thread at any later time
-                // (release_mbuf), with the block counting the return.
-                *frame = Some(unsafe {
-                    RxFrame::from_raw_parts(
-                        NonNull::new(data).expect("an mbuf's data is not null"),
-                        u32::from(len),
-                        self.frame_truesize,
-                        &MBUF_FRAME,
-                        self.frames.as_ptr().cast(),
-                        packet.expose_provenance(),
+        } else {
+            let config = self.rx_timestamp;
+            let mut received = RxMeta::default();
+            // SAFETY: this owned mbuf chain is freed by the shim on error
+            // and stays ours otherwise; `received` is writable, and the
+            // cached offset/flag were validated.
+            let status = unsafe {
+                ntcp_dpdk_receive_meta(
+                    packet,
+                    self.pool.as_ptr(),
+                    config.map_or(-1, |c| c.offset),
+                    config.map_or(0, |c| c.flag),
+                    i32::from(self.rx_checksum),
+                    &mut received,
+                )
+            };
+            match status {
+                1 => {
+                    let metadata = self.metadata(
+                        usize::from(received.length),
+                        received.timestamp,
+                        received.timestamp_valid,
+                        received.l4_status,
+                    );
+                    (
+                        NonNull::new(received.data).expect("an mbuf's data is not null"),
+                        received.length,
+                        metadata,
                     )
-                });
-                Ok(Some(metadata))
+                }
+                COPY => {
+                    let metadata = self.copy_packet(packet, scratch)?;
+                    *frame = Some(RxFrame::copy_from_slice(&scratch[..metadata.len]));
+                    return Ok(Some(metadata));
+                }
+                error => return Err(io::Error::from_raw_os_error(-error)),
             }
-            COPY => {
-                let metadata = self.copy_packet(packet, scratch)?;
-                *frame = Some(RxFrame::copy_from_slice(&scratch[..metadata.len]));
-                Ok(Some(metadata))
-            }
-            error => Err(io::Error::from_raw_os_error(-error)),
-        }
+        };
+        self.frames_taken += 1;
+        // SAFETY: the shim validated one segment of `length` bytes inside a
+        // direct, refcnt-1 mbuf of the adapter's pool (`direct_frame` and
+        // `receive_check`), which the device has finished writing and nothing
+        // writes again until it is freed. Only `MBUF_FRAME`'s release frees
+        // it via `ntcp_dpdk_frame_free`, once, on any thread at any later time
+        // (`release_mbuf`), with the block counting the return.
+        *frame = Some(unsafe {
+            RxFrame::from_raw_parts(
+                data,
+                u32::from(length),
+                self.frame_truesize,
+                &MBUF_FRAME,
+                self.frames.as_ptr().cast(),
+                packet.expose_provenance(),
+            )
+        });
+        Ok(Some(metadata))
     }
 
     fn rx_frame_budget(&self) -> Option<usize> {

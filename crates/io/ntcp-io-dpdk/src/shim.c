@@ -80,13 +80,15 @@ int ntcp_dpdk_rx_timestamp_status(uint16_t port, uint16_t queue,
     return 0;
 }
 
-uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
-                                  struct rte_mbuf **packets, uint16_t count) {
-    return rte_eth_rx_burst(port, queue, packets, count);
-}
-
 void ntcp_dpdk_packet_free(void *packet) {
     rte_pktmbuf_free(packet);
+}
+
+void ntcp_dpdk_frame_free(void *packet) {
+    // receive_check and direct_frame verified a direct mbuf with refcnt 1,
+    // nb_segs 1 and next NULL. Only the frame owned it since then, and the
+    // frame's cursors never modify the mbuf.
+    rte_mbuf_raw_free(packet);
 }
 
 // Whether TCP checksum offload is enabled on RX queue `queue`: on the port
@@ -122,6 +124,14 @@ static int receive_check(const struct rte_mbuf *m, size_t capacity) {
     size_t total = m->pkt_len;
     if (total > NTCP_DPDK_MAX_PACKET_LEN || total > capacity)
         return -EMSGSIZE;
+    // The usual packet is the head alone. Its packet and segment lengths
+    // must agree, and the entire data range must belong to its buffer.
+    if (m->nb_segs == 1) {
+        if (m->next || m->data_len != total ||
+            (uint32_t)m->data_off + m->data_len > m->buf_len)
+            return -EIO;
+        return 0;
+    }
     // Validate the entire chain before any of its bytes are used.
     size_t sum = 0;
     const struct rte_mbuf *segment = m;
@@ -136,6 +146,33 @@ static int receive_check(const struct rte_mbuf *m, size_t capacity) {
     if (segment || !m->nb_segs || sum != total)
         return -EIO;
     return 0;
+}
+
+// A burst can describe direct pool frames while the mbuf headers the PMD
+// just filled are hot. A null view requests the usual chain check at
+// delivery. All mbufs, including ones that check will reject, stay owned
+// by the adapter until it dequeues or drops them.
+static inline int direct_frame(struct rte_mbuf *m, const void *pool) {
+    return m->nb_segs == 1 && RTE_MBUF_DIRECT(m) && m->pool == pool &&
+           rte_mbuf_refcnt_read(m) == 1;
+}
+
+uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
+                                 struct rte_mbuf **packets, uint16_t count,
+                                 const void *pool, struct ntcp_rx_view *views) {
+    uint16_t received = rte_eth_rx_burst(port, queue, packets, count);
+    if (views) {
+        for (uint16_t i = 0; i < received; ++i) {
+            struct rte_mbuf *m = packets[i];
+            if (direct_frame(m, pool) && receive_check(m, NTCP_DPDK_MAX_PACKET_LEN) == 0) {
+                views[i].data = rte_pktmbuf_mtod(m, void *);
+                views[i].length = m->data_len;
+            } else {
+                views[i].data = NULL;
+            }
+        }
+    }
+    return received;
 }
 
 static void receive_metadata(const struct rte_mbuf *m, int timestamp_offset,
@@ -194,24 +231,20 @@ int ntcp_dpdk_receive(void *packet, uint8_t *out,
 // whole; an mbuf of another pool); a negative errno, the mbuf freed, as
 // ntcp_dpdk_receive refuses it.
 int ntcp_dpdk_receive_meta(void *packet, const void *pool, int timestamp_offset,
-                           uint64_t timestamp_flag, uint64_t *timestamp,
-                           int *timestamp_valid, int l4_checksum, int *l4_status,
-                           void **data, uint16_t *length) {
+                           uint64_t timestamp_flag, int l4_checksum,
+                           struct ntcp_rx_meta *out) {
     struct rte_mbuf *m = packet;
-    *data = NULL;
-    *length = 0;
     int result = receive_check(m, NTCP_DPDK_MAX_PACKET_LEN);
     if (result < 0) {
         rte_pktmbuf_free(m);
         return result;
     }
-    if (m->nb_segs != 1 || !RTE_MBUF_DIRECT(m) || m->pool != pool ||
-        rte_mbuf_refcnt_read(m) != 1)
+    if (!direct_frame(m, pool))
         return NTCP_DPDK_COPY;
-    receive_metadata(m, timestamp_offset, timestamp_flag, timestamp, timestamp_valid,
-                     l4_checksum, l4_status);
-    *data = rte_pktmbuf_mtod(m, void *);
-    *length = m->data_len;
+    receive_metadata(m, timestamp_offset, timestamp_flag, &out->timestamp,
+                     &out->timestamp_valid, l4_checksum, &out->l4_status);
+    out->data = rte_pktmbuf_mtod(m, void *);
+    out->length = m->data_len;
     return 1;
 }
 
@@ -244,6 +277,21 @@ int ntcp_dpdk_tx_checksum_check(uint16_t port, uint16_t queue) {
     return (qinfo.conf.offloads & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) ? 0 : -ENOTSUP;
 }
 
+// Fill one newly allocated segment, up to the room provided by its pool.
+static inline size_t copy_segment(struct rte_mbuf *m, const uint8_t *packet, size_t length) {
+    size_t count = rte_pktmbuf_tailroom(m);
+    if (count > length)
+        count = length;
+    // A freshly allocated mbuf is one empty segment. We already
+    // bounded the copy by its tailroom.
+    if (count) {
+        memcpy(rte_pktmbuf_mtod(m, void *), packet, count);
+        m->data_len = (uint16_t)count;
+        m->pkt_len = (uint32_t)count;
+    }
+    return count;
+}
+
 // `l3`: nonzero for a TCP segment over IPv4 (its header length) or IPv6
 // (40) whose checksum field holds the pseudo-header sum, which the device
 // completes (RTE_MBUF_F_TX_TCP_CKSUM, as Linux hands a device a
@@ -255,32 +303,30 @@ int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
         return -EINVAL;
     if (length > NTCP_DPDK_MAX_PACKET_LEN)
         return -EMSGSIZE;
-    struct rte_mbuf *head = NULL, *tail = NULL;
-    size_t offset = 0;
+    struct rte_mbuf *head = rte_pktmbuf_alloc(pool);
+    if (!head)
+        return NTCP_DPDK_NOMBUF;
+    size_t offset = copy_segment(head, packet, length);
+    if (!offset) {
+        rte_pktmbuf_free(head);
+        return -EINVAL;
+    }
+    struct rte_mbuf *tail = head;
     while (offset < length) {
         struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
         if (!m) {
             rte_pktmbuf_free(head);
             return NTCP_DPDK_NOMBUF;
         }
-        size_t chunk = rte_pktmbuf_tailroom(m);
+        size_t chunk = copy_segment(m, packet + offset, length - offset);
         if (!chunk) {
             rte_pktmbuf_free(m);
             rte_pktmbuf_free(head);
             return -EINVAL;
         }
-        if (chunk > length - offset)
-            chunk = length - offset;
-        void *dst = rte_pktmbuf_append(m, (uint16_t)chunk);
-        memcpy(dst, packet + offset, chunk);
-        // Newly allocated mbufs request no checksum or segmentation offloads.
-        if (!head) {
-            head = m;
-        } else {
-            tail->next = m;
-            head->nb_segs++;
-            head->pkt_len += (uint32_t)chunk;
-        }
+        tail->next = m;
+        head->nb_segs++;
+        head->pkt_len += (uint32_t)chunk;
         tail = m;
         offset += chunk;
     }
