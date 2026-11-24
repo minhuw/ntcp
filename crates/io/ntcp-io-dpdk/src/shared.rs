@@ -99,6 +99,11 @@ impl Dpdk {
         if result < 0 {
             return Err(io::Error::from_raw_os_error(-result));
         }
+        // Require at least 3 descriptors: 1 header + 1 payload + 1 Ethernet pad
+        // (mirrors ntcp_dpdk_shared_check in shim.c).
+        if limit < 3 {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
         self.shared_limit = Some(limit);
         Ok(())
     }
@@ -122,14 +127,19 @@ impl Dpdk {
         }
     }
     pub(super) fn shared_capabilities(&self) -> Option<ZeroCopyCapabilities> {
-        self.shared_limit.map(|limit| ZeroCopyCapabilities {
-            // Reserve one descriptor for headers and one for Ethernet padding.
-            max_payload_segments: usize::from(limit) - 2,
-            max_packet_len: MAX_PACKET_LEN,
+        self.shared_limit.and_then(|limit| {
+            // Reserve one descriptor for headers and one for Ethernet padding;
+            // at least one payload segment must remain (matches
+            // ntcp_dpdk_shared_check's `limit >= 3` requirement).
+            let max_payload_segments = usize::from(limit).checked_sub(2)?;
+            (max_payload_segments > 0).then_some(ZeroCopyCapabilities {
+                max_payload_segments,
+                max_packet_len: MAX_PACKET_LEN,
+            })
         })
     }
     pub(super) fn supports_shared(&self, payload: &Payload) -> bool {
-        self.shared_limit.is_some()
+        self.shared_capabilities().is_some()
             && payload.storage::<DpdkBuffer>().is_some()
             && !payload.is_empty()
     }
@@ -213,6 +223,20 @@ pub(super) fn ring_test(io: &mut Dpdk) {
     }
     assert!(io.enable_zero_copy().is_err()); // ring does not expose queue-info.
     assert!(io.zero_copy_capabilities().is_none());
+    // Limits below 3 (1 header + 1 payload + 1 Ethernet pad) must never
+    // underflow and must report zero-copy unavailable.
+    for limit in [0u16, 1, 2] {
+        io.shared_limit = Some(limit);
+        assert_eq!(io.zero_copy_capabilities(), None);
+    }
+    io.shared_limit = Some(3);
+    assert_eq!(
+        io.zero_copy_capabilities(),
+        Some(ZeroCopyCapabilities {
+            max_payload_segments: 1,
+            max_packet_len: MAX_PACKET_LEN,
+        })
+    );
     // Inject descriptor geometry only in this private test, as for TSO tests.
     // Public opt-in continues to require actual PMD configuration evidence.
     io.shared_limit = Some(8);

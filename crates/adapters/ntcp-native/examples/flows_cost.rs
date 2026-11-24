@@ -45,7 +45,7 @@
 // runs only one series (to profile it). With --check, exits nonzero unless
 // the handoff counters are as the steering dictates and the costs stay
 // within the bounds below.
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+use ntcp_io::{PacketIo, PacketLayer, TransmitError, TransmitRequest, TxOutcome, TxPacket};
 use ntcp_native::{
     CallerTimebase, ConnId, DEFAULT_FLOW_KEY, EthernetNextHop, Event, FlowOwnership, Link, Network,
     NetworkConfig, ReadOutcome, SharedFlowLimits, SharedFlows, WorkBudget, WriteOptions,
@@ -240,6 +240,46 @@ impl PacketIo for Wire {
         let mut frame = frames.spare.pop().unwrap_or_default();
         frame.clear();
         frame.extend_from_slice(packet);
+        frames.queued.push_back(frame);
+        Ok(TxOutcome::Submitted)
+    }
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        if request.timestamp.is_some_and(|t| !t.software && !t.hardware) {
+            return Err(TransmitError::InvalidInput);
+        }
+        if request != TransmitRequest::default() {
+            return Err(TransmitError::Unsupported);
+        }
+        let len = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+        let queue = if packet.header.len() >= 78 || packet.payload.is_empty() {
+            self.steer.queue(packet.header)
+        } else {
+            let mut prefix = [0u8; 78];
+            let mut n = packet.header.len().min(prefix.len());
+            prefix[..n].copy_from_slice(&packet.header[..n]);
+            for part in packet.payload {
+                if n == prefix.len() {
+                    break;
+                }
+                let src = part.bytes();
+                let take = src.len().min(prefix.len() - n);
+                prefix[n..n + take].copy_from_slice(&src[..take]);
+                n += take;
+            }
+            self.steer.queue(&prefix[..n])
+        };
+        let mut frames = self.queues[queue].borrow_mut();
+        let mut frame = frames.spare.pop().unwrap_or_default();
+        frame.clear();
+        frame.reserve(len);
+        frame.extend_from_slice(packet.header);
+        for part in packet.payload {
+            frame.extend_from_slice(part.bytes());
+        }
         frames.queued.push_back(frame);
         Ok(TxOutcome::Submitted)
     }
@@ -862,7 +902,7 @@ mod threaded {
         ADDRESS, Args, BUDGET, CONNECTIONS, Clock, GROUPS, INBOX, Kind, PEER, PEER_MAC, PORT,
         PORT_MAC, REQUEST_LEN, SECRET, Steer, Totals, config, frame, median, range, round_robin,
     };
-    use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+    use ntcp_io::{PacketIo, PacketLayer, TransmitError, TransmitRequest, TxOutcome, TxPacket};
     use ntcp_native::{
         ConnId, DEFAULT_FLOW_KEY, Event, FlowOwnership, Network, ReadOutcome, SharedFlowLimits,
         SharedFlows, WriteOptions,
@@ -917,6 +957,36 @@ mod threaded {
             };
             frame.bytes[..packet.len()].copy_from_slice(packet);
             let queue = self.steer.queue(packet);
+            Ok(match self.queues[queue].try_send(frame) {
+                Ok(()) => TxOutcome::Submitted,
+                Err(_) => TxOutcome::WouldBlock,
+            })
+        }
+        fn transmit_packet(
+            &mut self,
+            packet: &TxPacket<'_>,
+            request: TransmitRequest,
+        ) -> Result<TxOutcome, TransmitError> {
+            if request.timestamp.is_some_and(|t| !t.software && !t.hardware) {
+                return Err(TransmitError::InvalidInput);
+            }
+            if request != TransmitRequest::default() {
+                return Err(TransmitError::Unsupported);
+            }
+            let len = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+            assert!(len <= FRAME, "a {len}-octet frame");
+            let mut frame = Frame {
+                len,
+                bytes: [0; FRAME],
+            };
+            let mut offset = packet.header.len();
+            frame.bytes[..offset].copy_from_slice(packet.header);
+            for part in packet.payload {
+                let bytes = part.bytes();
+                frame.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+                offset += bytes.len();
+            }
+            let queue = self.steer.queue(&frame.bytes[..len]);
             Ok(match self.queues[queue].try_send(frame) {
                 Ok(()) => TxOutcome::Submitted,
                 Err(_) => TxOutcome::WouldBlock,

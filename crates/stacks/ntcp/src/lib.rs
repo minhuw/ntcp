@@ -74,6 +74,8 @@ mod schedule;
 mod seq;
 mod time_wait;
 mod tx_pool;
+#[cfg(test)]
+mod tx_pool_prop_tests;
 mod tx_timestamp;
 mod wheel;
 pub use wheel::{TimerWheel, TimerWheelGeometry};

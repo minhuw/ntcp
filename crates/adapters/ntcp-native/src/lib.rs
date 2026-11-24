@@ -775,8 +775,8 @@ impl<P: PacketIo> Network<P> {
         flows: Option<(&SharedFlows, usize)>,
     ) -> Result<Self> {
         config.validate(&io)?;
-        // Every TCP segment leaves through `transmit_tcp_checksum_offload`
-        // when the backend completes its checksum.
+        // Every TCP segment leaves through `transmit_packet` with
+        // `tcp_checksum_offload: true` when the backend completes its checksum.
         config.tcp.connection.tcp_checksum_offload = io.tcp_checksum_offload();
         if config.tcp.ipv4_options_enabled {
             return Err(Error::Unsupported(

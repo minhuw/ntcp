@@ -133,6 +133,7 @@ fn hosted_ring_ports() {
     segmentation_not_offered(eal);
     receive_pool_exhausted(eal);
     held_frames(eal);
+    hosted_network_e2e(eal);
     outstanding_mbufs_retain_pool(eal);
 }
 
@@ -731,6 +732,195 @@ fn held_frames(eal: &'static Eal) {
     drop(frames);
     assert_eq!(pools(), (1, 1));
     drop(port);
+    assert_eq!(pools(), (0, 0));
+}
+
+// End-to-end ntcp-native over two HostedQueues on a 2-queue net_ring port
+// (each queue loops TX -> RX, crossed between client and server). Verifies
+// small (<= copybreak) and bulk (> copybreak) transfers both ways through
+// HostedQueue::transmit_packet, receive_frame, and tx_chunk_source with zero
+// mbuf or pool leaks.
+fn hosted_network_e2e(eal: &'static Eal) {
+    use ntcp_io::{
+        ReceivedPacket, RxFrame, TransmitError, TransmitRequest, TxChunkSource, TxPacket,
+    };
+    use ntcp_io_dpdk::HostedQueue;
+    use ntcp_native::{
+        EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, WorkBudget, WriteOptions,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    struct CrossQueue {
+        tx: Rc<RefCell<HostedQueue>>,
+        rx: Rc<RefCell<HostedQueue>>,
+    }
+
+    impl PacketIo for CrossQueue {
+        fn layer(&self) -> PacketLayer {
+            self.tx.borrow().layer()
+        }
+        fn local_ip_mtu(&self) -> std::io::Result<Option<u32>> {
+            self.tx.borrow().local_ip_mtu()
+        }
+        fn max_packet_len(&self) -> Option<usize> {
+            self.tx.borrow().max_packet_len()
+        }
+        fn receive(&mut self, out: &mut [u8]) -> std::io::Result<Option<usize>> {
+            self.rx.borrow_mut().receive(out)
+        }
+        fn receive_with_metadata(
+            &mut self,
+            out: &mut [u8],
+        ) -> std::io::Result<Option<ReceivedPacket>> {
+            self.rx.borrow_mut().receive_with_metadata(out)
+        }
+        fn receive_frame(
+            &mut self,
+            scratch: &mut [u8],
+            frame: &mut Option<RxFrame>,
+        ) -> std::io::Result<Option<ReceivedPacket>> {
+            self.rx.borrow_mut().receive_frame(scratch, frame)
+        }
+        fn rx_frame_budget(&self) -> Option<usize> {
+            self.rx.borrow().rx_frame_budget()
+        }
+        fn rx_frames_outstanding(&self) -> Option<usize> {
+            self.rx.borrow().rx_frames_outstanding()
+        }
+        fn transmit(&mut self, packet: &[u8]) -> std::io::Result<TxOutcome> {
+            self.tx.borrow_mut().transmit(packet)
+        }
+        fn transmit_packet(
+            &mut self,
+            packet: &TxPacket<'_>,
+            request: TransmitRequest,
+        ) -> Result<TxOutcome, TransmitError> {
+            self.tx.borrow_mut().transmit_packet(packet, request)
+        }
+        fn tx_chunk_source(&self) -> Box<dyn TxChunkSource> {
+            self.tx.borrow().tx_chunk_source()
+        }
+    }
+
+    let mut config = PortConfig::new("net_ring_e2e");
+    config.queues = 2;
+    config.rx_desc = 64;
+    config.tx_desc = 64;
+    config.mbufs_per_queue = 2047;
+    let port = Port::start(eal, config).unwrap();
+    let q0 = Rc::new(RefCell::new(port.take_queue(0).unwrap().attach().unwrap()));
+    let q1 = Rc::new(RefCell::new(port.take_queue(1).unwrap().attach().unwrap()));
+
+    let io_a = CrossQueue {
+        tx: Rc::clone(&q0),
+        rx: Rc::clone(&q1),
+    };
+    let io_b = CrossQueue {
+        tx: Rc::clone(&q1),
+        rx: Rc::clone(&q0),
+    };
+
+    let make_cfg = |addr: &str, side: u8| {
+        let mut cfg = NetworkConfig::new(addr.parse().unwrap(), 1500);
+        cfg.tcp.max_connections = 2;
+        cfg.tcp.connection.send_capacity = 128 * 1024;
+        cfg.tcp.connection.receive_capacity = 128 * 1024;
+        cfg.tcp.connection.nagle = false;
+        cfg.tcp.max_buffer_bytes = 4 * 1024 * 1024;
+        cfg.link = Link::Ethernet {
+            local_mac: [2, 0, 0, 0, 0, side],
+            next_hop: EthernetNextHop::Fixed([2, 0, 0, 0, 0, 3 - side]),
+        };
+        cfg
+    };
+
+    let mut a = Network::new(make_cfg("10.77.0.1", 1), io_a, [5; 32], 0).unwrap();
+    let mut b = Network::new(make_cfg("10.77.0.2", 2), io_b, [6; 32], 0).unwrap();
+    let listener = b.listen(9200, 1).unwrap();
+    let client = a.connect("10.77.0.2:9200".parse().unwrap()).unwrap();
+
+    // Mix small (<= 512 B) and multi-MSS (> 512 B) payloads in both directions.
+    let c_to_s: Vec<u8> = (0..(128 + 32 * 1024))
+        .map(|i| ((i * 29 + 1) % 251) as u8)
+        .collect();
+    let s_to_c: Vec<u8> = (0..(96 + 16 * 1024))
+        .map(|i| ((i * 37 + 3) % 251) as u8)
+        .collect();
+    let budget = WorkBudget::new(64, 64, 64, 64);
+    let mut server = None;
+    let (mut sent_c, mut sent_s) = (0usize, 0usize);
+    let (mut got_s, mut got_c) = (Vec::new(), Vec::new());
+    let mut out = vec![0u8; 16384];
+
+    for step in 1..20_000u64 {
+        let now = step * 1000;
+        if sent_c < c_to_s.len() {
+            let chunk = if sent_c < 128 {
+                (128 - sent_c).min(64)
+            } else {
+                (c_to_s.len() - sent_c).min(8192)
+            };
+            if let Ok(r) = a.try_write(
+                client,
+                &c_to_s[sent_c..sent_c + chunk],
+                WriteOptions::default(),
+            ) {
+                sent_c += r.accepted;
+            }
+        }
+        a.drive(now, budget).unwrap();
+        b.drive(now, budget).unwrap();
+        if server.is_none() {
+            server = b.accept(listener).ok();
+        }
+        if let Some(srv) = server {
+            if sent_s < s_to_c.len() {
+                let chunk = if sent_s < 96 {
+                    (96 - sent_s).min(48)
+                } else {
+                    (s_to_c.len() - sent_s).min(8192)
+                };
+                if let Ok(r) = b.try_write(
+                    srv,
+                    &s_to_c[sent_s..sent_s + chunk],
+                    WriteOptions::default(),
+                ) {
+                    sent_s += r.accepted;
+                }
+            }
+            while let Ok(ReadOutcome::Data { len, .. }) = b.try_read(srv, &mut out) {
+                got_s.extend_from_slice(&out[..len]);
+            }
+        }
+        while let Ok(ReadOutcome::Data { len, .. }) = a.try_read(client, &mut out) {
+            got_c.extend_from_slice(&out[..len]);
+        }
+        if got_s.len() == c_to_s.len() && got_c.len() == s_to_c.len() {
+            break;
+        }
+    }
+
+    assert_eq!(got_s, c_to_s);
+    assert_eq!(got_c, s_to_c);
+    assert_eq!(a.counters().tcp_checksum_errors, 0);
+    assert_eq!(b.counters().tcp_checksum_errors, 0);
+
+    // Close and drain residual ACKs/FINs so no mbufs remain stranded on rings.
+    let _ = a.close(client);
+    if let Some(srv) = server {
+        let _ = b.close(srv);
+    }
+    for step in 1..64u64 {
+        let now = 25_000_000 + step * 1000;
+        a.drive(now, budget).unwrap();
+        b.drive(now, budget).unwrap();
+    }
+    drop((a, b));
+    let mut drain_buf = [0u8; 2048];
+    while q0.borrow_mut().receive(&mut drain_buf).unwrap().is_some() {}
+    while q1.borrow_mut().receive(&mut drain_buf).unwrap().is_some() {}
+    drop((q0, q1, port));
+    assert_eq!(port_named("net_ring_e2e"), None);
     assert_eq!(pools(), (0, 0));
 }
 

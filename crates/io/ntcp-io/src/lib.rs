@@ -646,6 +646,9 @@ pub trait PacketIo {
         packet: &TxPacket<'_>,
         request: TransmitRequest,
     ) -> Result<TxOutcome, TransmitError> {
+        if packet.payload.is_empty() {
+            return transmit_contiguous(self, packet.header, request);
+        }
         let len = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
         let mut contiguous = Vec::with_capacity(len);
         contiguous.extend_from_slice(packet.header);

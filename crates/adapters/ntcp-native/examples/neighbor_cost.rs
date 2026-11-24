@@ -4,7 +4,7 @@
 // with its own table and as a member of a shared table of one and of four
 // members (the other three idle). Side B keeps its own table. Two Networks
 // run back to back over in-memory queues on one thread.
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+use ntcp_io::{PacketIo, PacketLayer, TransmitError, TransmitRequest, TxOutcome, TxPacket};
 use ntcp_native::{
     ConnId, EthernetNextHop, Event, Link, Network, NetworkConfig, ReadOutcome,
     SharedNeighborLimits, SharedNeighbors, WorkBudget, WriteOptions,
@@ -38,6 +38,26 @@ impl PacketIo for Wire {
     }
     fn transmit(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
         self.outgoing.borrow_mut().push_back(packet.to_vec());
+        Ok(TxOutcome::Submitted)
+    }
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        if request.timestamp.is_some_and(|t| !t.software && !t.hardware) {
+            return Err(TransmitError::InvalidInput);
+        }
+        if request != TransmitRequest::default() {
+            return Err(TransmitError::Unsupported);
+        }
+        let len = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+        let mut frame = Vec::with_capacity(len);
+        frame.extend_from_slice(packet.header);
+        for part in packet.payload {
+            frame.extend_from_slice(part.bytes());
+        }
+        self.outgoing.borrow_mut().push_back(frame);
         Ok(TxOutcome::Submitted)
     }
 }

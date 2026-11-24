@@ -2863,6 +2863,11 @@ impl Endpoint {
         self.tx_pool_charged
     }
 
+    #[cfg(test)]
+    pub(crate) fn tx_pool_live(&self) -> usize {
+        self.tx_pool.live()
+    }
+
     fn settle_tx_pool_charge(&mut self) {
         let storage = self.tx_pool.storage_bytes();
         let old = core::mem::replace(&mut self.tx_pool_charged, storage);

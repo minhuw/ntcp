@@ -12,7 +12,7 @@
 // completed request (both sides together), and nanoseconds of one idle drive
 // plus event drain of the client with its connections open, each the
 // minimum over repetitions. --idle-only measures (and profiles) only that.
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+use ntcp_io::{PacketIo, PacketLayer, TransmitError, TransmitRequest, TxOutcome, TxPacket};
 use ntcp_native::{
     CallerTimebase, ConnId, EthernetNextHop, Event, Link, Network, NetworkConfig, ReadOutcome,
     WorkBudget, WriteOptions,
@@ -68,6 +68,29 @@ impl PacketIo for Wire {
         let mut frame = frames.spare.pop().unwrap_or_default();
         frame.clear();
         frame.extend_from_slice(packet);
+        frames.queued.push_back(frame);
+        Ok(TxOutcome::Submitted)
+    }
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        if request.timestamp.is_some_and(|t| !t.software && !t.hardware) {
+            return Err(TransmitError::InvalidInput);
+        }
+        if request != TransmitRequest::default() {
+            return Err(TransmitError::Unsupported);
+        }
+        let len = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+        let mut frames = self.outgoing.borrow_mut();
+        let mut frame = frames.spare.pop().unwrap_or_default();
+        frame.clear();
+        frame.reserve(len);
+        frame.extend_from_slice(packet.header);
+        for part in packet.payload {
+            frame.extend_from_slice(part.bytes());
+        }
         frames.queued.push_back(frame);
         Ok(TxOutcome::Submitted)
     }

@@ -152,9 +152,10 @@ impl NetworkConfig {
     ///
     /// On a backend that segments TCP aggregates
     /// (`PacketIo::tcp_segmentation_capabilities`, read here and when the
-    /// Network is built, so a backend's segmentation is enabled first) each
-    /// reservation also holds the payload of the largest aggregate, about
-    /// 64 KiB on a DPDK port.
+    /// Network is built, so a backend's segmentation is enabled first), output
+    /// reservations retain only TCP headers and references to payload chunks
+    /// rather than full aggregate byte buffers, so GSO does not add per-reservation
+    /// payload buffer overhead.
     pub fn buffer_budget(&self, connections: usize, io: &impl PacketIo) -> Option<usize> {
         let reservations = self.tcp.max_connections.checked_add(1)?;
         self.tcp
@@ -184,10 +185,10 @@ impl NetworkConfig {
         let low = limit / 4 * 3;
         (low * PAGE, limit * PAGE, low * 2 * PAGE)
     }
-    // The TCP packet an output reservation holds: the driver polls each
-    // into its frame after the link and IP headers, so no packet it
+    // The TCP packet an output reservation bounds: the driver polls each
+    // into its frame after the link and IP headers, so no single segment it
     // encodes, the first segment of an aggregate included, is larger. An
-    // aggregate's further payload has its own room (`gso`).
+    // aggregate's further payload is bounded by `gso`.
     pub(crate) fn reservation_packet_bytes(&self) -> usize {
         self.mtu as usize - if self.local_address.is_ipv4() { 20 } else { 40 }
     }
@@ -197,8 +198,8 @@ impl NetworkConfig {
     // largest aggregate, after the link, IP and TCP headers of its frame,
     // and the backend's segments. None without segmentation, or when an
     // aggregate cannot carry two segments of the MTU's size (a DPDK port
-    // without multi-segment mbufs): no aggregate could form, and the
-    // reservations' room would go unused.
+    // without multi-segment mbufs): no aggregate could form, so GSO
+    // selection stays off.
     pub(crate) fn gso(&self, io: &impl PacketIo) -> Option<ntcp::GsoLimits> {
         let capabilities = io.tcp_segmentation_capabilities()?;
         let ip = if self.local_address.is_ipv4() { 20 } else { 40 };

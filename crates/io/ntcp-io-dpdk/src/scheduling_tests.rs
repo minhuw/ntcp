@@ -392,6 +392,10 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         chunk_and_transmit_packet_ring_test(&mut io);
         segmented_network(io);
         assert_eq!(ntcp_test_available(), 1023);
+        let io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
+        dpdk_chunk_source_network(io);
+        assert_eq!(ntcp_test_available(), 1023);
+        assert_eq!(chunk::live_dpdk_chunks(), 0);
         for offload in [true, false] {
             let io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
             checksummed_network(io, offload);
@@ -1166,10 +1170,57 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
         }
         unsafe { ntcp_test_tx_free(m) };
 
-        // Lowering copybreak to 0 sends even short (<60) frames via extbuf + pad mbuf.
-        io.set_tx_copybreak(0);
+        // Copy path also pads short (<60) non-TSO frames with trailing zeros
+        // up to 60 bytes, matching the extbuf path.
+        io.set_tx_copybreak(DEFAULT_TX_COPYBREAK);
+        let short_hdr_only = [0x33u8; 54];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &short_hdr_only,
+                    payload: &[],
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.nb_segs, 1);
+        assert_eq!(info.pkt_len, 60);
+        assert_eq!(segs[0].external, 0);
+        let mut wire = vec![0u8; 60];
+        unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), 60) };
+        assert_eq!(&wire[..54], &short_hdr_only);
+        assert_eq!(&wire[54..60], &[0u8; 6]);
+        unsafe { ntcp_test_tx_free(m) };
+
         let short_hdr = [0x22u8; 34];
         let short_part = [TxPart::Chunk(ChunkSlice::new(&c, 10..20).unwrap())];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &short_hdr,
+                    payload: &short_part,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.nb_segs, 1);
+        assert_eq!(info.pkt_len, 60);
+        assert_eq!(segs[0].external, 0);
+        let mut wire = vec![0u8; 60];
+        unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), 60) };
+        assert_eq!(&wire[..34], &short_hdr);
+        assert_eq!(&wire[34..44], &data[10..20]);
+        assert_eq!(&wire[44..60], &[0u8; 16]);
+        unsafe { ntcp_test_tx_free(m) };
+
+        // Lowering copybreak to 0 sends even short (<60) frames via extbuf + pad mbuf.
+        io.set_tx_copybreak(0);
         assert_eq!(
             io.transmit_packet(
                 &TxPacket {
@@ -1628,4 +1679,197 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
 
     io.shared_limit = None;
     assert_eq!(unsafe { ntcp_test_available() }, 1023);
+    assert_eq!(chunk::live_dpdk_chunks(), 0);
+}
+
+// End-to-end ntcp-native over Dpdk with DpdkChunkSource + transmit_packet:
+// exercises (a) small scalar writes (<= 512 B copybreak path, no extbuf),
+// (b) large scalar writes (> 512 B single-MSS extbuf zero-copy path), and
+// (c) multi-MSS TSO aggregates over extbuf, verifying bit-exact delivery and
+// zero mbuf or EAL chunk leaks.
+unsafe fn dpdk_chunk_source_network(mut io: Dpdk) {
+    use ntcp_native::{
+        EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, WorkBudget, WriteOptions,
+    };
+    // Enable multi-seg extbuf + DpdkChunkSource and TSO in this private test
+    // fixture (ring PMD does not expose tx_queue_info_get or TSO caps).
+    io.shared_limit = Some(8);
+    io.tso = Some(TsoConfig {
+        mtu: 1500,
+        room: 128,
+        max_descriptors: 512,
+    });
+    let link = |side: u8| Link::Ethernet {
+        local_mac: [2, 0, 0, 0, 0, side],
+        next_hop: EthernetNextHop::Fixed([2, 0, 0, 0, 0, 3 - side]),
+    };
+    let config = |address: &str, side: u8| {
+        let mut config = NetworkConfig::new(address.parse().unwrap(), 1500);
+        config.tcp.max_connections = 2;
+        config.tcp.connection.send_capacity = 256 * 1024;
+        config.tcp.connection.receive_capacity = 256 * 1024;
+        config.tcp.connection.nagle = false;
+        config.link = link(side);
+        config
+    };
+    let headroom = |config: &NetworkConfig| 2 * (72 * config.tcp.connection.send_capacity + 65536);
+    let mut ca = config("10.76.0.1", 1);
+    ca.tcp.max_buffer_bytes = ca.buffer_budget(2, &io).unwrap() + headroom(&ca);
+    let incoming = Rc::new(RefCell::new(VecDeque::new()));
+    let outgoing = Rc::new(RefCell::new(VecDeque::new()));
+    let peer = Peer {
+        incoming: incoming.clone(),
+        outgoing: outgoing.clone(),
+    };
+    let mut cb = config("10.76.0.2", 2);
+    cb.tcp.max_buffer_bytes = cb.buffer_budget(2, &peer).unwrap() + headroom(&cb);
+
+    let mut a = Network::new(ca, io, [3; 32], 0).unwrap();
+    let mut b = Network::new(cb, peer, [4; 32], 0).unwrap();
+    let listener = b.listen(9100, 1).unwrap();
+    let client = a.connect("10.76.0.2:9100".parse().unwrap()).unwrap();
+
+    // Planned writes:
+    // - 4 small writes <= 512 B (copybreak path)
+    // - 4 large single-MSS writes > 512 B (scalar extbuf zero-copy path)
+    // - 1 bulk 48 KiB write (TSO extbuf zero-copy path)
+    let write_sizes: &[usize] = &[64, 180, 320, 500, 900, 1100, 1300, 1400, 48 * 1024];
+    let total_len: usize = write_sizes.iter().sum();
+    let expected: Vec<u8> = (0..total_len).map(|i| ((i * 19 + 5) % 251) as u8).collect();
+
+    // Ring PMD lacks `rte_eth_tx_done_cleanup` (normal `enable_zero_copy`
+    // rejects it; this private fixture injects `shared_limit` directly), so
+    // drive with `reclaim = 0` while dequeuing/freeing TX mbufs explicitly.
+    let budget = WorkBudget::new(64, 64, 64, 0);
+    let mut server = None;
+    let mut received = Vec::with_capacity(total_len);
+    let mut out = vec![0u8; 65536];
+    let mut wire = vec![0u8; MAX_PACKET_LEN];
+    let mut backlog = VecDeque::new();
+
+    let mut phase = 0usize;
+    let mut written_total = 0usize;
+    let mut phase_target = 0usize;
+    let mut small_copy_segs = 0usize;
+    let mut large_ext_scalar_segs = 0usize;
+    let mut tso_ext_aggregates = 0usize;
+
+    for step in 1..20_000u64 {
+        let now = step * 1000;
+        // Start next write once the peer has received the previous phase, so
+        // small and large scalar writes are never coalesced across phases.
+        if server.is_some() && phase < write_sizes.len() && received.len() == phase_target {
+            let chunk_len = write_sizes[phase];
+            if let Ok(receipt) = a.try_write(
+                client,
+                &expected[written_total..written_total + chunk_len],
+                WriteOptions::default(),
+            ) {
+                assert_eq!(receipt.accepted, chunk_len);
+                written_total += chunk_len;
+                phase_target = written_total;
+                phase += 1;
+            }
+        }
+        a.drive(now, budget).unwrap();
+        loop {
+            let mut info = TestTxInfo::default();
+            let mut segs = [TestTxSeg::default(); 16];
+            let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 16) };
+            if m.is_null() {
+                break;
+            }
+            let pkt_len = info.pkt_len as usize;
+            let got = unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), pkt_len as u32) };
+            assert_eq!(got as usize, pkt_len);
+            let frame = &wire[..pkt_len];
+            let has_ext = segs[..info.nb_segs as usize]
+                .iter()
+                .any(|s| s.external != 0);
+            if info.tso_segsz > 0 {
+                assert!(
+                    has_ext,
+                    "TSO aggregate ({pkt_len}B) should attach DpdkChunkSource extbufs"
+                );
+                tso_ext_aggregates += 1;
+                incoming
+                    .borrow_mut()
+                    .extend(cut(frame, info.tso_segsz as usize));
+            } else {
+                if pkt_len >= 54 && frame[12..14] == [0x08, 0x00] && frame[23] == 6 {
+                    let ip_hdr = usize::from(frame[14] & 0x0f) * 4;
+                    let ip_total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+                    let tcp_hdr = usize::from(frame[14 + ip_hdr + 12] >> 4) * 4;
+                    let tcp_payload = ip_total.saturating_sub(ip_hdr + tcp_hdr);
+                    if tcp_payload > 0 && tcp_payload <= DEFAULT_TX_COPYBREAK {
+                        assert!(
+                            !has_ext,
+                            "small scalar ({tcp_payload}B <= copybreak) must use copy path"
+                        );
+                        small_copy_segs += 1;
+                    } else if tcp_payload > DEFAULT_TX_COPYBREAK {
+                        assert!(
+                            has_ext,
+                            "large scalar ({tcp_payload}B > copybreak) must attach DpdkChunkSource extbuf"
+                        );
+                        large_ext_scalar_segs += 1;
+                    }
+                }
+                incoming.borrow_mut().push_back(frame.to_vec());
+            }
+            unsafe { ntcp_test_tx_free(m) };
+        }
+        b.drive(now, budget).unwrap();
+        backlog.extend(outgoing.borrow_mut().drain(..));
+        while let Some(pkt) = backlog.front() {
+            if unsafe { ntcp_test_inject(pkt.as_ptr(), pkt.len() as u32) } != 0 {
+                break;
+            }
+            backlog.pop_front();
+        }
+        if server.is_none() {
+            server = b.accept(listener).ok();
+        }
+        if let Some(srv) = server {
+            while let Ok(ReadOutcome::Data { len, .. }) = b.try_read(srv, &mut out) {
+                received.extend_from_slice(&out[..len]);
+            }
+        }
+        if received.len() == total_len {
+            break;
+        }
+    }
+
+    assert_eq!(received, expected);
+    assert_eq!(b.counters().tcp_checksum_errors, 0);
+    assert!(
+        small_copy_segs >= 4,
+        "expected >=4 copybreak segments, got {small_copy_segs}"
+    );
+    assert!(
+        large_ext_scalar_segs >= 4,
+        "expected >=4 extbuf scalar segments, got {large_ext_scalar_segs}"
+    );
+    assert!(
+        tso_ext_aggregates >= 1,
+        "expected >=1 extbuf TSO aggregates, got {tso_ext_aggregates}"
+    );
+
+    // Drain any residual frames on the rings before drop.
+    for step in 0..4 {
+        a.drive(30_000_000 + step, budget).unwrap();
+        let mut info = TestTxInfo::default();
+        let mut segs = [TestTxSeg::default(); 16];
+        loop {
+            let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 16) };
+            if m.is_null() {
+                break;
+            }
+            unsafe { ntcp_test_tx_free(m) };
+        }
+    }
+    drop(a);
+    drop(b);
+    assert_eq!(unsafe { ntcp_test_available() }, 1023);
+    assert_eq!(chunk::live_dpdk_chunks(), 0);
 }

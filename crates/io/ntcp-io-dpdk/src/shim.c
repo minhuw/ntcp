@@ -936,6 +936,16 @@ int ntcp_dpdk_packet_transmit_copy(uint16_t port, uint16_t queue, void *pool,
             return status;
         }
     }
+    // Ethernet padding for short non-TSO frames (matches extbuf path).
+    if (total < 60 && !offload->mss) {
+        static const uint8_t zero_pad[60] = {0};
+        status = copy_bytes_into_chain(pool, head, &cur, &dst, &cur_rem,
+                                       zero_pad, 60 - total);
+        if (status != 0) {
+            rte_pktmbuf_free(head);
+            return status;
+        }
+    }
     return prepare_and_send(port, queue, head, offload);
 }
 

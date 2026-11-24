@@ -4,6 +4,23 @@ use std::{
     ptr::{self, NonNull},
     sync::{Arc, Mutex},
 };
+#[cfg(all(test, feature = "test-pmd"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(all(test, feature = "test-pmd"))]
+static LIVE_DPDK_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(test, feature = "test-pmd"))]
+pub(crate) fn live_dpdk_chunks() -> usize {
+    LIVE_DPDK_CHUNKS.load(Ordering::SeqCst)
+}
+
+unsafe fn free_dpdk_chunk(raw: *mut c_void) {
+    #[cfg(all(test, feature = "test-pmd"))]
+    LIVE_DPDK_CHUNKS.fetch_sub(1, Ordering::SeqCst);
+    // SAFETY: caller guarantees exclusive ownership (refcnt == 0).
+    unsafe { ntcp_dpdk_chunk_free(raw) };
+}
 
 pub(crate) const DEFAULT_DPDK_CHUNK_SIZE: usize = 16 * 1024;
 pub(crate) const CHUNK_RECYCLER_CAP: usize = 64;
@@ -59,7 +76,7 @@ impl Drop for ChunkRecycler {
         let state = self.free.get_mut().unwrap_or_else(|e| e.into_inner());
         for raw in state.chunks.drain(..) {
             // SAFETY: exclusively owned by the free list; refcnt is 0.
-            unsafe { ntcp_dpdk_chunk_free(raw.0.as_ptr()) };
+            unsafe { free_dpdk_chunk(raw.0.as_ptr()) };
         }
     }
 }
@@ -84,7 +101,7 @@ unsafe extern "C" fn chunk_recycle_cb(chunk: *mut c_void, recycler_raw: *mut c_v
         if !recycled {
             // SAFETY: refcnt reached 0 and the chunk was not returned to the
             // free list, so we hold exclusive ownership to free it into EAL.
-            unsafe { ntcp_dpdk_chunk_free(raw.as_ptr()) };
+            unsafe { free_dpdk_chunk(raw.as_ptr()) };
         }
     }
 }
@@ -128,7 +145,7 @@ impl Drop for DpdkChunkSource {
         };
         for raw in drained {
             // SAFETY: exclusively owned by the free list; refcnt is 0.
-            unsafe { ntcp_dpdk_chunk_free(raw.0.as_ptr()) };
+            unsafe { free_dpdk_chunk(raw.0.as_ptr()) };
         }
     }
 }
@@ -178,6 +195,8 @@ impl TxChunkSource for DpdkChunkSource {
                 drop(unsafe { Arc::from_raw(recycler_raw.cast::<ChunkRecycler>()) });
                 return None;
             }
+            #[cfg(all(test, feature = "test-pmd"))]
+            LIVE_DPDK_CHUNKS.fetch_add(1, Ordering::SeqCst);
             ptr
         };
         let data = NonNull::new(data)?;
