@@ -133,6 +133,19 @@ impl RxFrame {
         core::ptr::eq(self.vtable, &HEAP)
     }
 
+    /// Retain the part of this frame covered by `bytes`, if the slice is
+    /// contained in it. The original allocation lives until frame release.
+    #[inline]
+    pub fn retain_slice(&mut self, bytes: &[u8]) -> bool {
+        let offset = (bytes.as_ptr() as usize).wrapping_sub(self.data.as_ptr() as usize);
+        if bytes.len() > self.len() || offset > self.len() - bytes.len() {
+            return false;
+        }
+        self.advance(offset);
+        self.truncate(bytes.len());
+        true
+    }
+
     /// Drops the first `count` bytes, as a holder trims data it already has
     /// or no longer wants. Trimming moves and releases nothing: bytes the
     /// frame covered stay valid and unchanged until it is dropped, so a
@@ -270,5 +283,160 @@ mod tests {
         let moved = vec![frame];
         drop(moved);
         assert_eq!(RELEASED.load(Ordering::SeqCst), before + 1);
+    }
+
+    struct RetainElement {
+        released: std::sync::Arc<AtomicUsize>,
+        bytes: [u8; 32],
+    }
+
+    static RETAIN_COUNTING: RxFrameVtable = RxFrameVtable {
+        release: release_retain_counting,
+    };
+
+    unsafe fn release_retain_counting(context: *mut (), token: usize) {
+        assert_eq!(context as usize, token);
+        let element = unsafe { std::boxed::Box::from_raw(context.cast::<RetainElement>()) };
+        element.released.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn backend_frame(
+        bytes: [u8; 32],
+        start: usize,
+        len: usize,
+    ) -> (*const u8, std::sync::Arc<AtomicUsize>, RxFrame) {
+        let released = std::sync::Arc::new(AtomicUsize::new(0));
+        let element = std::boxed::Box::into_raw(std::boxed::Box::new(RetainElement {
+            released: std::sync::Arc::clone(&released),
+            bytes,
+        }));
+        let base = unsafe { core::ptr::addr_of!((*element).bytes).cast::<u8>() };
+        let frame = unsafe {
+            RxFrame::from_raw_parts(
+                NonNull::new(base.add(start).cast_mut()).unwrap(),
+                len as u32,
+                32,
+                &RETAIN_COUNTING,
+                element.cast(),
+                element as usize,
+            )
+        };
+        (base, released, frame)
+    }
+
+    #[test]
+    fn retain_slice_trims_valid_subranges_and_preserves_truesize() {
+        let mut backing = [0u8; 32];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+
+        // Prefix
+        let released = {
+            let (base, released, mut frame) = backend_frame(backing, 4, 16);
+            let prefix = unsafe { slice::from_raw_parts(base.add(4), 6) };
+            assert!(frame.retain_slice(prefix));
+            assert_eq!(frame.as_slice(), &backing[4..10]);
+            assert_eq!(frame.truesize(), 32);
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            released
+        };
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+
+        // Suffix
+        let released = {
+            let (base, released, mut frame) = backend_frame(backing, 4, 16);
+            let suffix = unsafe { slice::from_raw_parts(base.add(14), 6) };
+            assert!(frame.retain_slice(suffix));
+            assert_eq!(frame.as_slice(), &backing[14..20]);
+            assert_eq!(frame.truesize(), 32);
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            released
+        };
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+
+        // Middle, then chained trim to a narrower middle
+        let released = {
+            let (base, released, mut frame) = backend_frame(backing, 4, 16);
+            let mid = unsafe { slice::from_raw_parts(base.add(7), 9) };
+            assert!(frame.retain_slice(mid));
+            assert_eq!(frame.as_slice(), &backing[7..16]);
+            let inner = unsafe { slice::from_raw_parts(base.add(9), 4) };
+            assert!(frame.retain_slice(inner));
+            assert_eq!(frame.as_slice(), &backing[9..13]);
+            assert_eq!(frame.truesize(), 32);
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            released
+        };
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+
+        // Exact full slice
+        let released = {
+            let (base, released, mut frame) = backend_frame(backing, 4, 16);
+            let full = unsafe { slice::from_raw_parts(base.add(4), 16) };
+            assert!(frame.retain_slice(full));
+            assert_eq!(frame.as_slice(), &backing[4..20]);
+            assert_eq!(frame.truesize(), 32);
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            released
+        };
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+
+        // Empty slices at start, middle, and end
+        for offset in [4, 11, 20] {
+            let released = {
+                let (base, released, mut frame) = backend_frame(backing, 4, 16);
+                let empty = unsafe { slice::from_raw_parts(base.add(offset), 0) };
+                assert!(frame.retain_slice(empty));
+                assert!(frame.is_empty());
+                assert_eq!(frame.as_ptr(), unsafe { base.add(offset) });
+                assert_eq!(frame.truesize(), 32);
+                assert_eq!(released.load(Ordering::SeqCst), 0);
+                released
+            };
+            assert_eq!(released.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn retain_slice_rejects_out_of_bounds_without_modifying_frame() {
+        let mut backing = [0u8; 32];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let unrelated = [4u8, 5, 6, 7];
+
+        let released = {
+            let (base, released, mut frame) = backend_frame(backing, 4, 16);
+            let orig_ptr = frame.as_ptr();
+            let orig_len = frame.len();
+
+            // Unrelated allocation
+            assert!(!frame.retain_slice(&unrelated));
+            // Starts before the active frame range
+            let before_start = unsafe { slice::from_raw_parts(base.add(3), 4) };
+            assert!(!frame.retain_slice(before_start));
+            // Empty slice before the active frame range
+            let empty_before = unsafe { slice::from_raw_parts(base.add(3), 0) };
+            assert!(!frame.retain_slice(empty_before));
+            // Extends past the active frame end
+            let past_end = unsafe { slice::from_raw_parts(base.add(16), 5) };
+            assert!(!frame.retain_slice(past_end));
+            // Longer than the active frame
+            let too_long = unsafe { slice::from_raw_parts(base.add(4), 17) };
+            assert!(!frame.retain_slice(too_long));
+            // Empty slice past the active frame end
+            let empty_after = unsafe { slice::from_raw_parts(base.add(21), 0) };
+            assert!(!frame.retain_slice(empty_after));
+
+            // Frame is completely unchanged and unreleased
+            assert_eq!(frame.as_ptr(), orig_ptr);
+            assert_eq!(frame.len(), orig_len);
+            assert_eq!(frame.as_slice(), &backing[4..20]);
+            assert_eq!(frame.truesize(), 32);
+            assert_eq!(released.load(Ordering::SeqCst), 0);
+            released
+        };
+        assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 }

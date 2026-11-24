@@ -550,6 +550,11 @@ impl EncodedIpv4Options {
 //# A TCP implementation MAY support the Timestamp (MAY-10) and Record
 //# Route (MAY-11) Options.
 impl OutgoingIpv4Options {
+    /// Whether the packet can use the unextended IP header.
+    pub fn is_empty(&self) -> bool {
+        self.source_route.is_none() && self.record_route_slots.is_none() && self.timestamp.is_none()
+    }
+
     //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
     //# The internet header padding is used to ensure that the internet
     //# header ends on a 32 bit boundary. The padding is zero.
@@ -613,10 +618,7 @@ impl OutgoingIpv4Options {
         if !unicast(source) || !unicast(final_destination) {
             return Err(Ipv4OptionsError::InvalidAddress);
         }
-        if self.source_route.is_none()
-            && self.record_route_slots.is_none()
-            && self.timestamp.is_none()
-        {
+        if self.is_empty() {
             return Ok((final_destination, 0));
         }
         let mut bytes = [0u8; 40];

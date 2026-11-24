@@ -82,9 +82,10 @@ pub use connection::{
     KeepaliveConfig, NetworkError, PacingConfig, State, TimestampGranularity, ScopedTuple, TransportInfo, Tuple,
 };
 pub use endpoint::{
-    ActiveOpenOptions, AddressValidation, ConfirmedProbe, ConnectionId, CorrelatedPmtu,
-    CorrelatedSegment, Endpoint, EndpointConfig, EndpointError, Event, InputDisposition,
-    ListenerId, PendingPmtuApplied, PhysicalReceipt, PollTransmit, Transmit,
+    ActiveOpenOptions, AddressValidation, ConfirmedProbe, ConnectedIpHeader, ConnectionId,
+    CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError, Event,
+    InputDisposition, IpHeader, ListenerId, PendingPmtuApplied, PhysicalReceipt, PollTransmit,
+    Transmit,
 };
 pub use ipv4_options::{
     EncodedIpv4Options, ExpectedRegistrations, ExpectedTimestamps, Ipv4Options, Ipv4OptionsError,

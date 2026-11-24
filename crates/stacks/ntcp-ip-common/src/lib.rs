@@ -20,8 +20,8 @@ pub enum Error {
     Quote,
 }
 
-// Two words at a time go into a 64-bit sum, folded at the end of each
-// block. A carry out of a word's position is the end-around carry
+// Accumulate native words, folding at the end of each block. A carry
+// out of a word's position is the end-around carry
 // (2^16 is congruent to 1 modulo 2^16 - 1), and a nonzero sum never folds
 // to zero. An odd final octet is padded with zero.
 //= https://www.rfc-editor.org/rfc/rfc791#section-3.1
@@ -30,12 +30,25 @@ pub enum Error {
 //# checksum, the value of the checksum field is zero.
 #[inline]
 pub fn checksum(bytes: &[u8]) -> u16 {
+    checksum_with_sum(bytes, 0)
+}
+
+/// The Internet checksum with the sum of an even-length prefix. The prefix
+/// may still contain carries (e.g. addresses and TCP header fields).
+#[inline]
+pub fn checksum_with_sum(bytes: &[u8], prefix: u64) -> u16 {
     // Even a slice larger than the IPv6 jumbogram limit has a bounded sum.
     const BLOCK: usize = 1 << 30;
-    if bytes.len() <= BLOCK {
-        return checksum_block(bytes);
+    checksum_with_sum_blocks(bytes, prefix, BLOCK)
+}
+
+#[inline]
+fn checksum_with_sum_blocks(bytes: &[u8], prefix: u64, block_size: usize) -> u16 {
+    if bytes.len() <= block_size {
+        return checksum_block(bytes, prefix);
     }
-    checksum_chunked(bytes, BLOCK)
+    let sum = !checksum_chunked(bytes, block_size);
+    checksum_block(&sum.to_be_bytes(), prefix)
 }
 
 #[cold]
@@ -43,20 +56,54 @@ fn checksum_chunked(bytes: &[u8], block_size: usize) -> u16 {
     debug_assert!(block_size > 0 && block_size.is_multiple_of(2));
     let mut sum = 0u32;
     for block in bytes.chunks(block_size) {
-        sum += u32::from(!checksum_block(block));
+        sum += u32::from(!checksum_block(block, 0));
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
 }
 
 #[inline]
-fn checksum_block(bytes: &[u8]) -> u16 {
-    // Add in native byte order. Swapping every word swaps the two bytes
-    // of the final folded sum, so one conversion suffices for the packet.
-    let (pairs, rest) = bytes.as_chunks::<4>();
-    let mut wide = 0u64;
-    for &pair in pairs {
-        wide += u64::from(u32::from_ne_bytes(pair));
+fn checksum_block(bytes: &[u8], prefix: u64) -> u16 {
+    // Sum native words with end-around carry. Two independent chains
+    // overlap on long buffers. Each 64-byte run folds its last carry
+    // once, with no per-word widening.
+    #[inline]
+    fn add(sum: u64, word: u64) -> u64 {
+        let (sum, carry) = sum.overflowing_add(word);
+        sum + u64::from(carry)
+    }
+    // Multiplication by 256 swaps the octets modulo 65535. First bring
+    // the network-order prefix below 2^33 so the shift fits.
+    let prefix = (prefix & 0xffff_ffff) + (prefix >> 32);
+    let mut first = prefix << if cfg!(target_endian = "little") { 8 } else { 0 };
+    let mut second = 0u64;
+    let (pairs, rest) = bytes.as_chunks::<128>();
+    for pair in pairs {
+        let words = pair.as_chunks::<8>().0;
+        let (mut a, mut b) = (false, false);
+        for i in 0..8 {
+            (first, a) = first.carrying_add(u64::from_ne_bytes(words[i]), a);
+            (second, b) = second.carrying_add(u64::from_ne_bytes(words[i + 8]), b);
+        }
+        first += u64::from(a);
+        second += u64::from(b);
+    }
+    let mut total = add(first, second);
+    let (lines, rest) = rest.as_chunks::<64>();
+    if let Some(line) = lines.first() {
+        let mut carry = false;
+        for &word in line.as_chunks::<8>().0 {
+            (total, carry) = total.carrying_add(u64::from_ne_bytes(word), carry);
+        }
+        total += u64::from(carry);
+    }
+    let (words, rest) = rest.as_chunks::<8>();
+    for &word in words {
+        total = add(total, u64::from_ne_bytes(word));
+    }
+    let (word, rest) = rest.as_chunks::<4>();
+    if let Some(&word) = word.first() {
+        total = add(total, u64::from(u32::from_ne_bytes(word)));
     }
     let tail = match rest {
         [a, b, c] => [*a, *b, *c, 0],
@@ -64,7 +111,7 @@ fn checksum_block(bytes: &[u8]) -> u16 {
         [a] => [*a, 0, 0, 0],
         _ => [0; 4],
     };
-    wide += u64::from(u32::from_ne_bytes(tail));
+    let wide = add(total, u64::from(u32::from_ne_bytes(tail)));
     let (half, carry) = (wide as u32).overflowing_add((wide >> 32) as u32);
     let half = half + u32::from(carry);
     let sum = (half & 0xffff) + (half >> 16);
@@ -195,7 +242,7 @@ pub fn parse_udp(source: IpAddr, destination: IpAddr, payload: &[u8]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{checksum, checksum_chunked};
+    use super::{checksum, checksum_chunked, checksum_with_sum, checksum_with_sum_blocks};
 
     // RFC 1071's sum of 16-bit words, folded after every word.
     fn reference(bytes: &[u8]) -> u16 {
@@ -228,6 +275,83 @@ mod tests {
             let ones = [0xff; 65536];
             assert_eq!(checksum(&ones[..len]), reference(&ones[..len]));
             assert_eq!(checksum(&[0; 64][..len.min(64)]), 0xffff);
+        }
+    }
+
+    #[test]
+    fn prefix_sum_matches_network_order_words() {
+        // Extend well past 128 and 256 bytes so the 128-byte dual-accumulator
+        // loop, 64-byte tail, 8-byte/4-byte tails, and 0..3 byte tails all run
+        // with nonzero prefixes.
+        let mut bytes = [0u8; 320];
+        for (i, b) in bytes[8..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(41).wrapping_add(7);
+        }
+        let prefixes = [0u64, 1, 0xffff, 0x10000, 0xff00_1234_abcd_ffff, u64::MAX];
+        for prefix in prefixes {
+            bytes[..8].copy_from_slice(&prefix.to_be_bytes());
+            for end in 8..=bytes.len() {
+                assert_eq!(
+                    checksum_with_sum(&bytes[8..end], prefix),
+                    reference(&bytes[..end])
+                );
+            }
+        }
+        // All-ones payload past 256 bytes with maximum prefix forces carries on
+        // every step of the 128-byte pair loop.
+        let mut ones = [0xffu8; 275];
+        for prefix in prefixes {
+            ones[..8].copy_from_slice(&prefix.to_be_bytes());
+            for len in [0, 1, 63, 64, 127, 128, 129, 255, 256, 257, 267] {
+                assert_eq!(
+                    checksum_with_sum(&ones[8..8 + len], prefix),
+                    reference(&ones[..8 + len])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_prefix_checksum_matches_reference() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut bytes = [0u8; 265];
+        for byte in &mut bytes[8..] {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        let prefixes = [0u64, 1, 0xffff, 0x10000, 0xff00_1234_abcd_ffff, u64::MAX];
+        for block_size in [2, 4, 8, 16, 64, 128] {
+            for prefix in prefixes {
+                bytes[..8].copy_from_slice(&prefix.to_be_bytes());
+                for len in [
+                    0, 1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+                ] {
+                    assert_eq!(
+                        checksum_with_sum_blocks(&bytes[8..8 + len], prefix, block_size),
+                        reference(&bytes[..8 + len])
+                    );
+                }
+
+                let mut ones = [0xffu8; 139];
+                ones[..8].copy_from_slice(&prefix.to_be_bytes());
+                for len in [0, 1, 2, 3, 7, 16, 65, 129, 131] {
+                    assert_eq!(
+                        checksum_with_sum_blocks(&ones[8..8 + len], prefix, block_size),
+                        reference(&ones[..8 + len])
+                    );
+                }
+
+                let mut zeros = [0u8; 73];
+                zeros[..8].copy_from_slice(&prefix.to_be_bytes());
+                for len in [0, 1, 4, 17, 65] {
+                    assert_eq!(
+                        checksum_with_sum_blocks(&zeros[8..8 + len], prefix, block_size),
+                        reference(&zeros[..8 + len])
+                    );
+                }
+            }
         }
     }
 

@@ -261,6 +261,63 @@ pub struct FragmentPacket<'a> {
     pub payload: &'a [u8],
 }
 
+#[inline]
+fn plain_header(bytes: &[u8], protocol: u8) -> Option<&[u8; IP_HEADER]> {
+    let header = bytes.first_chunk::<IP_HEADER>()?;
+    if header[0] != 0x45
+        || header[9] != protocol
+        || u16::from_be_bytes([header[6], header[7]]) & !0x4000 != 0
+        || usize::from(u16::from_be_bytes([header[2], header[3]])) != bytes.len()
+        || checksum(header) != 0
+    {
+        return None;
+    }
+    Some(header)
+}
+
+fn addresses(header: &[u8]) -> IpMetadata {
+    IpMetadata {
+        source: v4(&header[12..16]).into(),
+        destination: v4(&header[16..20]).into(),
+    }
+}
+
+/// A complete, checksum-validated IPv4 datagram carrying TCP, without IP
+/// options or fragmentation. The link layer can pass its validation to IP.
+#[derive(Clone, Copy)]
+pub struct PlainTcp<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> PlainTcp<'a> {
+    #[inline]
+    pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+        plain_header(bytes, PROTOCOL_TCP)?;
+        Some(Self { bytes })
+    }
+
+    pub fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// The wire source and destination of the validated IPv4 header.
+    pub fn addresses(self) -> (Ipv4Addr, Ipv4Addr) {
+        (v4(&self.bytes[12..16]), v4(&self.bytes[16..20]))
+    }
+
+    pub fn ip(self) -> IpMetadata {
+        addresses(self.bytes)
+    }
+
+    pub fn traffic_class(self) -> u8 {
+        self.bytes[1]
+    }
+
+    pub fn payload(self) -> &'a [u8] {
+        &self.bytes[IP_HEADER..]
+    }
+}
+
 /// Parse one complete IPv4 packet that may be a fragment. Validation equals
 /// `parse` except that MF and a nonzero offset are reported, not refused;
 /// alignment, overlap and reconstructed-size rules belong to reassembly,
@@ -276,10 +333,7 @@ pub fn parse_fragment(
     let options = Ipv4Options::parse(&bytes[20..header], source_routes_enabled)
         .map_err(|_| Error::Options)?;
     Ok(FragmentPacket {
-        ip: IpMetadata {
-            source: v4(&bytes[12..16]).into(),
-            destination: v4(&bytes[16..20]).into(),
-        },
+        ip: addresses(bytes),
         traffic_class: bytes[1],
         hop_limit: bytes[8],
         protocol: bytes[9],
@@ -491,6 +545,111 @@ pub fn encode_with(
     encode_present(packet, transmit.into(), PROTOCOL_TCP, len, area, len)
 }
 
+/// A validated option-free IPv4/TCP header. Consecutive segments on the
+/// same route can reuse every field except total length and checksum.
+#[derive(Default)]
+pub struct TcpHeaderCache(Option<(IpMetadata, [u8; IPV4_HEADER])>);
+
+impl TcpHeaderCache {
+    pub fn encode(
+        &mut self,
+        packet: &mut [u8],
+        transmit: &ntcp::Transmit,
+        timestamp: u32,
+    ) -> Result<usize, Error> {
+        let plain = transmit.ipv4_options.is_empty();
+        if plain
+            && let Some((ip, header)) = &mut self.0
+            && *ip == transmit.ip
+            && header[8] == transmit.hop_limit
+            && header[1] >> 2 == transmit.dscp
+            && header[1] & 3 == transmit.ecn
+        {
+            let len = IPV4_HEADER.checked_add(transmit.len).ok_or(Error::Length)?;
+            let total = u16::try_from(len).map_err(|_| Error::Length)?;
+            if packet.len() < len {
+                return Err(Error::Length);
+            }
+            let old = u16::from_be_bytes([header[2], header[3]]);
+            if total != old {
+                // RFC 1624, Eq. 3, with the changing 16-bit total length.
+                let check = u16::from_be_bytes([header[10], header[11]]);
+                let sum = u32::from(!check) + u32::from(!old) + u32::from(total);
+                let sum = (sum & 0xffff) + (sum >> 16);
+                let check = !((sum as u16).wrapping_add((sum >> 16) as u16));
+                header[2..4].copy_from_slice(&total.to_be_bytes());
+                header[10..12].copy_from_slice(&check.to_be_bytes());
+            }
+            packet[..IPV4_HEADER].copy_from_slice(header);
+            return Ok(len);
+        }
+        let len = encode_present(
+            packet,
+            (*transmit).into(),
+            PROTOCOL_TCP,
+            transmit.len,
+            Area::Originate(timestamp),
+            transmit.len,
+        )?;
+        if plain {
+            self.0 = Some((transmit.ip, packet[..IPV4_HEADER].try_into().unwrap()));
+        }
+        Ok(len)
+    }
+}
+
+/// Write the fixed IPv4 header of a connected TCP segment. Its cached
+/// transport seed already sums both addresses and the protocol octet.
+pub fn write_connected_header(
+    headroom: &mut [u8],
+    segment: ntcp::ConnectedIpHeader<'_>,
+) -> Result<usize, Error> {
+    write_connected_header_fields(
+        headroom,
+        segment.fields(),
+        segment.tcp_len(),
+        segment.address_protocol_sum(),
+    )
+}
+
+#[inline]
+fn write_connected_header_fields(
+    headroom: &mut [u8],
+    fields: ntcp::IpHeader,
+    tcp_len: usize,
+    address_protocol_sum: u16,
+) -> Result<usize, Error> {
+    let (IpAddr::V4(source), IpAddr::V4(destination)) = (fields.ip.source, fields.ip.destination)
+    else {
+        return Err(Error::Version);
+    };
+    let total = tcp_len
+        .checked_add(IPV4_HEADER)
+        .and_then(|len| u16::try_from(len).ok())
+        .ok_or(Error::Length)?;
+    let header = headroom.get_mut(..IPV4_HEADER).ok_or(Error::Length)?;
+    if fields.hop_limit == 0 || fields.dscp > 63 || fields.ecn > 3 {
+        return Err(Error::Invalid);
+    }
+    let class = fields.dscp << 2 | fields.ecn;
+    let first = u16::from_be_bytes([0x45, class]);
+    let sum = u32::from(address_protocol_sum)
+        + u32::from(first)
+        + u32::from(total)
+        + 0x4000
+        + (u32::from(fields.hop_limit) << 8);
+    let sum = (sum & 0xffff) + (sum >> 16);
+    let check = !((sum as u16).wrapping_add((sum >> 16) as u16));
+    header[..2].copy_from_slice(&first.to_be_bytes());
+    header[2..4].copy_from_slice(&total.to_be_bytes());
+    header[4..8].copy_from_slice(&[0, 0, 0x40, 0]);
+    header[8..10].copy_from_slice(&[fields.hop_limit, PROTOCOL_TCP]);
+    header[10..12].copy_from_slice(&check.to_be_bytes());
+    header[12..16].copy_from_slice(&source.octets());
+    header[16..20].copy_from_slice(&destination.octets());
+    Ok(IPV4_HEADER)
+}
+
 /// Encode IP around `len` transport bytes of `protocol` resident at
 /// `packet[IPV4_HEADER..]`; they move behind any options. Returns stored length.
 pub fn encode_datagram(
@@ -544,7 +703,7 @@ fn option_area(
             .encode_with(source, destination, provider, out)
             .map_err(|_| Error::Options),
         Area::Encoded(encoded) => {
-            if outgoing != OutgoingIpv4Options::default()
+            if !outgoing.is_empty()
                 || encoded.final_destination() != destination
             {
                 return Err(Error::Options);
@@ -802,6 +961,242 @@ fn quote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_tcp_headers_match_fresh_headers_across_lengths_and_route_changes() {
+        let mut cache = TcpHeaderCache::default();
+        let mut tx = ntcp::Transmit {
+            ip: IpMetadata {
+                source: Ipv4Addr::new(192, 0, 2, 30).into(),
+                destination: Ipv4Addr::new(198, 51, 100, 71).into(),
+            },
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+            tx_timestamp: None,
+            connection: None,
+            len: 0,
+            mark: 0,
+        };
+        let mut expected = [0x73; 4096];
+        let mut actual = expected;
+        for i in 0..512 {
+            tx.len = (i * 2047) % 4050;
+            if i == 100 {
+                tx.dscp = 46;
+            }
+            if i == 200 {
+                tx.ip.destination = Ipv4Addr::new(10, 1, 2, 1).into();
+            }
+            if i == 300 {
+                tx.ecn = 2;
+            }
+            if i == 350 {
+                tx.dscp = 18;
+            }
+            if i == 400 {
+                tx.hop_limit = 1;
+            }
+            if i == 450 {
+                tx.ip.source = Ipv4Addr::new(10, 1, 2, 99).into();
+            }
+            expected.fill(0x73);
+            actual.fill(0x73);
+            assert_eq!(cache.encode(&mut actual, &tx, 1), encode(&mut expected, tx, 1));
+            assert_eq!(actual, expected);
+        }
+        tx.dscp = 64;
+        assert_eq!(cache.encode(&mut actual, &tx, 1), Err(Error::Invalid));
+        tx.dscp = 0;
+        tx.len = usize::MAX;
+        assert_eq!(cache.encode(&mut actual, &tx, 1), Err(Error::Length));
+    }
+
+    fn ipv4_address_protocol_sum(source: Ipv4Addr, destination: Ipv4Addr) -> u16 {
+        let mut pseudo_prefix = [0u8; 10];
+        pseudo_prefix[..4].copy_from_slice(&source.octets());
+        pseudo_prefix[4..8].copy_from_slice(&destination.octets());
+        pseudo_prefix[9] = PROTOCOL_TCP;
+        let expected = !checksum(&pseudo_prefix);
+        let sum = u64::from(u32::from(source)) + u64::from(u32::from(destination)) + u64::from(PROTOCOL_TCP);
+        let sum = (sum & 0xffff) + (sum >> 16);
+        let sum = (sum & 0xffff) + (sum >> 16);
+        let seed = ((sum & 0xffff) + (sum >> 16)) as u16;
+        assert_eq!(seed, expected);
+        seed
+    }
+
+    #[test]
+    fn write_connected_header_matches_atomic_encode_across_fields_and_lengths() {
+        let pairs = [
+            (Ipv4Addr::new(192, 0, 2, 30), Ipv4Addr::new(198, 51, 100, 71)),
+            (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)),
+            (Ipv4Addr::new(223, 255, 255, 254), Ipv4Addr::new(223, 255, 255, 253)),
+        ];
+        let mut atomic = [0u8; 65536];
+        for (source, destination) in pairs {
+            let ip = IpMetadata {
+                source: source.into(),
+                destination: destination.into(),
+            };
+            let seed = ipv4_address_protocol_sum(source, destination);
+            for dscp in [0u8, 1, 18, 46, 63] {
+                for ecn in [0u8, 1, 2, 3] {
+                    for hop_limit in [1u8, 32, 64, 128, 255] {
+                        for tcp_len in [0usize, 1, 20, 21, 32, 1460, 1480, 65515] {
+                            let tx = ntcp::Transmit {
+                                ip,
+                                hop_limit,
+                                dscp,
+                                ecn,
+                                ipv4_options: OutgoingIpv4Options::default(),
+                                tx_timestamp: None,
+                                connection: None,
+                                len: tcp_len,
+                                mark: 0,
+                            };
+                            let fields = ntcp::IpHeader {
+                                ip,
+                                hop_limit,
+                                dscp,
+                                ecn,
+                            };
+                            atomic[..IPV4_HEADER].fill(0xaa);
+                            let atomic_len = encode(&mut atomic, tx, 0).unwrap();
+                            assert_eq!(atomic_len, IPV4_HEADER + tcp_len);
+
+                            let mut headroom = [0x55u8; IPV4_HEADER + 4];
+                            let written =
+                                write_connected_header_fields(&mut headroom, fields, tcp_len, seed)
+                                    .unwrap();
+                            assert_eq!(written, IPV4_HEADER);
+                            assert_eq!(&headroom[..IPV4_HEADER], &atomic[..IPV4_HEADER]);
+                            assert_eq!(checksum(&headroom[..IPV4_HEADER]), 0);
+                            assert_eq!(&headroom[IPV4_HEADER..], &[0x55; 4]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Error paths
+        let valid_ip = IpMetadata {
+            source: pairs[0].0.into(),
+            destination: pairs[0].1.into(),
+        };
+        let seed = ipv4_address_protocol_sum(pairs[0].0, pairs[0].1);
+        let mut headroom = [0u8; IPV4_HEADER];
+
+        // Non-IPv4 address -> Version
+        let v6_fields = ntcp::IpHeader {
+            ip: IpMetadata {
+                source: core::net::Ipv6Addr::LOCALHOST.into(),
+                destination: core::net::Ipv6Addr::LOCALHOST.into(),
+            },
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+        };
+        assert_eq!(
+            write_connected_header_fields(&mut headroom, v6_fields, 20, 0),
+            Err(Error::Version)
+        );
+
+        // Invalid hop_limit / dscp / ecn -> Invalid
+        for bad in [
+            ntcp::IpHeader { ip: valid_ip, hop_limit: 0, dscp: 0, ecn: 0 },
+            ntcp::IpHeader { ip: valid_ip, hop_limit: 64, dscp: 64, ecn: 0 },
+            ntcp::IpHeader { ip: valid_ip, hop_limit: 64, dscp: 0, ecn: 4 },
+        ] {
+            assert_eq!(
+                write_connected_header_fields(&mut headroom, bad, 20, seed),
+                Err(Error::Invalid)
+            );
+        }
+
+        // Length overflow and short headroom -> Length
+        let good = ntcp::IpHeader {
+            ip: valid_ip,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+        };
+        assert_eq!(
+            write_connected_header_fields(&mut headroom, good, 65516, seed),
+            Err(Error::Length)
+        );
+        assert_eq!(
+            write_connected_header_fields(&mut headroom, good, usize::MAX, seed),
+            Err(Error::Length)
+        );
+        let mut short = [0u8; IPV4_HEADER - 1];
+        assert_eq!(
+            write_connected_header_fields(&mut short, good, 20, seed),
+            Err(Error::Length)
+        );
+    }
+
+    #[test]
+    fn plain_tcp_parse_accepts_valid_and_rejects_non_plain_packets() {
+        let source = Ipv4Addr::new(192, 0, 2, 10);
+        let destination = Ipv4Addr::new(198, 51, 100, 20);
+        let tcp_payload = b"0123456789abcdefghij";
+        let tx = ntcp::Transmit {
+            ip: IpMetadata {
+                source: source.into(),
+                destination: destination.into(),
+            },
+            hop_limit: 64,
+            dscp: 12,
+            ecn: 3,
+            ipv4_options: OutgoingIpv4Options::default(),
+            tx_timestamp: None,
+            connection: None,
+            len: tcp_payload.len(),
+            mark: 0,
+        };
+        let mut packet = [0u8; IPV4_HEADER + 20];
+        packet[IPV4_HEADER..].copy_from_slice(tcp_payload);
+        let len = encode(&mut packet, tx, 0).unwrap();
+
+        let parsed = PlainTcp::parse(&packet[..len]).unwrap();
+        assert_eq!(parsed.bytes(), &packet[..len]);
+        assert_eq!(parsed.addresses(), (source, destination));
+        assert_eq!(parsed.ip(), tx.ip);
+        assert_eq!(parsed.traffic_class(), (12 << 2) | 3);
+        assert_eq!(parsed.payload(), tcp_payload);
+
+        // Truncated packet
+        assert!(PlainTcp::parse(&packet[..IPV4_HEADER - 1]).is_none());
+        // Trailing bytes (length mismatch)
+        let mut padded = [0u8; IPV4_HEADER + 21];
+        padded[..len].copy_from_slice(&packet[..len]);
+        assert!(PlainTcp::parse(&padded).is_none());
+        // Bad checksum
+        let mut bad_cksum = packet;
+        bad_cksum[10] ^= 1;
+        assert!(PlainTcp::parse(&bad_cksum).is_none());
+        // Non-TCP protocol (UDP)
+        let mut udp_pkt = [0u8; IPV4_HEADER + 20];
+        udp_pkt[IPV4_HEADER..].copy_from_slice(tcp_payload);
+        let header = Header {
+            ip: tx.ip,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: OutgoingIpv4Options::default(),
+        };
+        let udp_len = encode_datagram(&mut udp_pkt, header, PROTOCOL_UDP, 20, 0).unwrap();
+        assert!(PlainTcp::parse(&udp_pkt[..udp_len]).is_none());
+        // Non-zero fragment flags (MF set) with recomputed checksum
+        let mut mf_pkt = packet;
+        mf_pkt[6] |= 0x20;
+        mf_pkt[10..12].fill(0);
+        let sum = checksum(&mf_pkt[..IPV4_HEADER]);
+        mf_pkt[10..12].copy_from_slice(&sum.to_be_bytes());
+        assert!(PlainTcp::parse(&mf_pkt).is_none());
+    }
 
     #[test]
     fn encode_present_overwrites_dirty_buffer_across_option_lengths() {

@@ -376,6 +376,65 @@ pub enum Event {
     },
 }
 
+/// Per-datagram IP fields common to IPv4 and IPv6.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpHeader {
+    pub ip: IpMetadata,
+    pub hop_limit: u8,
+    pub dscp: u8,
+    pub ecn: u8,
+}
+
+/// IP fields of a selected socket segment and the checksum seed of its
+/// address pair and TCP protocol. The fields share the lifetime of the
+/// selection's route decision.
+#[derive(Clone, Copy)]
+pub struct ConnectedIpHeader<'a> {
+    slot: &'a Slot,
+    ip: IpMetadata,
+    len: usize,
+}
+
+impl<'a> ConnectedIpHeader<'a> {
+    pub fn fields(self) -> IpHeader {
+        IpHeader {
+            ip: self.ip,
+            hop_limit: self.slot.hop_limit,
+            dscp: self.slot.dscp,
+            ecn: self.slot.connection.last_output_ecn(),
+        }
+    }
+    pub fn ip(&self) -> &IpMetadata {
+        &self.ip
+    }
+    pub fn hop_limit(self) -> u8 {
+        self.slot.hop_limit
+    }
+    pub fn dscp(self) -> u8 {
+        self.slot.dscp
+    }
+    pub fn ecn(self) -> u8 {
+        self.slot.connection.last_output_ecn()
+    }
+    pub fn tcp_len(self) -> usize {
+        self.len
+    }
+    pub fn address_protocol_sum(self) -> u16 {
+        wire::PseudoHeader::new(self.ip)
+            .expect("connected tuple shares one address family")
+            .address_protocol_sum()
+    }
+    pub fn matches_route(self, route: &crate::ManagedRoute) -> bool {
+        let connection = &self.slot.connection;
+        connection.managed_path.as_ref().is_some_and(|binding| {
+            binding.client == route.client && binding.snapshot.stamp() == route.stamp
+        }) && self.slot.dscp == route.dscp
+            && connection.ip_header_len() == route.ip_header_len
+            && connection.scoped_tuple().zone() == route.zone
+            && self.ip.destination == route.forwarding_destination
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transmit {
     pub tx_timestamp: Option<TxTimestampToken>,

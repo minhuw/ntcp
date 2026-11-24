@@ -92,6 +92,18 @@ pub struct Segment<'a> {
     pub payload: &'a [u8],
 }
 
+impl Segment<'_> {
+    // The parser fills a contiguous prefix in wire order, starting with
+    // the DSACK block when present.
+    // Non-test callers land with the connection/endpoint ingress commits.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn carries_sack(&self) -> bool {
+        let present = self.options.sack_blocks[0].is_some();
+        debug_assert_eq!(present, self.options.sack_blocks.iter().any(Option::is_some));
+        present
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WireError {
     Truncated,
@@ -101,6 +113,62 @@ pub enum WireError {
     AddressFamily,
     TooLong,
     OutputTooSmall,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PseudoHeader {
+    limit: u32,
+    sum: u32,
+}
+
+impl PseudoHeader {
+    pub(crate) fn new(ip: IpMetadata) -> Result<Self, WireError> {
+        let (limit, addresses) = match (ip.source, ip.destination) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => (
+                u32::from(u16::MAX) - 20,
+                u64::from(u32::from(src)) + u64::from(u32::from(dst)),
+            ),
+            (IpAddr::V6(src), IpAddr::V6(dst)) => (
+                u32::MAX,
+                u64::from(add_words(add_words(0, &src.octets()), &dst.octets())),
+            ),
+            _ => return Err(WireError::AddressFamily),
+        };
+        let sum = addresses + 6;
+        let sum = (sum & 0xffff) + (sum >> 16);
+        let sum = (sum & 0xffff) + (sum >> 16);
+        Ok(Self {
+            limit,
+            sum: ((sum & 0xffff) + (sum >> 16)) as u32,
+        })
+    }
+
+    pub(crate) fn address_protocol_sum(self) -> u16 {
+        self.sum as u16
+    }
+
+    pub(crate) fn parse(self, bytes: &[u8], verified: bool) -> Result<Segment<'_>, WireError> {
+        if bytes.len() > self.limit as usize {
+            return Err(WireError::TooLong);
+        }
+        parse_segment(
+            bytes,
+            (!verified).then(|| u64::from(self.sum) + bytes.len() as u64),
+        )
+    }
+
+    fn sum(self, len: u32) -> u32 {
+        let sum = self.sum + (len & 0xffff) + (len >> 16);
+        let sum = (sum & 0xffff) + (sum >> 16);
+        (sum & 0xffff) + (sum >> 16)
+    }
+
+    fn checked_sum(self, len: usize) -> Result<u32, WireError> {
+        if len > self.limit as usize {
+            return Err(WireError::TooLong);
+        }
+        Ok(self.sum(len as u32))
+    }
 }
 
 fn checked_length(ip: IpMetadata, len: usize) -> Result<u32, WireError> {
@@ -131,31 +199,15 @@ fn add_words(sum: u32, bytes: &[u8]) -> u32 {
 //# The checksum field is the 16-bit ones' complement of the ones' complement sum of all
 //# 16-bit words in the header and text.
 pub fn checksum(ip: IpMetadata, segment: &[u8]) -> Result<u16, WireError> {
-    let len = checked_length(ip, segment.len())?;
-    let mut sum = pseudo_header_sum(ip, len)?;
-    // Only the segment's final octet can require virtual zero padding.
-    sum = add_words(sum, segment);
-    Ok(!(sum as u16))
+    let sum = PseudoHeader::new(ip)?.checked_sum(segment.len())?;
+    Ok(!(add_words(sum, segment) as u16))
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
 //# The checksum also covers a pseudo-header (Figure 2) conceptually prefixed to the TCP
 //# header. The pseudo-header is 96 bits for IPv4 and 320 bits for IPv6.
 fn pseudo_header_sum(ip: IpMetadata, len: u32) -> Result<u32, WireError> {
-    let addresses = match (ip.source, ip.destination) {
-        (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            u64::from(u32::from(source)) + u64::from(u32::from(destination))
-        }
-        (IpAddr::V6(source), IpAddr::V6(destination)) => u64::from(add_words(
-            add_words(0, &source.octets()),
-            &destination.octets(),
-        )),
-        _ => return Err(WireError::AddressFamily),
-    };
-    let sum = addresses + u64::from(len) + 6;
-    let sum = (sum & 0xffff) + (sum >> 16);
-    let sum = (sum & 0xffff) + (sum >> 16);
-    Ok(((sum & 0xffff) + (sum >> 16)) as u32)
+    Ok(PseudoHeader::new(ip)?.sum(len))
 }
 
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.2
@@ -333,7 +385,11 @@ fn aligned_timestamp(options: &[u8]) -> bool {
     options.len() == 12 && options.starts_with(&[1, 1, 8, 10])
 }
 
+#[inline]
 fn read_options(bytes: &[u8], outgoing: bool) -> Result<Options, WireError> {
+    if bytes.is_empty() {
+        return Ok(Options::default());
+    }
     if aligned_timestamp(bytes) {
         let ts = &bytes[4..];
         return Ok(Options {
@@ -406,7 +462,7 @@ pub(crate) fn write_options(options: &Options, out: &mut [u8; 40]) -> usize {
 }
 
 pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
-    parse_checked(ip, bytes, true)
+    PseudoHeader::new(ip)?.parse(bytes, false)
 }
 
 /// `parse` of a segment whose checksum is not this call's to verify: the
@@ -414,11 +470,12 @@ pub fn parse(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
 /// or this Endpoint encoded it, its checksum perhaps left for a device to
 /// complete (`ConnectionConfig::tcp_checksum_offload`).
 pub(crate) fn parse_unchecked(ip: IpMetadata, bytes: &[u8]) -> Result<Segment<'_>, WireError> {
-    parse_checked(ip, bytes, false)
+    checked_length(ip, bytes.len())?;
+    parse_segment(bytes, None)
 }
 
-fn parse_checked(ip: IpMetadata, bytes: &[u8], checksum: bool) -> Result<Segment<'_>, WireError> {
-    checked_length(ip, bytes.len())?;
+#[inline]
+fn parse_segment(bytes: &[u8], pseudo: Option<u64>) -> Result<Segment<'_>, WireError> {
     if bytes.len() < 20 {
         return Err(WireError::Truncated);
     }
@@ -436,7 +493,7 @@ fn parse_checked(ip: IpMetadata, bytes: &[u8], checksum: bool) -> Result<Segment
     // CHECKSUM_UNNECESSARY.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# and the receiver MUST check it (MUST-3).
-    if checksum && self::checksum(ip, bytes)? != 0 {
+    if pseudo.is_some_and(|sum| ntcp_ip_common::checksum_with_sum(bytes, sum) != 0) {
         return Err(WireError::InvalidChecksum);
     }
     let raw_options = &bytes[20..header_len];
@@ -523,21 +580,69 @@ pub(crate) fn encode_with(
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# The number of 32-bit words in the TCP header. This indicates where the data begins.
     //# The TCP header (even one including options) is an integer multiple of 32 bits long.
-    let header_len = 20 + options.len().div_ceil(4) * 4;
+    let pseudo = PseudoHeader::new(ip)?;
+    let option_len = options.len().div_ceil(4) * 4;
+    let ports = (u32::from(header.source_port) << 16) | u32::from(header.destination_port);
+    encode_segment(pseudo, ports, header, option_len, payload, out, partial, |area| {
+        let (encoded, padding) = area.split_at_mut(options.len());
+        encoded.copy_from_slice(options);
+        padding.fill(0);
+        None
+    })
+}
+
+/// Encode established stream output with the already negotiated options.
+/// The aligned timestamp can be written directly into the TCP header.
+// Non-test callers land with the stream-output commit.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn encode_stream(
+    pseudo_header: PseudoHeader,
+    ports: u32,
+    header: Header,
+    timestamps: Option<(u32, u32)>,
+    payload: &[u8],
+    out: &mut [u8],
+    partial: bool,
+) -> Result<usize, WireError> {
+    let option_len = if timestamps.is_some() { 12 } else { 0 };
+    encode_segment(pseudo_header, ports, header, option_len, payload, out, partial, |area| {
+        if let Some((value, echo)) = timestamps {
+            area[..4].copy_from_slice(&[1, 1, 8, 10]);
+            area[4..8].copy_from_slice(&value.to_be_bytes());
+            area[8..12].copy_from_slice(&echo.to_be_bytes());
+            Some(0x0101 + 0x080a + u64::from(value) + u64::from(echo))
+        } else {
+            Some(0)
+        }
+    })
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn encode_segment(
+    pseudo_header: PseudoHeader,
+    ports: u32,
+    header: Header,
+    option_len: usize,
+    payload: &[u8],
+    out: &mut [u8],
+    partial: bool,
+    write_options: impl FnOnce(&mut [u8]) -> Option<u64>,
+) -> Result<usize, WireError> {
+    let header_len = 20 + option_len;
     let len = header_len
         .checked_add(payload.len())
         .ok_or(WireError::TooLong)?;
-    let tcp_len = checked_length(ip, len)?;
+    if len > pseudo_header.limit as usize {
+        return Err(WireError::TooLong);
+    }
     if out.len() < len {
         return Err(WireError::OutputTooSmall);
     }
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# The content of the header beyond the End of Option List Option MUST
     //# be header padding of zeros (MUST-69).
-    out[16..18].fill(0);
-    out[20 + options.len()..header_len].fill(0);
-    out[0..2].copy_from_slice(&header.source_port.to_be_bytes());
-    out[2..4].copy_from_slice(&header.destination_port.to_be_bytes());
+    out[..4].copy_from_slice(&ports.to_be_bytes());
     out[4..8].copy_from_slice(&header.sequence.to_be_bytes());
     out[8..12].copy_from_slice(&header.acknowledgment.to_be_bytes());
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
@@ -547,7 +652,7 @@ pub(crate) fn encode_with(
     out[13] = header.flags;
     out[14..16].copy_from_slice(&header.window.to_be_bytes());
     out[18..20].copy_from_slice(&header.urgent_pointer.to_be_bytes());
-    out[20..20 + options.len()].copy_from_slice(options);
+    let option_sum = write_options(&mut out[20..header_len]);
     out[header_len..len].copy_from_slice(payload);
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //= reason=encode generates the checksum; parse rejects a nonzero checksum before exposing a segment.
@@ -555,11 +660,29 @@ pub(crate) fn encode_with(
     //# (MUST-2) and the receiver MUST check it (MUST-3).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.1
     //# While computing the checksum, the checksum field itself is replaced with zeros.
-    let pseudo = pseudo_header_sum(ip, tcp_len)?;
     let sum = if partial {
-        pseudo as u16
+        pseudo_header.sum(len as u32) as u16
+    } else if let Some(options) = option_sum {
+        // The TCP header is an even number of words. Sum the known
+        // header fields before folding with the immutable payload,
+        // without rereading the stores that constructed the header.
+        // Each 32-bit header field already represents the sum of its
+        // two 16-bit words modulo 65535, including the paired ports
+        // and the IPv6 pseudo-header's full length.
+        let fixed = pseudo_header.sum
+            + u32::from(u16::from_be_bytes([out[12], header.flags]))
+            + u32::from(header.window)
+            + u32::from(header.urgent_pointer);
+        let wide = u64::from(fixed)
+            + u64::from(ports)
+            + len as u64
+            + options
+            + u64::from(header.sequence)
+            + u64::from(header.acknowledgment);
+        ntcp_ip_common::checksum_with_sum(payload, wide)
     } else {
-        !(add_words(pseudo, &out[..len]) as u16)
+        out[16..18].fill(0);
+        !(add_words(pseudo_header.sum(len as u32), &out[..len]) as u16)
     };
     out[16..18].copy_from_slice(&sum.to_be_bytes());
     Ok(len)
@@ -569,7 +692,7 @@ pub(crate) fn encode_with(
 // checksum: the folded pseudo-header sum, which the device's one's
 // complement sum over the segment, this field included, completes.
 fn partial_checksum(ip: IpMetadata, len: usize) -> Result<u16, WireError> {
-    Ok(pseudo_header_sum(ip, checked_length(ip, len)?)? as u16)
+    Ok(PseudoHeader::new(ip)?.checked_sum(len)? as u16)
 }
 
 /// Encode a TCP header while checksumming immutable payload slices in place.
@@ -1949,6 +2072,237 @@ mod tests {
             );
             hdr.flags = SYN;
             assert!(encode(ip, hdr, &mss, &[], &mut out).is_ok());
+        }
+    }
+
+    #[test]
+    fn encode_stream_matches_encode_with_across_options_lengths_partial_and_families() {
+        let family_cases = [
+            IpMetadata {
+                source: Ipv4Addr::new(192, 0, 2, 1).into(),
+                destination: Ipv4Addr::new(198, 51, 100, 2).into(),
+            },
+            IpMetadata {
+                source: Ipv4Addr::new(255, 255, 255, 254).into(),
+                destination: Ipv4Addr::new(255, 255, 255, 253).into(),
+            },
+            IpMetadata {
+                source: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+                destination: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).into(),
+            },
+            IpMetadata {
+                source: Ipv6Addr::new(0xffff, 0xfffe, 0xabcd, 0x1234, 0x5678, 0x9abc, 0xdef0, 0xffff)
+                    .into(),
+                destination: Ipv6Addr::new(
+                    0xffff, 0xffff, 0x4321, 0x8765, 0xcba9, 0x0fed, 0xffff, 0xfffe,
+                )
+                .into(),
+            },
+        ];
+        let headers = [
+            header(),
+            Header {
+                source_port: u16::MAX,
+                destination_port: u16::MAX,
+                sequence: u32::MAX,
+                acknowledgment: u32::MAX,
+                flags: ACK | PSH | FIN | URG | ECE | CWR,
+                window: u16::MAX,
+                urgent_pointer: u16::MAX,
+            },
+            Header {
+                source_port: 80,
+                destination_port: 54321,
+                sequence: 0,
+                acknowledgment: 0,
+                flags: ACK,
+                window: 0,
+                urgent_pointer: 0,
+            },
+        ];
+        let timestamp_cases = [
+            None,
+            Some((0u32, 0u32)),
+            Some((0x1234_5678, 0x9abc_def0)),
+            Some((u32::MAX, u32::MAX)),
+        ];
+        let payload_lens = [0, 1, 2, 3, 7, 15, 63, 64, 65, 127, 128, 129, 255, 1448, 1449];
+
+        let mut payload_buf = [0u8; 1449];
+        for (i, b) in payload_buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(53).wrapping_add(11);
+        }
+
+        for ip in family_cases {
+            let pseudo = PseudoHeader::new(ip).unwrap();
+            for hdr in headers {
+                let ports = (u32::from(hdr.source_port) << 16) | u32::from(hdr.destination_port);
+                for timestamps in timestamp_cases {
+                    let mut opts = [0u8; 40];
+                    let opt_len = write_options(
+                        &Options {
+                            timestamps,
+                            ..Options::default()
+                        },
+                        &mut opts,
+                    );
+                    for &len in &payload_lens {
+                        let payload = &payload_buf[..len];
+                        for partial in [false, true] {
+                            let mut expected = vec![0xa5; 32 + len];
+                            let mut actual = vec![0x5a; 32 + len];
+                            let expected_len = encode_with(
+                                ip,
+                                hdr,
+                                &opts[..opt_len],
+                                payload,
+                                &mut expected,
+                                partial,
+                            )
+                            .unwrap();
+                            let actual_len = encode_stream(
+                                pseudo,
+                                ports,
+                                hdr,
+                                timestamps,
+                                payload,
+                                &mut actual,
+                                partial,
+                            )
+                            .unwrap();
+                            assert_eq!(actual_len, expected_len);
+                            assert_eq!(&actual[..actual_len], &expected[..expected_len]);
+                            if !partial {
+                                let parsed = pseudo.parse(&actual[..actual_len], false).unwrap();
+                                assert_eq!(parsed.header, hdr);
+                                assert_eq!(parsed.options.timestamps, timestamps);
+                                assert_eq!(parsed.payload, payload);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Error paths: OutputTooSmall and TooLong
+        let v4 = family_cases[0];
+        let pseudo_v4 = PseudoHeader::new(v4).unwrap();
+        let hdr = header();
+        let ports = (u32::from(hdr.source_port) << 16) | u32::from(hdr.destination_port);
+        let mut small = [0u8; 31];
+        assert_eq!(
+            encode_stream(pseudo_v4, ports, hdr, Some((1, 2)), &[], &mut small, false),
+            Err(WireError::OutputTooSmall)
+        );
+        let oversize = vec![0u8; usize::from(u16::MAX) - 20];
+        let mut big = vec![0u8; oversize.len() + 32];
+        assert_eq!(
+            encode_stream(pseudo_v4, ports, hdr, None, &oversize, &mut big, false),
+            Err(WireError::TooLong)
+        );
+    }
+
+    #[test]
+    fn pseudo_header_parse_and_seed_validate_checksum_and_length() {
+        let mixed = IpMetadata {
+            source: Ipv4Addr::new(192, 0, 2, 1).into(),
+            destination: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+        };
+        assert_eq!(PseudoHeader::new(mixed).err(), Some(WireError::AddressFamily));
+
+        for ip in ips() {
+            let pseudo = PseudoHeader::new(ip).unwrap();
+            let mut raw = [0u8; 64];
+            let len = encode(ip, header(), &[], b"pseudo-parse-test", &mut raw).unwrap();
+
+            let verified = pseudo.parse(&raw[..len], false).unwrap();
+            assert_eq!(verified.header, header());
+            assert_eq!(verified.payload, b"pseudo-parse-test");
+
+            // Corrupt checksum: rejected when verified == false, accepted when verified == true.
+            raw[16] ^= 0x01;
+            assert_eq!(
+                pseudo.parse(&raw[..len], false).err(),
+                Some(WireError::InvalidChecksum)
+            );
+            let unchecked = pseudo.parse(&raw[..len], true).unwrap();
+            assert_eq!(unchecked.header, header());
+            assert_eq!(unchecked.payload, b"pseudo-parse-test");
+        }
+
+        // IPv4 length limit check (65535 - 20 = 65515 max TCP segment length).
+        let v4 = ips()[0];
+        let pseudo_v4 = PseudoHeader::new(v4).unwrap();
+        let too_long = vec![0u8; usize::from(u16::MAX) - 20 + 1];
+        assert_eq!(
+            pseudo_v4.parse(&too_long, true).err(),
+            Some(WireError::TooLong)
+        );
+        assert_eq!(
+            pseudo_v4.parse(&too_long, false).err(),
+            Some(WireError::TooLong)
+        );
+    }
+
+    #[test]
+    fn carries_sack_reflects_parsed_sack_blocks() {
+        let ip = ips()[0];
+        let pseudo = PseudoHeader::new(ip).unwrap();
+
+        // No options
+        let mut buf = [0u8; 80];
+        let len = encode(ip, header(), &[], b"data", &mut buf).unwrap();
+        assert!(!pseudo.parse(&buf[..len], false).unwrap().carries_sack());
+
+        // Timestamps only
+        let mut opts = [0u8; 40];
+        let opt_len = write_options(
+            &Options {
+                timestamps: Some((10, 20)),
+                ..Options::default()
+            },
+            &mut opts,
+        );
+        let len = encode(ip, header(), &opts[..opt_len], b"data", &mut buf).unwrap();
+        assert!(!pseudo.parse(&buf[..len], false).unwrap().carries_sack());
+
+        // SACK-permitted on SYN (no SACK blocks)
+        let mut syn = header();
+        syn.flags = SYN;
+        let opt_len = write_options(
+            &Options {
+                sack_permitted: true,
+                ..Options::default()
+            },
+            &mut opts,
+        );
+        let len = encode(ip, syn, &opts[..opt_len], &[], &mut buf).unwrap();
+        assert!(!pseudo.parse(&buf[..len], false).unwrap().carries_sack());
+
+        // 1..=4 SACK blocks (and 1..=3 with timestamps)
+        for count in 1..=4usize {
+            for with_ts in [false, true] {
+                if with_ts && count == 4 {
+                    continue;
+                }
+                let mut sack_blocks = [None; 4];
+                for (i, slot) in sack_blocks[..count].iter_mut().enumerate() {
+                    let base = 1000 + (i as u32) * 100;
+                    *slot = Some((base, base + 50));
+                }
+                let opt_len = write_options(
+                    &Options {
+                        timestamps: with_ts.then_some((11, 22)),
+                        sack_blocks,
+                        ..Options::default()
+                    },
+                    &mut opts,
+                );
+                let len = encode(ip, header(), &opts[..opt_len], b"data", &mut buf).unwrap();
+                let seg = pseudo.parse(&buf[..len], false).unwrap();
+                assert!(seg.carries_sack());
+                assert_eq!(seg.options.sack_blocks, sack_blocks);
+            }
         }
     }
 }

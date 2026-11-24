@@ -8,14 +8,7 @@ pub use ntcp_ip_common::ipv6::{
 pub use ntcp_ip_common::{Error, PROTOCOL_TCP, PROTOCOL_UDP, UDP_HEADER};
 pub const IPV6_HEADER: usize = 40;
 
-/// Per-packet IPv6 send parameters shared by every upper-layer protocol.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Header {
-    pub ip: IpMetadata,
-    pub hop_limit: u8,
-    pub dscp: u8,
-    pub ecn: u8,
-}
+pub use ntcp::IpHeader as Header;
 
 /// A received packet whose extension headers, if any, passed receive
 /// processing (`Chain::receive`). `ip.destination` is the base Destination
@@ -309,7 +302,7 @@ fn encode_tcp(
         return Err(Error::Version);
     }
     transmit.len.checked_add(IPV6_HEADER).ok_or(Error::Length)?;
-    if transmit.len == 0 || transmit.ipv4_options != ntcp::OutgoingIpv4Options::default() {
+    if transmit.len == 0 || !transmit.ipv4_options.is_empty() {
         return Err(Error::Invalid);
     }
     let header = Header {
@@ -319,6 +312,18 @@ fn encode_tcp(
         ecn: transmit.ecn,
     };
     encode_unfragmentable(packet, header, segments, PROTOCOL_TCP, transmit.len, present)
+}
+
+/// The fixed IPv6 header for a preflighted scalar segment.
+pub fn write_plain_tcp_header(
+    headroom: &mut [u8],
+    header: Header,
+    tcp_len: usize,
+) -> Result<usize, Error> {
+    if tcp_len == 0 {
+        return Err(Error::Invalid);
+    }
+    encode_unfragmentable(headroom, header, &[], PROTOCOL_TCP, tcp_len, 0)
 }
 
 // Encode only the resident header. Payload ranges remain owned by PacketIo.
@@ -651,5 +656,121 @@ impl<'a> Fragmenter<'a> {
         f[4..8].copy_from_slice(&self.identification.to_be_bytes());
         packet[header..len].copy_from_slice(data);
         Ok(len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::any::TypeId;
+    use core::net::Ipv4Addr;
+
+    #[test]
+    fn header_is_alias_of_ntcp_ip_header() {
+        assert_eq!(TypeId::of::<Header>(), TypeId::of::<ntcp::IpHeader>());
+        let header: ntcp::IpHeader = Header {
+            ip: IpMetadata {
+                source: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+                destination: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).into(),
+            },
+            hop_limit: 64,
+            dscp: 18,
+            ecn: 2,
+        };
+        let aliased: Header = header;
+        assert_eq!(aliased, header);
+    }
+
+    #[test]
+    fn write_plain_tcp_header_matches_encode_tcp_and_rejects_zero_len() {
+        let ip = IpMetadata {
+            source: Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6).into(),
+            destination: Ipv6Addr::new(0x2001, 0xdb8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe).into(),
+        };
+        let mut expected = [0u8; IPV6_HEADER + u16::MAX as usize];
+        for dscp in [0u8, 1, 18, 46, 63] {
+            for ecn in [0u8, 1, 2, 3] {
+                for hop_limit in [1u8, 64, 255] {
+                    for tcp_len in [1usize, 20, 32, 1440, 65535] {
+                        let header = Header {
+                            ip,
+                            hop_limit,
+                            dscp,
+                            ecn,
+                        };
+                        let tx = ntcp::Transmit {
+                            ip,
+                            hop_limit,
+                            dscp,
+                            ecn,
+                            ipv4_options: ntcp::OutgoingIpv4Options::default(),
+                            tx_timestamp: None,
+                            connection: None,
+                            len: tcp_len,
+                            mark: 0,
+                        };
+                        expected[..IPV6_HEADER].fill(0xaa);
+                        let encoded_len = encode_tcp(&mut expected, tx, &[], tcp_len).unwrap();
+                        assert_eq!(encoded_len, IPV6_HEADER + tcp_len);
+
+                        let mut headroom = [0x55u8; IPV6_HEADER + 4];
+                        let written = write_plain_tcp_header(&mut headroom, header, tcp_len).unwrap();
+                        assert_eq!(written, IPV6_HEADER);
+                        assert_eq!(&headroom[..IPV6_HEADER], &expected[..IPV6_HEADER]);
+                        assert_eq!(&headroom[IPV6_HEADER..], &[0x55; 4]);
+                    }
+                }
+            }
+        }
+
+        let header = Header {
+            ip,
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+        };
+        let mut headroom = [0x55u8; IPV6_HEADER];
+
+        // tcp_len == 0 is rejected
+        assert_eq!(
+            write_plain_tcp_header(&mut headroom, header, 0),
+            Err(Error::Invalid)
+        );
+        // tcp_len > u16::MAX is rejected
+        assert_eq!(
+            write_plain_tcp_header(&mut headroom, header, usize::from(u16::MAX) + 1),
+            Err(Error::Invalid)
+        );
+        // Short headroom is rejected
+        let mut short = [0u8; IPV6_HEADER - 1];
+        assert_eq!(
+            write_plain_tcp_header(&mut short, header, 20),
+            Err(Error::Invalid)
+        );
+        // Invalid header fields are rejected
+        for bad in [
+            Header { hop_limit: 0, ..header },
+            Header { dscp: 64, ..header },
+            Header { ecn: 4, ..header },
+        ] {
+            assert_eq!(
+                write_plain_tcp_header(&mut headroom, bad, 20),
+                Err(Error::Invalid)
+            );
+        }
+        // IPv4 addresses are rejected with Version
+        let v4_header = Header {
+            ip: IpMetadata {
+                source: Ipv4Addr::new(192, 0, 2, 1).into(),
+                destination: Ipv4Addr::new(198, 51, 100, 2).into(),
+            },
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+        };
+        assert_eq!(
+            write_plain_tcp_header(&mut headroom, v4_header, 20),
+            Err(Error::Version)
+        );
     }
 }
