@@ -4,6 +4,10 @@ use alloc::{collections::VecDeque, vec::Vec};
 
 use crate::Payload;
 
+#[path = "send_marks.rs"]
+mod send_marks;
+use send_marks::SendMarks;
+
 #[derive(Clone, Debug)]
 struct SharedSpan {
     start: u64,
@@ -42,22 +46,17 @@ pub(crate) struct SendBuffer {
     // metadata with the data. Kept apart so a segment's payload copies as
     // whole slices and its metadata scans as plain bytes.
     data: VecDeque<u8>,
-    marks: VecDeque<u8>,
+    marks: SendMarks,
     capacity: usize,
     head: u64,
     shared: VecDeque<SharedSpan>,
     shared_output: Option<usize>,
-    // Stream position of the last queued byte carrying PUSH, or u64::MAX for
-    // none (no stream reaches that position), so that asking whether the
-    // rest of the queue holds one needs no pass over it, as Linux keeps PSH
-    // on the skb.
-    last_push: u64,
-    // Number of bytes ending at last_push known to contain just that PUSH. Collapsing
-    // a packet already marked on its last byte leaves these bytes intact.
+    // Queue offsets immediately after the last PUSH and EOR, zero if absent.
+    // A prefix ACK subtracts its byte count from both boundaries.
+    push_end: usize,
+    // Bytes ending at push_end known to carry only that final PUSH.
     single_push_len: usize,
-    // The same for EOR: a selection past it needs no pass over its marks to
-    // find its record's end, as Linux keeps EOR on the skb.
-    last_eor: u64,
+    eor_end: usize,
 }
 
 impl SendBuffer {
@@ -66,8 +65,8 @@ impl SendBuffer {
     pub(crate) fn new(capacity: usize) -> Result<Self, ()> {
         let mut data = VecDeque::new();
         data.try_reserve_exact(capacity).map_err(|_| ())?;
-        let mut marks = VecDeque::new();
-        marks.try_reserve_exact(capacity).map_err(|_| ())?;
+        let mut marks = SendMarks::default();
+        marks.reserve(capacity)?;
         Ok(Self {
             data,
             marks,
@@ -75,9 +74,9 @@ impl SendBuffer {
             head: 0,
             shared: VecDeque::new(),
             shared_output: None,
-            last_push: u64::MAX,
+            push_end: 0,
             single_push_len: 0,
-            last_eor: u64::MAX,
+            eor_end: 0,
         })
     }
 
@@ -87,14 +86,14 @@ impl SendBuffer {
     pub(crate) fn unallocated(capacity: usize) -> Self {
         Self {
             data: VecDeque::new(),
-            marks: VecDeque::new(),
+            marks: SendMarks::default(),
             capacity,
             head: 0,
             shared: VecDeque::new(),
             shared_output: None,
-            last_push: u64::MAX,
+            push_end: 0,
             single_push_len: 0,
-            last_eor: u64::MAX,
+            eor_end: 0,
         }
     }
 
@@ -124,7 +123,7 @@ impl SendBuffer {
     pub(crate) fn grow(&mut self, capacity: usize) -> Result<(), ()> {
         let additional = capacity.saturating_sub(self.data.len());
         self.data.try_reserve_exact(additional).map_err(|_| ())?;
-        self.marks.try_reserve_exact(additional).map_err(|_| ())
+        self.marks.reserve(capacity)
     }
 
     pub(crate) fn set_limit(&mut self, capacity: usize) {
@@ -139,12 +138,12 @@ impl SendBuffer {
     pub(crate) fn release(&mut self) {
         assert!(self.data.is_empty());
         debug_assert!(self.shared.is_empty());
-        debug_assert!(self.push_offset().is_none() && self.eor_offset().is_none());
+        debug_assert!(self.push_end == 0 && self.eor_end == 0);
         self.data = VecDeque::new();
-        self.marks = VecDeque::new();
+        self.marks = SendMarks::default();
         self.shared = VecDeque::new();
-        self.last_push = u64::MAX;
-        self.last_eor = u64::MAX;
+        self.push_end = 0;
+        self.eor_end = 0;
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -174,23 +173,29 @@ impl SendBuffer {
         assert!(count <= self.marks.capacity() - self.marks.len());
     }
 
+    pub(crate) fn append(&mut self, input: &[u8]) {
+        debug_assert!(input.len() <= self.remaining());
+        self.assert_reserved(input.len());
+        self.data.extend(input);
+        self.marks.extend_to(self.data.len());
+    }
+
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
-        self.assert_reserved(count);
-        self.data.extend(&input[..count]);
-        self.marks.resize(self.data.len(), 0);
+        self.append(&input[..count]);
         count
     }
 
     fn mark_slices(&self, offset: usize, count: usize) -> [&[u8]; 2] {
-        let (front, back) = self.marks.as_slices();
-        let [first, second] = ring_ranges(front.len(), self.marks.len(), offset, count);
+        debug_assert!(self.marks.singleton().is_none_or(|(_, bits)| bits == 0));
+        let (front, back) = self.marks.ring.as_slices();
+        let [first, second] = ring_ranges(front.len(), self.marks.ring.len(), offset, count);
         [&front[first], &back[second]]
     }
 
     fn mark_slices_mut(&mut self, offset: usize, count: usize) -> [&mut [u8]; 2] {
         let len = self.marks.len();
-        let (front, back) = self.marks.as_mut_slices();
+        let (front, back) = self.marks.materialize().as_mut_slices();
         let [first, second] = ring_ranges(front.len(), len, offset, count);
         [&mut front[first], &mut back[second]]
     }
@@ -199,6 +204,11 @@ impl SendBuffer {
     // first carrying `flag`. Each block is first tested whole, which needs
     // no early exit and so runs many marks per instruction.
     fn first_flagged(&self, flag: u8, offset: usize, count: usize) -> Option<usize> {
+        if let Some((at, bits)) = self.marks.singleton() {
+            return at
+                .checked_sub(offset)
+                .filter(|&distance| bits & flag != 0 && distance < count);
+        }
         let mut at = 0;
         for part in self.mark_slices(offset, count) {
             for block in part.chunks(64) {
@@ -215,18 +225,20 @@ impl SendBuffer {
     }
 
     pub(crate) fn mark_push(&mut self) {
-        if let Some(last) = self.marks.back_mut() {
-            *last |= 1;
+        if self.marks.or_back(1) {
             self.note_push(self.marks.len() - 1);
         }
     }
 
     // Offset of the last queued byte carrying PUSH.
     fn push_offset(&self) -> Option<usize> {
-        Some(self.last_push)
-            .filter(|&position| position != u64::MAX)
-            .map(|position| position.wrapping_sub(self.head) as usize)
-            .filter(|&offset| offset < self.marks.len())
+        self.push_end.checked_sub(1)
+    }
+
+    // Production callers land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn push_after(&self, offset: usize) -> bool {
+        self.push_end > offset
     }
 
     // Records a PUSH mark at `offset`, where none is past the last one.
@@ -238,18 +250,14 @@ impl SendBuffer {
             Some(last) if offset == last => {}
             previous => {
                 self.single_push_len = previous.map_or(offset + 1, |last| offset - last);
-                self.last_push = self.head.wrapping_add(offset as u64);
+                self.push_end = offset + 1;
             }
         }
     }
 
     // Finds the last PUSH mark again after marks at or past it went away.
     fn find_last_push(&mut self) {
-        self.last_push = self
-            .marks
-            .iter()
-            .rposition(|mark| mark & 1 != 0)
-            .map_or(u64::MAX, |offset| self.head.wrapping_add(offset as u64));
+        self.push_end = self.marks.last(1).map_or(0, |offset| offset + 1);
         self.single_push_len = 1;
     }
 
@@ -262,8 +270,12 @@ impl SendBuffer {
         if last < offset {
             return false;
         }
-        if last - offset < count {
+        let distance = last - offset;
+        if distance < count {
             return true;
+        }
+        if distance < self.single_push_len {
+            return false;
         }
         let [front, back] = self.mark_slices(offset, count);
         front.iter().chain(back).fold(0, |any, mark| any | mark) & 1 != 0
@@ -280,7 +292,11 @@ impl SendBuffer {
         segments: usize,
     ) -> Option<usize> {
         let last = self.push_offset().filter(|&last| last >= offset)?;
-        let holding_last = (last - offset) / size;
+        let distance = last - offset;
+        let holding_last = distance / size;
+        if distance < self.single_push_len {
+            return (holding_last < segments).then_some(holding_last);
+        }
         let mut at = 0;
         for part in self.mark_slices(offset, holding_last.min(segments) * size) {
             for block in part.chunks(4096) {
@@ -299,8 +315,16 @@ impl SendBuffer {
         (holding_last < segments).then_some(holding_last)
     }
 
+    // Only the last byte of this nonempty range carries PUSH. Selecting
+    // it leaves its persisted retransmission boundary unchanged.
+    pub(crate) fn push_at_end(&self, offset: usize, count: usize) -> bool {
+        count != 0
+            && offset.checked_add(count) == Some(self.push_end)
+            && count <= self.single_push_len
+    }
+
     pub(crate) fn collapse_push(&mut self, offset: usize, count: usize) {
-        if count <= self.single_push_len && self.push_offset() == Some(offset + count - 1) {
+        if self.push_at_end(offset, count) {
             return;
         }
         for part in self.mark_slices_mut(offset, count) {
@@ -312,8 +336,7 @@ impl SendBuffer {
             .push_offset()
             .is_some_and(|last| last >= offset && last - offset < count);
         let end = offset + count - 1;
-        if let Some(last) = self.marks.get_mut(end) {
-            *last |= 1;
+        if self.marks.or_at(end, 1) {
             self.note_push(end);
         } else if cleared {
             self.find_last_push();
@@ -321,8 +344,8 @@ impl SendBuffer {
     }
 
     pub(crate) fn finish_send(&mut self, offset: usize, push: bool, end_of_record: bool) {
-        if let Some(mark) = self.marks.get_mut(offset) {
-            *mark |= u8::from(push) | (u8::from(end_of_record) << 1);
+        let bits = u8::from(push) | (u8::from(end_of_record) << 1);
+        if self.marks.or_at(offset, bits) {
             if push {
                 self.note_push(offset);
             }
@@ -332,27 +355,39 @@ impl SendBuffer {
         }
     }
 
-    pub(crate) fn mark_end_of_record(&mut self) {
-        if let Some(last) = self.marks.back_mut() {
-            *last |= 2;
-            self.last_eor = self.head.wrapping_add(self.marks.len() as u64 - 1);
+    // A nonempty append puts its last byte strictly past all old marks.
+    // Production callers land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn finish_append(&mut self, push: bool, end_of_record: bool) {
+        if push || end_of_record {
+            let end = self.len();
+            let marked = self
+                .marks
+                .or_back(u8::from(push) | (u8::from(end_of_record) << 1));
+            assert!(marked, "finish_append requires a nonempty buffer");
+            if push {
+                debug_assert!(end > self.push_end);
+                self.single_push_len = end - self.push_end;
+                self.push_end = end;
+            }
+            if end_of_record {
+                self.eor_end = end;
+            }
         }
     }
 
-    // Offset of the last queued byte carrying EOR.
-    fn eor_offset(&self) -> Option<usize> {
-        Some(self.last_eor)
-            .filter(|&position| position != u64::MAX)
-            .map(|position| position.wrapping_sub(self.head) as usize)
-            .filter(|&offset| offset < self.marks.len())
+    pub(crate) fn mark_end_of_record(&mut self) {
+        if self.marks.or_back(2) {
+            self.eor_end = self.marks.len();
+        }
     }
 
     // Records an EOR mark at `offset`, where none is past the last one.
     // EOR marks are never cleared, so the last one moves only forward here
     // and back only when its byte goes.
     fn note_end_of_record(&mut self, offset: usize) {
-        if self.eor_offset().is_none_or(|last| last < offset) {
-            self.last_eor = self.head.wrapping_add(offset as u64);
+        if self.eor_end <= offset {
+            self.eor_end = offset + 1;
         }
     }
 
@@ -364,14 +399,20 @@ impl SendBuffer {
 
     // Whether a byte at or past `offset` carries EOR.
     fn record_ends_after(&self, offset: usize) -> bool {
-        self.eor_offset().is_some_and(|last| last >= offset)
+        self.eor_end > offset
     }
 
     // EOR is a local coalescing boundary, not a TCP wire flag or framing
     // guarantee (RFC 9293 section 3.7.1). PUSH may collapse; EOR never does.
     // Only a selection reaching the last EOR scans its marks.
     pub(crate) fn record_len(&self, offset: usize, limit: usize) -> usize {
-        let limit = limit.min(self.len().saturating_sub(offset));
+        self.record_len_within(offset, limit.min(self.len().saturating_sub(offset)))
+    }
+
+    // The selector already bounded this range by its unsent bytes.
+    #[inline]
+    pub(crate) fn record_len_within(&self, offset: usize, limit: usize) -> usize {
+        debug_assert!(limit <= self.len().saturating_sub(offset));
         if !self.record_ends_after(offset) {
             return limit;
         }
@@ -386,7 +427,15 @@ impl SendBuffer {
         if !self.record_ends_after(offset) {
             return offset;
         }
+        if let Some((at, bits)) = self.marks.singleton() {
+            return if bits & 2 != 0 && at >= offset && at + 1 < offset + count {
+                at + 1
+            } else {
+                offset
+            };
+        }
         self.marks
+            .ring
             .iter()
             .skip(offset)
             .take(count.saturating_sub(1))
@@ -476,10 +525,12 @@ impl SendBuffer {
         end: usize,
         limit: usize,
     ) -> Option<(usize, usize)> {
-        let end = end.min(self.marks.len());
-        let start = (offset..end).find(|&i| self.marks[i] & flag != 0)?;
+        debug_assert_eq!(flag & 0b11, 0);
+        let end = end.min(self.marks.ring.len());
+        let start = (offset..end).find(|&i| self.marks.ring[i] & flag != 0)?;
         let len = self
             .marks
+            .ring
             .range(start..end)
             .take(limit)
             .take_while(|&byte| byte & flag != 0)
@@ -490,7 +541,8 @@ impl SendBuffer {
     // Bytes of one range that carry PTB work.
     pub(crate) fn count_ptb(&self, offset: usize, count: usize) -> usize {
         self.marks
-            .range(offset.min(self.marks.len())..)
+            .ring
+            .range(offset.min(self.marks.ring.len())..)
             .take(count)
             .filter(|&byte| byte & PTB_PENDING != 0)
             .count()
@@ -499,6 +551,7 @@ impl SendBuffer {
     #[cfg(test)]
     pub(crate) fn ptb_pending(&self, offset: usize) -> bool {
         self.marks
+            .ring
             .get(offset)
             .is_some_and(|&byte| byte & PTB_PENDING != 0)
     }
@@ -506,6 +559,7 @@ impl SendBuffer {
     #[cfg(test)]
     pub(crate) fn ptb_copy(&self, offset: usize) -> bool {
         self.marks
+            .ring
             .get(offset)
             .is_some_and(|&byte| byte & PTB_COPY != 0)
     }
@@ -513,6 +567,7 @@ impl SendBuffer {
     #[cfg(test)]
     pub(crate) fn retransmitted(&self, offset: usize) -> bool {
         self.marks
+            .ring
             .get(offset)
             .is_some_and(|&byte| byte & RETRANSMITTED != 0)
     }
@@ -522,15 +577,11 @@ impl SendBuffer {
         self.marks.truncate(len);
         // Discarding queued bytes is rare; only then is the queue searched
         // back to its new last mark.
-        if self.last_push != u64::MAX && self.push_offset().is_none() {
+        if self.push_end > len {
             self.find_last_push();
         }
-        if self.last_eor != u64::MAX && self.eor_offset().is_none() {
-            self.last_eor = self
-                .marks
-                .iter()
-                .rposition(|mark| mark & 2 != 0)
-                .map_or(u64::MAX, |offset| self.head.wrapping_add(offset as u64));
+        if self.eor_end > len {
+            self.eor_end = self.marks.last(2).map_or(0, |offset| offset + 1);
         }
         while self
             .shared
@@ -556,15 +607,20 @@ impl SendBuffer {
         if count > self.len() {
             return Err(());
         }
+        if count == self.len() {
+            self.data.clear();
+            self.marks.clear();
+            self.shared.clear();
+            self.head = self.head.wrapping_add(count as u64);
+            self.push_end = 0;
+            self.eor_end = 0;
+            return Ok(());
+        }
         self.data.drain(..count);
-        self.marks.drain(..count);
+        self.marks.drop_prefix(count);
         self.head = self.head.wrapping_add(count as u64);
-        if self.push_offset().is_none() {
-            self.last_push = u64::MAX;
-        }
-        if self.eor_offset().is_none() {
-            self.last_eor = u64::MAX;
-        }
+        self.push_end = self.push_end.saturating_sub(count);
+        self.eor_end = self.eor_end.saturating_sub(count);
         while let Some(span) = self.shared.front_mut() {
             let consumed = self.head.wrapping_sub(span.start) as usize;
             if consumed >= 1usize << (usize::BITS - 1) {
@@ -584,10 +640,15 @@ impl SendBuffer {
     // Borrow a scalar payload directly when the selected bytes all come
     // from one slice of the ring. Shared spans overlay the ring's bytes.
     pub(crate) fn contiguous(&self, offset: usize, limit: usize) -> Option<&[u8]> {
+        self.selected_slice(offset, self.record_len(offset, limit))
+    }
+
+    // The caller has already clipped these bytes to the record boundary.
+    pub(crate) fn selected_slice(&self, offset: usize, count: usize) -> Option<&[u8]> {
+        debug_assert_eq!(self.record_len(offset, count), count);
         if !self.shared.is_empty() {
             return None;
         }
-        let count = self.record_len(offset, limit);
         let (front, back) = self.data.as_slices();
         if offset < front.len() {
             front.get(offset..offset + count)
@@ -677,7 +738,7 @@ impl SendBuffer {
         // Only PUSH/EOR bookkeeping is initialized. Payload remains in its
         // original immutable allocation and is never read/copied here.
         self.data.resize(self.data.len() + count, 0);
-        self.marks.resize(self.data.len(), 0);
+        self.marks.extend_to(self.data.len());
         count
     }
 
@@ -1349,5 +1410,289 @@ mod tests {
         assert_eq!(send.write_shared(payload), 4);
         assert!(send.contiguous(0, 1).is_none());
         assert!(send.contiguous(send.len() - 4, 4).is_none());
+    }
+
+    #[test]
+    fn send_marks_and_buffer_operations_match_vecdeque_oracle() {
+        let mut send = SendBuffer::new(256).unwrap();
+        let mut oracle: VecDeque<u8> = VecDeque::new();
+        let mut state = 0x7319_a5c1_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+
+        let mut saw_singleton_push = false;
+        let mut saw_singleton_eor = false;
+        let mut saw_materialized = false;
+        let mut saw_full_ack_return_to_singleton = false;
+        let mut saw_ptb = false;
+
+        for step in 0..6000 {
+            let was_materialized = send.marks.singleton().is_none();
+            match next(14) {
+                0..=2 => {
+                    // Nonempty append + optional finish_append.
+                    let room = send.remaining();
+                    if room != 0 {
+                        let len = 1 + next(room.min(48));
+                        let input: Vec<u8> = (0..len).map(|i| (step + i) as u8).collect();
+                        send.append(&input);
+                        oracle.extend(core::iter::repeat_n(0u8, len));
+                        let push = next(3) == 0;
+                        let eor = next(4) == 0;
+                        send.finish_append(push, eor);
+                        if push || eor {
+                            *oracle.back_mut().unwrap() |= u8::from(push) | (u8::from(eor) << 1);
+                        }
+                    }
+                }
+                3 => {
+                    send.mark_push();
+                    if let Some(last) = oracle.back_mut() {
+                        *last |= 1;
+                    }
+                }
+                4 => {
+                    send.mark_end_of_record();
+                    if let Some(last) = oracle.back_mut() {
+                        *last |= 2;
+                    }
+                }
+                5 if !oracle.is_empty() => {
+                    let offset = next(oracle.len());
+                    let count = 1 + next(oracle.len() - offset);
+                    send.collapse_push(offset, count);
+                    for mark in oracle.range_mut(offset..offset + count) {
+                        *mark &= !1;
+                    }
+                    oracle[offset + count - 1] |= 1;
+                }
+                6 => {
+                    let offset = next(oracle.len() + 2);
+                    let push = next(2) == 0;
+                    let eor = next(3) == 0;
+                    send.finish_send(offset, push, eor);
+                    if let Some(mark) = oracle.get_mut(offset) {
+                        *mark |= u8::from(push) | (u8::from(eor) << 1);
+                    }
+                }
+                7 => {
+                    // Full ACK back to singleton, or partial ACK.
+                    let count = if next(3) == 0 {
+                        oracle.len()
+                    } else {
+                        next(oracle.len() + 1)
+                    };
+                    send.acknowledge(count).unwrap();
+                    oracle.drain(..count);
+                    if was_materialized && count > 0 && oracle.is_empty() {
+                        assert!(send.marks.singleton().is_some());
+                        saw_full_ack_return_to_singleton = true;
+                    }
+                }
+                8 => {
+                    let len = next(oracle.len() + 1);
+                    send.truncate(len);
+                    oracle.truncate(len);
+                }
+                9 => {
+                    let offset = next(oracle.len() + 2);
+                    let count = next(oracle.len().saturating_sub(offset) + 4);
+                    let end = (offset + count).min(oracle.len());
+                    let start = offset.min(oracle.len());
+                    let mut expected = 0;
+                    for m in oracle.range_mut(start..end) {
+                        if *m & (PTB_PENDING | RETRANSMITTED) == 0 {
+                            *m |= PTB_PENDING;
+                            expected += 1;
+                        }
+                    }
+                    assert_eq!(send.mark_ptb(offset, count), expected);
+                    if expected > 0 {
+                        saw_ptb = true;
+                    }
+                }
+                10 => {
+                    let offset = next(oracle.len() + 2);
+                    let count = next(oracle.len().saturating_sub(offset) + 4);
+                    let end = (offset + count).min(oracle.len());
+                    let start = offset.min(oracle.len());
+                    let (mut pending, mut copies) = (0, 0);
+                    for m in oracle.range_mut(start..end) {
+                        pending += usize::from(*m & PTB_PENDING != 0);
+                        copies += usize::from(*m & PTB_COPY != 0);
+                        *m &= !(PTB_PENDING | PTB_COPY);
+                    }
+                    assert_eq!(send.release_ptb(offset, count), (pending, copies));
+                }
+                11 => {
+                    let offset = next(oracle.len() + 2);
+                    let count = next(oracle.len().saturating_sub(offset) + 4);
+                    let end = (offset + count).min(oracle.len());
+                    let start = offset.min(oracle.len());
+                    let mut marked = 0;
+                    for m in oracle.range_mut(start..end) {
+                        marked += usize::from(*m & PTB_COPY == 0);
+                        *m |= PTB_COPY;
+                    }
+                    assert_eq!(send.mark_ptb_copy(offset, count), marked);
+                }
+                12 => {
+                    let offset = next(oracle.len() + 2);
+                    let count = next(oracle.len().saturating_sub(offset) + 4);
+                    let end = (offset + count).min(oracle.len());
+                    let start = offset.min(oracle.len());
+                    let mut cleared = 0;
+                    for m in oracle.range_mut(start..end) {
+                        cleared += usize::from(*m & PTB_COPY != 0);
+                        *m &= !PTB_COPY;
+                    }
+                    assert_eq!(send.clear_ptb_copy(offset, count), cleared);
+                }
+                _ => {
+                    let offset = next(oracle.len() + 2);
+                    let count = next(oracle.len().saturating_sub(offset) + 4);
+                    let end = (offset + count).min(oracle.len());
+                    let start = offset.min(oracle.len());
+                    let mut cleared = 0;
+                    for m in oracle.range_mut(start..end) {
+                        cleared += usize::from(*m & PTB_PENDING != 0);
+                        *m = (*m & !PTB_PENDING) | RETRANSMITTED;
+                    }
+                    assert_eq!(send.mark_retransmitted(offset, count), cleared);
+                }
+            }
+
+            // Core invariants: marks match oracle, push_end/eor_end exact, singleton has no PTB bits.
+            assert_eq!(send.len(), oracle.len());
+            assert!(send.marks.iter().copied().eq(oracle.iter().copied()));
+            let expected_push_end = oracle
+                .iter()
+                .rposition(|&m| m & 1 != 0)
+                .map_or(0, |i| i + 1);
+            let expected_eor_end = oracle
+                .iter()
+                .rposition(|&m| m & 2 != 0)
+                .map_or(0, |i| i + 1);
+            assert_eq!(send.push_end, expected_push_end);
+            assert_eq!(send.eor_end, expected_eor_end);
+            if let Some((pos, bits)) = send.marks.singleton() {
+                assert_eq!(bits & !(1 | 2), 0, "singleton must not hold PTB bits");
+                if bits & 1 != 0 {
+                    saw_singleton_push = true;
+                }
+                if bits & 2 != 0 {
+                    saw_singleton_eor = true;
+                }
+                if bits != 0 {
+                    assert!(pos < oracle.len());
+                    assert_eq!(oracle[pos], bits);
+                }
+            } else {
+                saw_materialized = true;
+            }
+
+            // Query checks across random offset/count/end/size.
+            let offset = next(oracle.len() + 3);
+            let count = next(oracle.len() + 5);
+            let available = oracle.len().saturating_sub(offset);
+            let bounded = count.min(available);
+            let tail: Vec<u8> = oracle.iter().skip(offset).take(bounded).copied().collect();
+
+            let expected_record = tail
+                .iter()
+                .position(|&m| m & 2 != 0)
+                .map_or(tail.len(), |n| n + 1);
+            assert_eq!(send.record_len(offset, count), expected_record);
+            assert_eq!(send.record_len_within(offset, bounded), expected_record);
+            assert_eq!(
+                send.tail_record_offset(offset, count),
+                tail.iter()
+                    .take(tail.len().saturating_sub(1))
+                    .rposition(|&m| m & 2 != 0)
+                    .map_or(offset, |n| offset + n + 1)
+            );
+            assert_eq!(send.pushed(offset, count), tail.iter().any(|&m| m & 1 != 0));
+            assert_eq!(
+                send.push_after(offset),
+                oracle.iter().skip(offset).any(|&m| m & 1 != 0)
+            );
+            // If push_at_end returns true, PUSH must be ONLY on the last byte of [offset..offset+count)
+            // and must also be the last PUSH in the buffer.
+            if send.push_at_end(offset, count) {
+                assert!(count != 0 && offset + count == expected_push_end);
+                assert!(oracle[offset + count - 1] & 1 != 0);
+                assert!(
+                    oracle
+                        .range(offset..offset + count - 1)
+                        .all(|&m| m & 1 == 0)
+                );
+            }
+            let size = 1 + next(16);
+            let segments = next(12);
+            let expected_seg = (0..segments).find(|&s| {
+                let start = offset + s * size;
+                let end = (start + size).min(oracle.len());
+                start < end && oracle.range(start..end).any(|&m| m & 1 != 0)
+            });
+            assert_eq!(
+                send.first_pushed_segment(offset, size, segments),
+                expected_seg
+            );
+
+            // PTB queries.
+            let end = offset + count;
+            let limit = 1 + next(16);
+            let expected_next_flag = |flag: u8, lim: usize| -> Option<(usize, usize)> {
+                let hi = end.min(oracle.len());
+                let start = (offset..hi).find(|&i| oracle[i] & flag != 0)?;
+                let run = (start..hi)
+                    .take(lim)
+                    .take_while(|&i| oracle[i] & flag != 0)
+                    .count();
+                Some((start, run))
+            };
+            assert_eq!(
+                send.next_ptb(offset, end, limit),
+                expected_next_flag(PTB_PENDING, limit)
+            );
+            assert_eq!(
+                send.next_ptb_copy(offset, end),
+                expected_next_flag(PTB_COPY, usize::MAX)
+            );
+            let expected_count_ptb = oracle
+                .range(offset.min(oracle.len())..)
+                .take(count)
+                .filter(|&&m| m & PTB_PENDING != 0)
+                .count();
+            assert_eq!(send.count_ptb(offset, count), expected_count_ptb);
+            assert_eq!(
+                send.ptb_pending(offset),
+                oracle.get(offset).is_some_and(|&m| m & PTB_PENDING != 0)
+            );
+            assert_eq!(
+                send.ptb_copy(offset),
+                oracle.get(offset).is_some_and(|&m| m & PTB_COPY != 0)
+            );
+            assert_eq!(
+                send.retransmitted(offset),
+                oracle.get(offset).is_some_and(|&m| m & RETRANSMITTED != 0)
+            );
+
+            // selected_slice agrees with contiguous on record-clipped count.
+            assert_eq!(
+                send.selected_slice(offset, expected_record),
+                send.contiguous(offset, count)
+            );
+        }
+
+        assert!(saw_singleton_push);
+        assert!(saw_singleton_eor);
+        assert!(saw_materialized);
+        assert!(saw_full_ack_return_to_singleton);
+        assert!(saw_ptb);
     }
 }

@@ -18,7 +18,7 @@ use ntcp_buffer::RxFrame;
 
 use crate::seq::Seq;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ReceiveOutcome {
     pub new_bytes: usize,
     pub sack_overflow: bool,
@@ -140,14 +140,15 @@ pub(crate) struct RxOutputUndo {
 // empty), length, FIN and PUSH.
 type DeferredSyn = (Option<RxFrame>, usize, bool, bool);
 
-// The received frame an input lends the queue (`Endpoint::input_frame`):
-// the addresses of its bytes, and the frame until the queue takes it, or
-// again once the queue lets it go before the lend ends, so that its bytes,
-// which the segment being processed borrows, outlive that processing.
-struct Lend {
-    bytes: core::ops::Range<usize>,
-    frame: Option<RxFrame>,
-    taken: bool,
+// One input can lend one frame. While it is in the queue, keep its
+// address range so that removing it gives ownership back to the input.
+#[derive(Default)]
+enum Lend {
+    #[default]
+    None,
+    Available(RxFrame),
+    Held(core::ops::Range<usize>),
+    Returned(RxFrame),
 }
 
 pub(crate) struct RxQueue {
@@ -176,7 +177,7 @@ pub(crate) struct RxQueue {
     // Running sums over held frames: their truesize, and how many.
     frames: usize,
     entries: usize,
-    lend: Option<Lend>,
+    lend: Lend,
 }
 
 impl core::fmt::Debug for RxQueue {
@@ -213,7 +214,7 @@ impl RxQueue {
             dsack: None,
             frames: 0,
             entries: 0,
-            lend: None,
+            lend: Lend::None,
         }
     }
 
@@ -246,19 +247,17 @@ impl RxQueue {
     // place of a copy. Until `end_lend`, the queue drops no frame it took
     // from it.
     pub(crate) fn lend(&mut self, frame: RxFrame) {
-        debug_assert!(self.lend.is_none());
-        let start = frame.as_ptr() as usize;
-        self.lend = Some(Lend {
-            bytes: start..start + frame.len(),
-            frame: Some(frame),
-            taken: false,
-        });
+        debug_assert!(matches!(self.lend, Lend::None));
+        self.lend = Lend::Available(frame);
     }
 
     // Ends the lend: the frame if the queue did not take it or has let it
     // go since, which its lender drops once the segment is processed.
     pub(crate) fn end_lend(&mut self) -> Option<RxFrame> {
-        self.lend.take().and_then(|lend| lend.frame)
+        match core::mem::take(&mut self.lend) {
+            Lend::Available(frame) | Lend::Returned(frame) => Some(frame),
+            Lend::None | Lend::Held(_) => None,
+        }
     }
 
     // The frame holding bytes `from..to` of `payload`.
@@ -281,19 +280,17 @@ impl RxQueue {
     // the lent frame would lie past its range, and `discard` would not
     // know it for the lent frame and would release it during its input.
     pub(crate) fn frame_of(&mut self, bytes: &[u8]) -> Result<RxFrame, ()> {
-        let at = bytes.as_ptr() as usize;
-        if let Some(lend) = &mut self.lend
-            && !bytes.is_empty()
-            && !lend.taken
-            && lend.bytes.start <= at
-            && at + bytes.len() <= lend.bytes.end
-        {
-            let mut frame = lend.frame.take().unwrap();
-            lend.taken = true;
-            let offset = at - lend.bytes.start;
-            frame.truncate(offset + bytes.len());
-            frame.advance(offset);
-            return Ok(frame);
+        if let Lend::Available(frame) = &mut self.lend {
+            let base = frame.as_ptr() as usize;
+            let end = base + frame.len();
+            if !bytes.is_empty() && frame.retain_slice(bytes) {
+                let Lend::Available(frame) =
+                    core::mem::replace(&mut self.lend, Lend::Held(base..end))
+                else {
+                    unreachable!()
+                };
+                return Ok(frame);
+            }
         }
         heap_copy(bytes)
     }
@@ -301,13 +298,10 @@ impl RxQueue {
     // Drops a frame the queue no longer holds, except the lent one, which
     // goes back to the lend.
     fn discard(&mut self, frame: RxFrame) {
-        if let Some(lend) = &mut self.lend
-            && lend.taken
-            && lend.bytes.contains(&(frame.as_ptr() as usize))
+        if let Lend::Held(bytes) = &self.lend
+            && bytes.contains(&(frame.as_ptr() as usize))
         {
-            lend.frame = Some(frame);
-        } else {
-            drop(frame);
+            self.lend = Lend::Returned(frame);
         }
     }
 
@@ -321,8 +315,12 @@ impl RxQueue {
     // frames, the in-order deque's slots and the maps' nodes (a bound
     // the counting-allocator test checks).
     pub(crate) fn storage(&self) -> usize {
-        self.frames
-            + self.inorder.capacity() * size_of::<RxFrame>()
+        let inorder = self.frames + self.inorder.capacity() * size_of::<RxFrame>();
+        if !self.rooted {
+            debug_assert!(self.ofo.is_empty() && self.runs.is_empty() && self.anchors.is_empty());
+            return inorder;
+        }
+        inorder
             + map_bytes(self.ofo.len(), OFO_PAIR)
             + map_bytes(self.runs.len(), RUN_PAIR)
             + map_bytes(self.anchors.len(), ANCHOR_PAIR)
@@ -418,7 +416,7 @@ impl RxQueue {
     }
 
     pub(crate) fn clear(&mut self) {
-        if self.lend.as_ref().is_some_and(|lend| lend.taken) {
+        if matches!(self.lend, Lend::Held(_)) {
             let inorder = core::mem::take(&mut self.inorder);
             let ofo = core::mem::take(&mut self.ofo);
             let syn = self.deferred_syn.take().and_then(|syn| syn.0);
@@ -577,6 +575,15 @@ impl RxQueue {
     // emptiness.
     pub(crate) fn has_sack_blocks(&self) -> bool {
         self.dsack.is_some() || !self.runs.is_empty()
+    }
+
+    // The next in-sequence segment can append all its admitted text. This
+    // also excludes a FIN held beyond a gap without accompanying text.
+    // Production callers land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn can_append(&self) -> bool {
+        debug_assert!(!self.eof || self.fin_sequence.is_some());
+        self.runs.is_empty() && self.fin_sequence.is_none()
     }
 
     //= https://www.rfc-editor.org/rfc/rfc2018#section-4
@@ -757,7 +764,20 @@ impl RxQueue {
     }
 
     // Whether an anchor was taken (storage may have changed).
+    #[inline]
     pub(crate) fn commit_report(&mut self) -> bool {
+        if !self.rooted {
+            // After the last anchor was read a cumulative ACK can still
+            // pay down report debt. There is no map entry to release.
+            debug_assert!(self.anchors.is_empty());
+            self.report_debt = self.report_debt.saturating_sub(1);
+            return false;
+        }
+        self.commit_anchored_report()
+    }
+
+    #[inline(never)]
+    fn commit_anchored_report(&mut self) -> bool {
         self.report_debt = self.report_debt.saturating_sub(1);
         let Some(anchor) = self.report_anchor() else {
             return false;
@@ -818,17 +838,37 @@ impl RxQueue {
         // Each frame read to its end is released (Linux
         // tcp_eat_recv_skb); a partly read one keeps its whole charge.
         let mut remaining = &mut out[..count];
-        while !remaining.is_empty() {
-            let front = self.inorder.front_mut().unwrap();
-            let copied = remaining.len().min(front.len());
-            remaining[..copied].copy_from_slice(&front[..copied]);
-            if copied < front.len() {
-                front.advance(copied);
-                break;
-            }
-            remaining = &mut remaining[copied..];
-            let frame = self.inorder.pop_front().unwrap();
+        if self.inorder.len() == 1 && count == self.readable {
+            // The last frame is both ends of the deque. Popping the back
+            // keeps its head (and the next append) on the same slot.
+            let frame = self.inorder.pop_back().unwrap();
+            debug_assert_eq!(frame.len(), count);
+            remaining.copy_from_slice(&frame);
             self.release(frame);
+        } else if count == self.readable {
+            // The destination takes every remaining byte. Each entire
+            // frame can leave the queue before its copy, with no cursor
+            // to advance or partial-frame ownership to retain.
+            while !remaining.is_empty() {
+                let frame = self.inorder.pop_front().unwrap();
+                let (bytes, rest) = remaining.split_at_mut(frame.len());
+                bytes.copy_from_slice(&frame);
+                self.release(frame);
+                remaining = rest;
+            }
+        } else {
+            while !remaining.is_empty() {
+                let front = self.inorder.front_mut().unwrap();
+                let copied = remaining.len().min(front.len());
+                remaining[..copied].copy_from_slice(&front[..copied]);
+                if copied < front.len() {
+                    front.advance(copied);
+                    break;
+                }
+                remaining = &mut remaining[copied..];
+                let frame = self.inorder.pop_front().unwrap();
+                self.release(frame);
+            }
         }
         // A drained deque within DEQUE_RESERVE keeps its allocation,
         // charged as held, until its connection frees it (`release_spare`);
@@ -840,6 +880,10 @@ impl RxQueue {
         self.readable -= count;
         self.read += count as u64;
         self.read_base = self.read_base.wrapping_add(count as u32);
+        if !self.rooted {
+            debug_assert!(self.anchors.is_empty() && self.pending_first.is_none());
+            return count;
+        }
         // Anchors survive in the in-order data only after out-of-order
         // input.
         while let Some(&anchor) = self.anchors.first()
@@ -940,6 +984,96 @@ impl RxQueue {
         self.runs.insert(start, end);
     }
 
+    // Every byte is new, follows the readable prefix, and fits ahead of
+    // any held FIN. Secure both the frame and its queue slot before
+    // publishing it or its metadata.
+    fn append(
+        &mut self,
+        payload: RxPayload<'_>,
+        len: usize,
+        push: bool,
+        mut accepted: impl FnMut(usize, usize),
+    ) -> ReceiveOutcome {
+        let Ok(frame) = self.payload_frame(payload, 0, len) else {
+            return ReceiveOutcome {
+                refused: true,
+                ..Default::default()
+            };
+        };
+        if self.inorder.try_reserve(1).is_err() {
+            self.discard(frame);
+            return ReceiveOutcome {
+                refused: true,
+                ..Default::default()
+            };
+        }
+        let start = self.readable;
+        let outcome = self.append_frame(frame, push);
+        accepted(start, self.readable);
+        outcome
+    }
+
+    // A predicted in-order segment on an open read side keeps its entire
+    // text until a later input, read or clear. Keep ownership with the caller
+    // until there is a slot for it, including when allocation fails.
+    // Production callers land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn append_backed(
+        &mut self,
+        backing: &mut Option<RxFrame>,
+        bytes: &[u8],
+        push: bool,
+    ) -> Option<ReceiveOutcome> {
+        debug_assert!(self.can_append() && !self.eof && matches!(self.lend, Lend::None));
+        if bytes.is_empty() || !backing.as_mut()?.retain_slice(bytes) {
+            return None;
+        }
+        if self.inorder.try_reserve(1).is_err() {
+            return Some(ReceiveOutcome {
+                refused: true,
+                ..Default::default()
+            });
+        }
+        Some(self.append_frame(backing.take().unwrap(), push))
+    }
+
+    fn append_frame(&mut self, frame: RxFrame, push: bool) -> ReceiveOutcome {
+        let len = frame.len();
+        let truesize = frame.truesize();
+        self.hold(&frame);
+        self.inorder.push_back(frame);
+        self.readable += len;
+        self.pushed |= push;
+        self.latest = None;
+        ReceiveOutcome {
+            new_bytes: len,
+            truesize,
+            advanced: true,
+            ..Default::default()
+        }
+    }
+
+    // Production callers land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_segment<const IN_ORDER: bool>(
+        &mut self,
+        sequence: Seq,
+        payload: RxPayload<'_>,
+        fin: bool,
+        push: bool,
+        limit: Seq,
+        accepted: impl FnMut(usize, usize),
+    ) -> ReceiveOutcome {
+        if IN_ORDER {
+            debug_assert!(self.can_append() && !self.eof);
+            let len = payload.len();
+            debug_assert!(!fin && len != 0 && sequence == self.next() && self.runs.is_empty());
+            debug_assert!(self.readable + len <= limit.distance_from(self.read_base) as usize);
+            return self.append(payload, len, push, accepted);
+        }
+        self.insert(sequence, payload, fin, push, limit, accepted)
+    }
+
     // Takes the part of `payload`, the stream from `sequence`, within the
     // right edge `limit` and not already held; the connection performs
     // state and segment acceptability checks. Accepted runs are relative to
@@ -984,23 +1118,11 @@ impl RxQueue {
         // kept yet, as below. Its frame and deque slot are taken first: a
         // refusal leaves the queue as it was.
         if len != 0 && !outcome.out_of_order && !had_holes && contiguous + len <= data_limit {
-            let Ok(frame) = self.payload_frame(payload, 0, len) else {
-                outcome.refused = true;
-                return outcome;
-            };
-            if self.inorder.try_reserve(1).is_err() {
-                self.discard(frame);
-                outcome.refused = true;
+            let mut outcome = self.append(payload, len, push, &mut accepted);
+            if outcome.refused {
                 return outcome;
             }
-            self.hold(&frame);
-            outcome.truesize = frame.truesize();
-            self.inorder.push_back(frame);
-            let end = contiguous + len;
-            accepted(contiguous, end);
-            outcome.new_bytes = len;
-            self.readable = end;
-            self.pushed |= push;
+            let end = self.readable;
             if fin && self.fin_sequence.is_none() && end < capacity {
                 self.fin_sequence = Some(self.read_base.wrapping_add(end as u32));
             }
@@ -1008,8 +1130,6 @@ impl RxQueue {
                 self.eof = true;
                 outcome.fin = true;
             }
-            outcome.advanced = true;
-            self.latest = None;
             return outcome;
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
@@ -1246,11 +1366,7 @@ impl RxQueue {
     // the lent frame's (`Endpoint::input_frame`), or a copy's.
     pub(crate) fn incoming_truesize(&self, len: usize) -> usize {
         match &self.lend {
-            Some(Lend {
-                frame: Some(frame),
-                taken: false,
-                ..
-            }) => frame.truesize(),
+            Lend::Available(frame) => frame.truesize(),
             _ => len,
         }
     }
@@ -1260,7 +1376,7 @@ impl RxQueue {
     // collapses run before an input takes its frame (tcp_try_rmem_schedule
     // before queueing), so none is taken.
     fn assert_lend_untaken(&self) {
-        assert!(self.lend.as_ref().is_none_or(|lend| !lend.taken));
+        assert!(matches!(self.lend, Lend::None | Lend::Available(_)));
     }
 
     // Collapse is worth it for a frame whose window cost, `win` of its
@@ -2069,10 +2185,7 @@ mod tests {
         assert_eq!(queue.read(&mut out[..1]), 1);
         assert_eq!(queue.storage(), 50 + deque);
         assert_eq!(queue.read(&mut out), 50);
-        assert_eq!(
-            (queue.storage_less_spare(), queue.rmem()),
-            (0, 0)
-        );
+        assert_eq!((queue.storage_less_spare(), queue.rmem()), (0, 0));
         queue.release_spare();
         assert_eq!((queue.storage(), queue.inorder.capacity()), (0, 0));
         assert!(queue.take_push());
@@ -2208,6 +2321,416 @@ mod tests {
         assert_eq!(queue.readable(), 0);
         assert_eq!((queue.storage_less_spare(), queue.rmem()), (0, 0));
         queue.debug_check();
+    }
+
+    #[test]
+    fn lend_state_machine_transitions_and_clear_in_held_and_returned() {
+        let start = Seq(10);
+        let limit = Seq(1000);
+        let mut queue = RxQueue::new(start);
+
+        // None -> end_lend returns None.
+        assert!(queue.end_lend().is_none());
+
+        // Available -> end_lend returns the untaken frame.
+        let frame = heap_frame(b"unused-payload", 128);
+        let truesize = frame.truesize();
+        let ptr = frame.as_ptr();
+        queue.lend(frame);
+        assert_eq!(queue.incoming_truesize(4), truesize);
+        let back = queue.end_lend().expect("available frame returned");
+        assert_eq!(back.as_ptr(), ptr);
+        assert_eq!(&back[..], b"unused-payload");
+
+        // Available -> Held -> Returned (via read) -> end_lend returns the frame.
+        let frame = heap_frame(b"HDRhelloTRL", 160);
+        let truesize = frame.truesize();
+        let payload_slice = unsafe { core::slice::from_raw_parts(frame.as_ptr().add(3), 5) };
+        let orig_ptr = frame.as_ptr();
+        queue.lend(frame);
+        let out = queue.insert(
+            start,
+            RxPayload::Borrowed(payload_slice),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(out.new_bytes, 5);
+        assert_eq!(out.truesize, truesize);
+        assert!(matches!(queue.lend, Lend::Held(_)));
+        // Draining the held frame while lend is active moves it to Returned.
+        let mut buf = [0u8; 8];
+        assert_eq!(queue.read(&mut buf), 5);
+        assert_eq!(&buf[..5], b"hello");
+        assert!(matches!(queue.lend, Lend::Returned(_)));
+        let returned = queue.end_lend().expect("returned frame handed back");
+        assert_eq!(returned.as_ptr(), unsafe { orig_ptr.add(3) });
+        assert_eq!(&returned[..], b"hello");
+
+        // Available -> Held -> end_lend while still held returns None.
+        let frame = heap_frame(b"XXworldYY", 144);
+        let payload_slice = unsafe { core::slice::from_raw_parts(frame.as_ptr().add(2), 5) };
+        queue.lend(frame);
+        let out = queue.insert(
+            queue.next(),
+            RxPayload::Borrowed(payload_slice),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(out.new_bytes, 5);
+        assert!(matches!(queue.lend, Lend::Held(_)));
+        assert!(queue.end_lend().is_none());
+        assert_eq!(queue.read(&mut buf), 5);
+        assert_eq!(&buf[..5], b"world");
+
+        // clear() in Held state moves frame into Returned and end_lend returns it.
+        let frame = heap_frame(b"AAclearBB", 176);
+        let payload_slice = unsafe { core::slice::from_raw_parts(frame.as_ptr().add(2), 5) };
+        let expected_ptr = unsafe { frame.as_ptr().add(2) };
+        queue.lend(frame);
+        let out = queue.insert(
+            queue.next(),
+            RxPayload::Borrowed(payload_slice),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(out.new_bytes, 5);
+        assert!(matches!(queue.lend, Lend::Held(_)));
+        queue.clear();
+        assert!(matches!(queue.lend, Lend::Returned(_)));
+        let returned = queue.end_lend().expect("clear in Held returns frame");
+        assert_eq!(returned.as_ptr(), expected_ptr);
+        assert_eq!(&returned[..], b"clear");
+
+        // clear() in Returned state keeps Returned and end_lend still returns it.
+        let frame = heap_frame(b"CCagainDD", 192);
+        let payload_slice = unsafe { core::slice::from_raw_parts(frame.as_ptr().add(2), 5) };
+        let expected_ptr = unsafe { frame.as_ptr().add(2) };
+        queue.lend(frame);
+        queue.insert(
+            queue.next(),
+            RxPayload::Borrowed(payload_slice),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(queue.read(&mut buf), 5);
+        assert!(matches!(queue.lend, Lend::Returned(_)));
+        queue.clear();
+        assert!(matches!(queue.lend, Lend::Returned(_)));
+        let returned = queue.end_lend().expect("clear in Returned keeps frame");
+        assert_eq!(returned.as_ptr(), expected_ptr);
+        assert_eq!(&returned[..], b"again");
+    }
+
+    #[test]
+    fn frame_of_retain_slice_failure_leaves_lent_frame_unchanged() {
+        let mut queue = RxQueue::new(Seq(0));
+        let frame = heap_frame(b"HDR:payload:TRL", 200);
+        let truesize = frame.truesize();
+        let orig_ptr = frame.as_ptr();
+        let orig_len = frame.len();
+        let interior = unsafe { core::slice::from_raw_parts(orig_ptr.add(4), 7) };
+        queue.lend(frame);
+
+        // External bytes fail retain_slice -> heap copy returned, lent frame stays Available & unchanged.
+        let external = b"external-bytes";
+        let copied = queue.frame_of(external).unwrap();
+        assert_eq!(&copied[..], external);
+        assert_ne!(copied.as_ptr(), orig_ptr);
+        assert_eq!(queue.incoming_truesize(1), truesize);
+        match &queue.lend {
+            Lend::Available(f) => {
+                assert_eq!(f.as_ptr(), orig_ptr);
+                assert_eq!(f.len(), orig_len);
+                assert_eq!(&f[..], b"HDR:payload:TRL");
+            }
+            _ => panic!("expected lend to remain Available"),
+        }
+
+        // Empty slice takes nothing from the lend either.
+        let empty = queue.frame_of(&[]).unwrap();
+        assert!(empty.is_empty());
+        assert!(matches!(queue.lend, Lend::Available(_)));
+
+        // A valid interior slice subsequently takes the lent frame intact.
+        let taken = queue.frame_of(interior).unwrap();
+        assert_eq!(taken.as_ptr(), unsafe { orig_ptr.add(4) });
+        assert_eq!(&taken[..], b"payload");
+        assert_eq!(taken.truesize(), truesize);
+        assert!(matches!(queue.lend, Lend::Held(_)));
+        queue.discard(taken);
+        let back = queue.end_lend().expect("discarded lent frame returned");
+        assert_eq!(&back[..], b"payload");
+    }
+
+    #[test]
+    fn read_three_branches_cover_partial_front_followed_by_full_drain() {
+        let start = Seq(500);
+        let limit = Seq(2000);
+        let mut queue = RxQueue::new(start);
+        let mut out = [0u8; 32];
+
+        // Branch A: single frame full drain (inorder.len() == 1 && count == readable).
+        queue.insert(
+            start,
+            RxPayload::Borrowed(b"solo!"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(queue.inorder.len(), 1);
+        assert_eq!(queue.read(&mut out), 5);
+        assert_eq!(&out[..5], b"solo!");
+        assert_eq!(queue.readable(), 0);
+        assert_eq!(queue.rmem(), 0);
+        queue.debug_check();
+
+        // Branch C (partial read of single frame) followed by Branch A (full drain of remainder).
+        let seq = queue.next();
+        queue.insert(
+            seq,
+            RxPayload::Borrowed(b"abcdef"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(queue.read(&mut out[..2]), 2);
+        assert_eq!(&out[..2], b"ab");
+        assert_eq!(queue.readable(), 4);
+        assert_eq!(queue.inorder.len(), 1);
+        assert_eq!(queue.read(&mut out[..4]), 4);
+        assert_eq!(&out[..4], b"cdef");
+        assert_eq!(queue.readable(), 0);
+        assert_eq!(queue.rmem(), 0);
+        queue.debug_check();
+
+        // Branch C (partial read of front frame in multi-frame queue) followed by
+        // Branch B (full drain of remaining partial front + subsequent frames).
+        let seq = queue.next();
+        queue.insert(
+            seq,
+            RxPayload::Borrowed(b"012345"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        let seq = queue.next();
+        queue.insert(
+            seq,
+            RxPayload::Owned(heap_frame(b"ABCDEF", 64)),
+            false,
+            true,
+            limit,
+            |_, _| {},
+        );
+        let seq = queue.next();
+        queue.insert(
+            seq,
+            RxPayload::Borrowed(b"xyz"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(queue.inorder.len(), 3);
+        assert_eq!(queue.readable(), 15);
+
+        // Partial read leaves 3 bytes in front frame (Branch C).
+        assert_eq!(queue.read(&mut out[..3]), 3);
+        assert_eq!(&out[..3], b"012");
+        assert_eq!(queue.readable(), 12);
+        assert_eq!(queue.inorder.len(), 3);
+        queue.debug_check();
+
+        // Oversized read drains remaining 12 bytes across 3 frames (Branch B).
+        assert_eq!(queue.read(&mut out), 12);
+        assert_eq!(&out[..12], b"345ABCDEFxyz");
+        assert_eq!(queue.readable(), 0);
+        assert_eq!((queue.storage_less_spare(), queue.rmem()), (0, 0));
+        queue.debug_check();
+    }
+
+    #[test]
+    fn append_backed_allocation_refusal_keeps_backing_and_retry_succeeds() {
+        use crate::allocation_tests::fail_after;
+
+        let mut queue = RxQueue::new(Seq(100));
+        let frame = heap_frame(b"HDR:payload:TRL", 256);
+        let truesize = frame.truesize();
+        let orig_ptr = frame.as_ptr();
+        let orig_len = frame.len();
+        let payload = unsafe { core::slice::from_raw_parts(orig_ptr.add(4), 7) };
+        let mut backing = Some(frame);
+
+        // Empty slice or out-of-frame slice returns None without modifying backing.
+        assert!(queue.append_backed(&mut backing, &[], false).is_none());
+        assert!(
+            queue
+                .append_backed(&mut backing, b"outside", false)
+                .is_none()
+        );
+        assert_eq!(backing.as_ref().unwrap().as_ptr(), orig_ptr);
+        assert_eq!(backing.as_ref().unwrap().len(), orig_len);
+        assert_eq!(queue.readable(), 0);
+
+        // Fresh queue has inorder.capacity() == 0, so try_reserve(1) allocates.
+        // Refusing that allocation returns refused=true and keeps ownership in `backing`.
+        assert_eq!(queue.inorder.capacity(), 0);
+        let refused = fail_after(0, || queue.append_backed(&mut backing, payload, true))
+            .expect("valid slice returns Some outcome");
+        assert!(refused.refused);
+        assert_eq!(refused.new_bytes, 0);
+        assert!(!refused.advanced);
+        assert_eq!(queue.readable(), 0);
+        assert!(!queue.take_push());
+        assert_eq!(queue.rmem(), 0);
+        let retained = backing
+            .as_ref()
+            .expect("backing retained by caller on refusal");
+        assert_eq!(&retained[..], b"payload");
+        queue.debug_check();
+
+        // Retry with the same bytes succeeds and transfers ownership into the queue.
+        let retry_slice = unsafe { core::slice::from_raw_parts(retained.as_ptr(), retained.len()) };
+        let accepted = queue
+            .append_backed(&mut backing, retry_slice, true)
+            .expect("retry returns Some outcome");
+        assert!(!accepted.refused);
+        assert!(accepted.advanced);
+        assert_eq!(accepted.new_bytes, 7);
+        assert_eq!(accepted.truesize, truesize);
+        assert!(backing.is_none());
+        assert_eq!(queue.readable(), 7);
+        assert!(queue.take_push());
+        let mut out = [0u8; 16];
+        assert_eq!(queue.read(&mut out), 7);
+        assert_eq!(&out[..7], b"payload");
+        queue.debug_check();
+    }
+
+    #[test]
+    fn storage_unrooted_and_insert_segment_equivalence() {
+        let start = Seq(1_000);
+        let limit = Seq(10_000);
+        let mut fast = RxQueue::new(start);
+        let mut slow = RxQueue::new(start);
+
+        let check_unrooted_storage = |q: &RxQueue| {
+            assert!(!q.rooted);
+            let expected = q.frames + q.inorder.capacity() * size_of::<RxFrame>();
+            assert_eq!(q.storage(), expected);
+        };
+        check_unrooted_storage(&fast);
+        check_unrooted_storage(&slow);
+
+        // Equivalent in-order non-FIN segments with varying payloads, push flags, and reads.
+        let segments: &[(&[u8], bool, bool)] = &[
+            (b"alpha", false, false),
+            (b"BETA-owned", true, true),
+            (b"gamma", false, false),
+            (b"DELTA", true, false),
+            (b"epsilon-owned", false, true),
+        ];
+        for &(bytes, push, owned) in segments {
+            assert!(fast.can_append() && slow.can_append());
+            let seq = fast.next();
+            assert_eq!(seq, slow.next());
+            let mut fast_acc = Vec::new();
+            let mut slow_acc = Vec::new();
+            let p_fast = if owned {
+                RxPayload::Owned(heap_frame(bytes, 128))
+            } else {
+                RxPayload::Borrowed(bytes)
+            };
+            let p_slow = if owned {
+                RxPayload::Owned(heap_frame(bytes, 128))
+            } else {
+                RxPayload::Borrowed(bytes)
+            };
+            let o_fast = fast.insert_segment::<true>(seq, p_fast, false, push, limit, |a, b| {
+                fast_acc.push((a, b));
+            });
+            let o_slow = slow.insert_segment::<false>(seq, p_slow, false, push, limit, |a, b| {
+                slow_acc.push((a, b));
+            });
+            assert_eq!(o_fast.new_bytes, o_slow.new_bytes);
+            assert_eq!(o_fast.truesize, o_slow.truesize);
+            assert_eq!(o_fast.advanced, o_slow.advanced);
+            assert_eq!(o_fast.out_of_order, o_slow.out_of_order);
+            assert_eq!(o_fast.fin, o_slow.fin);
+            assert_eq!(o_fast.refused, o_slow.refused);
+            assert_eq!(o_fast.sack_overflow, o_slow.sack_overflow);
+            assert_eq!(fast_acc, slow_acc);
+            assert_eq!(fast.readable(), slow.readable());
+            assert_eq!(fast.next(), slow.next());
+            assert_eq!(fast.rmem(), slow.rmem());
+            assert_eq!(fast.storage(), slow.storage());
+            assert_eq!(fast.take_push(), slow.take_push());
+            check_unrooted_storage(&fast);
+            check_unrooted_storage(&slow);
+            fast.debug_check();
+            slow.debug_check();
+
+            // Interleave partial read after every second segment.
+            if push {
+                let mut f_buf = [0u8; 4];
+                let mut s_buf = [0u8; 4];
+                let fn_read = fast.read(&mut f_buf);
+                let sn_read = slow.read(&mut s_buf);
+                assert_eq!(fn_read, sn_read);
+                assert_eq!(&f_buf[..fn_read], &s_buf[..sn_read]);
+                check_unrooted_storage(&fast);
+                check_unrooted_storage(&slow);
+            }
+        }
+
+        // Drain both queues and verify byte-exact equality.
+        let mut f_out = [0u8; 64];
+        let mut s_out = [0u8; 64];
+        let f_n = fast.read(&mut f_out);
+        let s_n = slow.read(&mut s_out);
+        assert_eq!(f_n, s_n);
+        assert_eq!(&f_out[..f_n], &s_out[..s_n]);
+        check_unrooted_storage(&fast);
+        check_unrooted_storage(&slow);
+
+        // Verify rooted -> unrooted transition (after OOO gap fill + report commit) restores unrooted storage().
+        let next = fast.next();
+        fast.insert(
+            next.wrapping_add(4),
+            RxPayload::Borrowed(b"tail"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert!(fast.rooted);
+        assert!(!fast.can_append());
+        fast.insert(
+            next,
+            RxPayload::Borrowed(b"head"),
+            false,
+            false,
+            limit,
+            |_, _| {},
+        );
+        assert_eq!(fast.read(&mut f_out), 8);
+        assert_eq!(&f_out[..8], b"headtail");
+        assert!(!fast.rooted);
+        assert!(fast.can_append());
+        assert!(!fast.commit_report());
+        check_unrooted_storage(&fast);
+        fast.debug_check();
     }
 }
 
