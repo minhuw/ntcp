@@ -5,7 +5,11 @@ use core::mem::size_of;
 
 use ntcp_buffer::{ChunkArena, ChunkRef, ChunkSlice, PayloadSlice, TxPart};
 
-use crate::{Payload, tx_pool::TxPool};
+use crate::{
+    Payload,
+    output_reservation::OwnedTxPart,
+    tx_pool::{TxPartsBuf, TxPool},
+};
 
 #[path = "send_marks.rs"]
 mod send_marks;
@@ -1004,6 +1008,7 @@ impl SendBuffer {
 
     // Borrow a scalar payload directly when the selected bytes all come
     // from one chunk entry and no shared payloads are queued.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn contiguous<'a>(
         &'a self,
         arena: &'a ChunkArena,
@@ -1014,6 +1019,7 @@ impl SendBuffer {
     }
 
     // The caller has already clipped these bytes to the record boundary.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn selected_slice<'a>(
         &'a self,
         arena: &'a ChunkArena,
@@ -1046,8 +1052,16 @@ impl SendBuffer {
         }
     }
 
+    /// Length of the next output span at `offset` bounded by `limit`,
+    /// respecting record boundaries and shared-output segmentation.
+    #[inline]
+    pub(crate) fn plan_len(&self, offset: usize, limit: usize) -> usize {
+        self.selection_len(offset, self.record_len(offset, limit))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn copy(&self, arena: &ChunkArena, offset: usize, out: &mut [u8]) -> usize {
-        let count = self.selection_len(offset, self.record_len(offset, out.len()));
+        let count = self.plan_len(offset, out.len());
         if count == 0 {
             return 0;
         }
@@ -1090,14 +1104,14 @@ impl SendBuffer {
     }
 
     /// Borrow covering `TxPart` slices for `[offset, offset + count)` directly
-    /// from the queue's chunks and shared payloads (zero copy).
-    #[allow(dead_code)]
+    /// from the queue's chunks and shared payloads (zero copy), merging
+    /// adjacent contiguous slices from the same `TxChunk`.
     pub(crate) fn tx_parts<'a>(
         &'a self,
         arena: &'a ChunkArena,
         offset: usize,
         count: usize,
-        out: &mut Vec<TxPart<'a>>,
+        out: &mut TxPartsBuf<'a>,
     ) -> usize {
         let count = count.min(self.len.saturating_sub(offset));
         if count == 0 {
@@ -1121,15 +1135,84 @@ impl SendBuffer {
                     let start = *chunk_off as usize + rel;
                     let slice = ChunkSlice::new(arena.get(chunk), start..start + take)
                         .expect("chunk slice within filled prefix");
-                    out.push(TxPart::Chunk(slice));
+                    out.push_merged(TxPart::Chunk(slice));
                 }
                 TxSegData::Shared(payload) => {
                     let slice = PayloadSlice::new(payload, rel..rel + take)
                         .expect("payload slice within bounds");
-                    out.push(TxPart::Shared(slice));
+                    out.push_merged(TxPart::Shared(slice));
                 }
                 TxSegData::Released(_) => {
                     debug_assert!(false, "tx_parts from released shared segment");
+                    break;
+                }
+            }
+            at += take;
+            covered += take;
+            idx += 1;
+        }
+        covered
+    }
+
+    /// Clone/dup owning `OwnedTxPart` references covering `[offset, offset + count)`,
+    /// merging adjacent contiguous ranges of the same `TxChunk` before dup'ing.
+    pub(crate) fn dup_tx_parts(
+        &self,
+        pool: &mut TxPool,
+        offset: usize,
+        count: usize,
+        out: &mut Vec<OwnedTxPart>,
+    ) -> usize {
+        let count = count.min(self.len.saturating_sub(offset));
+        if count == 0 {
+            return 0;
+        }
+        let Some(mut idx) = self.entry_at(offset) else {
+            return 0;
+        };
+        let mut at = offset;
+        let mut covered = 0;
+        while covered < count {
+            let seg = &self.entries[idx];
+            let rel = at - self.seg_start(seg);
+            let take = (seg.len() - rel).min(count - covered);
+            match &seg.data {
+                TxSegData::Chunk {
+                    chunk,
+                    offset: chunk_off,
+                    ..
+                } => {
+                    let start = *chunk_off + rel as u32;
+                    let len = take as u32;
+                    if let Some(OwnedTxPart::Chunk {
+                        chunk: prev_chunk,
+                        offset: prev_off,
+                        len: prev_len,
+                    }) = out.last_mut()
+                        && pool.same_chunk(prev_chunk, chunk)
+                        && *prev_off + *prev_len == start
+                    {
+                        *prev_len += len;
+                    } else {
+                        out.push(OwnedTxPart::Chunk {
+                            chunk: pool.dup(chunk),
+                            offset: start,
+                            len,
+                        });
+                    }
+                }
+                TxSegData::Shared(payload) => {
+                    let sliced = payload.slice(rel..rel + take).unwrap();
+                    if let Some(OwnedTxPart::Shared(prev)) = out.last_mut()
+                        && let Some(joined) = prev.join(&sliced)
+                    {
+                        *prev = joined;
+                    } else {
+                        out.push(OwnedTxPart::Shared(sliced));
+                    }
+                }
+                TxSegData::Released(_) => {
+                    debug_assert!(false, "dup_tx_parts from released shared segment");
                     break;
                 }
             }
@@ -2100,17 +2183,40 @@ mod tests {
             if let Some(slice) = send.selected_slice(pool.arena(), offset, expected_record) {
                 assert_eq!(slice, &out[..copied]);
             }
-            let mut parts = Vec::new();
+            let mut parts = TxPartsBuf::new();
             let covered = send.tx_parts(pool.arena(), offset, expected_record, &mut parts);
             assert_eq!(covered, expected_record);
+            assert_eq!(send.plan_len(offset, bounded), expected_record);
             let mut flattened = Vec::with_capacity(covered);
-            for part in &parts {
+            for part in parts.as_slice() {
                 flattened.extend_from_slice(part.bytes());
             }
             assert_eq!(flattened, &out[..copied]);
             if !parts.is_empty() {
                 saw_tx_parts = true;
             }
+            let mut owned = Vec::new();
+            let owned_covered = send.dup_tx_parts(&mut pool, offset, expected_record, &mut owned);
+            assert_eq!(owned_covered, expected_record);
+            let mut owned_bytes = Vec::with_capacity(owned_covered);
+            for part in owned.drain(..) {
+                match part {
+                    OwnedTxPart::Chunk {
+                        chunk,
+                        offset: c_off,
+                        len,
+                    } => {
+                        owned_bytes.extend_from_slice(
+                            pool.arena()
+                                .get(&chunk)
+                                .bytes(c_off as usize..(c_off + len) as usize),
+                        );
+                        pool.release(chunk);
+                    }
+                    OwnedTxPart::Shared(p) => owned_bytes.extend_from_slice(p.as_slice()),
+                }
+            }
+            assert_eq!(owned_bytes, &out[..copied]);
         }
 
         assert!(saw_shared);

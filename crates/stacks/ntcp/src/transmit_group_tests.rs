@@ -122,7 +122,22 @@ fn snapshot(e: &Endpoint, id: ConnectionId) -> std::string::String {
 // The physical segments a backend cuts from the aggregate, as Linux
 // tcp_gso_segment does: full segments and the remainder, PSH and FIN on the
 // last, CWR on the first only.
-fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
+fn group_payload(endpoint: &Endpoint, group: crate::TransmitGroup) -> Vec<u8> {
+    endpoint
+        .with_transmit_group_parts(group, |parts| {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend_from_slice(part.bytes());
+            }
+            out
+        })
+        .unwrap()
+}
+
+fn cut(endpoint: &Endpoint, group: crate::TransmitGroup) -> Vec<Vec<u8>> {
+    let view = endpoint.transmit_group(group).unwrap();
+    let payload = group_payload(endpoint, group);
+    assert_eq!(payload.len(), view.payload_len);
     let size = view.segment_payload_len;
     (0..view.segment_count)
         .map(|n| {
@@ -139,7 +154,7 @@ fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
                 view.packet.ip,
                 header,
                 view.options,
-                &view.payload[n * size..((n + 1) * size).min(view.payload.len())],
+                &payload[n * size..((n + 1) * size).min(payload.len())],
                 &mut out,
             )
             .unwrap();
@@ -179,8 +194,7 @@ fn receipt(view: &crate::TransmitGroupView<'_>) -> crate::PhysicalReceipt {
         40
     };
     crate::PhysicalReceipt {
-        ip_packet_len: (ip + view.packet.len - view.payload.len() + view.segment_payload_len)
-            as u32,
+        ip_packet_len: (ip + view.packet.len - view.payload_len + view.segment_payload_len) as u32,
         dont_fragment: true,
     }
 }
@@ -215,10 +229,10 @@ fn group_acceptance_records_what_scalar_acceptance_at_its_instant_records() {
                 );
                 assert!(view.segment_count >= 6, "{}", view.segment_count);
                 assert_eq!(view.options.len(), if timestamps { 12 } else { 0 });
-                assert_eq!(view.packet.len, s.tcp_header_len + view.payload.len());
+                assert_eq!(view.packet.len, s.tcp_header_len + view.payload_len);
                 assert!(view.packet.tx_timestamp.is_none());
-                assert_eq!(view.payload, &data[..view.payload.len()]);
-                let segments = cut(&view);
+                assert_eq!(group_payload(&a, group), &data[..view.payload_len]);
+                let segments = cut(&a, group);
                 let ip = view.packet.ip;
                 let each = receipt(&view);
                 // Group preparation records nothing.
@@ -411,7 +425,7 @@ fn refused_gso_range_takes_a_current_tsval_until_a_segment_departs() {
         .prepare_transmit_group(attempt.unwrap(), limits())
         .unwrap()
         .unwrap();
-    let segments = cut(&a.transmit_group(group).unwrap());
+    let segments = cut(&a, group);
     assert!(segments.len() >= 2);
     for segment in &segments {
         assert_eq!(segment[20..32], rebuilt[20..32]);
@@ -594,7 +608,7 @@ fn group(e: &mut Endpoint, id: ConnectionId, now: Instant) -> Vec<Vec<u8>> {
         .prepare_transmit_group(attempt.unwrap(), limits())
         .unwrap()
         .unwrap();
-    let segments = cut(&e.transmit_group(group).unwrap());
+    let segments = cut(&e, group);
     assert!(e.accept_transmit_group(now, group).unwrap());
     segments
 }
@@ -747,7 +761,7 @@ fn queued_fin_ends_a_group_on_its_last_segment() {
             let segments = length.div_ceil(988);
             assert_eq!(view.segment_count, segments - usize::from(!allow_psh));
             assert_eq!(view.header.flags & wire::FIN != 0, allow_psh);
-            let mut wire = cut(&view);
+            let mut wire = cut(&a, group);
             // Scalar acceptance of the same segments records the same.
             let scalar_b = scalar(&mut b, bid, 2);
             for (n, segment) in wire.iter().enumerate() {
@@ -883,7 +897,7 @@ fn drain(e: &mut Endpoint, id: ConnectionId, now: Instant) -> (Vec<Vec<u8>>, Vec
         };
         let attempt = attempt.unwrap();
         if let Some(group) = e.prepare_transmit_group(attempt, limits()).unwrap() {
-            let segments = cut(&e.transmit_group(group).unwrap());
+            let segments = cut(&e, group);
             groups.push(segments.len());
             wire.extend(segments);
             assert!(e.accept_transmit_group(now, group).unwrap());
@@ -1390,7 +1404,7 @@ fn drain_completed(e: &mut Endpoint, id: ConnectionId, now: Instant) -> (Vec<Vec
         if let Some(group) = e.prepare_transmit_group(attempt, limits()).unwrap() {
             let view = e.transmit_group(group).unwrap();
             assert!(view.packet.tx_timestamp.is_none());
-            let segments = cut(&view);
+            let segments = cut(&e, group);
             groups.push(segments.len());
             wire.extend(segments);
             assert!(e.accept_transmit_group(now, group).unwrap());

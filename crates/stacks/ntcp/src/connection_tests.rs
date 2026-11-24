@@ -12055,11 +12055,9 @@ fn network_errors_validate_quote_and_mss_reduction_repacketizes() {
     );
     assert_eq!(a.lower_mss(0), Err(Error::InvalidArgument));
     assert_eq!(a.lower_mss(9), Err(Error::InvalidArgument));
-    let storage = (a.scratch.as_ptr(), a.scratch.capacity());
     let high = a.snd_nxt;
     a.lower_mss(3).unwrap();
     assert!(a.retx_pending);
-    assert_eq!((a.scratch.as_ptr(), a.scratch.capacity()), storage);
     let bytes = packet(&mut a, 80);
     let segment = wire::parse(ip(tuple()), &bytes).unwrap();
     assert_eq!(segment.payload, b"abc");
@@ -13863,8 +13861,7 @@ fn ip_limits_bound_receive_offer_send_payload_options_and_allocations() {
             cfg.receive_ip_payload_limit = receive;
             cfg.send_ip_payload_limit = send;
             let mut a = Connection::active(tuple, cfg, 100, 0).unwrap();
-            let storage = (a.scratch.as_ptr(), a.scratch.capacity());
-            assert_eq!(a.scratch.len(), configured as usize);
+            assert_eq!(a.config.mss, configured);
             let before = (a.snd_nxt, a.now, a.next_deadline());
             assert_eq!(a.transmit(1, &mut [0; 27]), Err(Error::OutputTooSmall));
             assert_eq!((a.snd_nxt, a.now, a.next_deadline()), before);
@@ -13901,7 +13898,6 @@ fn ip_limits_bound_receive_offer_send_payload_options_and_allocations() {
                 effective
             );
             a.lower_mss(1).unwrap();
-            assert_eq!((a.scratch.as_ptr(), a.scratch.capacity()), storage);
             assert_eq!(packet(&mut a, 50).len(), 21);
             a.abort();
             assert_eq!(packet(&mut a, 60).len(), 20);

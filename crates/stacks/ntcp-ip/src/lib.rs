@@ -596,6 +596,58 @@ impl TcpHeaderCache {
         }
         Ok(len)
     }
+
+    /// Cached header-only variant of [`encode_shared_header`]: writes the IPv4
+    /// header around an already-encoded TCP header of `tcp_header_len` bytes
+    /// while the total IPv4 length reflects the full `transmit.len`.
+    pub fn encode_shared_header(
+        &mut self,
+        packet: &mut [u8],
+        transmit: &ntcp::Transmit,
+        timestamp: u32,
+        tcp_header_len: usize,
+    ) -> Result<usize, Error> {
+        if !(20..=60).contains(&tcp_header_len)
+            || !tcp_header_len.is_multiple_of(4)
+            || tcp_header_len > transmit.len
+        {
+            return Err(Error::Length);
+        }
+        let plain = transmit.ipv4_options.is_empty();
+        if plain
+            && let Some((ip, header)) = &mut self.0
+            && *ip == transmit.ip
+            && header[8] == transmit.hop_limit
+            && header[1] >> 2 == transmit.dscp
+            && header[1] & 3 == transmit.ecn
+        {
+            let total = IPV4_HEADER
+                .checked_add(transmit.len)
+                .and_then(|len| u16::try_from(len).ok())
+                .ok_or(Error::Length)?;
+            let stored = IPV4_HEADER.checked_add(tcp_header_len).ok_or(Error::Length)?;
+            if packet.len() < stored {
+                return Err(Error::Length);
+            }
+            let old = u16::from_be_bytes([header[2], header[3]]);
+            if total != old {
+                // RFC 1624, Eq. 3, with the changing 16-bit total length.
+                let check = u16::from_be_bytes([header[10], header[11]]);
+                let sum = u32::from(!check) + u32::from(!old) + u32::from(total);
+                let sum = (sum & 0xffff) + (sum >> 16);
+                let check = !((sum as u16).wrapping_add((sum >> 16) as u16));
+                header[2..4].copy_from_slice(&total.to_be_bytes());
+                header[10..12].copy_from_slice(&check.to_be_bytes());
+            }
+            packet[..IPV4_HEADER].copy_from_slice(header);
+            return Ok(stored);
+        }
+        let stored = encode_shared_header(packet, *transmit, timestamp, tcp_header_len)?;
+        if plain {
+            self.0 = Some((transmit.ip, packet[..IPV4_HEADER].try_into().unwrap()));
+        }
+        Ok(stored)
+    }
 }
 
 /// Write the fixed IPv4 header of a connected TCP segment. Its cached
@@ -1011,6 +1063,84 @@ mod tests {
         tx.dscp = 0;
         tx.len = usize::MAX;
         assert_eq!(cache.encode(&mut actual, &tx, 1), Err(Error::Length));
+    }
+
+    #[test]
+    fn cached_shared_tcp_headers_match_encode_shared_header_across_lengths_and_options() {
+        let mut cache = TcpHeaderCache::default();
+        let mut tx = ntcp::Transmit {
+            ip: IpMetadata {
+                source: Ipv4Addr::new(192, 0, 2, 30).into(),
+                destination: Ipv4Addr::new(198, 51, 100, 71).into(),
+            },
+            hop_limit: 64,
+            dscp: 0,
+            ecn: 0,
+            ipv4_options: Default::default(),
+            tx_timestamp: None,
+            connection: None,
+            len: 0,
+            mark: 0,
+        };
+        let mut expected = [0x5A; 128];
+        let mut actual = expected;
+        for (i, &tcp_hdr_len) in [20usize, 32, 40, 60, 20, 32].iter().enumerate() {
+            for payload in [0usize, 1, 512, 1448, 65000] {
+                tx.len = tcp_hdr_len + payload;
+                if i == 2 {
+                    tx.dscp = 46;
+                    tx.ecn = 2;
+                } else if i == 3 {
+                    tx.hop_limit = 32;
+                    tx.ip.destination = Ipv4Addr::new(10, 2, 3, 4).into();
+                } else if i == 4 {
+                    tx.ipv4_options = ntcp::OutgoingIpv4Options {
+                        record_route_slots: Some(3),
+                        ..Default::default()
+                    };
+                } else if i == 5 {
+                    tx.ipv4_options = Default::default();
+                }
+                for (idx, byte) in expected.iter_mut().enumerate() {
+                    *byte = (idx as u8).wrapping_mul(13).wrapping_add(i as u8);
+                }
+                actual.copy_from_slice(&expected);
+                let got = cache.encode_shared_header(&mut actual, &tx, 99, tcp_hdr_len);
+                let want = encode_shared_header(&mut expected, tx, 99, tcp_hdr_len);
+                assert_eq!(got, want, "case i={i} tcp_hdr_len={tcp_hdr_len} payload={payload}");
+                assert_eq!(actual, expected);
+            }
+        }
+        // Validation errors on cached hit too.
+        tx.len = 100;
+        assert_eq!(
+            cache.encode_shared_header(&mut actual, &tx, 99, 16),
+            Err(Error::Length)
+        );
+        assert_eq!(
+            cache.encode_shared_header(&mut actual, &tx, 99, 21),
+            Err(Error::Length)
+        );
+        assert_eq!(
+            cache.encode_shared_header(&mut actual, &tx, 99, 64),
+            Err(Error::Length)
+        );
+        tx.len = 24;
+        assert_eq!(
+            cache.encode_shared_header(&mut actual, &tx, 99, 32),
+            Err(Error::Length)
+        );
+        tx.len = 1480;
+        let mut tiny = [0u8; IPV4_HEADER + 31];
+        assert_eq!(
+            cache.encode_shared_header(&mut tiny, &tx, 99, 32),
+            Err(Error::Length)
+        );
+        tx.len = usize::from(u16::MAX);
+        assert_eq!(
+            cache.encode_shared_header(&mut actual, &tx, 99, 32),
+            Err(Error::Length)
+        );
     }
 
     fn ipv4_address_protocol_sum(source: Ipv4Addr, destination: Ipv4Addr) -> u16 {

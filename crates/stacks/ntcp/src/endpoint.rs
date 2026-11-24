@@ -20,14 +20,16 @@ use crate::{
     TxTimestampStage, TxTimestampToken,
     connection::{
         Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple,
-        SendWriteKind, State, Tuple,
+        SelectedOutput, SendWriteKind, State, Tuple,
     },
+    output_reservation::{OwnedTxPart, RESERVATION_INITIAL_PARTS},
     rx_timestamp::RxTimestamps,
     schedule::{ReadyQueue, SocketTimers},
     seq::Seq,
-    tx_pool::TxPool,
+    tx_pool::{TxPartsBuf, TxPool},
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
 };
+use ntcp_buffer::{TxPacket, TxPart};
 
 // A managed drain's provider of the complete IP header length of the path a
 // stateless reply with these addresses (and zone) leaves on now.
@@ -350,14 +352,21 @@ pub enum FreshPoll {
 }
 
 /// A preflighted segment during a synchronous device offer. Encapsulation
-/// can write the headroom and pad the frame. The original TCP bytes remain
-/// available if submission blocks and the endpoint must retain them.
+/// writes the headroom in `bytes[..offset]`; the TCP header (plus any 1-byte
+/// keepalive garbage) resides in `bytes[offset..offset + header_len]`, while
+/// payload bytes remain in the endpoint's TX pool and are exposed zero-copy
+/// through `with_tx_packet`. The original TCP header remains available if
+/// submission blocks and the endpoint must retain the selection.
 pub struct FreshTransmit<'a> {
     endpoint: &'a mut Endpoint,
     owner: ConnectionId,
     attempt: crate::TransmitAttempt,
     packet: OnceCell<Transmit>,
     len: usize,
+    header_len: usize,
+    payload_offset: usize,
+    payload_len: usize,
+    keepalive_garbage: bool,
     bytes: &'a mut [u8],
     offset: usize,
     record: Option<crate::connection::StreamRecord>,
@@ -372,6 +381,12 @@ impl FreshTransmit<'_> {
     }
     pub fn owner(&self) -> ConnectionId {
         self.owner
+    }
+    pub fn header_len(&self) -> usize {
+        self.header_len
+    }
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
     }
     pub fn plain_encapsulation(&mut self) -> Option<(ConnectedIpHeader<'_>, &mut [u8])> {
         let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
@@ -402,8 +417,8 @@ impl FreshTransmit<'_> {
     pub fn headroom(&mut self) -> &mut [u8] {
         &mut self.bytes[..self.offset]
     }
-    pub fn frame(&self) -> &[u8] {
-        &self.bytes[..self.offset + self.len]
+    pub fn header_frame(&self) -> &[u8] {
+        &self.bytes[..self.offset + self.header_len]
     }
     /// Whether the selected TCP segment carries bytes which can remain in
     /// the device after submission.
@@ -417,11 +432,60 @@ impl FreshTransmit<'_> {
         }
     }
 
-    pub fn padded_frame(&mut self, minimum: usize) -> Option<&[u8]> {
-        let end = self.offset + self.len;
-        let len = end.max(minimum);
-        self.bytes.get_mut(end..len)?.fill(0);
-        Some(&self.bytes[..len])
+    /// Expose the encapsulated frame as a scatter-gather `TxPacket`, padding
+    /// short frames up to `minimum` bytes inline when `offset + len < minimum`.
+    pub fn with_tx_packet<R>(
+        &mut self,
+        minimum: usize,
+        f: impl FnOnce(&TxPacket<'_>) -> R,
+    ) -> Option<R> {
+        let total = self.offset + self.len;
+        if total < minimum {
+            if minimum > self.bytes.len() {
+                return None;
+            }
+            if self.payload_len != 0 {
+                let mut parts = TxPartsBuf::new();
+                let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+                let covered = slot.connection.send_tx_parts(
+                    self.endpoint.tx_pool.arena(),
+                    self.payload_offset,
+                    self.payload_len,
+                    &mut parts,
+                );
+                debug_assert_eq!(covered, self.payload_len);
+                let mut dst = self.offset + self.header_len;
+                for part in parts.as_slice() {
+                    let src = part.bytes();
+                    self.bytes[dst..dst + src.len()].copy_from_slice(src);
+                    dst += src.len();
+                }
+                debug_assert_eq!(dst, total);
+            }
+            self.bytes[total..minimum].fill(0);
+            let packet = TxPacket {
+                header: &self.bytes[..minimum],
+                payload: &[],
+            };
+            Some(f(&packet))
+        } else {
+            let mut parts = TxPartsBuf::new();
+            if self.payload_len != 0 {
+                let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+                let covered = slot.connection.send_tx_parts(
+                    self.endpoint.tx_pool.arena(),
+                    self.payload_offset,
+                    self.payload_len,
+                    &mut parts,
+                );
+                debug_assert_eq!(covered, self.payload_len);
+            }
+            let packet = TxPacket {
+                header: &self.bytes[..self.offset + self.header_len],
+                payload: parts.as_slice(),
+            };
+            Some(f(&packet))
+        }
     }
 
     fn submitted(
@@ -449,11 +513,16 @@ impl FreshTransmit<'_> {
             debug_assert!(false, "preflighted immediate submission missing selection");
             return false;
         };
+        let entries_delta = connection.settle_send_entries_charge();
+        if let Some((old, new)) = entries_delta {
+            endpoint.recharge(old, new);
+        }
         endpoint.preflighted.set(None);
         if stream {
             // The offer held this steady socket through submission. A data
             // packet or ACK leaves the send head and ACK as its only
             // possible output, with the owner still in the scheduler.
+            let connection = &endpoint.slots[index].as_ref().unwrap().connection;
             let drained = finish_owner && connection.stream_queue_drained();
             debug_assert_eq!(drained, finish_owner && connection.output_idle());
             debug_assert!(!connection.refresh_work());
@@ -490,15 +559,23 @@ impl Drop for FreshTransmit<'_> {
             if let Some(record) = self.record.take() {
                 slot.connection.finish_offered_record(record);
             }
-            let Some(tcp) = self.bytes.get(self.offset..) else {
+            let Some(tcp) = self.bytes.get(self.offset..self.offset + self.header_len) else {
                 debug_assert!(false, "valid headroom offset in FreshTransmit");
                 return;
+            };
+            let selected = SelectedOutput {
+                total_len: self.len,
+                written_len: self.header_len,
+                payload_offset: self.payload_offset,
+                payload_len: self.payload_len,
+                keepalive_garbage: self.keepalive_garbage,
             };
             if let Err(_error) = self.endpoint.capture_selection(
                 self.attempt.reservation,
                 self.attempt,
                 &packet,
                 tcp,
+                selected,
                 None,
                 None,
             ) {
@@ -517,6 +594,24 @@ pub struct PreparedTransmit<'a> {
 }
 
 impl PreparedTransmit<'_> {
+    /// Borrow the payload parts of this validated transmit attempt zero-copy.
+    pub fn with_tx_parts<R>(&self, f: impl FnOnce(&[TxPart<'_>]) -> R) -> R {
+        let slot = &self.endpoint.reservations[self.index];
+        let r = slot.current.as_ref().unwrap();
+        if slot.inline_payload_len != 0 || r.emitted_bytes == 0 || slot.is_shared() {
+            f(&[])
+        } else {
+            let mut parts = TxPartsBuf::new();
+            slot.collect_parts(
+                self.endpoint.tx_pool.arena(),
+                r.offset,
+                r.emitted_bytes,
+                &mut parts,
+            );
+            f(parts.as_slice())
+        }
+    }
+
     /// Commit the departure after the backend reports physical submission.
     /// Validation completed when this permit was constructed under an
     /// exclusive borrow of the endpoint, so commitment is infallible.
@@ -709,23 +804,20 @@ impl EndpointConfig {
 
     /// The share of `max_buffer_bytes` taken by `count` output reservations
     /// (`enable_output_reservations_with_packet_bytes` with the same
-    /// arguments). Each holds one TCP packet of up to `packet_bytes`, at
-    /// most `send_ip_payload_limit`, and with `gso` the payload of one
-    /// aggregate. `enable_output_reservations_with_capacity`, or `_with_gso`
-    /// with `gso`, charges `packet_bytes` of `usize::MAX`: a packet of the
-    /// send limit. None if it overflows.
+    /// arguments). Reservations retain only the TCP header and references to
+    /// payload chunks rather than full packet or aggregate byte copies;
+    /// `packet_bytes` and `gso` still bound output selection but do not
+    /// allocate per-reservation byte buffers. None if it overflows.
     pub fn output_reservations_charge(
         &self,
         count: usize,
-        packet_bytes: usize,
-        gso: Option<crate::GsoLimits>,
+        _packet_bytes: usize,
+        _gso: Option<crate::GsoLimits>,
     ) -> Option<usize> {
-        packet_bytes
-            .min(self.connection.send_ip_payload_limit as usize)
-            .checked_add(gso.map_or(0, |limits| limits.max_bytes))?
-            .checked_add(core::mem::size_of::<
-                crate::output_reservation::OutputReservation,
-            >())?
+        core::mem::size_of::<crate::output_reservation::OutputReservation>()
+            .checked_add(
+                RESERVATION_INITIAL_PARTS.checked_mul(core::mem::size_of::<OwnedTxPart>())?,
+            )?
             .checked_mul(count)
     }
 
@@ -1444,6 +1536,9 @@ pub struct Endpoint {
 // (`Endpoint::leave_buffer_memory`).
 impl Drop for Endpoint {
     fn drop(&mut self) {
+        for slot in &mut self.reservations {
+            slot.clear(&mut self.tx_pool);
+        }
         for slot in self.slots.iter_mut().flatten() {
             slot.connection.release_send_chunks(&mut self.tx_pool);
         }
@@ -4312,6 +4407,11 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             slot.connection.expand_send(allowed);
         }
+        if let Some(slot) = self.slots[index].as_mut()
+            && let Some((old, new)) = slot.connection.settle_send_entries_charge()
+        {
+            self.recharge(old, new);
+        }
         if self.slots[index].as_ref().is_some_and(|slot| {
             slot.connection.ledgers_reclaimable() || slot.connection.send_ring_reclaimable()
         }) {
@@ -6386,11 +6486,14 @@ impl Endpoint {
         force: bool,
     ) -> Result<(), EndpointError> {
         self.access_slot(id, true)?;
-        self.slots[id.slot]
-            .as_mut()
-            .unwrap()
-            .connection
-            .finish_send_in(&mut self.tx_pool, end, more, end_of_record, force);
+        let entries_delta = {
+            let connection = &mut self.slots[id.slot].as_mut().unwrap().connection;
+            connection.finish_send_in(&mut self.tx_pool, end, more, end_of_record, force);
+            connection.settle_send_entries_charge()
+        };
+        if let Some((old, new)) = entries_delta {
+            self.recharge(old, new);
+        }
         self.refresh(id.slot);
         Ok(())
     }
@@ -7787,6 +7890,25 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Install a custom TX payload chunk source (for example a DPDK mbuf or
+    /// ring-buffer pool). Must be called before any connections or output
+    /// reservations are active and while no chunks are live.
+    pub fn enable_tx_chunk_source(
+        &mut self,
+        source: Box<dyn ntcp_buffer::TxChunkSource>,
+    ) -> Result<(), EndpointError> {
+        if self.tx_pool.live() != 0
+            || self.slots.iter().any(Option::is_some)
+            || self.reservations.iter().any(|s| s.current.is_some())
+        {
+            return Err(Error::InvalidState.into());
+        }
+        self.tx_pool.release_tail();
+        self.tx_pool = TxPool::new(source);
+        self.settle_tx_pool_charge();
+        Ok(())
+    }
+
     /// Poll one owner with immutable payload references. For shared output,
     /// `packet.len` includes payload but only its TCP header is written to `out`;
     /// subtract payload lengths to obtain the initialized header length. Empty
@@ -7813,7 +7935,7 @@ impl Endpoint {
             return Err(Error::InvalidArgument.into());
         }
         let polled =
-            self.poll_reserved_selected(now, out, budget, Some(id), Some(payload), None)?;
+            self.poll_reserved_selected(now, out, budget, Some(id), true, Some(payload), None)?;
         self.polled(polled)
     }
 
@@ -7868,14 +7990,13 @@ impl Endpoint {
         if !self.reservations.is_empty() {
             return if count == self.reservations.len()
                 && self.reservations[0].gso == gso
-                && self.reservations[0].bytes.len() == size
+                && self.reservations[0].packet_bytes == size
             {
                 Ok(())
             } else {
                 Err(Error::InvalidArgument.into())
             };
         }
-        let payload_size = gso.map_or(0, |limits| limits.max_bytes);
         let charge = self
             .config
             .output_reservations_charge(count, packet_bytes, gso)
@@ -7890,12 +8011,8 @@ impl Endpoint {
         for index in 0..count {
             let mut slot = crate::output_reservation::OutputReservation::new();
             slot.index = index;
-            slot.bytes = reserved_vec(size)?;
-            slot.bytes.resize(size, 0);
-            // Written on first use (poll_reserved_selected), so an
-            // aggregate's room costs no page until its reservation selects
-            // one. The pool is taken lowest slot first.
-            slot.payload = reserved_vec(payload_size)?;
+            slot.packet_bytes = size;
+            slot.parts = reserved_vec(RESERVATION_INITIAL_PARTS)?;
             slot.gso = gso;
             slot.checksum_partial = self.config.connection.tcp_checksum_offload;
             slots.push(slot);
@@ -7956,7 +8073,7 @@ impl Endpoint {
         let flags = s.terminal_flags;
         let owner = &self.retained_slot(id)?.connection;
         let original =
-            wire::parse_unchecked(r.packet.ip, &slot.bytes[..r.packet.len]).map_err(Error::Wire)?;
+            wire::parse_unchecked(r.packet.ip, &slot.header[..slot.header_len]).map_err(Error::Wire)?;
         // The aggregate must split into exactly the segments scalar polling
         // emits from here: full-sized at the current path limit but for the
         // reservation's short last one, with the same flags and options.
@@ -8018,7 +8135,7 @@ impl Endpoint {
         let r = slot.current.as_ref()?;
         let group = r.group.filter(|g| g.token == token)?;
         let s = r.departure?.segmentation?;
-        let original = wire::parse_unchecked(r.packet.ip, &slot.bytes[..r.packet.len]).ok()?;
+        let original = wire::parse_unchecked(r.packet.ip, &slot.header[..slot.header_len]).ok()?;
         // The flags `fragment` gives the group's first segment, except that
         // PSH and FIN stay for the backend to place on the last one.
         let mut header = original.header;
@@ -8038,10 +8155,38 @@ impl Endpoint {
             },
             header,
             options: original.raw_options,
-            payload: &slot.payload[r.offset..r.offset + group.bytes],
+            payload_len: group.bytes,
             segment_payload_len: s.segment_payload_len,
             segment_count: group.segments,
         })
+    }
+
+    /// Borrow the zero-copy payload parts for a prepared transmit group.
+    pub fn with_transmit_group_parts<R>(
+        &self,
+        token: crate::TransmitGroup,
+        f: impl FnOnce(&[TxPart<'_>]) -> R,
+    ) -> Option<R> {
+        let slot = self.reservations.get(token.0.reservation)?;
+        let r = slot.current.as_ref()?;
+        let group = r.group.filter(|g| g.token == token)?;
+        let mut parts = TxPartsBuf::new();
+        slot.collect_parts(self.tx_pool.arena(), r.offset, group.bytes, &mut parts);
+        Some(f(parts.as_slice()))
+    }
+
+    /// Resident bytes written into `out` for this attempt: the TCP header
+    /// length, plus one byte for a keepalive garbage octet if present.
+    pub fn transmit_attempt_resident_len(
+        &self,
+        attempt: crate::TransmitAttempt,
+    ) -> Option<usize> {
+        let r = self
+            .reservations
+            .get(attempt.reservation)?
+            .current
+            .as_ref()?;
+        (r.attempt == Some(attempt)).then_some(r.emitted_header_len)
     }
 
     /// Read-only form of every check `accept_transmit_group` performs, as
@@ -8266,7 +8411,7 @@ impl Endpoint {
             return;
         };
         let (ip, len) = (r.packet.ip, r.packet.len);
-        let ports = slot.bytes.get(..4).map(|p| {
+        let ports = slot.header[..slot.header_len].get(..4).map(|p| {
             (
                 u16::from_be_bytes([p[0], p[1]]),
                 u16::from_be_bytes([p[2], p[3]]),
@@ -8305,7 +8450,8 @@ impl Endpoint {
             self.free_reservations += 1;
             self.unattempted_reservations.remove(index);
         }
-        self.reservations[index].clear();
+        self.reservations[index].clear(&mut self.tx_pool);
+        self.maybe_shrink_and_settle_tx_pool();
         self.check_reservation_index();
     }
 
@@ -8395,7 +8541,7 @@ impl Endpoint {
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         self.retained_slot(id)?;
-        let polled = self.poll_reserved_selected(now, out, budget, Some(id), None, None)?;
+        let polled = self.poll_reserved_selected(now, out, budget, Some(id), true, None, None)?;
         self.polled(polled)
     }
 
@@ -8405,7 +8551,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
-        let polled = self.poll_reserved_selected(now, out, budget, None, None, None)?;
+        let polled = self.poll_reserved_selected(now, out, budget, None, true, None, None)?;
         self.polled(polled)
     }
 
@@ -8415,7 +8561,7 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
-        let polled = self.poll_reserved_any(now, out, budget, None)?;
+        let polled = self.poll_reserved_any(now, out, budget, true, None)?;
         self.polled(polled)
     }
 
@@ -8444,9 +8590,12 @@ impl Endpoint {
             && !self.stateless_pending()
     }
 
-    /// Select a reservation, leaving its packet metadata in place for
-    /// `transmit_attempt_packet_ref`. A supplied owner restricts the poll
-    /// to that connection, otherwise every output lane is eligible.
+    /// Select a reservation, writing only the TCP header (plus any 1-byte
+    /// keepalive garbage) into `out` and leaving its packet metadata in place
+    /// for `transmit_attempt_packet_ref` and `transmit_attempt_resident_len`.
+    /// Payload parts are exposed zero-copy through `PreparedTransmit::with_tx_parts`.
+    /// A supplied owner restricts the poll to that connection, otherwise every
+    /// output lane is eligible.
     pub fn poll_transmit_attempt(
         &mut self,
         now: Instant,
@@ -8456,18 +8605,21 @@ impl Endpoint {
     ) -> Result<(bool, Option<crate::TransmitAttempt>), EndpointError> {
         let result = if let Some(id) = owner {
             self.retained_slot(id)?;
-            self.poll_reserved_selected(now, out, budget, Some(id), None, None)?
+            self.poll_reserved_selected(now, out, budget, Some(id), false, None, None)?
         } else {
-            self.poll_reserved_any(now, out, budget, None)?
+            self.poll_reserved_any(now, out, budget, false, None)?
         };
         Ok((result.more_work, result.attempt))
     }
 
-    /// Offer a fresh scalar segment before making a retained copy. The
-    /// callback has exclusively borrowed its owner through the physical
-    /// attempt. Returning no receipt (including link or device backpressure)
-    /// leaves an ordinary, fully captured reservation. A directed poll can
-    /// also consume the drained owner's hint when it has budget to poll again.
+    /// Offer a fresh scalar segment before making a retained copy. Writes only
+    /// the TCP header (plus any 1-byte keepalive garbage) into `bytes[headroom..]`;
+    /// payload parts remain zero-copy in the TX pool and are exposed through
+    /// `FreshTransmit::with_tx_packet`. The callback has exclusively borrowed
+    /// its owner through the physical attempt. Returning no receipt (including
+    /// link or device backpressure) leaves an ordinary, fully captured
+    /// reservation. A directed poll can also consume the drained owner's hint
+    /// when it has budget to poll again.
     pub fn offer_fresh_transmit(
         &mut self,
         now: Instant,
@@ -8500,26 +8652,28 @@ impl Endpoint {
             &mut self.reservations[0]
         };
         let out = bytes.get_mut(headroom..).ok_or(Error::InvalidArgument)?;
-        let len = out.len().min(reservation.bytes.len());
+        let packet_limit = reservation.packet_bytes;
         let attempt = reservation.token()?;
         self.clock(now)?;
         let mut record = None;
-        let len = if self.output.contains(id.slot) {
+        let selected = if self.output.contains(id.slot) {
             self.poll_connection(
                 now,
-                &mut out[..len],
+                out,
                 id,
+                packet_limit,
+                false,
                 true,
                 None,
                 None,
                 Some(&mut record),
-                |_, _, len| len,
+                |_, _, selected| selected,
             )?
         } else {
             None
         };
         let more_work = self.has_pending_output();
-        let Some(len) = len else {
+        let Some(selected) = selected else {
             return Ok(FreshPoll::Empty { more_work });
         };
         // A held steady socket only publishes delivery progress and masks
@@ -8540,7 +8694,11 @@ impl Endpoint {
             None
         };
         let mut selected = FreshTransmit {
-            len,
+            len: selected.total_len,
+            header_len: selected.written_len,
+            payload_offset: selected.payload_offset,
+            payload_len: selected.payload_len,
+            keepalive_garbage: selected.keepalive_garbage,
             packet: OnceCell::new(),
             endpoint: self,
             owner: id,
@@ -8568,6 +8726,7 @@ impl Endpoint {
         now: Instant,
         out: &mut [u8],
         budget: usize,
+        gather: bool,
         mut reply: ReplyHeader<'_>,
     ) -> Result<Polled, EndpointError> {
         if self.reservations.is_empty() {
@@ -8593,7 +8752,7 @@ impl Endpoint {
                 continue;
             }
             let resize = reply.as_mut().map(|f| &mut **f as _);
-            let result = self.poll_reserved_selected(now, out, 1, owner, None, resize)?;
+            let result = self.poll_reserved_selected(now, out, 1, owner, gather, None, resize)?;
             if result.attempt.is_some() {
                 return Ok(result);
             }
@@ -8641,12 +8800,14 @@ impl Endpoint {
     }
 
     // Select exactly one owner; None is the independent stateless lane.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn poll_reserved_selected(
         &mut self,
         now: Instant,
         out: &mut [u8],
         budget: usize,
         selected: Option<ConnectionId>,
+        gather: bool,
         mut shared: Option<&mut Vec<crate::Payload>>,
         reply: ReplyHeader<'_>,
     ) -> Result<Polled, EndpointError> {
@@ -8694,7 +8855,13 @@ impl Endpoint {
                     tsval,
                 )
             } else {
-                self.reservations[index].fragment(limit, out, tsval)
+                self.reservations[index].fragment(
+                    self.tx_pool.arena(),
+                    limit,
+                    out,
+                    gather,
+                    tsval,
+                )
             };
             let packet = match packet {
                 Ok(packet) => packet,
@@ -8751,7 +8918,7 @@ impl Endpoint {
         }
         // Reserve identity before selection: exhaustion must not consume output.
         let attempt = self.reservations[index].token()?;
-        let capacity = out.len().min(self.reservations[index].bytes.len());
+        let packet_limit = self.reservations[index].packet_bytes;
         if let Some(id) = selected
             && budget == 1
             && self.cleanup.is_empty()
@@ -8763,71 +8930,54 @@ impl Endpoint {
             // No held reservation, competing lane, cleanup, or aggregate.
             // The one ready owner can consume this turn directly.
             self.clock(now)?;
-            let packet = if self.output.contains(id.slot) {
+            let polled = if self.output.contains(id.slot) {
                 self.poll_connection(
                     now,
-                    &mut out[..capacity],
+                    out,
                     id,
+                    packet_limit,
+                    gather,
                     true,
                     None,
                     None,
                     None,
-                    Slot::transmit,
+                    |slot, id, selected| (slot.transmit(id, selected.total_len), selected),
                 )?
             } else {
                 None
             };
             let more_work = self.has_pending_output();
-            if let Some(packet) = &packet {
-                self.capture_selection(index, attempt, packet, out, None, None)?;
+            if let Some((packet, selected)) = &polled {
+                self.capture_selection(index, attempt, packet, out, *selected, None, None)?;
             }
             return Ok(Polled {
                 more_work,
-                attempt: packet.is_some().then_some(attempt),
+                attempt: polled.is_some().then_some(attempt),
             });
         }
-        // Move the preallocated payload backing temporarily to avoid aliasing
-        // the endpoint during selection; restore it on every result, no allocation.
-        let mut payload = core::mem::take(&mut self.reservations[index].payload);
-        let gso = self.reservations[index]
-            .gso
-            .filter(|_| shared.is_none())
-            .map(|limits| {
-                if payload.len() != limits.max_bytes {
-                    // Within the capacity reserved when enabled: no
-                    // allocation. One memset in every build, where resize
-                    // writes byte by byte without optimization.
-                    assert!(payload.is_empty() && payload.capacity() >= limits.max_bytes);
-                    // SAFETY: the capacity holds max_bytes, and write_bytes
-                    // initializes all of them before set_len exposes them.
-                    unsafe {
-                        payload.as_mut_ptr().write_bytes(0, limits.max_bytes);
-                        payload.set_len(limits.max_bytes);
-                    }
-                }
-                crate::output_reservation::GsoBuffer {
-                    limits,
-                    payload: &mut payload[..],
-                }
-            });
-        let output = self.poll_transmit_inner(
+        let gso = self.reservations[index].gso.filter(|_| shared.is_none());
+        let (output, selected_out, zone) = self.poll_transmit_inner(
             now,
-            &mut out[..capacity],
+            out,
             budget,
+            packet_limit,
+            gather,
             true,
             Some(selected),
             gso,
             shared.as_deref_mut(),
             reply,
-        );
-        self.reservations[index].payload = payload;
-        // By reference: the packet is copied once, into the reservation.
-        let (output, zone) = match &output {
-            Ok((output, zone)) => (output, *zone),
-            Err(error) => return Err(*error),
-        };
+        )?;
         if let Some(packet) = &output.packet {
-            self.capture_selection(index, attempt, packet, out, shared, zone)?;
+            self.capture_selection(
+                index,
+                attempt,
+                packet,
+                out,
+                selected_out.unwrap(),
+                shared,
+                zone,
+            )?;
         }
         Ok(Polled {
             more_work: output.more_work,
@@ -8835,19 +8985,61 @@ impl Endpoint {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn capture_selection(
         &mut self,
         index: usize,
         attempt: crate::TransmitAttempt,
         packet: &Transmit,
         out: &[u8],
+        selected: SelectedOutput,
         shared: Option<&mut Vec<crate::Payload>>,
         zone: Option<ntcp_path::LinkId>,
     ) -> Result<(), EndpointError> {
         if let Some(parts) = shared.filter(|p| !p.is_empty()) {
-            self.reservations[index].capture_shared(packet, out, parts, attempt)?;
+            self.reservations[index].capture_shared(&mut self.tx_pool, packet, out, parts, attempt)?;
         } else {
-            self.reservations[index].capture(packet, out, attempt);
+            let tcp_hdr_len = usize::from(out[12] >> 4) * 4;
+            let header = &out[..tcp_hdr_len];
+            if selected.keepalive_garbage {
+                let inline = &out[tcp_hdr_len..tcp_hdr_len + 1];
+                self.reservations[index].capture_parts(
+                    &mut self.tx_pool,
+                    packet,
+                    header,
+                    inline,
+                    1,
+                    attempt,
+                    |_, _| {},
+                );
+            } else {
+                let owner_slot = packet.connection.map(|id| id.slot);
+                let slots = &self.slots;
+                let tx_pool = &mut self.tx_pool;
+                let reservation = &mut self.reservations[index];
+                reservation.capture_parts(
+                    tx_pool,
+                    packet,
+                    header,
+                    &[],
+                    selected.payload_len,
+                    attempt,
+                    |pool, parts| {
+                        if selected.payload_len != 0
+                            && let Some(slot_index) = owner_slot
+                            && let Some(slot) = slots[slot_index].as_ref()
+                        {
+                            let covered = slot.connection.dup_send_tx_parts(
+                                pool,
+                                selected.payload_offset,
+                                selected.payload_len,
+                                parts,
+                            );
+                            debug_assert_eq!(covered, selected.payload_len);
+                        }
+                    },
+                );
+            }
         }
         self.reservation_held(index);
         if let Some(id) = packet.connection {
@@ -9247,7 +9439,7 @@ impl Endpoint {
         id: ConnectionId,
     ) -> Result<(), EndpointError> {
         let r = self.reservations[index].current.as_ref().unwrap();
-        let flags = self.reservations[index].bytes[13];
+        let flags = self.reservations[index].header[13];
         let sequence = flags & (wire::SYN | wire::FIN) != 0
             || r.departure.is_some_and(|d| d.payload != 0)
             || self.reservations[index].is_shared();
@@ -9561,8 +9753,19 @@ impl Endpoint {
         out: &mut [u8],
         budget: usize,
     ) -> Result<PollTransmit, EndpointError> {
-        self.poll_transmit_inner(now, out, budget, false, None, None, None, None)
-            .map(|(output, _)| output)
+        self.poll_transmit_inner(
+            now,
+            out,
+            budget,
+            usize::MAX,
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map(|(output, _, _)| output)
     }
 
     // Select data or control from one ready socket. The caller has checked
@@ -9574,31 +9777,57 @@ impl Endpoint {
         now: Instant,
         out: &mut [u8],
         id: ConnectionId,
+        packet_limit: usize,
+        gather: bool,
         reserve: bool,
-        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        gso: Option<crate::GsoLimits>,
         shared: Option<&mut Vec<crate::Payload>>,
         offered: Option<&mut Option<crate::connection::StreamRecord>>,
-        describe: impl FnOnce(&Slot, ConnectionId, usize) -> T,
+        describe: impl FnOnce(&Slot, ConnectionId, SelectedOutput) -> T,
     ) -> Result<Option<T>, EndpointError> {
         let index = id.slot;
         let slot = self.slots[index].as_mut().unwrap();
         let output = if let Some(record) = offered {
-            slot.connection
-                .transmit_offered_in(&mut self.tx_pool, now, out, record)
+            slot.connection.transmit_offered_in(
+                &mut self.tx_pool,
+                now,
+                out,
+                packet_limit,
+                gather,
+                record,
+            )
         } else if let Some(parts) = shared {
-            slot.connection
-                .transmit_shared_selected_in(&mut self.tx_pool, now, out, parts)
+            slot.connection.transmit_shared_selected_in(
+                &mut self.tx_pool,
+                now,
+                out,
+                packet_limit,
+                parts,
+            )
         } else if reserve {
-            slot.connection
-                .transmit_selected_with_gso_in(&mut self.tx_pool, now, out, true, gso)
+            slot.connection.transmit_selected_with_gso_in(
+                &mut self.tx_pool,
+                now,
+                out,
+                packet_limit,
+                gather,
+                true,
+                gso,
+            )
         } else {
-            slot.connection
-                .transmit_selected_in(&mut self.tx_pool, now, out, false)
+            slot.connection.transmit_selected_in(
+                &mut self.tx_pool,
+                now,
+                out,
+                packet_limit,
+                gather,
+                false,
+            )
         };
         match output {
-            Ok(Some(len)) => {
+            Ok(Some(selected)) => {
                 slot.closed_output_drained = slot.connection.state() == State::Closed;
-                let packet = describe(slot, id, len);
+                let packet = describe(slot, id, selected);
                 self.control_turn = true;
                 if reserve {
                     self.output.move_to_back(index);
@@ -9631,18 +9860,20 @@ impl Endpoint {
     }
 
     // Also returns the zone a selected stateless reply was queued with.
-    #[allow(clippy::too_many_arguments)] // Selection policy and reusable output carriers stay explicit.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)] // Selection policy and reusable output carriers stay explicit.
     fn poll_transmit_inner(
         &mut self,
         now: Instant,
         out: &mut [u8],
         budget: usize,
+        packet_limit: usize,
+        gather: bool,
         reserve: bool,
         selected: Option<Option<ConnectionId>>,
-        mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        gso: Option<crate::GsoLimits>,
         mut shared: Option<&mut Vec<crate::Payload>>,
         mut reply: ReplyHeader<'_>,
-    ) -> Result<(PollTransmit, Option<ntcp_path::LinkId>), EndpointError> {
+    ) -> Result<(PollTransmit, Option<SelectedOutput>, Option<ntcp_path::LinkId>), EndpointError> {
         self.clock(now)?;
         for _ in 0..budget {
             if !self.cleanup.is_empty() {
@@ -9675,9 +9906,20 @@ impl Endpoint {
                 && selected.is_none_or(|owner| owner.is_none())
                 && (self.control_turn || next.is_none() || selected == Some(None))
             {
+                let stateless_cap = out.len().min(packet_limit);
                 if self.control.is_empty() {
-                    match self.time_wait_ack(now, out, reply.as_mut())? {
-                        Some(output) => return Ok(output),
+                    match self.time_wait_ack(now, &mut out[..stateless_cap], reply.as_mut())? {
+                        Some((output, zone)) => {
+                            let len = output.packet.unwrap().len;
+                            let sel = SelectedOutput {
+                                total_len: len,
+                                written_len: len,
+                                payload_offset: 0,
+                                payload_len: 0,
+                                keepalive_garbage: false,
+                            };
+                            return Ok((output, Some(sel), zone));
+                        }
                         None => continue,
                     }
                 }
@@ -9727,10 +9969,24 @@ impl Endpoint {
                 }
                 let options = if echo.is_some() { &options[..] } else { &[] };
                 let partial = self.config.connection.tcp_checksum_offload;
-                let len = wire::encode_with(ip, header, options, &[], out, partial)
-                    .map_err(Error::Wire)?;
+                let len = wire::encode_with(
+                    ip,
+                    header,
+                    options,
+                    &[],
+                    &mut out[..stateless_cap],
+                    partial,
+                )
+                .map_err(Error::Wire)?;
                 self.control.pop_front();
                 self.control_turn = false;
+                let sel = SelectedOutput {
+                    total_len: len,
+                    written_len: len,
+                    payload_offset: 0,
+                    payload_len: 0,
+                    keepalive_garbage: false,
+                };
                 return Ok((
                     PollTransmit {
                         packet: Some(Transmit {
@@ -9746,6 +10002,7 @@ impl Endpoint {
                         }),
                         more_work: self.has_pending_output(),
                     },
+                    Some(sel),
                     zone,
                 ));
             }
@@ -9753,27 +10010,24 @@ impl Endpoint {
                 continue;
             };
             let id = self.id(index);
-            let gso = gso
-                .as_mut()
-                .map(|buffer| crate::output_reservation::GsoBuffer {
-                    limits: buffer.limits,
-                    payload: &mut *buffer.payload,
-                });
-            if let Some(packet) = self.poll_connection(
+            if let Some((packet, sel)) = self.poll_connection(
                 now,
                 out,
                 id,
+                packet_limit,
+                gather,
                 reserve,
                 gso,
                 shared.as_deref_mut(),
                 None,
-                Slot::transmit,
+                |slot, id, selected| (slot.transmit(id, selected.total_len), selected),
             )? {
                 return Ok((
                     PollTransmit {
                         packet: Some(packet),
                         more_work: self.has_pending_output(),
                     },
+                    Some(sel),
                     None,
                 ));
             }
@@ -9783,6 +10037,7 @@ impl Endpoint {
                 packet: None,
                 more_work: self.has_pending_output(),
             },
+            None,
             None,
         ))
     }
@@ -12926,11 +13181,26 @@ mod reserved_poll_tests {
             let offered = b
                 .offer_fresh_transmit(9, cb, &mut bytes, prefix, false, |frame| {
                     assert_eq!(frame.packet().ip, packet.ip);
-                    assert_eq!(&frame.frame()[prefix..], &tcp[..packet.len]);
+                    let wire = frame
+                        .with_tx_packet(0, |tx| {
+                            let mut flat = tx.header[prefix..].to_vec();
+                            for part in tx.payload {
+                                flat.extend_from_slice(part.bytes());
+                            }
+                            flat
+                        })
+                        .unwrap();
+                    assert_eq!(&wire[..], &tcp[..packet.len]);
                     assert!(frame.carries_payload());
                     frame.headroom().fill(0x82);
                     let end = prefix + packet.len;
-                    assert_eq!(&frame.padded_frame(end + 5).unwrap()[end..], &[0; 5]);
+                    frame
+                        .with_tx_packet(end + 5, |tx| {
+                            assert!(tx.payload.is_empty());
+                            assert_eq!(&tx.header[prefix..end], &tcp[..packet.len]);
+                            assert_eq!(&tx.header[end..], &[0; 5]);
+                        })
+                        .unwrap();
                     (!blocked).then_some(receipt)
                 })
                 .unwrap();
@@ -12939,7 +13209,19 @@ mod reserved_poll_tests {
                 FreshPoll::Reserved { attempt, more_work } if blocked => {
                     assert_eq!(more_work, poll.more_work);
                     let slot = &b.reservations[attempt.reservation];
-                    assert_eq!(&slot.bytes[..packet.len], &tcp[..packet.len]);
+                    assert_eq!(&slot.header[..slot.header_len], &tcp[..slot.header_len]);
+                    let mut parts = TxPartsBuf::new();
+                    slot.collect_parts(
+                        b.tx_pool.arena(),
+                        0,
+                        packet.len - slot.header_len,
+                        &mut parts,
+                    );
+                    let mut flat = slot.header[..slot.header_len].to_vec();
+                    for part in parts.as_slice() {
+                        flat.extend_from_slice(part.bytes());
+                    }
+                    assert_eq!(&flat[..], &tcp[..packet.len]);
                     assert!(b.accept_transmit_submitted(at, attempt, receipt).unwrap());
                 }
                 FreshPoll::Submitted {
@@ -12993,7 +13275,8 @@ mod reserved_poll_tests {
             let mut bytes = [0; 2048];
             let result = offered
                 .offer_fresh_transmit(at, rb, &mut bytes, 0, false, |frame| {
-                    assert_eq!(frame.frame(), &tcp[..packet.len]);
+                    assert_eq!(frame.header_frame(), &tcp[..packet.len]);
+                    assert_eq!(frame.payload_len(), 0);
                     assert_eq!(frame.packet(), &packet);
                     assert!(!frame.carries_payload());
                     (!blocked).then_some(receipt)
@@ -13253,7 +13536,8 @@ mod reserved_poll_tests {
             let mut bytes = [0u8; 2048];
             let offered = b
                 .offer_fresh_transmit(10, cb, &mut bytes, 14, true, |frame| {
-                    assert_eq!(&frame.frame()[14..], &tcp[..pkt.len]);
+                    assert_eq!(&frame.header_frame()[14..], &tcp[..pkt.len]);
+                    assert_eq!(frame.payload_len(), 0);
                     (!blocked).then_some(receipt)
                 })
                 .unwrap();
@@ -13356,7 +13640,16 @@ mod reserved_poll_tests {
             let mut bytes = [0u8; 2048];
             let offered = b
                 .offer_fresh_transmit(15, cb, &mut bytes, 14, false, |frame| {
-                    assert_eq!(&frame.frame()[14..], &tcp[..pkt.len]);
+                    let wire = frame
+                        .with_tx_packet(0, |tx| {
+                            let mut flat = tx.header[14..].to_vec();
+                            for part in tx.payload {
+                                flat.extend_from_slice(part.bytes());
+                            }
+                            flat
+                        })
+                        .unwrap();
+                    assert_eq!(&wire[..], &tcp[..pkt.len]);
                     (!blocked).then_some(receipt)
                 })
                 .unwrap();
@@ -13406,7 +13699,8 @@ mod reserved_poll_tests {
             let mut bytes = [0u8; 2048];
             let offered = b
                 .offer_fresh_transmit(due, cb, &mut bytes, 0, false, |frame| {
-                    assert_eq!(frame.frame(), &tcp[..pkt.len]);
+                    assert_eq!(frame.header_frame(), &tcp[..pkt.len]);
+                    assert_eq!(frame.payload_len(), 0);
                     (!blocked).then_some(receipt)
                 })
                 .unwrap();
@@ -13510,7 +13804,16 @@ mod reserved_poll_tests {
                 let res = offered
                     .offer_fresh_transmit(10, oa, &mut bytes, 34, false, |frame| {
                         called = true;
-                        assert_eq!(&frame.frame()[34..], &tcp[..pkt.len]);
+                        let wire = frame
+                            .with_tx_packet(0, |tx| {
+                                let mut flat = tx.header[34..].to_vec();
+                                for part in tx.payload {
+                                    flat.extend_from_slice(part.bytes());
+                                }
+                                flat
+                            })
+                            .unwrap();
+                        assert_eq!(&wire[..], &tcp[..pkt.len]);
                         assert!(frame.carries_payload());
                         Some(receipt)
                     })
@@ -13518,9 +13821,9 @@ mod reserved_poll_tests {
                 assert!(called);
                 assert!(matches!(res, FreshPoll::Submitted { .. }));
                 assert!(!offered.has_output_reservations());
-                // GSO payload scratch was never initialized and reservation bytes were never captured.
-                assert!(offered.reservations[0].payload.is_empty());
-                assert!(offered.reservations[0].bytes.iter().all(|&b| b == 0));
+                // Reservation parts and header were never captured.
+                assert!(offered.reservations[0].parts.is_empty());
+                assert_eq!(offered.reservations[0].header_len, 0);
 
                 assert!(reserved.accept_transmit_submitted(10, attempt, receipt).unwrap());
                 assert_eq!(reserved.next_deadline(), offered.next_deadline());
@@ -13554,7 +13857,7 @@ mod reserved_poll_tests {
                     })
                     .unwrap();
                 assert!(matches!(res, FreshPoll::Submitted { .. }));
-                assert!(ep.reservations[0].payload.is_empty());
+                assert!(ep.reservations[0].parts.is_empty());
 
                 // Standalone FIN after shutdown.
                 ep.shutdown(receiver).unwrap();
@@ -13568,7 +13871,7 @@ mod reserved_poll_tests {
                     .unwrap();
                 assert!(matches!(res, FreshPoll::Submitted { .. }));
                 assert_eq!(ep.state(receiver).unwrap(), State::FinWait1);
-                assert!(ep.reservations[0].payload.is_empty());
+                assert!(ep.reservations[0].parts.is_empty());
             }
 
             // 3) Multi-MSS writes (wire_mss + 1 and 6 KiB) return FreshPoll::Unavailable
@@ -13604,7 +13907,7 @@ mod reserved_poll_tests {
                     .expect("prepare_transmit_group must succeed");
                 let view = ep.transmit_group(group).unwrap();
                 assert!(view.segment_count >= 2);
-                assert_eq!(view.payload.len(), seg.payload_len);
+                assert_eq!(view.payload_len, seg.payload_len);
             }
         }
     }
@@ -13773,7 +14076,7 @@ mod reserved_poll_tests {
         // Directly exercise poll_reserved_selected with an out-of-bounds id:
         // must bypass the idle fast path without panicking and return no attempt.
         let polled = a
-            .poll_reserved_selected(2, &mut out, 8, Some(oob), None, None)
+            .poll_reserved_selected(2, &mut out, 8, Some(oob), false, None, None)
             .unwrap();
         assert!(polled.attempt.is_none());
     }
@@ -13837,7 +14140,7 @@ mod reserved_poll_tests {
         }
         a.output.push(client.slot);
         let polled = a
-            .poll_reserved_selected(102, &mut out, 8, Some(client), None, None)
+            .poll_reserved_selected(102, &mut out, 8, Some(client), false, None, None)
             .unwrap();
         assert!(polled.attempt.is_none());
         assert!(a.slots[client.slot].is_none());
@@ -13887,7 +14190,17 @@ mod reserved_poll_tests {
                     let pkt1 = poll1.packet.unwrap();
                     let pkt2 = *a2.transmit_attempt_packet_ref(t2).unwrap();
                     assert_eq!(pkt1, pkt2);
-                    assert_eq!(&out1[..pkt1.len], &out2[..pkt2.len]);
+                    let resident = a2.transmit_attempt_resident_len(t2).unwrap();
+                    let prepared = a2.prepare_transmit_submission(10, t2).unwrap().unwrap();
+                    let wire2 = prepared.with_tx_parts(|parts| {
+                        let mut flat = out2[..resident].to_vec();
+                        for part in parts {
+                            flat.extend_from_slice(part.bytes());
+                        }
+                        flat
+                    });
+                    assert_eq!(&out1[..pkt1.len], &wire2[..]);
+                    drop(prepared);
                     if let Some(ts) = pkt2.tx_timestamp {
                         let range = ts.stream_range();
                         assert_eq!(range.start, covered);
@@ -15316,5 +15629,224 @@ mod deferred_timer_model_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn enable_tx_chunk_source_injects_custom_source_and_refuses_active_endpoint() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingSource {
+            chunk_size: usize,
+            allocated: alloc::sync::Arc<AtomicUsize>,
+        }
+        impl ntcp_buffer::TxChunkSource for CountingSource {
+            fn chunk_size(&self) -> usize {
+                self.chunk_size
+            }
+            fn allocate(&mut self) -> Option<ntcp_buffer::TxChunk> {
+                self.allocated.fetch_add(1, Ordering::SeqCst);
+                ntcp_buffer::TxChunk::try_heap(self.chunk_size)
+            }
+        }
+
+        let allocated = alloc::sync::Arc::new(AtomicUsize::new(0));
+        let mut a = Endpoint::new(EndpointConfig::default(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(EndpointConfig::default(), [2; 32], 0, |_| true).unwrap();
+        a.enable_tx_chunk_source(Box::new(CountingSource {
+            chunk_size: 4096,
+            allocated: allocated.clone(),
+        }))
+        .unwrap();
+        assert_eq!(a.tx_pool.chunk_size(), 4096);
+        assert_eq!(a.tx_pool_bytes(), 0);
+
+        let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+        let local: SocketAddr = "192.0.2.1:43001".parse().unwrap();
+        let listener = b.listen(remote, 8).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        // Refused once a connection exists.
+        assert_eq!(
+            a.enable_tx_chunk_source(Box::new(CountingSource {
+                chunk_size: 4096,
+                allocated: allocated.clone(),
+            })),
+            Err(Error::InvalidState.into())
+        );
+        let mut out = [0u8; 2048];
+        loop {
+            let mut moved = false;
+            while let Some(p) = a.poll_transmit(1, &mut out, 16).unwrap().packet {
+                b.input(1, p.ip, &out[..p.len]).unwrap();
+                moved = true;
+            }
+            while let Some(p) = b.poll_transmit(1, &mut out, 16).unwrap().packet {
+                a.input(1, p.ip, &out[..p.len]).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        let _server = b.accept(listener).unwrap();
+        a.write(client, &[0xAB; 1448]).unwrap();
+        assert!(allocated.load(Ordering::SeqCst) >= 1);
+        assert_eq!(a.tx_pool_bytes(), a.tx_pool.storage_bytes());
+    }
+
+    #[test]
+    fn zero_copy_header_only_buffers_for_offer_fresh_and_poll_attempt_and_drop_capture() {
+        let cfg = EndpointConfig::default();
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
+        let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+        let local: SocketAddr = "192.0.2.1:43002".parse().unwrap();
+        let listener = b.listen(remote, 8).unwrap();
+        let client = a.connect(0, local, remote).unwrap();
+        let mut wire = [0u8; 2048];
+        loop {
+            let mut moved = false;
+            while let Some(p) = a.poll_transmit(1, &mut wire, 16).unwrap().packet {
+                b.input(1, p.ip, &wire[..p.len]).unwrap();
+                moved = true;
+            }
+            while let Some(p) = b.poll_transmit(1, &mut wire, 16).unwrap().packet {
+                a.input(1, p.ip, &wire[..p.len]).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        let server = b.accept(listener).unwrap();
+        a.enable_output_reservations_with_capacity(2).unwrap();
+
+        // First verify software scatter-gather checksum with a 128-byte header-only
+        // buffer: reassembling header + payload must pass peer `b.input` checksum check.
+        let payload: Vec<u8> = (0..1448).map(|i| (i * 31) as u8).collect();
+        a.write(client, &payload).unwrap();
+        let mut small = [0u8; 128];
+        let mut saw_payload = Vec::new();
+        let mut assembled = Vec::new();
+        let offered = a
+            .offer_fresh_transmit(10, client, &mut small, 34, false, |frame| {
+                let hdr_len = frame.header_len();
+                assert_eq!(frame.payload_len(), 1448);
+                assert_eq!(hdr_len, frame.packet().len - 1448);
+                assert_eq!(frame.header_frame().len(), 34 + hdr_len);
+                frame
+                    .with_tx_packet(60, |tx| {
+                        assert_eq!(tx.header.len(), 34 + hdr_len);
+                        assembled.extend_from_slice(&tx.header[34..]);
+                        for part in tx.payload {
+                            saw_payload.extend_from_slice(part.bytes());
+                            assembled.extend_from_slice(part.bytes());
+                        }
+                    })
+                    .unwrap();
+                // Simulate blocked device so FreshTransmit::drop captures dup'd parts!
+                None
+            })
+            .unwrap();
+        assert_eq!(saw_payload, payload);
+        let FreshPoll::Reserved { attempt, .. } = offered else {
+            panic!("expected Reserved on blocked offer");
+        };
+        let pkt_sw = *a.transmit_attempt_packet_ref(attempt).unwrap();
+        assert_eq!(assembled.len(), pkt_sw.len);
+        // Verify software scatter-gather checksum is valid end-to-end on peer `b`.
+        b.input(10, pkt_sw.ip, &assembled).unwrap();
+        let mut recv = [0u8; 1448];
+        assert_eq!(b.read(server, &mut recv).unwrap(), 1448);
+        assert_eq!(&recv[..], payload.as_slice());
+
+        assert_eq!(
+            a.transmit_attempt_resident_len(attempt),
+            Some(pkt_sw.len - 1448)
+        );
+        // PreparedTransmit exposes the exact dup'd payload zero-copy.
+        let prepared = a.prepare_transmit_submission(10, attempt).unwrap().unwrap();
+        let captured = prepared.with_tx_parts(|parts| {
+            let mut flat = Vec::new();
+            for part in parts {
+                flat.extend_from_slice(part.bytes());
+            }
+            flat
+        });
+        assert_eq!(captured, payload);
+        drop(prepared);
+
+        // Reject and re-poll via poll_transmit_attempt into a 64-byte header-only buffer.
+        assert!(a.reject_unsubmitted(attempt).unwrap());
+        let mut hdr_only = [0u8; 64];
+        let (_, att2) = a
+            .poll_transmit_attempt(11, &mut hdr_only, 8, Some(client))
+            .unwrap();
+        let att2 = att2.unwrap();
+        let pkt2 = *a.transmit_attempt_packet_ref(att2).unwrap();
+        let res2 = a.transmit_attempt_resident_len(att2).unwrap();
+        assert_eq!(pkt2.len, res2 + 1448);
+        let prepared = a.prepare_transmit_submission(11, att2).unwrap().unwrap();
+        let captured2 = prepared.with_tx_parts(|parts| {
+            let mut flat = Vec::new();
+            for part in parts {
+                flat.extend_from_slice(part.bytes());
+            }
+            flat
+        });
+        assert_eq!(captured2, payload);
+        drop(prepared);
+
+        // Also test `with_tx_packet` minimum-frame padding (`total < minimum`)
+        // on a short payload, ensuring `Drop` capture still preserves exact header + parts.
+        assert!(a.accept_transmit(12, att2).unwrap());
+        // Deliver peer's delayed ACK so `a` has zero flight and immediately emits the 3-byte write.
+        let _ = b.on_timeout(300_000, 16);
+        while let Some(p) = b.poll_transmit(300_000, &mut wire, 16).unwrap().packet {
+            a.input(300_000, p.ip, &wire[..p.len]).unwrap();
+        }
+        a.write(client, b"xyz").unwrap();
+        let mut pad_buf = [0xEEu8; 128];
+        let padded = a
+            .offer_fresh_transmit(300_000, client, &mut pad_buf, 14, false, |frame| {
+                let hdr_len = frame.header_len();
+                assert_eq!(frame.payload_len(), 3);
+                // Force `total < minimum` (14 + hdr_len + 3 < 96)
+                frame
+                    .with_tx_packet(96, |tx| {
+                        assert_eq!(tx.header.len(), 96);
+                        assert!(tx.payload.is_empty());
+                        assert_eq!(
+                            &tx.header[14 + hdr_len..14 + hdr_len + 3],
+                            b"xyz"
+                        );
+                        assert!(tx.header[14 + hdr_len + 3..96].iter().all(|&b| b == 0));
+                    })
+                    .unwrap();
+                None
+            })
+            .unwrap();
+        let FreshPoll::Reserved {
+            attempt: pad_att, ..
+        } = padded
+        else {
+            panic!("expected Reserved on blocked padded offer");
+        };
+        let prepared = a
+            .prepare_transmit_submission(300_000, pad_att)
+            .unwrap()
+            .unwrap();
+        let pad_captured = prepared.with_tx_parts(|parts| {
+            let mut flat = Vec::new();
+            for part in parts {
+                flat.extend_from_slice(part.bytes());
+            }
+            flat
+        });
+        assert_eq!(pad_captured, b"xyz");
+        drop(prepared);
+
+        // Dropping Endpoint while a reservation holds dup'd ChunkRefs must release
+        // every ChunkRef cleanly (Endpoint::drop debug_assert_eq!(live(), 0)).
+        drop(a);
     }
 }

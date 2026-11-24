@@ -1,4 +1,5 @@
 use core::net::IpAddr;
+use ntcp_buffer::TxPart;
 
 pub const FIN: u8 = 0x01;
 pub const SYN: u8 = 0x02;
@@ -591,6 +592,7 @@ pub(crate) fn encode_with(
 
 /// Encode established stream output with the already negotiated options.
 /// The aligned timestamp can be written directly into the TCP header.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_stream(
     pseudo_header: PseudoHeader,
     ports: u32,
@@ -750,6 +752,235 @@ pub(crate) fn encode_shared_with(
     }
     out[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
     Ok(n)
+}
+
+/// Encode a TCP header (and optionally gather `payload` parts into `out`).
+///
+/// When `gather` is true, `out` must hold `header_len + payload_len` bytes and
+/// `payload` is copied after the header; returns `header_len + payload_len`.
+/// When `gather` is false, `out` need only hold `header_len` bytes; returns
+/// `header_len`. When `partial && !gather`, `payload` is not read at all (and
+/// may be empty).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_parts_with(
+    ip: IpMetadata,
+    header: Header,
+    options: &[u8],
+    payload: &[TxPart<'_>],
+    payload_len: usize,
+    out: &mut [u8],
+    partial: bool,
+    gather: bool,
+) -> Result<usize, WireError> {
+    if !options.is_empty() && !aligned_timestamp(options) {
+        validate_output_options(header.flags, options)?;
+    }
+    let pseudo = PseudoHeader::new(ip)?;
+    let option_len = options.len().div_ceil(4) * 4;
+    let ports = (u32::from(header.source_port) << 16) | u32::from(header.destination_port);
+    encode_segment_parts(
+        pseudo,
+        ports,
+        header,
+        option_len,
+        payload,
+        payload_len,
+        out,
+        partial,
+        gather,
+        |area| {
+            let (encoded, padding) = area.split_at_mut(options.len());
+            encoded.copy_from_slice(options);
+            padding.fill(0);
+            None
+        },
+    )
+}
+
+/// Stream fast-path counterpart of `encode_parts_with` for established
+/// segments carrying no options or an aligned Timestamps option.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_stream_parts(
+    pseudo_header: PseudoHeader,
+    ports: u32,
+    header: Header,
+    timestamps: Option<(u32, u32)>,
+    payload: &[TxPart<'_>],
+    payload_len: usize,
+    out: &mut [u8],
+    partial: bool,
+    gather: bool,
+) -> Result<usize, WireError> {
+    let option_len = if timestamps.is_some() { 12 } else { 0 };
+    encode_segment_parts(
+        pseudo_header,
+        ports,
+        header,
+        option_len,
+        payload,
+        payload_len,
+        out,
+        partial,
+        gather,
+        |area| {
+            if let Some((value, echo)) = timestamps {
+                area[..4].copy_from_slice(&[1, 1, 8, 10]);
+                area[4..8].copy_from_slice(&value.to_be_bytes());
+                area[8..12].copy_from_slice(&echo.to_be_bytes());
+                Some(0x0101 + 0x080a + u64::from(value) + u64::from(echo))
+            } else {
+                Some(0)
+            }
+        },
+    )
+}
+
+/// Encode a TCP header and options with the checksum field zeroed, skipping
+/// checksum computation (used for TSO template headers). Returns header length.
+pub fn encode_header_zero_checksum(
+    ip: IpMetadata,
+    header: Header,
+    options: &[u8],
+    out: &mut [u8],
+) -> Result<usize, WireError> {
+    if !options.is_empty() && !aligned_timestamp(options) {
+        validate_output_options(header.flags, options)?;
+    }
+    let pseudo = PseudoHeader::new(ip)?;
+    let option_len = options.len().div_ceil(4) * 4;
+    let header_len = 20 + option_len;
+    if header_len > pseudo.limit as usize {
+        return Err(WireError::TooLong);
+    }
+    if out.len() < header_len {
+        return Err(WireError::OutputTooSmall);
+    }
+    let ports = (u32::from(header.source_port) << 16) | u32::from(header.destination_port);
+    out[..4].copy_from_slice(&ports.to_be_bytes());
+    out[4..8].copy_from_slice(&header.sequence.to_be_bytes());
+    out[8..12].copy_from_slice(&header.acknowledgment.to_be_bytes());
+    out[12] = ((header_len / 4) as u8) << 4;
+    out[13] = header.flags;
+    out[14..16].copy_from_slice(&header.window.to_be_bytes());
+    out[16..18].fill(0);
+    out[18..20].copy_from_slice(&header.urgent_pointer.to_be_bytes());
+    let (encoded, padding) = out[20..header_len].split_at_mut(options.len());
+    encoded.copy_from_slice(options);
+    padding.fill(0);
+    Ok(header_len)
+}
+
+fn sum_tx_parts(mut sum: u32, payload: &[TxPart<'_>]) -> u32 {
+    let mut odd = None;
+    for part in payload {
+        let mut bytes = part.bytes();
+        if let Some(high) = odd
+            && let Some((&low, rest)) = bytes.split_first()
+        {
+            sum = add_words(sum, &[high, low]);
+            bytes = rest;
+            odd = None;
+        }
+        let even = bytes.len() & !1;
+        if even != 0 {
+            sum = add_words(sum, &bytes[..even]);
+        }
+        if let Some(&last) = bytes.get(even) {
+            odd = Some(last);
+        }
+    }
+    if let Some(high) = odd {
+        sum = add_words(sum, &[high]);
+    }
+    sum
+}
+
+#[inline]
+fn fold_wide(wide: u64) -> u32 {
+    let folded = (wide & 0xffff_ffff) + (wide >> 32);
+    let folded = (folded & 0xffff) + (folded >> 16);
+    let folded = ((folded & 0xffff) + (folded >> 16)) as u32;
+    (folded & 0xffff) + (folded >> 16)
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn encode_segment_parts(
+    pseudo_header: PseudoHeader,
+    ports: u32,
+    header: Header,
+    option_len: usize,
+    payload: &[TxPart<'_>],
+    payload_len: usize,
+    out: &mut [u8],
+    partial: bool,
+    gather: bool,
+    write_options: impl FnOnce(&mut [u8]) -> Option<u64>,
+) -> Result<usize, WireError> {
+    let header_len = 20 + option_len;
+    let total = header_len
+        .checked_add(payload_len)
+        .ok_or(WireError::TooLong)?;
+    if total > pseudo_header.limit as usize {
+        return Err(WireError::TooLong);
+    }
+    let required = if gather { total } else { header_len };
+    if out.len() < required {
+        return Err(WireError::OutputTooSmall);
+    }
+    debug_assert!(
+        (partial && !gather)
+            || payload.iter().map(TxPart::len).sum::<usize>() == payload_len,
+        "TxPart payload length mismatch"
+    );
+    out[..4].copy_from_slice(&ports.to_be_bytes());
+    out[4..8].copy_from_slice(&header.sequence.to_be_bytes());
+    out[8..12].copy_from_slice(&header.acknowledgment.to_be_bytes());
+    out[12] = ((header_len / 4) as u8) << 4;
+    out[13] = header.flags;
+    out[14..16].copy_from_slice(&header.window.to_be_bytes());
+    out[18..20].copy_from_slice(&header.urgent_pointer.to_be_bytes());
+    let option_sum = write_options(&mut out[20..header_len]);
+    let sum = if partial {
+        pseudo_header.sum(total as u32) as u16
+    } else if let Some(options) = option_sum {
+        let fixed = pseudo_header.sum
+            + u32::from(u16::from_be_bytes([out[12], header.flags]))
+            + u32::from(header.window)
+            + u32::from(header.urgent_pointer);
+        let wide = u64::from(fixed)
+            + u64::from(ports)
+            + total as u64
+            + options
+            + u64::from(header.sequence)
+            + u64::from(header.acknowledgment);
+        match payload {
+            [] => ntcp_ip_common::checksum_with_sum(&[], wide),
+            [only] => ntcp_ip_common::checksum_with_sum(only.bytes(), wide),
+            many => !(sum_tx_parts(fold_wide(wide), many) as u16),
+        }
+    } else {
+        out[16..18].fill(0);
+        let header_sum = add_words(pseudo_header.sum(total as u32), &out[..header_len]);
+        match payload {
+            [] => !(header_sum as u16),
+            [only] => ntcp_ip_common::checksum_with_sum(only.bytes(), u64::from(header_sum)),
+            many => !(sum_tx_parts(header_sum, many) as u16),
+        }
+    };
+    out[16..18].copy_from_slice(&sum.to_be_bytes());
+    if gather {
+        let mut at = header_len;
+        for part in payload {
+            let bytes = part.bytes();
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        }
+        debug_assert_eq!(at, total);
+        Ok(total)
+    } else {
+        Ok(header_len)
+    }
 }
 
 #[cfg(test)]
@@ -2298,6 +2529,142 @@ mod tests {
                 let seg = pseudo.parse(&buf[..len], false).unwrap();
                 assert!(seg.carries_sack());
                 assert_eq!(seg.options.sack_blocks, sack_blocks);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_parts_and_stream_parts_match_encode_with_across_parts_families_partial_and_gather() {
+        use crate::Payload;
+        use ntcp_buffer::{ChunkSlice, PayloadSlice, TxChunk};
+
+        let mut chunk = TxChunk::heap(256);
+        let all_data: Vec<u8> = (0..180u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        chunk.append(&all_data);
+        let shared = Payload::from_vec(all_data.clone());
+
+        let hdr = Header {
+            source_port: 44321,
+            destination_port: 8080,
+            sequence: 0x1234_5678,
+            acknowledgment: 0x9abc_def0,
+            flags: ACK | PSH,
+            window: 0x4321,
+            urgent_pointer: 0,
+        };
+        let ports = (u32::from(hdr.source_port) << 16) | u32::from(hdr.destination_port);
+        let ts = Some((0x1122_3344, 0x5566_7788));
+        let mut ts_opts = [0u8; 40];
+        let ts_len = write_options(
+            &Options {
+                timestamps: ts,
+                ..Options::default()
+            },
+            &mut ts_opts,
+        );
+        let mut sack_opts = [0u8; 40];
+        let sack_len = write_options(
+            &Options {
+                timestamps: ts,
+                sack_blocks: [Some((100, 200)), Some((300, 450)), None, None],
+                ..Options::default()
+            },
+            &mut sack_opts,
+        );
+
+        // Part-split cases: 0 parts, 1 part (even & odd), 2 parts (odd+odd, odd+even),
+        // 3 parts (odd+odd+odd, mixed Chunk+Shared), plus empty interior part.
+        let splits: &[&[(usize, usize, bool)]] = &[
+            &[],
+            &[(0, 16, false)],
+            &[(0, 17, true)],
+            &[(0, 3, false), (3, 10, true)],
+            &[(0, 5, false), (5, 11, false)],
+            &[(0, 1, false), (1, 4, true), (4, 15, false)],
+            &[(0, 7, false), (7, 7, true), (7, 20, true), (20, 63, false)],
+        ];
+
+        for ip in ips() {
+            let pseudo = PseudoHeader::new(ip).unwrap();
+            for &split in splits {
+                let mut parts = Vec::new();
+                let mut flat = Vec::new();
+                for &(start, end, is_shared) in split {
+                    flat.extend_from_slice(&all_data[start..end]);
+                    if is_shared {
+                        parts.push(TxPart::Shared(PayloadSlice::new(&shared, start..end).unwrap()));
+                    } else {
+                        parts.push(TxPart::Chunk(ChunkSlice::new(&chunk, start..end).unwrap()));
+                    }
+                }
+                let payload_len = flat.len();
+
+                for &(opt_slice, stream_ts) in &[
+                    (&[][..], Some(None)),
+                    (&ts_opts[..ts_len], Some(ts)),
+                    (&sack_opts[..sack_len], None),
+                ] {
+                    let header_len = 20 + opt_slice.len();
+                    for partial in [false, true] {
+                        let mut expected = vec![0u8; header_len + payload_len];
+                        let exp_len =
+                            encode_with(ip, hdr, opt_slice, &flat, &mut expected, partial).unwrap();
+                        assert_eq!(exp_len, header_len + payload_len);
+
+                        for gather in [false, true] {
+                            let buf_len = if gather { exp_len } else { header_len };
+                            let pass_parts: &[TxPart<'_>] = if partial && !gather {
+                                &[]
+                            } else {
+                                &parts
+                            };
+
+                            let mut out = vec![0xaa; buf_len + 8];
+                            let n = encode_parts_with(
+                                ip,
+                                hdr,
+                                opt_slice,
+                                pass_parts,
+                                payload_len,
+                                &mut out[..buf_len],
+                                partial,
+                                gather,
+                            )
+                            .unwrap();
+                            assert_eq!(n, buf_len);
+                            assert_eq!(&out[..buf_len], &expected[..buf_len]);
+                            assert!(out[buf_len..].iter().all(|&b| b == 0xaa));
+
+                            if let Some(ts_arg) = stream_ts {
+                                let mut stream_out = vec![0x55; buf_len + 8];
+                                let sn = encode_stream_parts(
+                                    pseudo,
+                                    ports,
+                                    hdr,
+                                    ts_arg,
+                                    pass_parts,
+                                    payload_len,
+                                    &mut stream_out[..buf_len],
+                                    partial,
+                                    gather,
+                                )
+                                .unwrap();
+                                assert_eq!(sn, buf_len);
+                                assert_eq!(&stream_out[..buf_len], &expected[..buf_len]);
+                                assert!(stream_out[buf_len..].iter().all(|&b| b == 0x55));
+                            }
+                        }
+                    }
+
+                    // Verify encode_header_zero_checksum matches header bytes except zeroed checksum.
+                    let mut zero_out = vec![0xcc; header_len];
+                    let zn = encode_header_zero_checksum(ip, hdr, opt_slice, &mut zero_out).unwrap();
+                    assert_eq!(zn, header_len);
+                    let mut ref_hdr = vec![0u8; header_len];
+                    encode_with(ip, hdr, opt_slice, &[], &mut ref_hdr, true).unwrap();
+                    ref_hdr[16..18].fill(0);
+                    assert_eq!(zero_out, ref_hdr);
+                }
             }
         }
     }

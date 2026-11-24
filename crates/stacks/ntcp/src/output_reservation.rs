@@ -1,6 +1,33 @@
 use alloc::vec::Vec;
+use ntcp_buffer::{ChunkArena, ChunkRef, ChunkSlice, PayloadSlice, TxPart};
 
-use crate::{EndpointError, Error, Instant, Transmit, seq::Seq, wire};
+use crate::{
+    EndpointError, Error, Instant, Transmit,
+    seq::Seq,
+    tx_pool::{TxPartsBuf, TxPool},
+    wire,
+};
+
+pub(crate) const RESERVATION_INITIAL_PARTS: usize = 16;
+
+pub(crate) enum OwnedTxPart {
+    Chunk {
+        chunk: ChunkRef,
+        offset: u32,
+        len: u32,
+    },
+    Shared(crate::Payload),
+}
+
+impl OwnedTxPart {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Chunk { len, .. } => *len as usize,
+            Self::Shared(payload) => payload.len(),
+        }
+    }
+}
 
 // Only physical-departure work; sequence, recovery and PRR charges stay selected.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -102,7 +129,8 @@ pub struct TransmitGroup(pub(crate) TransmitAttempt);
 
 /// Logical aggregate, not a checksummed jumbo wire packet: `header` and
 /// `options` are the first segment's TCP header with the group's terminal
-/// flags, `payload` the contiguous payload of all `segment_count` segments of
+/// flags, `payload_len` the total payload bytes (accessible zero-copy via
+/// `Endpoint::with_transmit_group_parts`) of all `segment_count` segments of
 /// `segment_payload_len` bytes each but the last, which may be shorter (as
 /// with Linux TSO, the device cuts `segment_payload_len` chunks and the
 /// remainder). `packet.len` is the aggregate's TCP length (header, options
@@ -113,7 +141,7 @@ pub struct TransmitGroupView<'a> {
     pub packet: Transmit,
     pub header: wire::Header,
     pub options: &'a [u8],
-    pub payload: &'a [u8],
+    pub payload_len: usize,
     pub segment_payload_len: usize,
     pub segment_count: usize,
 }
@@ -125,11 +153,6 @@ pub(crate) struct PreparedGroup {
     pub bytes: usize,
 }
 
-pub(crate) struct GsoBuffer<'a> {
-    pub limits: GsoLimits,
-    pub payload: &'a mut [u8],
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitAttempt {
     pub(crate) ordinal: core::num::NonZeroU64,
@@ -138,8 +161,12 @@ pub struct TransmitAttempt {
 
 pub(crate) struct OutputReservation {
     pub index: usize,
-    pub bytes: Vec<u8>,
-    pub payload: Vec<u8>,
+    pub packet_bytes: usize,
+    // Max 60B TCP header + optional 1B keepalive garbage octet.
+    pub header: [u8; 64],
+    pub header_len: usize,
+    pub inline_payload_len: usize,
+    pub parts: Vec<OwnedTxPart>,
     pub shared: Vec<crate::Payload>,
     shared_header: Option<wire::Header>,
     shared_option_len: usize,
@@ -162,6 +189,7 @@ pub(crate) struct ReservedOutput {
     pub offset: usize,
     pub sacks: usize,
     pub emitted_bytes: usize,
+    pub emitted_header_len: usize,
     pub emitted_sacks: usize,
     pub finished: bool,
     pub repaired: bool,
@@ -185,12 +213,64 @@ impl ReservedOutput {
     }
 }
 
+fn parts_len(parts: &[OwnedTxPart]) -> usize {
+    parts.iter().map(OwnedTxPart::len).sum()
+}
+
+fn collect_parts_from<'a>(
+    parts: &'a [OwnedTxPart],
+    arena: &'a ChunkArena,
+    offset: usize,
+    count: usize,
+    out: &mut TxPartsBuf<'a>,
+) {
+    if count == 0 {
+        return;
+    }
+    let mut skip = offset;
+    let mut remaining = count;
+    for part in parts {
+        let len = part.len();
+        if skip >= len {
+            skip -= len;
+            continue;
+        }
+        let take = (len - skip).min(remaining);
+        match part {
+            OwnedTxPart::Chunk {
+                chunk,
+                offset: chunk_off,
+                ..
+            } => {
+                let start = *chunk_off as usize + skip;
+                let slice = ChunkSlice::new(arena.get(chunk), start..start + take)
+                    .expect("reserved chunk slice within filled prefix");
+                out.push_merged(TxPart::Chunk(slice));
+            }
+            OwnedTxPart::Shared(payload) => {
+                let slice = PayloadSlice::new(payload, skip..skip + take)
+                    .expect("reserved shared slice within bounds");
+                out.push_merged(TxPart::Shared(slice));
+            }
+        }
+        remaining -= take;
+        skip = 0;
+        if remaining == 0 {
+            break;
+        }
+    }
+    debug_assert_eq!(remaining, 0);
+}
+
 impl OutputReservation {
     pub fn new() -> Self {
         Self {
             index: 0,
-            bytes: Vec::new(),
-            payload: Vec::new(),
+            packet_bytes: usize::MAX,
+            header: [0; 64],
+            header_len: 0,
+            inline_payload_len: 0,
+            parts: Vec::new(),
             shared: Vec::new(),
             shared_header: None,
             shared_option_len: 0,
@@ -214,7 +294,14 @@ impl OutputReservation {
         })
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self, pool: &mut TxPool) {
+        for part in self.parts.drain(..) {
+            if let OwnedTxPart::Chunk { chunk, .. } = part {
+                pool.release(chunk);
+            }
+        }
+        self.header_len = 0;
+        self.inline_payload_len = 0;
         self.current = None;
         self.shared.clear();
         self.shared_header = None;
@@ -224,8 +311,23 @@ impl OutputReservation {
         self.shared_header.is_some()
     }
 
+    pub fn parts_len(&self) -> usize {
+        parts_len(&self.parts)
+    }
+
+    pub fn collect_parts<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        count: usize,
+        out: &mut TxPartsBuf<'a>,
+    ) {
+        collect_parts_from(&self.parts, arena, offset, count, out);
+    }
+
     pub fn capture_shared(
         &mut self,
+        pool: &mut TxPool,
         packet: &Transmit,
         header: &[u8],
         payload: &[crate::Payload],
@@ -242,8 +344,9 @@ impl OutputReservation {
         if !(20..=60).contains(&n) || n > header.len() || payload.len() > self.shared.capacity() {
             return Err(Error::InvalidArgument.into());
         }
-        self.clear();
-        self.bytes[..n].copy_from_slice(&header[..n]);
+        self.clear(pool);
+        self.header[..n].copy_from_slice(&header[..n]);
+        self.header_len = n;
         self.shared.extend(payload.iter().cloned());
         let word = |at| u16::from_be_bytes(header[at..at + 2].try_into().unwrap());
         let seq = |at| u32::from_be_bytes(header[at..at + 4].try_into().unwrap());
@@ -266,6 +369,7 @@ impl OutputReservation {
             offset: 0,
             sacks: 0,
             emitted_bytes: length,
+            emitted_header_len: n,
             emitted_sacks: 0,
             finished: true,
             repaired: false,
@@ -328,7 +432,7 @@ impl OutputReservation {
                 header.flags &= !wire::URG;
             }
         }
-        let mut set = wire::parse_unchecked(r.packet.ip, &self.bytes[..header_len])
+        let mut set = wire::parse_unchecked(r.packet.ip, &self.header[..header_len])
             .map_err(Error::Wire)?
             .options;
         restamp(r, header.flags, &mut set, tsval);
@@ -345,6 +449,7 @@ impl OutputReservation {
         )
         .map_err(Error::Wire)?;
         r.emitted_bytes = count;
+        r.emitted_header_len = n;
         r.emitted_sacks = 0;
         r.finished = finished;
         let packet = Transmit {
@@ -357,9 +462,36 @@ impl OutputReservation {
         Ok(packet)
     }
 
-    pub fn capture(&mut self, packet: &Transmit, bytes: &[u8], attempt: TransmitAttempt) {
-        self.clear();
-        self.bytes[..packet.len].copy_from_slice(&bytes[..packet.len]);
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_parts(
+        &mut self,
+        pool: &mut TxPool,
+        packet: &Transmit,
+        header: &[u8],
+        inline_payload: &[u8],
+        payload_len: usize,
+        attempt: TransmitAttempt,
+        fill_parts: impl FnOnce(&mut TxPool, &mut Vec<OwnedTxPart>),
+    ) {
+        debug_assert!(header.len() + inline_payload.len() <= self.header.len());
+        debug_assert!(inline_payload.len() <= 1);
+        self.clear(pool);
+        self.header[..header.len()].copy_from_slice(header);
+        self.header_len = header.len();
+        if !inline_payload.is_empty() {
+            self.header[header.len()..header.len() + inline_payload.len()]
+                .copy_from_slice(inline_payload);
+            self.inline_payload_len = inline_payload.len();
+        }
+        fill_parts(pool, &mut self.parts);
+        debug_assert_eq!(
+            if self.inline_payload_len != 0 {
+                self.inline_payload_len
+            } else {
+                self.parts_len()
+            },
+            payload_len
+        );
         self.current = Some(ReservedOutput {
             emitted_packet: None,
             packet: *packet,
@@ -368,7 +500,8 @@ impl OutputReservation {
             abandon_attempt: attempt,
             offset: 0,
             sacks: 0,
-            emitted_bytes: 0,
+            emitted_bytes: payload_len,
+            emitted_header_len: header.len() + inline_payload.len(),
             emitted_sacks: 0,
             finished: true,
             repaired: false,
@@ -380,6 +513,31 @@ impl OutputReservation {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn capture_bytes_for_test(
+        &mut self,
+        pool: &mut TxPool,
+        packet: &Transmit,
+        bytes: &[u8],
+        attempt: TransmitAttempt,
+    ) {
+        let tcp_hdr_len = usize::from(bytes[12] >> 4) * 4;
+        let payload = &bytes[tcp_hdr_len..packet.len];
+        self.capture_parts(
+            pool,
+            packet,
+            &bytes[..tcp_hdr_len],
+            &[],
+            payload.len(),
+            attempt,
+            |_, parts| {
+                if !payload.is_empty() {
+                    parts.push(OwnedTxPart::Shared(crate::Payload::new(payload.to_vec())));
+                }
+            },
+        );
+    }
+
     // Encode only from immutable, already-admitted output. No sender selection or
     // credit accounting occurs here. Buffer space was reserved before selection.
     // The options are written anew by `wire::write_options`, as at selection,
@@ -387,21 +545,22 @@ impl OutputReservation {
     // each transmission's options (`restamped`).
     pub fn fragment(
         &mut self,
+        arena: &ChunkArena,
         limit: usize,
         out: &mut [u8],
+        gather: bool,
         tsval: u32,
     ) -> Result<Transmit, EndpointError> {
         if self.is_shared() {
             return Err(Error::InvalidArgument.into());
         }
+        let limit = limit.min(self.packet_bytes);
         if limit < 20 {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
         let r = self.current.as_mut().unwrap();
-        // ponytail: reparsing costs O(original length) per fragment, bounded by
-        // one configured packet; cache parsed metadata if repair throughput matters.
-        let original =
-            wire::parse_unchecked(r.packet.ip, &self.bytes[..r.packet.len]).map_err(Error::Wire)?;
+        let original = wire::parse_unchecked(r.packet.ip, &self.header[..self.header_len])
+            .map_err(Error::Wire)?;
         // A SYN is one handshake, not a stream fragment. Splitting TFO data
         // would repeat SYN at the wrong sequence and release ownership before
         // the handshake can acknowledge the retained suffix. Keep it indivisible.
@@ -409,7 +568,11 @@ impl OutputReservation {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
         let segmentation = r.departure.and_then(|d| d.segmentation);
-        let payload = segmentation.map_or(original.payload, |s| &self.payload[..s.payload_len]);
+        let total_payload = if self.inline_payload_len != 0 {
+            self.inline_payload_len
+        } else {
+            parts_len(&self.parts)
+        };
         let mut header = original.header;
         if let Some(s) = segmentation {
             header.flags = s.terminal_flags;
@@ -429,7 +592,7 @@ impl OutputReservation {
             // transmission, cut by the device. Until a segment of it departs
             // (a refused first segment), the range is not transmitted yet:
             // its options are written anew with `tsval` and kept in the held
-            // bytes, which its later segments and groups repeat.
+            // header, which its later segments and groups repeat.
             if r.offset == 0 {
                 let mut set = original.options;
                 rewritten = restamp(r, header.flags, &mut set, tsval);
@@ -479,16 +642,15 @@ impl OutputReservation {
                 return Err(EndpointError::ReservationMtuTooSmall);
             }
         }
-        let count = payload
-            .len()
+        let count = total_payload
             .saturating_sub(r.offset)
             .min(limit.saturating_sub(20 + used))
             .min(segmentation.map_or(usize::MAX, |s| s.segment_payload_len));
-        if count == 0 && r.offset < payload.len() && emitted_sacks == 0 {
+        if count == 0 && r.offset < total_payload && emitted_sacks == 0 {
             return Err(EndpointError::ReservationMtuTooSmall);
         }
         let finished =
-            r.offset + count == payload.len() && omitted_sacks + emitted_sacks == remaining_sacks;
+            r.offset + count == total_payload && omitted_sacks + emitted_sacks == remaining_sacks;
         header.sequence = header.sequence.wrapping_add(r.offset as u32);
         if !finished {
             header.flags &= !(wire::FIN | wire::PSH);
@@ -504,19 +666,48 @@ impl OutputReservation {
                 header.flags &= !wire::URG;
             }
         }
-        let len = wire::encode_with(
-            r.packet.ip,
-            header,
-            &options[..used],
-            &payload[r.offset..r.offset + count],
-            out,
-            self.checksum_partial,
-        )
-        .map_err(Error::Wire)?;
+        let header_len = 20 + used;
+        let written = if self.inline_payload_len != 0 {
+            let inline = &self.header[self.header_len + r.offset..self.header_len + r.offset + count];
+            wire::encode_with(
+                r.packet.ip,
+                header,
+                &options[..used],
+                inline,
+                out,
+                self.checksum_partial,
+            )
+            .map_err(Error::Wire)?
+        } else {
+            let mut parts = TxPartsBuf::new();
+            if count != 0 && (!self.checksum_partial || gather) {
+                collect_parts_from(&self.parts, arena, r.offset, count, &mut parts);
+            }
+            wire::encode_parts_with(
+                r.packet.ip,
+                header,
+                &options[..used],
+                parts.as_slice(),
+                count,
+                out,
+                self.checksum_partial,
+                gather,
+            )
+            .map_err(Error::Wire)?
+        };
+        debug_assert_eq!(
+            written,
+            if gather || self.inline_payload_len != 0 {
+                header_len + count
+            } else {
+                header_len
+            }
+        );
         if rewritten {
-            self.bytes[20..20 + used].copy_from_slice(&options[..used]);
+            self.header[20..20 + used].copy_from_slice(&options[..used]);
         }
         r.emitted_bytes = count;
+        r.emitted_header_len = header_len + if self.inline_payload_len != 0 { count } else { 0 };
         r.emitted_sacks = omitted_sacks + emitted_sacks;
         r.finished = finished;
         // A cancelled backend observation must not masquerade as a retry's actual
@@ -524,7 +715,7 @@ impl OutputReservation {
         // A GSO segment carries the token of its own bytes, as when selected
         // alone: its range holds no pending Transmit phase to cancel.
         let packet = Transmit {
-            len,
+            len: header_len + count,
             tx_timestamp: segmentation
                 .and(r.packet.tx_timestamp)
                 .map(|token| token.part(r.offset, count)),

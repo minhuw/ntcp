@@ -37,7 +37,7 @@ fn receive_offer_cap_validation_and_existing_bounds() {
             assert!(c.validate(ipv4).is_ok());
             let a = Connection::active(address_pair(ipv4), c.clone(), 10, 0).unwrap();
             assert_eq!(a.transport_info().advertised_mss, u32::from(cap.min(1460)));
-            assert_eq!(a.scratch.len(), 1460);
+            assert_eq!(a.config.mss, 1460);
         }
         c.receive_ip_payload_limit = 620;
         c.advertised_mss = Some(700);
@@ -191,7 +191,7 @@ fn receive_offer_cap_preserves_real_ack_confirmed_upward_probe() {
             a.config.receive_ip_payload_limit,
             if ipv4 { 65515 } else { 65535 }
         );
-        assert_eq!(a.scratch.len(), 1460);
+        assert_eq!(a.config.mss, 1460);
     }
 }
 

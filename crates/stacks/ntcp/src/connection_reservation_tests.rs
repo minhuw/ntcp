@@ -27,9 +27,10 @@ fn reserved_nonhead_sack_retry_keeps_exhausted_prr_credit_and_recovery_state() {
         assert_ne!(Seq(sequence), a.snd_una);
         assert!(!payload.is_empty());
         let mut reservation = OutputReservation::new();
-        reservation.bytes.resize(2048, 0);
         let token = reservation.token().unwrap();
-        reservation.capture(
+        let mut scratch_pool = crate::tx_pool::TxPool::heap_default();
+        reservation.capture_bytes_for_test(
+            &mut scratch_pool,
             &crate::Transmit {
                 connection: None,
                 tx_timestamp: None,
@@ -54,7 +55,13 @@ fn reserved_nonhead_sack_retry_keeps_exhausted_prr_credit_and_recovery_state() {
         crate::allocation_tests::fail_after(0, || {
             loop {
                 let p = reservation
-                    .fragment(84, &mut bytes, a.timestamp_value(400_000))
+                    .fragment(
+                        scratch_pool.arena(),
+                        84,
+                        &mut bytes,
+                        true,
+                        a.timestamp_value(400_000),
+                    )
                     .unwrap();
                 let s = wire::parse(p.ip, &bytes[..p.len]).unwrap();
                 assert_eq!(s.header.sequence, sequence.wrapping_add(total as u32));
@@ -482,18 +489,29 @@ fn gso_select(
     payload: &mut [u8],
     bytes: &mut [u8],
 ) -> Option<usize> {
-    a.transmit_selected_with_gso(
-        now,
-        bytes,
-        true,
-        Some(crate::output_reservation::GsoBuffer {
-            limits: crate::GsoLimits {
-                max_bytes: payload.len(),
+    gso_select_out(a, now, payload.len(), bytes).map(|s| s.total_len)
+}
+
+fn gso_select_out(
+    a: &mut Connection,
+    now: Instant,
+    max_bytes: usize,
+    bytes: &mut [u8],
+) -> Option<crate::connection::SelectedOutput> {
+    a.with_local_tx(|c, pool| {
+        c.transmit_selected_with_gso_in(
+            pool,
+            now,
+            bytes,
+            usize::MAX,
+            true,
+            true,
+            Some(crate::GsoLimits {
+                max_bytes,
                 max_segments: 4,
-            },
-            payload,
-        }),
-    )
+            }),
+        )
+    })
     .unwrap()
 }
 
@@ -516,11 +534,11 @@ fn gso_wrap_eor_cwr_rack_physical_segments_and_no_hotpath_allocation() {
             c.ecn_cwr_pending = true;
         }
         let mut reservation = crate::output_reservation::OutputReservation::new();
-        reservation.bytes.resize(2048, 0);
-        reservation.payload.resize(1000, 0);
+        reservation.parts =
+            Vec::with_capacity(crate::output_reservation::RESERVATION_INITIAL_PARTS);
         let mut bytes = [0; 2048];
-        let n = crate::allocation_tests::fail_after(0, || {
-            gso_select(&mut a, 40, &mut reservation.payload, &mut bytes).unwrap()
+        let sel = crate::allocation_tests::fail_after(0, || {
+            gso_select_out(&mut a, 40, 1000, &mut bytes).unwrap()
         });
         let mut departure = a.last_departure.unwrap();
         let s = departure.segmentation.unwrap();
@@ -529,27 +547,39 @@ fn gso_wrap_eor_cwr_rack_physical_segments_and_no_hotpath_allocation() {
         let start = Seq(departure.start);
         assert_eq!(a.snd_nxt, start.wrapping_add(300));
         let token = reservation.token().unwrap();
-        reservation.capture(
-            &crate::Transmit {
-                connection: None,
-                tx_timestamp: None,
-                ipv4_options: Default::default(),
-                ecn: 2,
-                ip: ip(tuple()),
-                len: n,
-                hop_limit: 64,
-                dscp: 0,
-                mark: 0,
-            },
-            &bytes,
-            token,
-        );
+        let tcp_hdr_len = usize::from(bytes[12] >> 4) * 4;
+        a.with_local_tx(|c, pool| {
+            reservation.capture_parts(
+                pool,
+                &crate::Transmit {
+                    connection: None,
+                    tx_timestamp: None,
+                    ipv4_options: Default::default(),
+                    ecn: 2,
+                    ip: ip(tuple()),
+                    len: sel.total_len,
+                    hop_limit: 64,
+                    dscp: 0,
+                    mark: 0,
+                },
+                &bytes[..tcp_hdr_len],
+                &[],
+                sel.payload_len,
+                token,
+                |pool, parts| {
+                    c.dup_send_tx_parts(pool, sel.payload_offset, sel.payload_len, parts);
+                },
+            );
+        });
         reservation.current.as_mut().unwrap().departure = Some(departure);
         crate::allocation_tests::fail_after(0, || {
             for segment in 0..3 {
-                let p = reservation
-                    .fragment(120, &mut bytes, a.timestamp_value(50))
-                    .unwrap();
+                let tsval = a.timestamp_value(50);
+                let p = a.with_local_tx(|_, pool| {
+                    reservation
+                        .fragment(pool.arena(), 120, &mut bytes, true, tsval)
+                        .unwrap()
+                });
                 let parsed = wire::parse(p.ip, &bytes[..p.len]).unwrap();
                 assert_eq!(parsed.header.sequence, start.wrapping_add(segment * 100).0);
                 assert_eq!(parsed.header.flags & CWR != 0, segment == 0);
@@ -575,6 +605,7 @@ fn gso_wrap_eor_cwr_rack_physical_segments_and_no_hotpath_allocation() {
                 r.offset += r.emitted_bytes;
             }
         });
+        a.with_local_tx(|_, pool| reservation.clear(pool));
         assert_eq!(a.snd_nxt, start.wrapping_add(300)); // Acceptance never recharges.
         assert_eq!(a.rack.counts().retransmitted, 0);
         assert_eq!(a.rack.counts().lost, 0);
@@ -606,18 +637,15 @@ fn gso_full_range_credit_bounds_and_scalar_nagle_cork_tail() {
     // Real initial cwnd=10*MSS, aggregate bounds must not extend it.
     let (mut a, _) = pair(config(4096, 100), 0);
     let cwnd = a.congestion.cwnd() as usize;
-    a.write(&[1; 2000]).unwrap();
     let mut payload = [0; 2000];
+    a.write(&[1; 2000]).unwrap();
     a.transmit_selected_with_gso(
         40,
         &mut [0; 2048],
         true,
-        Some(crate::output_reservation::GsoBuffer {
-            limits: crate::GsoLimits {
-                max_bytes: 2000,
-                max_segments: 20,
-            },
-            payload: &mut payload,
+        Some(crate::GsoLimits {
+            max_bytes: 2000,
+            max_segments: 20,
         }),
     )
     .unwrap()
@@ -793,12 +821,9 @@ fn gso_pmtu_probe_sack_and_timestamp_credit_fallbacks() {
             40,
             &mut [0; 31],
             true,
-            Some(crate::output_reservation::GsoBuffer {
-                limits: crate::GsoLimits {
-                    max_bytes: 1000,
-                    max_segments: 4
-                },
-                payload: &mut [0; 1000]
+            Some(crate::GsoLimits {
+                max_bytes: 1000,
+                max_segments: 4,
             })
         ),
         Err(Error::OutputTooSmall)
@@ -949,18 +974,14 @@ fn actual_group_flush_failed_encoding_cannot_create_an_application_mark() {
     );
     a.write(&[5; 7000]).unwrap();
     let before = (a.snd_nxt, a.flight(), a.rack.counts().unacked);
-    let mut payload = [0; 8000];
     assert_eq!(
         a.transmit_selected_with_gso(
             40,
             &mut [],
             true,
-            Some(crate::output_reservation::GsoBuffer {
-                limits: crate::GsoLimits {
-                    max_bytes: 8000,
-                    max_segments: 8
-                },
-                payload: &mut payload,
+            Some(crate::GsoLimits {
+                max_bytes: 8000,
+                max_segments: 8,
             })
         ),
         Err(Error::OutputTooSmall)
@@ -982,40 +1003,53 @@ fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
     );
     a.write(&[9; 7000]).unwrap();
     let mut reservation = crate::output_reservation::OutputReservation::new();
-    reservation.bytes.resize(2048, 0);
-    reservation.payload.resize(8000, 0);
+    reservation.parts = Vec::with_capacity(crate::output_reservation::RESERVATION_INITIAL_PARTS);
     let mut bytes = [0; 2048];
-    let n = gso_select(&mut a, 40, &mut reservation.payload, &mut bytes).unwrap();
+    let sel = gso_select_out(&mut a, 40, 8000, &mut bytes).unwrap();
     let mut departure = a.last_departure.unwrap();
     let total = departure.segmentation.unwrap().payload_len;
     assert_eq!(total, 4000);
     let token = reservation.token().unwrap();
-    reservation.capture(
-        &crate::Transmit {
-            connection: None,
-            tx_timestamp: None,
-            ipv4_options: Default::default(),
-            ecn: 0,
-            ip: ip(tuple()),
-            len: n,
-            hop_limit: 64,
-            dscp: 0,
-            mark: 0,
-        },
-        &bytes,
-        token,
-    );
+    let tcp_hdr_len = usize::from(bytes[12] >> 4) * 4;
+    a.with_local_tx(|c, pool| {
+        reservation.capture_parts(
+            pool,
+            &crate::Transmit {
+                connection: None,
+                tx_timestamp: None,
+                ipv4_options: Default::default(),
+                ecn: 0,
+                ip: ip(tuple()),
+                len: sel.total_len,
+                hop_limit: 64,
+                dscp: 0,
+                mark: 0,
+            },
+            &bytes[..tcp_hdr_len],
+            &[],
+            sel.payload_len,
+            token,
+            |pool, parts| {
+                c.dup_send_tx_parts(pool, sel.payload_offset, sel.payload_len, parts);
+            },
+        );
+    });
     reservation.current.as_mut().unwrap().departure = Some(departure);
     let mut accepted = 0;
     crate::allocation_tests::fail_after(0, || {
         while accepted < total {
-            let p = reservation
-                .fragment(
-                    if accepted < 2000 { 1020 } else { 520 },
-                    &mut bytes,
-                    a.timestamp_value(50),
-                )
-                .unwrap();
+            let tsval = a.timestamp_value(50);
+            let p = a.with_local_tx(|_, pool| {
+                reservation
+                    .fragment(
+                        pool.arena(),
+                        if accepted < 2000 { 1020 } else { 520 },
+                        &mut bytes,
+                        true,
+                        tsval,
+                    )
+                    .unwrap()
+            });
             let segment = wire::parse(p.ip, &bytes[..p.len]).unwrap();
             let count = segment.payload.len();
             assert_eq!(
@@ -1036,6 +1070,7 @@ fn actual_group_flush_tracks_final_accepted_fragment_through_mtu_shrink() {
             r.offset += r.emitted_bytes;
         }
     });
+    a.with_local_tx(|_, pool| reservation.clear(pool));
     assert_eq!(a.rack.counts().unacked, 1);
     assert_eq!(a.rack.packet_counts().unacked, 6);
     assert!(!a.send.pushed(0, 6999));
@@ -1320,54 +1355,67 @@ fn gso_matches_scalar(
 ) -> crate::TransmitSegmentation {
     use crate::output_reservation::OutputReservation;
     let mut reservation = OutputReservation::new();
-    reservation.bytes.resize(2048, 0);
-    reservation.payload.resize(4000, 0);
     let mut bytes = [0; 2048];
-    let n = a
-        .transmit_selected_with_gso(
-            now,
-            &mut bytes,
-            true,
-            Some(crate::output_reservation::GsoBuffer {
-                limits: crate::GsoLimits {
+    let sel = a
+        .with_local_tx(|c, pool| {
+            c.transmit_selected_with_gso_in(
+                pool,
+                now,
+                &mut bytes,
+                usize::MAX,
+                true,
+                true,
+                Some(crate::GsoLimits {
                     max_bytes: 4000,
                     max_segments: 16,
-                },
-                payload: &mut reservation.payload,
-            }),
-        )
+                }),
+            )
+        })
         .unwrap()
         .unwrap();
     let departure = a.last_departure.unwrap();
     let s = departure.segmentation.unwrap();
     let token = reservation.token().unwrap();
-    reservation.capture(
-        &crate::Transmit {
-            connection: None,
-            tx_timestamp: None,
-            ipv4_options: Default::default(),
-            ecn: 0,
-            ip: ip(tuple()),
-            len: n,
-            hop_limit: 64,
-            dscp: 0,
-            mark: 0,
-        },
-        &bytes,
-        token,
-    );
+    let tcp_hdr_len = usize::from(bytes[12] >> 4) * 4;
+    a.with_local_tx(|c, pool| {
+        reservation.capture_parts(
+            pool,
+            &crate::Transmit {
+                connection: None,
+                tx_timestamp: None,
+                ipv4_options: Default::default(),
+                ecn: 0,
+                ip: ip(tuple()),
+                len: sel.total_len,
+                hop_limit: 64,
+                dscp: 0,
+                mark: 0,
+            },
+            &bytes[..tcp_hdr_len],
+            &[],
+            sel.payload_len,
+            token,
+            |pool, parts| {
+                c.dup_send_tx_parts(pool, sel.payload_offset, sel.payload_len, parts);
+            },
+        );
+    });
     reservation.current.as_mut().unwrap().departure = Some(departure);
     let limit = a.path_payload_limit();
     while reservation.current.as_ref().unwrap().offset < s.payload_len {
-        let p = reservation
-            .fragment(limit, &mut bytes, scalar.timestamp_value(now))
-            .unwrap();
+        let tsval = scalar.timestamp_value(now);
+        let p = a.with_local_tx(|_, pool| {
+            reservation
+                .fragment(pool.arena(), limit, &mut bytes, true, tsval)
+                .unwrap()
+        });
         let mut expected = [0; 2048];
         let n = scalar.transmit(now, &mut expected).unwrap().unwrap();
         assert_eq!(&bytes[..p.len], &expected[..n]);
         let r = reservation.current.as_mut().unwrap();
         r.offset += r.emitted_bytes;
     }
+    a.with_local_tx(|_, pool| reservation.clear(pool));
     s
 }
 

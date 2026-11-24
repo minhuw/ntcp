@@ -1370,7 +1370,7 @@ impl Endpoint {
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         let dscp = self.config.dscp;
         let mut reply = |ip, zone| provider.reply_header_len(ip, zone, dscp);
-        let polled = self.poll_reserved_any(now, out, budget, Some(&mut reply))?;
+        let polled = self.poll_reserved_any(now, out, budget, true, Some(&mut reply))?;
         self.polled(polled)
     }
 
@@ -1385,7 +1385,8 @@ impl Endpoint {
     ) -> Result<(PollTransmit, Option<crate::TransmitAttempt>), EndpointError> {
         let dscp = self.config.dscp;
         let mut reply = |ip, zone| provider.reply_header_len(ip, zone, dscp);
-        let polled = self.poll_reserved_selected(now, out, budget, None, None, Some(&mut reply))?;
+        let polled =
+            self.poll_reserved_selected(now, out, budget, None, true, None, Some(&mut reply))?;
         self.polled(polled)
     }
 

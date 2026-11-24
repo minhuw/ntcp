@@ -4909,12 +4909,13 @@ fn syn_data_charge(len: usize) -> usize {
     len + deque.capacity() * core::mem::size_of::<ntcp_buffer::RxFrame>()
 }
 
-// A connection's charge at open: its scratch segment and the sender
-// ledgers' first entries (two RACK intervals, four SACK ranges).
-fn connection_charge(cfg: &EndpointConfig) -> usize {
+// A connection's charge at open: the sender ledgers' first entries (two
+// RACK intervals, four SACK ranges).
+fn connection_charge(_cfg: &EndpointConfig) -> usize {
     // The receive window allocates nothing: received data is charged as it
-    // is held (n0bw stage 1).
-    usize::from(cfg.connection.mss) + open_ledgers()
+    // is held (n0bw stage 1), and output no longer allocates a per-connection
+    // scratch segment.
+    open_ledgers()
 }
 
 // What a connection's first write, of `live` bytes, adds to the endpoint's
@@ -5030,17 +5031,28 @@ fn opens_are_charged_as_they_happen_and_reclaims_return_everything() {
     assert_eq!(a.buffer_bytes(), 2 * charge + written);
     let mut third_local = local;
     third_local.set_port(local.port() + 2);
+    // Once `write` finishes, the staging headroom (`open_ledgers()`) equals
+    // `connection_charge` (no per-connection scratch buffer), so a third open
+    // fits exactly and a fourth hits `max_buffer_bytes`.
+    let third = a.connect(0, third_local, remote).unwrap();
+    assert_eq!(a.buffer_bytes(), 3 * charge + written);
+    let mut fourth_local = local;
+    fourth_local.set_port(local.port() + 3);
     assert_eq!(
-        a.connect(0, third_local, remote),
+        a.connect(0, fourth_local, remote),
         Err(EndpointError::Connection(Error::NoMemory))
     );
     pump(&mut a, &mut b, 0);
-    let servers = [b.accept(listener).unwrap(), b.accept(listener).unwrap()];
+    let servers = [
+        b.accept(listener).unwrap(),
+        b.accept(listener).unwrap(),
+        b.accept(listener).unwrap(),
+    ];
     // One server holds the 9 bytes unread.
     let charges = servers.map(|id| charge_of(&b, id));
-    assert_eq!(b.buffer_bytes(), charges[0] + charges[1]);
+    assert_eq!(b.buffer_bytes(), charges[0] + charges[1] + charges[2]);
     assert!(charges.contains(&charge) && charges.iter().any(|&c| c > charge + 9));
-    for id in [first, second] {
+    for id in [first, second, third] {
         a.abort(id).unwrap();
         a.release(id).unwrap();
         assert!(a.connection_exists(id));
@@ -6405,7 +6417,7 @@ fn buffer_capacities_prehandshake_inheritance_and_open_charge() {
     let charge = connection_charge(&cfg);
     cfg.max_buffer_bytes = charge;
     let mut limited = Endpoint::new(cfg.clone(), [1; 32], 0, test_policy).unwrap();
-    for allocation in 0..4 {
+    for allocation in 0..3 {
         assert_eq!(
             crate::allocation_tests::fail_after(allocation, || limited.connect(0, local, remote)),
             Err(Error::NoMemory.into())

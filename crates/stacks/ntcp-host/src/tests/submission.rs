@@ -1012,10 +1012,25 @@ fn ip_frame(packet: Transmit, tcp: &[u8]) -> Vec<u8> {
 // cuts from it, as Linux tcp_gso_segment cuts them.
 fn group_frames(endpoint: &Endpoint, group: ntcp::TransmitGroup) -> (Vec<u8>, Vec<Vec<u8>>) {
     let view = endpoint.transmit_group(group).unwrap();
+    let payload = endpoint
+        .with_transmit_group_parts(group, |parts| {
+            let mut out = Vec::with_capacity(view.payload_len);
+            for part in parts {
+                out.extend_from_slice(part.bytes());
+            }
+            out
+        })
+        .unwrap();
+    assert_eq!(payload.len(), view.payload_len);
     let mut tcp = vec![0; view.packet.len];
-    let n = ntcp::wire::encode(view.packet.ip, view.header, view.options, &[], &mut tcp).unwrap();
-    tcp[16..18].fill(0);
-    tcp[n..].copy_from_slice(view.payload);
+    let n = ntcp::wire::encode_header_zero_checksum(
+        view.packet.ip,
+        view.header,
+        view.options,
+        &mut tcp,
+    )
+    .unwrap();
+    tcp[n..].copy_from_slice(&payload);
     let size = view.segment_payload_len;
     let segments = (0..view.segment_count)
         .map(|k| {
@@ -1032,7 +1047,7 @@ fn group_frames(endpoint: &Endpoint, group: ntcp::TransmitGroup) -> (Vec<u8>, Ve
                 view.packet.ip,
                 header,
                 view.options,
-                &view.payload[k * size..(k + 1) * size],
+                &payload[k * size..(k + 1) * size],
                 &mut out,
             )
             .unwrap();
@@ -1131,6 +1146,94 @@ fn groups_retry_submit_and_refuse_like_one_packet() {
             input(&mut b.0, &mut b.1, b.2, now + 1, &frame, 0);
         }
         assert_eq!((a.0.ledger.pending_count(), records(&a.0).len()), (0, 0));
+        for _ in 0..10 {
+            now += 10;
+            pump(&mut a, &mut b, &mut now);
+        }
+        let mut bytes = vec![0; payload.len()];
+        assert_eq!(b.1.read(child, &mut bytes).unwrap(), payload.len());
+        assert_eq!(bytes, payload);
+    }
+}
+
+#[test]
+fn submit_group_parts_matches_contiguous_aggregate_bytes() {
+    for v6 in [false, true] {
+        let mut cfg = config(4);
+        cfg.connection.pmtud.as_mut().unwrap().initial_search_low = Some(1500);
+        let (local, remote) = addresses(v6);
+        let mut a = managed_configured(local, 1032, cfg.clone(), true, None);
+        let mut b = managed(remote, 1033, cfg.clone());
+        let listener = b.1.listen(remote, 1).unwrap();
+        let id =
+            a.1.connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut a.0)
+                .unwrap();
+        let mut now = 0;
+        pump(&mut a, &mut b, &mut now);
+        let child = b.1.accept(listener).unwrap();
+        let limits = ntcp::TransmitGroupLimits {
+            max_bytes: usize::MAX,
+            max_segments: usize::MAX,
+            allow_psh: false,
+            allow_cwr: false,
+            allow_options: true,
+        };
+        let payload: Vec<u8> = (0..16000).map(|i| (i * 5 + 1) as u8).collect();
+        a.1.write(id, &payload).unwrap();
+        now += 10;
+        let (attempt, _, _) = selected(&mut a.1, now).unwrap();
+        let context = a.0.egress_context(&mut a.1, attempt).unwrap();
+        let group =
+            a.1.prepare_transmit_group(attempt, limits)
+                .unwrap()
+                .unwrap();
+        let (expected_frame, segments) = group_frames(&a.1, group);
+        let ip_hdr = if v6 { 40 } else { 20 };
+        let mut header_buf = [0u8; 144];
+        let (resident_ip_len, payload_len) = {
+            let view = a.1.transmit_group(group).unwrap();
+            let tcp_len = ntcp::wire::encode_header_zero_checksum(
+                view.packet.ip,
+                view.header,
+                view.options,
+                &mut header_buf[ip_hdr..],
+            )
+            .unwrap();
+            let resident_ip_len = if v6 {
+                ntcp_ip6::encode_shared_header(&mut header_buf, view.packet, tcp_len).unwrap()
+            } else {
+                let len = ntcp_ip::encode_shared_header(&mut header_buf, view.packet, 0, tcp_len)
+                    .unwrap();
+                header_buf[10..12].fill(0);
+                len
+            };
+            (resident_ip_len, view.payload_len)
+        };
+        let mut gathered = Vec::new();
+        let result = a
+            .0
+            .submit_group_parts(
+                &mut a.1,
+                now,
+                context,
+                group,
+                &header_buf[..resident_ip_len],
+                payload_len,
+                |_, parts| {
+                    gathered.extend_from_slice(&header_buf[..resident_ip_len]);
+                    for part in parts {
+                        gathered.extend_from_slice(part.bytes());
+                    }
+                    BackendOutcome::Submitted
+                },
+            )
+            .unwrap();
+        assert_eq!(result, Submission::Submitted);
+        assert_eq!(gathered, expected_frame);
+        assert!(a.1.transmit_group(group).is_none());
+        for segment in &segments {
+            input(&mut b.0, &mut b.1, b.2, now + 4, segment, 0);
+        }
         for _ in 0..10 {
             now += 10;
             pump(&mut a, &mut b, &mut now);

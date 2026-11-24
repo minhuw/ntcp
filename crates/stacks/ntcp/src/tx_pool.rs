@@ -1,7 +1,111 @@
-use alloc::boxed::Box;
-use core::fmt;
+use alloc::{boxed::Box, vec::Vec};
+use core::{fmt, mem::MaybeUninit};
 
-use ntcp_buffer::{ChunkArena, ChunkRef, HeapChunkSource, TxChunkSource};
+use ntcp_buffer::{ChunkArena, ChunkRef, ChunkSlice, HeapChunkSource, TxChunkSource, TxPart};
+
+/// Stack-inline buffer for borrowed `TxPart` slices with heap overflow only
+/// when a segment spans more than `N` parts. `TxPart` is `Copy`, so the
+/// inline `[MaybeUninit<TxPart<'a>>; N]` array needs no element drop.
+pub(crate) struct TxPartsBuf<'a, const N: usize = 32> {
+    inline: [MaybeUninit<TxPart<'a>>; N],
+    len: usize,
+    overflow: Vec<TxPart<'a>>,
+}
+
+impl<'a, const N: usize> TxPartsBuf<'a, N> {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            inline: [const { MaybeUninit::uninit() }; N],
+            len: 0,
+            overflow: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, part: TxPart<'a>) {
+        if !self.overflow.is_empty() {
+            self.overflow.push(part);
+        } else if self.len < N {
+            self.inline[self.len].write(part);
+            self.len += 1;
+        } else {
+            self.overflow.reserve(N.saturating_mul(2).max(1));
+            // SAFETY: `self.inline[..self.len]` are initialized when overflow is empty.
+            let inline = unsafe {
+                core::slice::from_raw_parts(self.inline.as_ptr().cast::<TxPart<'a>>(), self.len)
+            };
+            self.overflow.extend_from_slice(inline);
+            self.overflow.push(part);
+            self.len = 0;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push_merged(&mut self, part: TxPart<'a>) {
+        if part.is_empty() {
+            return;
+        }
+        if let TxPart::Chunk(slice) = part
+            && let Some(TxPart::Chunk(prev)) = self.last_mut()
+            && core::ptr::eq(prev.chunk(), slice.chunk())
+            && prev.offset() + prev.len() == slice.offset()
+        {
+            *prev = ChunkSlice::new(
+                prev.chunk(),
+                prev.offset()..prev.offset() + prev.len() + slice.len(),
+            )
+            .expect("merged chunk slice within filled prefix");
+            return;
+        }
+        self.push(part);
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[TxPart<'a>] {
+        if !self.overflow.is_empty() {
+            &self.overflow
+        } else {
+            // SAFETY: `self.inline[..self.len]` are initialized by `push`.
+            unsafe { core::slice::from_raw_parts(self.inline.as_ptr().cast(), self.len) }
+        }
+    }
+
+    #[inline]
+    fn last_mut(&mut self) -> Option<&mut TxPart<'a>> {
+        if !self.overflow.is_empty() {
+            self.overflow.last_mut()
+        } else if self.len > 0 {
+            // SAFETY: `self.inline[self.len - 1]` was initialized by `push`.
+            Some(unsafe { self.inline[self.len - 1].assume_init_mut() })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        if !self.overflow.is_empty() {
+            self.overflow.len()
+        } else {
+            self.len
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+        self.overflow.clear();
+    }
+}
 
 // ChunkArena allocates slots in 64-entry pages.
 const ARENA_PAGE_SLOTS: usize = 64;
@@ -59,7 +163,6 @@ impl fmt::Debug for TxPool {
 }
 
 impl TxPool {
-    #[allow(dead_code)]
     pub(crate) fn new(source: Box<dyn TxChunkSource>) -> Self {
         Self {
             arena: ChunkArena::new(),
@@ -497,5 +600,43 @@ mod tests {
             pool.release(h);
         }
         assert_eq!(pool.live(), 0);
+    }
+
+    #[test]
+    fn tx_parts_buf_inline_spill_merge_and_clear() {
+        let mut c1 = TxChunk::heap(16);
+        c1.append(b"0123456789abcdef");
+        let mut c2 = TxChunk::heap(8);
+        c2.append(b"ABCDEFGH");
+
+        let mut buf: TxPartsBuf<'_, 2> = TxPartsBuf::new();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        assert!(buf.as_slice().is_empty());
+
+        // Adjacent slices in same chunk merge inline.
+        buf.push_merged(TxPart::Chunk(ChunkSlice::new(&c1, 0..4).unwrap()));
+        buf.push_merged(TxPart::Chunk(ChunkSlice::new(&c1, 4..8).unwrap()));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.as_slice()[0].bytes(), b"01234567");
+
+        // Non-adjacent slice in same chunk and different chunk spill to overflow.
+        buf.push_merged(TxPart::Chunk(ChunkSlice::new(&c1, 10..12).unwrap()));
+        assert_eq!(buf.len(), 2);
+        buf.push_merged(TxPart::Chunk(ChunkSlice::new(&c2, 0..3).unwrap()));
+        assert_eq!(buf.len(), 3);
+        // Merge also works after spilling into overflow.
+        buf.push_merged(TxPart::Chunk(ChunkSlice::new(&c2, 3..6).unwrap()));
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.as_slice()[0].bytes(), b"01234567");
+        assert_eq!(buf.as_slice()[1].bytes(), b"ab");
+        assert_eq!(buf.as_slice()[2].bytes(), b"ABCDEF");
+
+        buf.clear();
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        buf.push(TxPart::Chunk(ChunkSlice::new(&c1, 0..1).unwrap()));
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.as_slice()[0].bytes(), b"0");
     }
 }

@@ -513,6 +513,10 @@ impl ConnectedSubmission<'_> {
         self.address
     }
 
+    pub fn with_tx_parts<R>(&self, f: impl FnOnce(&[ntcp::TxPart<'_>]) -> R) -> R {
+        self.permit.with_tx_parts(f)
+    }
+
     pub fn submitted(self) {
         self.permit.submitted(self.receipt);
     }
@@ -3063,12 +3067,14 @@ impl Host {
     /// Prepare an immediate, scalar submission using a connection's live
     /// destination. A miss leaves resolution, rebind, stateless evidence and
     /// option registration to the ordinary egress path.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_connected_submission<'a>(
         &'a mut self,
         endpoint: &'a mut Endpoint,
         attempt: TransmitAttempt,
         now: Instant,
         frame: &[u8],
+        shared_payload_len: usize,
         resolve: bool,
     ) -> Result<Option<ConnectedSubmission<'a>>, EndpointError> {
         if self.check_endpoint(endpoint).is_err() {
@@ -3083,6 +3089,9 @@ impl Host {
         if !packet.ipv4_options.is_empty() {
             return Ok(None);
         }
+        let Some(total_len) = frame.len().checked_add(shared_payload_len) else {
+            return Ok(None);
+        };
         let Some((binding, address)) = self.connected_frame::<false>(
             owner,
             &packet.ip,
@@ -3090,7 +3099,7 @@ impl Host {
             resolve,
             now,
             |route| endpoint.managed_route_matches(owner, route),
-            |snapshot| frame_fits(snapshot, packet.ip.source.is_ipv4(), frame, frame.len()),
+            |snapshot| frame_fits(snapshot, packet.ip.source.is_ipv4(), frame, total_len),
         ) else {
             return Ok(None);
         };
@@ -3104,7 +3113,7 @@ impl Host {
                     .key(),
                 packet,
                 frame,
-                0,
+                shared_payload_len,
                 false,
             ),
             Ok(())
@@ -3120,7 +3129,7 @@ impl Host {
             context,
             address,
             receipt: ntcp::PhysicalReceipt {
-                ip_packet_len: frame.len() as u32,
+                ip_packet_len: total_len as u32,
                 dont_fragment: unfragmentable(frame),
             },
         }))
@@ -3175,7 +3184,7 @@ impl Host {
         link_header: usize,
         minimum: usize,
         resolve: bool,
-        submit: impl FnOnce(&[u8]) -> BackendOutcome,
+        submit: impl FnOnce(&ntcp::TxPacket<'_>) -> BackendOutcome,
     ) -> Option<FreshSubmission> {
         if selected.managed_context() != Some(self.paths.context()) || resolve && link_header < 14 {
             return None;
@@ -3209,8 +3218,9 @@ impl Host {
         )?;
         #[cfg(debug_assertions)]
         {
-            let frame = &selected.frame()[link_header..];
-            debug_assert!(unfragmentable(frame) && len == frame.len());
+            let frame = &selected.header_frame()[link_header..];
+            let payload_len = selected.payload_len();
+            debug_assert!(unfragmentable(frame) && len == frame.len() + payload_len);
             debug_assert_eq!(
                 self.attempt_frame(
                     self.bindings[index]
@@ -3221,7 +3231,7 @@ impl Host {
                         .key(),
                     selected.packet(),
                     frame,
-                    0,
+                    payload_len,
                     false,
                 ),
                 Ok(())
@@ -3234,9 +3244,9 @@ impl Host {
         if let Some(mac) = address {
             selected.headroom().get_mut(..6)?.copy_from_slice(&mac);
         }
-        let wire = selected.padded_frame(minimum)?;
+        let outcome = selected.with_tx_packet(minimum, submit)?;
         self.now = self.now.max(now);
-        Some(match submit(wire) {
+        Some(match outcome {
             BackendOutcome::Submitted => FreshSubmission::Submitted(receipt),
             outcome => FreshSubmission::Retained {
                 context: EgressContext::for_path(
@@ -3787,6 +3797,52 @@ impl Host {
         shared_payload_len: usize,
         submit: impl FnOnce(EgressContext) -> BackendOutcome,
     ) -> Result<Submission, Refused> {
+        self.submit_with(
+            endpoint,
+            now,
+            ticket,
+            context,
+            frame,
+            shared_payload_len,
+            |live, _| submit(live),
+        )
+    }
+
+    /// Zero-copy form of [`Host::submit`]: borrows the reservation's payload
+    /// [`ntcp::TxPart`] slice while the permit holds `&mut Endpoint`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_parts(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        ticket: SubmissionTicket,
+        context: EgressContext,
+        frame: &[u8],
+        shared_payload_len: usize,
+        submit: impl FnOnce(EgressContext, &[ntcp::TxPart<'_>]) -> BackendOutcome,
+    ) -> Result<Submission, Refused> {
+        self.submit_with(
+            endpoint,
+            now,
+            ticket,
+            context,
+            frame,
+            shared_payload_len,
+            |live, permit| permit.with_tx_parts(|parts| submit(live, parts)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_with(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        ticket: SubmissionTicket,
+        context: EgressContext,
+        frame: &[u8],
+        shared_payload_len: usize,
+        call: impl FnOnce(EgressContext, &ntcp::PreparedTransmit<'_>) -> BackendOutcome,
+    ) -> Result<Submission, Refused> {
         let packet = endpoint.transmit_attempt_packet_ref(context.attempt);
         let ticketed = match ticket.ticket {
             Some(ticket) => self
@@ -3827,7 +3883,7 @@ impl Host {
                 .is_some_and(|index| self.ledger.has_evidence(index))
         }));
         self.now = self.now.max(now);
-        match submit(live) {
+        match call(live, &permit) {
             BackendOutcome::Submitted => {
                 if let Some(ticket) = ticket.ticket {
                     self.ledger.seal(ticket, now, false);
@@ -3886,10 +3942,44 @@ impl Host {
         frame: &[u8],
         submit: impl FnOnce(EgressContext) -> BackendOutcome,
     ) -> Result<Submission, Error> {
-        let segment = self.validate_group_egress(endpoint, now, context, group, frame)?;
+        let segment = self.validate_group_egress(endpoint, now, context, group, frame, 0)?;
         self.now = self.now.max(now);
+        let outcome = submit(context);
+        Self::finalize_group_submission(endpoint, now, group, segment, outcome)
+    }
+
+    /// Zero-copy form of [`Host::submit_group`]: `frame` carries only the
+    /// resident IP and TCP aggregate headers while `shared_payload_len` bytes
+    /// are borrowed from `endpoint` as [`ntcp::TxPart`]s for the backend call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_group_parts(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        context: EgressContext,
+        group: TransmitGroup,
+        frame: &[u8],
+        shared_payload_len: usize,
+        submit: impl FnOnce(EgressContext, &[ntcp::TxPart<'_>]) -> BackendOutcome,
+    ) -> Result<Submission, Error> {
+        let segment =
+            self.validate_group_egress(endpoint, now, context, group, frame, shared_payload_len)?;
+        self.now = self.now.max(now);
+        let outcome = endpoint
+            .with_transmit_group_parts(group, |parts| submit(context, parts))
+            .ok_or(Error::Obsolete)?;
+        Self::finalize_group_submission(endpoint, now, group, segment, outcome)
+    }
+
+    fn finalize_group_submission(
+        endpoint: &mut Endpoint,
+        now: Instant,
+        group: TransmitGroup,
+        segment: usize,
+        outcome: BackendOutcome,
+    ) -> Result<Submission, Error> {
         let none = SubmissionTicket { ticket: None };
-        match submit(context) {
+        match outcome {
             BackendOutcome::Submitted => {
                 let receipt = ntcp::PhysicalReceipt {
                     ip_packet_len: segment as u32,
@@ -3905,6 +3995,7 @@ impl Host {
             BackendOutcome::Unknown => Ok(Submission::PossiblySubmitted),
         }
     }
+
     // `submit_group`'s checks; the IP length of each physical segment.
     fn validate_group_egress(
         &mut self,
@@ -3913,6 +4004,7 @@ impl Host {
         context: EgressContext,
         group: TransmitGroup,
         frame: &[u8],
+        shared_payload_len: usize,
     ) -> Result<usize, Error> {
         self.check_endpoint(endpoint)?;
         let view = endpoint.transmit_group(group).ok_or(Error::Obsolete)?;
@@ -3926,14 +4018,15 @@ impl Host {
         // payload of all of them.
         let segment = frame
             .len()
-            .checked_sub(view.payload.len())
+            .checked_add(shared_payload_len)
+            .and_then(|total| total.checked_sub(view.payload_len))
             .ok_or(Error::Obsolete)?
             + view.segment_payload_len;
         if segment > snapshot.first_hop_mtu() as usize {
             return Err(Error::Obsolete);
         }
         debug_assert_eq!(
-            self.attempt_frame(snapshot.key(), &packet, frame, 0, true),
+            self.attempt_frame(snapshot.key(), &packet, frame, shared_payload_len, true),
             Ok(())
         );
         if packet.ip.source.is_ipv4() && (snapshot.clears_dont_fragment() || !unfragmentable(frame))
@@ -5003,6 +5096,15 @@ mod commit7_cache_tests {
             Submission::Submitted
         );
 
+        let gather_tx_packet = |packet: &ntcp::TxPacket<'_>| -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(packet.header);
+            for part in packet.payload {
+                out.extend_from_slice(part.bytes());
+            }
+            out
+        };
+
         // Fast path: offer_fresh_transmit + submit_fresh_tcp with 14B Ethernet + 20B IPv4 headroom.
         let mut fast_buf = [0xeeu8; 2048];
         let mut fast_wire = Vec::new();
@@ -5011,8 +5113,8 @@ mod commit7_cache_tests {
             .offer_fresh_transmit(50, fast_c, &mut fast_buf, 34, false, |selected| {
                 match fast_a
                     .0
-                    .submit_fresh_tcp(selected, 50, 14, 60, true, |wire| {
-                        fast_wire = wire.to_vec();
+                    .submit_fresh_tcp(selected, 50, 14, 60, true, |packet| {
+                        fast_wire = gather_tx_packet(packet);
                         BackendOutcome::Submitted
                     })
                     .expect("submit_fresh_tcp should hit connected IPv4 route")
@@ -5040,16 +5142,19 @@ mod commit7_cache_tests {
 
         // 2) IPv4 blocked submit_fresh_tcp -> FreshSubmission::Retained -> prepare_connected_submission
         let (mut blk_a, _, blk_c, _) = connect_v4_pair(Some(PmtudConfig::new(1500)));
-        blk_a.1.write(blk_c, b"blocked-then-prepared").unwrap();
+        let blk_payload = b"blocked-then-prepared";
+        blk_a.1.write(blk_c, blk_payload).unwrap();
         let mut blk_buf = [0u8; 2048];
         let mut saved_ip = Vec::new();
+        let mut saved_shared = 0usize;
         let reserved = blk_a
             .1
             .offer_fresh_transmit(60, blk_c, &mut blk_buf, 34, false, |selected| {
                 match blk_a
                     .0
-                    .submit_fresh_tcp(selected, 60, 14, 0, true, |wire| {
-                        saved_ip = wire[14..].to_vec();
+                    .submit_fresh_tcp(selected, 60, 14, 0, true, |packet| {
+                        saved_ip = packet.header[14..].to_vec();
+                        saved_shared = packet.payload.iter().map(|p| p.len()).sum();
                         BackendOutcome::WouldBlock
                     })
                     .expect("submit_fresh_tcp should run on live route")
@@ -5065,13 +5170,22 @@ mod commit7_cache_tests {
         let ntcp::FreshPoll::Reserved { attempt, .. } = reserved else {
             panic!("blocked offer must capture reservation");
         };
+        assert_eq!(saved_shared, blk_payload.len());
         let prepared = blk_a
             .0
-            .prepare_connected_submission(&mut blk_a.1, attempt, 65, &saved_ip, true)
+            .prepare_connected_submission(&mut blk_a.1, attempt, 65, &saved_ip, saved_shared, true)
             .unwrap()
             .expect("prepare_connected_submission must succeed on live IPv4 route");
         assert_eq!(prepared.address(), Some(mac));
         assert_eq!(prepared.context().attempt, attempt);
+        let gathered_payload = prepared.with_tx_parts(|parts| {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend_from_slice(part.bytes());
+            }
+            out
+        });
+        assert_eq!(gathered_payload, blk_payload);
         prepared.submitted();
         assert!(!blk_a.1.is_output_reserved(blk_c));
 
@@ -5217,8 +5331,8 @@ mod commit7_cache_tests {
             .offer_fresh_transmit(70, v6_fc, &mut v6_buf, 54, false, |selected| {
                 match v6_fast
                     .0
-                    .submit_fresh_tcp(selected, 70, 14, 0, false, |wire| {
-                        v6_wire = wire.to_vec();
+                    .submit_fresh_tcp(selected, 70, 14, 0, false, |packet| {
+                        v6_wire = gather_tx_packet(packet);
                         BackendOutcome::Submitted
                     })
                     .expect("submit_fresh_tcp should hit connected IPv6 route")
@@ -5252,12 +5366,100 @@ mod commit7_cache_tests {
         v6_frame.truncate(n);
         let prepared = v6_fast
             .0
-            .prepare_connected_submission(&mut v6_fast.1, att, 80, &v6_frame, false)
+            .prepare_connected_submission(&mut v6_fast.1, att, 80, &v6_frame, 0, false)
             .unwrap()
             .expect("prepare_connected_submission must succeed on live IPv6 route");
         assert_eq!(prepared.address(), None);
         prepared.submitted();
         assert!(!v6_fast.1.is_output_reserved(v6_fc));
+
+        // 3) submit_parts byte-identical comparison (IPv4 and IPv6) vs general submit
+        let (mut parts_v4, _, parts_v4_c, _) = connect_v4_pair(None);
+        let (mut gen_v4, _, gen_v4_c, _) = connect_v4_pair(None);
+        let msg = b"submit-parts-zero-copy-payload";
+        parts_v4.1.write(parts_v4_c, msg).unwrap();
+        gen_v4.1.write(gen_v4_c, msg).unwrap();
+        let gen_v4_wire = emit_ipv4(&mut gen_v4.0, &mut gen_v4.1, 90).unwrap();
+        let mut hdr_v4 = [0u8; 144];
+        let (_, att_v4) = parts_v4
+            .1
+            .poll_transmit_attempt(90, &mut hdr_v4[20..], 1, Some(parts_v4_c))
+            .unwrap();
+        let att_v4 = att_v4.unwrap();
+        let pkt_v4 = parts_v4.1.transmit_attempt_packet(att_v4).unwrap();
+        let res_v4 = parts_v4.1.transmit_attempt_resident_len(att_v4).unwrap();
+        let ip_res_v4 =
+            ntcp_ip::encode_shared_header(&mut hdr_v4, pkt_v4, 0, res_v4).unwrap();
+        let shared_v4 = pkt_v4.len - res_v4;
+        assert_eq!(shared_v4, msg.len());
+        let ctx_v4 = parts_v4.0.egress_context(&mut parts_v4.1, att_v4).unwrap();
+        let tkt_v4 = parts_v4.0.submission_ticket(&mut parts_v4.1, ctx_v4).unwrap();
+        let mut parts_v4_wire = Vec::new();
+        assert_eq!(
+            parts_v4
+                .0
+                .submit_parts(
+                    &mut parts_v4.1,
+                    90,
+                    tkt_v4,
+                    ctx_v4,
+                    &hdr_v4[..ip_res_v4],
+                    shared_v4,
+                    |_, parts| {
+                        parts_v4_wire.extend_from_slice(&hdr_v4[..ip_res_v4]);
+                        for part in parts {
+                            parts_v4_wire.extend_from_slice(part.bytes());
+                        }
+                        BackendOutcome::Submitted
+                    },
+                )
+                .unwrap(),
+            Submission::Submitted
+        );
+        assert_eq!(parts_v4_wire, gen_v4_wire);
+
+        let (mut parts_v6, _, parts_v6_c, _) = connect_v6_pair();
+        let (mut gen_v6, _, gen_v6_c, _) = connect_v6_pair();
+        parts_v6.1.write(parts_v6_c, msg).unwrap();
+        gen_v6.1.write(gen_v6_c, msg).unwrap();
+        let gen_v6_wire = emit_v6(&mut gen_v6.0, &mut gen_v6.1, 90).unwrap();
+        let mut hdr_v6 = [0u8; 144];
+        let (_, att_v6) = parts_v6
+            .1
+            .poll_transmit_attempt(90, &mut hdr_v6[40..], 1, Some(parts_v6_c))
+            .unwrap();
+        let att_v6 = att_v6.unwrap();
+        let pkt_v6 = parts_v6.1.transmit_attempt_packet(att_v6).unwrap();
+        let res_v6 = parts_v6.1.transmit_attempt_resident_len(att_v6).unwrap();
+        let ip_res_v6 =
+            ntcp_ip6::encode_shared_header(&mut hdr_v6, pkt_v6, res_v6).unwrap();
+        let shared_v6 = pkt_v6.len - res_v6;
+        assert_eq!(shared_v6, msg.len());
+        let ctx_v6 = parts_v6.0.egress_context(&mut parts_v6.1, att_v6).unwrap();
+        let tkt_v6 = parts_v6.0.submission_ticket(&mut parts_v6.1, ctx_v6).unwrap();
+        let mut parts_v6_wire = Vec::new();
+        assert_eq!(
+            parts_v6
+                .0
+                .submit_parts(
+                    &mut parts_v6.1,
+                    90,
+                    tkt_v6,
+                    ctx_v6,
+                    &hdr_v6[..ip_res_v6],
+                    shared_v6,
+                    |_, parts| {
+                        parts_v6_wire.extend_from_slice(&hdr_v6[..ip_res_v6]);
+                        for part in parts {
+                            parts_v6_wire.extend_from_slice(part.bytes());
+                        }
+                        BackendOutcome::Submitted
+                    },
+                )
+                .unwrap(),
+            Submission::Submitted
+        );
+        assert_eq!(parts_v6_wire, gen_v6_wire);
     }
 
     #[test]
@@ -5298,21 +5500,23 @@ mod commit7_cache_tests {
             panic!("stale route offer must fall back to captured reservation");
         };
         let pkt = a.1.transmit_attempt_packet(attempt).unwrap();
-        let mut ip_frame = vec![0u8; 20 + pkt.len];
-        ip_frame[20..].copy_from_slice(&buf[34..34 + pkt.len]);
-        let n = ntcp_ip::encode(&mut ip_frame, pkt, 0).unwrap();
+        let resident = a.1.transmit_attempt_resident_len(attempt).unwrap();
+        let shared = pkt.len - resident;
+        let mut ip_frame = vec![0u8; 20 + resident];
+        ip_frame[20..].copy_from_slice(&buf[34..34 + resident]);
+        let n = ntcp_ip::encode_shared_header(&mut ip_frame, pkt, 0, resident).unwrap();
         ip_frame.truncate(n);
         assert!(
-            a.0.prepare_connected_submission(&mut a.1, attempt, 100, &ip_frame, false)
+            a.0.prepare_connected_submission(&mut a.1, attempt, 100, &ip_frame, shared, false)
                 .unwrap()
                 .is_none(),
             "stale route must cause prepare_connected_submission to return Ok(None)"
         );
-        // General egress_context + submit still refreshes and succeeds cleanly!
+        // General egress_context + submit_parts still refreshes and succeeds cleanly!
         let ctx = a.0.egress_context(&mut a.1, attempt).unwrap();
         let ticket = a.0.submission_ticket(&mut a.1, ctx).unwrap();
         assert_eq!(
-            a.0.submit(&mut a.1, 100, ticket, ctx, &ip_frame, 0, |_| {
+            a.0.submit_parts(&mut a.1, 100, ticket, ctx, &ip_frame, shared, |_, _| {
                 BackendOutcome::Submitted
             })
             .unwrap(),
@@ -5334,7 +5538,7 @@ mod commit7_cache_tests {
         big_ip.truncate(n);
         a.0.set_link_mtu(a.2.link(), 576).unwrap();
         assert!(
-            a.0.prepare_connected_submission(&mut a.1, att, 110, &big_ip, false)
+            a.0.prepare_connected_submission(&mut a.1, att, 110, &big_ip, 0, false)
                 .unwrap()
                 .is_none(),
             "MTU decrease must cause prepare_connected_submission to return Ok(None)"
@@ -5462,14 +5666,16 @@ mod commit7_cache_tests {
             panic!("expired ARP must fall back to captured reservation");
         };
         let pkt = arp_ep.transmit_attempt_packet(attempt).unwrap();
-        let mut arp_ip = vec![0u8; 20 + pkt.len];
-        arp_ip[20..].copy_from_slice(&arp_buf[34..34 + pkt.len]);
-        let n = ntcp_ip::encode(&mut arp_ip, pkt, 0).unwrap();
+        let arp_resident = arp_ep.transmit_attempt_resident_len(attempt).unwrap();
+        let arp_shared = pkt.len - arp_resident;
+        let mut arp_ip = vec![0u8; 20 + arp_resident];
+        arp_ip[20..].copy_from_slice(&arp_buf[34..34 + arp_resident]);
+        let n = ntcp_ip::encode_shared_header(&mut arp_ip, pkt, 0, arp_resident).unwrap();
         arp_ip.truncate(n);
 
         assert!(
             arp_host
-                .prepare_connected_submission(&mut arp_ep, attempt, 600, &arp_ip, true)
+                .prepare_connected_submission(&mut arp_ep, attempt, 600, &arp_ip, arp_shared, true)
                 .unwrap()
                 .is_none(),
             "expired ARP must cause prepare_connected_submission(resolve=true) to return Ok(None)"
@@ -5480,7 +5686,7 @@ mod commit7_cache_tests {
         assert_eq!(resolved_mac, None, "expired ARP must yield None MAC");
         // With resolve=false, prepare_connected_submission still hits the held route and commits cleanly.
         let prepared = arp_host
-            .prepare_connected_submission(&mut arp_ep, attempt, 600, &arp_ip, false)
+            .prepare_connected_submission(&mut arp_ep, attempt, 600, &arp_ip, arp_shared, false)
             .unwrap()
             .expect("resolve=false should succeed even with expired ARP");
         prepared.submitted();

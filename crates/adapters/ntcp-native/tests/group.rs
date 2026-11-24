@@ -1076,9 +1076,9 @@ fn the_buffer_budget_admits_exactly_its_connections() {
         .buffer_budget(3, &wires(PacketLayer::Ip).0)
         .unwrap();
     // Nine output reservations, eight connection slots and the stateless
-    // lane, each charged the TCP packet of one IP packet of the MTU rather
-    // than one of the largest IPv4 packet, and the ICMP output queue's
-    // slots.
+    // lane, each retaining only the TCP header and references to payload
+    // chunks rather than per-packet byte buffers, and the ICMP output
+    // queue's slots.
     let plain = config(address, false, 1);
     let icmp_slots = ntcp_host::IcmpOutputLimits {
         messages: plain.icmp_output_messages,
@@ -1095,7 +1095,7 @@ fn the_buffer_budget_admits_exactly_its_connections() {
     );
     assert_eq!(
         plain.tcp.output_reservations_charge(9, usize::MAX, None),
-        reservations.map(|n| n + 9 * (65535 - 1480))
+        reservations
     );
     let admitted = |budget: usize| {
         let mut config = config(address, false, 1);

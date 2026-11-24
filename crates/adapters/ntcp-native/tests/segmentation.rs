@@ -547,10 +547,10 @@ fn ecn_capable_segments_are_sent_one_at_a_time() {
     assert_eq!(pair.a.counters().segmentation_refused, 0);
 }
 
-// Without segmentation the backend is never offered an aggregate, and the
-// buffer budget charges no aggregate room; with it, each output
-// reservation holds the payload of the largest aggregate. Either budget
-// admits exactly its connections.
+// Without segmentation the backend is never offered an aggregate; with it,
+// output reservations retain only headers and payload chunk references rather
+// than full aggregate copies, so either budget is equal and admits exactly its
+// connections.
 #[test]
 fn the_buffer_budget_follows_the_backends_segmentation() {
     let address = "10.73.0.1".parse().unwrap();
@@ -562,8 +562,9 @@ fn the_buffer_budget_follows_the_backends_segmentation() {
     let with = plain
         .buffer_budget(3, &wires(PacketLayer::Ethernet, Some(dpdk())).0)
         .unwrap();
-    // Five reservations: four connection slots and the stateless lane.
-    assert_eq!(with - without, 5 * (65535 - 14 - 20 - 20));
+    // Five reservations: four connection slots and the stateless lane, none
+    // preallocating per-aggregate byte copies.
+    assert_eq!(with, without);
     for (capabilities, budget) in [(None, without), (Some(dpdk()), with)] {
         let admitted = |budget: usize| {
             let mut config = config(address, true, 1);

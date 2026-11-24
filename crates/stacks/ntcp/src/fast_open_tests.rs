@@ -798,9 +798,9 @@ fn fast_open_reserved_syn_is_indivisible_after_path_shrink() {
         .packet
         .unwrap();
     let mut reservation = crate::output_reservation::OutputReservation::new();
-    reservation.bytes = vec![0; 2048];
+    let mut pool = crate::tx_pool::TxPool::heap_default();
     let attempt = reservation.token().unwrap();
-    reservation.capture(&tx, &bytes, attempt);
+    reservation.capture_bytes_for_test(&mut pool, &tx, &bytes, attempt);
     // Built again in the selection's tick: the same TSval.
     let tsval = wire::parse(tx.ip, &bytes[..tx.len])
         .unwrap()
@@ -808,11 +808,13 @@ fn fast_open_reserved_syn_is_indivisible_after_path_shrink() {
         .timestamps
         .map_or(0, |(value, _)| value);
     assert_eq!(
-        reservation.fragment(tx.len - 1, &mut bytes, tsval),
+        reservation.fragment(pool.arena(), tx.len - 1, &mut bytes, true, tsval),
         Err(EndpointError::ReservationMtuTooSmall)
     );
     assert_eq!(reservation.current.as_ref().unwrap().offset, 0);
-    let retry = reservation.fragment(tx.len, &mut bytes, tsval).unwrap();
+    let retry = reservation
+        .fragment(pool.arena(), tx.len, &mut bytes, true, tsval)
+        .unwrap();
     let syn = wire::parse(retry.ip, &bytes[..retry.len]).unwrap();
     assert_eq!(syn.payload, b"one handshake");
     assert_eq!(syn.header.flags & wire::SYN, wire::SYN);

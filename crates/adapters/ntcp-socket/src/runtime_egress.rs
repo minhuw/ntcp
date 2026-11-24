@@ -160,7 +160,7 @@ impl Egress {
     }
     // Test fixture: substitute the frame retained for `id`, keeping its
     // deferred association, to model a quote that correlates elsewhere.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "packet-test"))]
     pub(super) fn replace_retained_rx(&mut self, id: ConnectionId, bytes: &[u8]) {
         let slot = self.rx.iter_mut().find(|slot| slot.owner == Some(id)).unwrap();
         slot.bytes.clear();
@@ -1562,15 +1562,16 @@ mod tests {
     #[test]
     fn software_gso_pool_storage_is_separate_and_budgeted() {
         let local = Ipv4Addr::new(10, 73, 0, 2);
-        let config = SocketConfig::new("test", local).tcp;
-        let budget = config.max_buffer_bytes;
+        let mut config = SocketConfig::new("test", local).tcp;
+        let per_slot = config.output_reservations_charge(1, 0, None).unwrap();
+        config.max_buffer_bytes = per_slot;
         let mut owner = Owner::with_config(local, (local, 24), [1; 32], None, config).unwrap();
         assert_eq!(
             owner.enable_egress(
-                1,
+                2,
                 Some(ntcp::GsoLimits {
-                    max_bytes: budget,
-                    max_segments: 2,
+                    max_bytes: 65536,
+                    max_segments: 16,
                 })
             ),
             Err(ENOMEM)

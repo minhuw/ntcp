@@ -416,7 +416,7 @@ fn reserved_ack_dsack_option_splitting_wrap_and_ordinal_exhaustion() {
         mark: 0,
     };
     let token = a.reservations[0].token().unwrap();
-    a.reservations[0].capture(&packet, &bytes, token);
+    a.reservations[0].capture_bytes_for_test(&mut a.tx_pool, &packet, &bytes, token);
     a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
@@ -513,13 +513,13 @@ fn reserved_above_ack_dsack_pair_without_room_reports_its_containing_block() {
         mark: 0,
     };
     let token = a.reservations[0].token().unwrap();
-    a.reservations[0].capture(&packet, &bytes, token);
+    a.reservations[0].capture_bytes_for_test(&mut a.tx_pool, &packet, &bytes, token);
     a.reservation_held(0);
     a.set_first_hop_mtu(2, id, 68).unwrap();
     a.reject_unsubmitted(token).unwrap();
     // No room for one block beside the timestamp: nothing to send.
     assert_eq!(
-        a.reservations[0].fragment(36, &mut bytes, 1),
+        a.reservations[0].fragment(a.tx_pool.arena(), 36, &mut bytes, true, 1),
         Err(EndpointError::ReservationMtuTooSmall)
     );
     assert_eq!(a.reservations[0].current.as_ref().unwrap().sacks, 0);
@@ -571,7 +571,8 @@ fn reserved_options_only_fragment_defers_ecn_and_cwr_until_actual_data() {
     let mut bytes = [0; 200];
     let len = wire::encode(ip, header, &options, &[7; 40], &mut bytes).unwrap();
     let token = a.reservations[0].token().unwrap();
-    a.reservations[0].capture(
+    a.reservations[0].capture_bytes_for_test(
+        &mut a.tx_pool,
         &Transmit {
             connection: Some(id),
             tx_timestamp: None,
@@ -1279,8 +1280,9 @@ fn pool_allocation_budget_and_failure_are_atomic() {
     let mut a = endpoint();
     let before = a.buffer_bytes();
     let charge = 2
-        * (a.config.connection.send_ip_payload_limit as usize
-            + core::mem::size_of::<crate::output_reservation::OutputReservation>());
+        * (core::mem::size_of::<crate::output_reservation::OutputReservation>()
+            + crate::output_reservation::RESERVATION_INITIAL_PARTS
+                * core::mem::size_of::<crate::output_reservation::OwnedTxPart>());
     a.config.max_buffer_bytes = before + charge - 1;
     assert_eq!(
         a.enable_output_reservations_with_capacity(2),
@@ -1320,7 +1322,10 @@ fn pool_allocation_budget_and_failure_are_atomic() {
 fn pool_packet_bytes_bound_the_charge_and_every_encoded_packet() {
     let (_, mut b, _, server) = pair();
     let before = b.buffer_bytes();
-    let charge = 2 * (1100 + core::mem::size_of::<crate::output_reservation::OutputReservation>());
+    let charge = 2
+        * (core::mem::size_of::<crate::output_reservation::OutputReservation>()
+            + crate::output_reservation::RESERVATION_INITIAL_PARTS
+                * core::mem::size_of::<crate::output_reservation::OwnedTxPart>());
     assert_eq!(
         b.config.output_reservations_charge(2, 1100, None),
         Some(charge)
@@ -1762,7 +1767,7 @@ fn gso_prefix_wouldblock_mtu_shrink_and_failed_encoding_are_atomic() {
     );
     assert_eq!(a.transport_info(id).unwrap(), before);
     assert!(!a.is_output_reserved(id));
-    assert_eq!(a.reservations[0].payload.len(), 5000);
+    assert!(a.reservations[0].parts.is_empty());
     let (out, token) = a.poll_reserved_transmit_for(2, id, &mut bytes, 1).unwrap();
     let token = token.unwrap();
     let s = a.transmit_segmentation(token).unwrap();
@@ -1809,9 +1814,9 @@ fn gso_enable_budget_bounds_and_full_pool_are_atomic() {
         max_segments: 4,
     };
     let charge = 2
-        * (a.config.connection.send_ip_payload_limit as usize
-            + 4096
-            + core::mem::size_of::<crate::output_reservation::OutputReservation>());
+        * (core::mem::size_of::<crate::output_reservation::OutputReservation>()
+            + crate::output_reservation::RESERVATION_INITIAL_PARTS
+                * core::mem::size_of::<crate::output_reservation::OwnedTxPart>());
     a.config.max_buffer_bytes = before + charge - 1;
     assert_eq!(
         a.enable_output_reservations_with_gso(2, limits),

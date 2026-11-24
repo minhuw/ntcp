@@ -1387,7 +1387,7 @@ impl Owner {
         let started = clock.sample().map_err(clock_failure)?.ticks;
         #[cfg(test)]
         let (test_origin, started) = (started, 0);
-        let endpoint = Endpoint::new(config, secret, started, move |r| match r {
+        let mut endpoint = Endpoint::new(config, secret, started, move |r| match r {
             AddressValidation::Bind { local: bind } => {
                 // Per-socket local-address permission is checked by Op::Bind.
                 // FREEBIND does not relax Open, Incoming, or Route policy.
@@ -1404,6 +1404,13 @@ impl Owner {
             AddressValidation::Route { .. } => false,
         })
         .map_err(engine)?;
+        if ports.len() == 1
+            && let Some(eth) = &ports[0].ethernet
+        {
+            endpoint
+                .enable_tx_chunk_source(eth.io.tx_chunk_source())
+                .map_err(engine)?;
+        }
         let ephemeral = endpoint.ephemeral_ports().map_err(engine)?;
         Ok(Self {
             fast_open_keys: None,

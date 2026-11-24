@@ -268,10 +268,10 @@ pub struct Network<P: PacketIo> {
     // retransmitted ones taken out, Linux's OutSegs.
     tcp_segments: u64,
     // The backend's TCP segmentation, when reservations are sized for it
-    // (`NetworkConfig::gso`), and the frame of the aggregate being
-    // submitted, built again for every call.
+    // (`NetworkConfig::gso`), and the maximum wire length of one aggregate
+    // frame (headers + payload).
     segmentation: Option<ntcp_io::TcpSegmentationCapabilities>,
-    aggregate: Vec<u8>,
+    aggregate_max_len: usize,
     // The one transmit slot of ARP control frames (empty without ARP).
     control: Vec<u8>,
     // The Host's ICMP output: the packet it writes and the frame that
@@ -941,6 +941,7 @@ impl<P: PacketIo> Network<P> {
         };
         let mut endpoint = Endpoint::for_local_address(config.tcp.clone(), secret, now, local)?;
         host.attach(&mut endpoint)?;
+        endpoint.enable_tx_chunk_source(io.tx_chunk_source())?;
         // A member charges its group's buffer memory, its output
         // reservations included.
         if let Some(member) = &flows {
@@ -963,13 +964,10 @@ impl<P: PacketIo> Network<P> {
         let frame_target = frame_budget.map_or(0, |budget| budget / 2);
         // The largest frame an aggregate fills: the backend's, within the
         // largest IP packet of the local family.
-        let aggregate = match segmentation {
-            Some(c) => bytes(
-                c.max_aggregate_len
-                    .min(config.link.offset() + 65535 + if local.is_ipv4() { 0 } else { 40 }),
-            )?,
-            None => Vec::new(),
-        };
+        let aggregate_max_len = segmentation.map_or(0, |c| {
+            c.max_aggregate_len
+                .min(config.link.offset() + 65535 + if local.is_ipv4() { 0 } else { 40 })
+        });
         let retained = config.retained_receive_packets.unwrap_or(owners);
         let ip_capacity = config.mtu as usize;
         // A reassembled datagram is completed into `completed` and may be
@@ -979,7 +977,7 @@ impl<P: PacketIo> Network<P> {
         tx.try_reserve_exact(owners).map_err(|_| Error::Capacity)?;
         for _ in 0..owners {
             tx.push(driver::TxSlot {
-                bytes: bytes((ip_capacity + config.link.offset()).max(60))?,
+                bytes: [0u8; 144],
                 pending: None,
             });
         }
@@ -1099,7 +1097,7 @@ impl<P: PacketIo> Network<P> {
             tx_submitted: 0,
             tcp_segments: 0,
             segmentation,
-            aggregate,
+            aggregate_max_len,
             control,
             icmp_packet,
             icmp_frame,

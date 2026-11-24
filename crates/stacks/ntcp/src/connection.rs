@@ -18,7 +18,7 @@ use crate::{
     rx_timestamp::RxTimestamps,
     sack::Scoreboard,
     seq::Seq,
-    tx_pool::TxPool,
+    tx_pool::{TxPartsBuf, TxPool},
     tx_timestamp::TxTimestamps,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
@@ -919,6 +919,15 @@ const RCV_MEMORY_LIMIT_UNSET: (usize, usize) = (usize::MAX, 0);
 
 // A fresh scalar packet offered with its owner exclusively borrowed. RACK
 // and the PTO timer learn of the selection together when the device returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectedOutput {
+    pub total_len: usize,
+    pub written_len: usize,
+    pub payload_offset: usize,
+    pub payload_len: usize,
+    pub keepalive_garbage: bool,
+}
+
 pub(crate) struct StreamRecord {
     start: Seq,
     end: Seq,
@@ -996,6 +1005,7 @@ pub(crate) struct Connection {
     // aged by a serial half-range. New samples can only move it later.
     sample_review: Instant,
     send: SendBuffer,
+    send_entries_charged: usize,
     send_ptb_charged: usize,
     #[cfg(test)]
     local_tx: Option<TxPool>,
@@ -1003,7 +1013,6 @@ pub(crate) struct Connection {
     // The receive queue's storage as last settled with the Endpoint's
     // budget (`settle_receive_charge`), the part of buffer_charge it holds.
     receive_charged: usize,
-    scratch: Vec<u8>,
     iss: Seq,
     irs: Option<Seq>,
     passive_open: bool,
@@ -1470,11 +1479,6 @@ impl Connection {
         let (send_sizes, receive_sizes) = (config.send_buffer(), config.receive_buffer());
         let send_tuned = send_sizes.max > send_sizes.initial;
         let receive_tuned = receive_sizes.max > receive_sizes.initial;
-        let mut scratch = Vec::new();
-        scratch
-            .try_reserve_exact(config.mss as usize)
-            .map_err(|_| Error::NoMemory)?;
-        scratch.resize(config.mss as usize, 0);
         //= https://www.rfc-editor.org/rfc/rfc7323#section-2.1
         //= reason=The exponent comes from the largest receive buffer the connection may grow to, receive_capacity_max (Linux's tcp_rmem[2] in tcp_select_initial_window), or from the size a setter locked; it is frozen after the first successful SYN output, and the negotiated true window stays bounded by the allocated ring.
         //# The maximum receive window, and therefore the scale factor, is
@@ -1582,12 +1586,12 @@ impl Connection {
             events: PendingEvents::default(),
             now,
             send,
+            send_entries_charged: 0,
             send_ptb_charged: 0,
             #[cfg(test)]
             local_tx: with_local_tx.then(TxPool::heap_default),
             receive: RxQueue::new(Seq(0)),
             receive_charged: 0,
-            scratch,
             iss: Seq(iss),
             irs: None,
             passive_open: false,
@@ -1998,30 +2002,34 @@ impl Connection {
         Ok(())
     }
 
-    // What a connection with an `mss`-byte scratch segment allocates at
-    // open, its charge until the first write: the scratch segment and the
-    // sender ledgers' initial entries (the RACK ledger's SPARE entries, the
-    // scoreboard's four spare ranges). The send ring and the ledgers'
-    // growth are allocated, and charged, at write; received data is charged
-    // as it is held (`settle_receive_charge`), as Linux charges skbs to
-    // sk_rmem_alloc when they are queued.
-    pub(crate) fn open_bytes(mss: usize) -> Option<usize> {
-        mss.checked_add(Rack::storage_bytes(SPARE)?)?
-            .checked_add(Scoreboard::allocation_bytes(0)?)
+    // What a connection allocates at open, its charge until the first write:
+    // the sender ledgers' initial entries (the RACK ledger's SPARE entries,
+    // the scoreboard's four spare ranges). The send queue entries and the
+    // ledgers' growth are allocated, and charged, at write; received data is
+    // charged as it is held (`settle_receive_charge`), as Linux charges skbs
+    // to sk_rmem_alloc when they are queued.
+    pub(crate) fn open_bytes(_mss: usize) -> Option<usize> {
+        Rack::storage_bytes(SPARE)?.checked_add(Scoreboard::allocation_bytes(0)?)
     }
 
     // What the connection's buffers and records hold allocated, as last
     // settled with the Endpoint: its share of the endpoint's
     // max_buffer_bytes.
     pub(crate) fn buffer_charge(&self) -> usize {
-        self.send.entries_storage_bytes()
+        self.send_entries_charged
             + self.send_ptb_charged
             + self.receive_charged
             + self.scoreboard.storage_bytes()
             + self.rack.allocation_bytes()
-            + self.scratch.capacity()
             + self.tx_timestamps.storage_bytes()
             + self.rx_timestamps.storage_bytes()
+    }
+
+    pub(crate) fn settle_send_entries_charge(&mut self) -> Option<(usize, usize)> {
+        let storage = self.send.entries_storage_bytes();
+        self.large_send_ring = storage > SEND_RING_RESERVE;
+        let old = core::mem::replace(&mut self.send_entries_charged, storage);
+        (old != storage).then_some((old, storage))
     }
 
     pub(crate) fn settle_send_ptb_charge(&mut self) -> Option<(usize, usize)> {
@@ -2037,6 +2045,28 @@ impl Connection {
 
     pub(crate) fn release_send_chunks(&mut self, pool: &mut TxPool) {
         self.send.clear_chunks(pool);
+    }
+
+    #[inline]
+    pub(crate) fn send_tx_parts<'a>(
+        &'a self,
+        arena: &'a ntcp_buffer::ChunkArena,
+        offset: usize,
+        count: usize,
+        out: &mut TxPartsBuf<'a>,
+    ) -> usize {
+        self.send.tx_parts(arena, offset, count, out)
+    }
+
+    #[inline]
+    pub(crate) fn dup_send_tx_parts(
+        &self,
+        pool: &mut TxPool,
+        offset: usize,
+        count: usize,
+        out: &mut Vec<crate::output_reservation::OwnedTxPart>,
+    ) -> usize {
+        self.send.dup_tx_parts(pool, offset, count, out)
     }
 
     // The receive queue's storage now and as charged, when they differ:
@@ -2309,7 +2339,7 @@ impl Connection {
         )
         .saturating_sub(40)
         .min(self.path_payload_limit().saturating_sub(60))
-        .min(self.scratch.len());
+        .min(usize::from(self.config.mss));
         let count = initial.len().min(limit).min(self.send_space_remaining());
         if count == 0 {
             return Ok(0);
@@ -3593,7 +3623,7 @@ impl Connection {
                 .max(floor),
         )
         .min((u32::from(self.peer_mss.min(self.send_mss_limit)) + base + 20).max(floor))
-        .min((self.scratch.len() as u32 + base + 20).max(floor))
+        .min((u32::from(self.config.mss) + base + 20).max(floor))
     }
 
     //= https://www.rfc-editor.org/rfc/rfc1191#section-6.4
@@ -3666,7 +3696,7 @@ impl Connection {
                 let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
                 let effective = usize::from(self.peer_mss.min(self.send_mss_limit)
                     .min(self.config.user_mss.unwrap_or(u16::MAX)))
-                    .min(self.scratch.len()).saturating_sub(options).max(1)
+                    .min(usize::from(self.config.mss)).saturating_sub(options).max(1)
                     .min(self.path_payload_limit().saturating_sub(20 + if self.timestamps { 12 } else { 0 }).max(1));
                 self.update_path_mss(effective, repair);
             }
@@ -3693,7 +3723,7 @@ impl Connection {
                 .min(self.send_mss_limit)
                 .min(self.config.user_mss.unwrap_or(u16::MAX)),
         )
-        .min(self.scratch.len())
+        .min(usize::from(self.config.mss))
         .saturating_sub(options)
         .max(1);
         let budget = (self.config.send_ip_payload_limit as usize)
@@ -4039,6 +4069,7 @@ impl Connection {
                 Seq(d.start).distance_from(self.send_base) as usize,
                 d.payload,
             );
+            self.large_send_ring = self.send.entries_storage_bytes() > SEND_RING_RESERVE;
             d.defer_push = false;
         }
         if !ORIGINAL
@@ -4420,7 +4451,7 @@ impl Connection {
         });
         let effective = usize::from(self.peer_mss.min(self.send_mss_limit)
             .min(self.config.user_mss.unwrap_or(u16::MAX)))
-            .min(self.scratch.len()).saturating_sub(options).max(1)
+            .min(usize::from(self.config.mss)).saturating_sub(options).max(1)
             .min(self.config.send_ip_payload_limit as usize - 20 - if self.timestamps { 12 } else { 0 })
             .min(local).min(self.managed_payload_mss());
         self.set_path_mss_budget(effective);
@@ -4887,7 +4918,7 @@ impl Connection {
             peer_mss: self.peer_mss,
             user_mss: self.config.user_mss,
             local_mss: self.send_mss_limit,
-            allocation: self.scratch.len(),
+            allocation: usize::from(self.config.mss),
             send_ip_payload_limit: self.config.send_ip_payload_limit,
             destination_mtu: self.pmtud.as_ref().and_then(|p| p.info.route_mtu),
             effective_mss: self.mss,
@@ -6363,6 +6394,7 @@ impl Connection {
     // again.
     pub(crate) fn reclaim_send_ring(&mut self) {
         self.send.release();
+        self.send_entries_charged = 0;
         self.large_send_ring = false;
     }
 
@@ -6404,6 +6436,7 @@ impl Connection {
     pub(crate) fn refresh_work(&self) -> bool {
         debug_assert!(self.refresh_work || !self.refresh_work_held());
         self.refresh_work
+            || self.send.entries_storage_bytes() != self.send_entries_charged
             || (self.large_send_ring | self.large_ledgers)
                 && (self.send_ring_reclaimable() || self.ledgers_reclaimable())
             || self.receive_spare_reclaimable()
@@ -6412,7 +6445,9 @@ impl Connection {
     // A write accepted bytes, so neither send allocation can be reclaimed.
     pub(crate) fn refresh_after_write(&self) -> bool {
         debug_assert!(self.send.len() != 0);
-        let work = self.refresh_work || self.receive_spare_reclaimable();
+        let work = self.refresh_work
+            || self.send.entries_storage_bytes() != self.send_entries_charged
+            || self.receive_spare_reclaimable();
         debug_assert_eq!(work, self.refresh_work());
         work
     }
@@ -7136,7 +7171,8 @@ impl Connection {
         }
         if grow_entries {
             let result = self.send.reserve_entries(needed_entries);
-            self.large_send_ring = self.send.entries_storage_bytes() > SEND_RING_RESERVE;
+            self.send_entries_charged = self.send.entries_storage_bytes();
+            self.large_send_ring = self.send_entries_charged > SEND_RING_RESERVE;
             result.map_err(|_| staged)?;
         }
         if let Some(rack) = rack {
@@ -7171,7 +7207,8 @@ impl Connection {
         self.send
             .prepare_shared(payload, peak_room)
             .map_err(|_| Error::NoMemory)?;
-        self.large_send_ring = self.send.entries_storage_bytes() > SEND_RING_RESERVE;
+        self.send_entries_charged = self.send.entries_storage_bytes();
+        self.large_send_ring = self.send_entries_charged > SEND_RING_RESERVE;
         Ok(())
     }
 
@@ -8147,6 +8184,7 @@ impl Connection {
             && let Ok(offset) = usize::try_from(offset)
         {
             self.send.finish_send(pool, offset, !more, end_of_record);
+            self.large_send_ring = self.send.entries_storage_bytes() > SEND_RING_RESERVE;
         }
         if end == self.acknowledged + self.send.len() as u64 {
             self.more = more;
@@ -11410,7 +11448,10 @@ impl Connection {
         now: Instant,
         out: &mut [u8],
     ) -> Result<Option<usize>, Error> {
-        self.with_local_tx(|c, pool| c.transmit_selected_in(pool, now, out, false))
+        self.with_local_tx(|c, pool| {
+            c.transmit_selected_in(pool, now, out, usize::MAX, true, false)
+                .map(|opt| opt.map(|s| s.total_len))
+        })
     }
 
     #[cfg(test)]
@@ -11420,7 +11461,10 @@ impl Connection {
         out: &mut [u8],
         reserve: bool,
     ) -> Result<Option<usize>, Error> {
-        self.with_local_tx(|c, pool| c.transmit_selected_in(pool, now, out, reserve))
+        self.with_local_tx(|c, pool| {
+            c.transmit_selected_in(pool, now, out, usize::MAX, true, reserve)
+                .map(|opt| opt.map(|s| s.total_len))
+        })
     }
 
     pub(crate) fn transmit_selected_in(
@@ -11428,9 +11472,11 @@ impl Connection {
         pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
+        packet_limit: usize,
+        gather: bool,
         reserve: bool,
-    ) -> Result<Option<usize>, Error> {
-        self.transmit_selected_with_gso_in(pool, now, out, reserve, None)
+    ) -> Result<Option<SelectedOutput>, Error> {
+        self.transmit_selected_with_gso_in(pool, now, out, packet_limit, gather, reserve, None)
     }
 
     #[cfg(test)]
@@ -11440,7 +11486,10 @@ impl Connection {
         out: &mut [u8],
         payload: &mut Vec<crate::Payload>,
     ) -> Result<Option<usize>, Error> {
-        self.with_local_tx(|c, pool| c.transmit_shared_selected_in(pool, now, out, payload))
+        self.with_local_tx(|c, pool| {
+            c.transmit_shared_selected_in(pool, now, out, usize::MAX, payload)
+                .map(|opt| opt.map(|s| s.total_len))
+        })
     }
 
     pub(crate) fn transmit_shared_selected_in(
@@ -11448,15 +11497,24 @@ impl Connection {
         pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
+        packet_limit: usize,
         payload: &mut Vec<crate::Payload>,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<SelectedOutput>, Error> {
         payload.clear();
         if payload.capacity() == 0 {
             return Err(Error::InvalidArgument);
         }
         self.send.set_shared_output(Some(payload.capacity()));
-        let result =
-            self.transmit_selected_payload(pool, now, out, true, None, Some(&mut *payload));
+        let result = self.transmit_selected_payload(
+            pool,
+            now,
+            out,
+            packet_limit,
+            true,
+            true,
+            None,
+            Some(&mut *payload),
+        );
         self.send.set_shared_output(None);
         if result.is_err() {
             payload.clear();
@@ -11470,20 +11528,26 @@ impl Connection {
         now: Instant,
         out: &mut [u8],
         reserve: bool,
-        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        gso: Option<crate::GsoLimits>,
     ) -> Result<Option<usize>, Error> {
-        self.with_local_tx(|c, pool| c.transmit_selected_with_gso_in(pool, now, out, reserve, gso))
+        self.with_local_tx(|c, pool| {
+            c.transmit_selected_with_gso_in(pool, now, out, usize::MAX, true, reserve, gso)
+                .map(|opt| opt.map(|s| s.total_len))
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transmit_selected_with_gso_in(
         &mut self,
         pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
+        packet_limit: usize,
+        gather: bool,
         reserve: bool,
-        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
-    ) -> Result<Option<usize>, Error> {
-        self.transmit_selected_payload(pool, now, out, reserve, gso, None)
+        gso: Option<crate::GsoLimits>,
+    ) -> Result<Option<SelectedOutput>, Error> {
+        self.transmit_selected_payload(pool, now, out, packet_limit, gather, reserve, gso, None)
     }
 
     #[cfg(test)]
@@ -11493,7 +11557,10 @@ impl Connection {
         out: &mut [u8],
         record: &mut Option<StreamRecord>,
     ) -> Result<Option<usize>, Error> {
-        self.with_local_tx(|c, pool| c.transmit_offered_in(pool, now, out, record))
+        self.with_local_tx(|c, pool| {
+            c.transmit_offered_in(pool, now, out, usize::MAX, true, record)
+                .map(|opt| opt.map(|s| s.total_len))
+        })
     }
 
     pub(crate) fn transmit_offered_in(
@@ -11501,8 +11568,10 @@ impl Connection {
         pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
+        packet_limit: usize,
+        gather: bool,
         record: &mut Option<StreamRecord>,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<SelectedOutput>, Error> {
         // A directly offered packet has a scalar backend buffer. Keep its
         // selection and accounting together while the owner is borrowed.
         if self.selects_stream()
@@ -11521,6 +11590,8 @@ impl Connection {
                     pool,
                     now,
                     out,
+                    packet_limit,
+                    gather,
                     true,
                     None,
                     None,
@@ -11531,6 +11602,8 @@ impl Connection {
                     pool,
                     now,
                     out,
+                    packet_limit,
+                    gather,
                     true,
                     None,
                     None,
@@ -11538,7 +11611,7 @@ impl Connection {
                 )
             }
         } else {
-            self.transmit_selected_in(pool, now, out, true)
+            self.transmit_selected_in(pool, now, out, packet_limit, gather, true)
         }
     }
 
@@ -11569,15 +11642,18 @@ impl Connection {
         self.arm_work_with_probe(true);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transmit_selected_payload(
         &mut self,
         pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
+        packet_limit: usize,
+        gather: bool,
         reserve: bool,
-        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        gso: Option<crate::GsoLimits>,
         shared: Option<&mut Vec<crate::Payload>>,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<SelectedOutput>, Error> {
         // A connection is offered output after every change, and most changes
         // (input, a read, the send that took its last data) leave it nothing
         // to send. The selection below would find that only after building
@@ -11590,7 +11666,15 @@ impl Connection {
             #[cfg(debug_assertions)]
             debug_assert_eq!(
                 self.select_output::<false, false, false>(
-                    pool, now, out, reserve, gso, shared, None
+                    pool,
+                    now,
+                    out,
+                    packet_limit,
+                    gather,
+                    reserve,
+                    gso,
+                    shared,
+                    None
                 ),
                 idle,
                 "an idle connection selected output"
@@ -11598,9 +11682,29 @@ impl Connection {
             return idle;
         }
         if gso.is_none() && shared.is_none() && self.selects_stream() {
-            self.select_output::<true, false, false>(pool, now, out, reserve, None, None, None)
+            self.select_output::<true, false, false>(
+                pool,
+                now,
+                out,
+                packet_limit,
+                gather,
+                reserve,
+                None,
+                None,
+                None,
+            )
         } else {
-            self.select_output::<false, false, false>(pool, now, out, reserve, gso, shared, None)
+            self.select_output::<false, false, false>(
+                pool,
+                now,
+                out,
+                packet_limit,
+                gather,
+                reserve,
+                gso,
+                shared,
+                None,
+            )
         }
     }
 
@@ -11689,22 +11793,25 @@ impl Connection {
             && self.ptb_idle()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn select_output<const STREAM: bool, const OFFERED: bool, const ACK_ONLY: bool>(
         &mut self,
         pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
+        packet_limit: usize,
+        gather: bool,
         reserve: bool,
-        mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        gso: Option<crate::GsoLimits>,
         mut shared: Option<&mut Vec<crate::Payload>>,
         offered: Option<&mut Option<StreamRecord>>,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<Option<SelectedOutput>, Error> {
         self.check_time(now)?;
         if self.local_resource.is_some_and(|r| r.retry_at.is_some()) || self.timestamp_ambiguous {
             return Ok(None); // Owner must service the timer first.
         }
         let mut segmentation = None;
-        let mut direct_payload = None;
+        let mut keepalive_garbage = false;
         let mut idle_before_send = false;
         let mut startup_room = 0;
         // Plan entirely before encode. Even timer/clock/accounting changes
@@ -12061,7 +12168,7 @@ impl Connection {
         // capacity still bounds the selected wire span. No header-only encoder
         // error may silently bypass a backend's packet-size bound.
         let output_limit = if shared.is_some() {
-            out.len()
+            out.len().min(packet_limit)
         } else {
             usize::MAX
         };
@@ -12315,7 +12422,7 @@ impl Connection {
                     )
                     .min(self.fresh_send_allowance())
                     .min(self.fresh_entry_room());
-                count = self.send.copy(pool.arena(), 0, &mut self.scratch[..limit]);
+                count = self.send.plan_len(0, limit);
             }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
         //# Probing of zero (offered) windows MUST be supported (MUST-36).
@@ -12335,21 +12442,18 @@ impl Connection {
             let credit = self
                 .prr
                 .map_or(credit, |prr| credit.min(self.prr_bytes(prr)));
-            count = self.send.copy(
-                pool.arena(),
+            count = self.send.plan_len(
                 seq.distance_from(self.send_base) as usize,
-                &mut self.scratch[..(right.distance_from(left) as usize)
+                (right.distance_from(left) as usize)
                     .min(repair_packet_mss)
-                    .min(credit as usize)],
+                    .min(credit as usize),
             );
             retransmitted = count != 0;
         } else if let Some((left, payload, fin)) = ptb_segment {
             seq = left;
-            count = self.send.copy(
-                pool.arena(),
-                left.distance_from(self.send_base) as usize,
-                &mut self.scratch[..payload],
-            );
+            count = self
+                .send
+                .plan_len(left.distance_from(self.send_base) as usize, payload);
             if fin {
                 flags |= FIN;
             }
@@ -12367,11 +12471,7 @@ impl Connection {
                 .min(self.fresh_send_allowance())
                 .min(self.fresh_entry_room());
             if unsent != 0 && credit >= unsent.min(packet_mss) {
-                count = self.send.copy(
-                    pool.arena(),
-                    offset,
-                    &mut self.scratch[..unsent.min(packet_mss)],
-                );
+                count = self.send.plan_len(offset, unsent.min(packet_mss));
             } else if let Some(fin) = self.fin_sequence.filter(|&fin| {
                 fin.at_or_after(self.snd_una) && (self.fin_standalone || fin == self.snd_una)
             }) {
@@ -12386,11 +12486,9 @@ impl Connection {
             } else if let Some((left, right)) = self.rack.tail_segment(repair_packet_mss as u32) {
                 seq = left;
                 let limit = self.retry_limit(left, right.distance_from(left)) as usize;
-                count = self.send.copy(
-                    pool.arena(),
-                    seq.distance_from(self.send_base) as usize,
-                    &mut self.scratch[..limit],
-                );
+                count = self
+                    .send
+                    .plan_len(seq.distance_from(self.send_base) as usize, limit);
                 retransmitted = count != 0;
                 if count != 0
                     && self.fin_sequence == Some(seq.wrapping_add(count as u32))
@@ -12415,10 +12513,9 @@ impl Connection {
             } else if let Some(recovery) = self.sack_recovery {
                 credit = credit.min(self.recovery_credit(recovery));
             }
-            count = self.send.copy(
-                pool.arena(),
+            count = self.send.plan_len(
                 start.distance_from(self.send_base) as usize,
-                &mut self.scratch[..limit.min(repair_packet_mss).min(credit as usize)],
+                limit.min(repair_packet_mss).min(credit as usize),
             );
             retransmitted = count != 0;
         } else if probe && self.flight() == 0 {
@@ -12477,7 +12574,7 @@ impl Connection {
                 self.prr
                     .map_or(limit, |prr| limit.min(self.prr_bytes(prr) as usize))
             };
-            count = self.send.copy(pool.arena(), offset, &mut self.scratch[..limit]);
+            count = self.send.plan_len(offset, limit);
             retransmitted = seq != self.snd_nxt;
             if self.fin_sequence == Some(seq.wrapping_add(count as u32))
                 && !probe
@@ -12509,7 +12606,7 @@ impl Connection {
                 .keepalive
                 .is_some_and(|config| config.send_garbage)
             {
-                self.scratch[0] = 0;
+                keepalive_garbage = true;
                 count = 1;
             }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
@@ -12740,7 +12837,7 @@ impl Connection {
                         .min(self.config.user_mss.unwrap_or(u16::MAX)),
                 ) + base + 20)
                     .min(u32::from(self.config.send_ip_payload_limit) + u32::from(self.ip_header_len))
-                    .min(self.scratch.len() as u32 + u32::from(self.ip_header_len) + 20 + option_len as u32);
+                    .min(u32::from(self.config.mss) + u32::from(self.ip_header_len) + 20 + option_len as u32);
                 let low = self.pmtud.as_ref().map_or(0, |p| p.info.search_low);
                 if size <= transport {
                     Some(size)
@@ -12806,7 +12903,7 @@ impl Connection {
                         <= u32::from(self.config.send_ip_payload_limit)
                             + u32::from(self.ip_header_len)
                     && payload > 0
-                    && payload <= self.scratch.len()
+                    && payload <= usize::from(self.config.mss)
                     && payload <= output_limit.saturating_sub(20 + option_len)
                     && usable >= needed
                     && paced
@@ -12958,12 +13055,11 @@ impl Connection {
                 && (sack_option_len == 0 || !self.receive.dsack_pending())
                 && gso.is_some();
             if group_eligible {
-                let buffer = gso.as_ref().unwrap();
+                let limits = gso.unwrap();
                 let bounded = unsent
                     .min(usable)
                     .min(timestamp_credit as usize)
-                    .min(buffer.limits.max_bytes)
-                    .min(buffer.payload.len())
+                    .min(limits.max_bytes)
                     .min(stamp_room);
                 let group_limit = if self.config.output_group_flush {
                     // Aim for at most 1ms of estimated send work per group.
@@ -12988,14 +13084,13 @@ impl Connection {
                         .max(2);
                     target.min((cwnd as usize / wire_mss / 2).max(1))
                 } else {
-                    buffer.limits.max_segments
+                    limits.max_segments
                 };
                 let record = self.send.record_len_within(offset, bounded);
                 // Each segment of the group becomes its own ledger entry.
                 // PRR's credit is packets: one per segment, whatever SMSS
                 // its byte form allows past option space.
-                let limit = buffer
-                    .limits
+                let limit = limits
                     .max_segments
                     .min(group_limit)
                     .min(self.rack.fresh_room())
@@ -13083,20 +13178,11 @@ impl Connection {
                 && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)
                 && self.send.push_after(offset);
             if segmentation.is_none() {
-                direct_payload = if STREAM {
-                    self.send.selected_slice(pool.arena(), offset, count)
+                count = if STREAM {
+                    self.send.record_len(offset, count)
                 } else {
-                    self.send.contiguous(pool.arena(), offset, count)
+                    self.send.plan_len(offset, count)
                 };
-                count = match direct_payload {
-                    Some(bytes) => bytes.len(),
-                    None => self.send.copy(pool.arena(), offset, &mut self.scratch[..count]),
-                };
-            } else {
-                // The reservation's payload, whose first segment is encoded
-                // from it below: copied from the send buffer once.
-                let buffer = gso.as_mut().unwrap();
-                self.send.copy(pool.arena(), offset, &mut buffer.payload[..count]);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
@@ -13461,22 +13547,37 @@ impl Connection {
         } else {
             false
         };
-        let partial = self.config.tcp_checksum_offload;
-        let payload = || match &gso {
-            Some(buffer) if segmentation.is_some() => &buffer.payload[..wire_count],
-            _ => &direct_payload.unwrap_or(&self.scratch)[..wire_count],
+        let header_len = 20 + option_len;
+        let total_len = header_len + wire_count;
+        let required_out = if shared_payload {
+            header_len
+        } else if gather {
+            total_len
+        } else {
+            header_len + usize::from(keepalive_garbage)
         };
+        if total_len > packet_limit || out.len() < required_out {
+            return Err(Error::OutputTooSmall);
+        }
+        let partial = self.config.tcp_checksum_offload;
         let encoded = if STREAM {
-            debug_assert!(!shared_payload && segmentation.is_none());
+            debug_assert!(!shared_payload && !keepalive_garbage && segmentation.is_none());
             debug_assert_eq!(option_len, 12 * usize::from(options.timestamps.is_some()));
-            wire::encode_stream(
+            let mut parts = TxPartsBuf::new();
+            if wire_count != 0 && (!partial || gather) {
+                let covered = self.send.tx_parts(pool.arena(), offset, wire_count, &mut parts);
+                debug_assert_eq!(covered, wire_count);
+            }
+            wire::encode_stream_parts(
                 self.pseudo_header,
                 self.wire_ports,
                 wire_header,
                 options.timestamps,
-                payload(),
+                parts.as_slice(),
+                wire_count,
                 out,
                 partial,
+                gather,
             )
         } else {
             let ip = self.ip;
@@ -13493,18 +13594,44 @@ impl Connection {
                     out,
                     partial,
                 )
-                .map(|n| n + wire_count)
+            } else if keepalive_garbage {
+                wire::encode_with(ip, wire_header, options, &[0u8], out, partial)
             } else {
-                wire::encode_with(ip, wire_header, options, payload(), out, partial)
+                let mut parts = TxPartsBuf::new();
+                if wire_count != 0 && (!partial || gather) {
+                    let covered = self.send.tx_parts(pool.arena(), offset, wire_count, &mut parts);
+                    debug_assert_eq!(covered, wire_count);
+                }
+                wire::encode_parts_with(
+                    ip,
+                    wire_header,
+                    options,
+                    parts.as_slice(),
+                    wire_count,
+                    out,
+                    partial,
+                    gather,
+                )
             }
         };
-        let size = encoded.map_err(|error| {
+        let written_len = encoded.map_err(|error| {
             if error == wire::WireError::OutputTooSmall {
                 Error::OutputTooSmall
             } else {
                 Error::Wire(error)
             }
         })?;
+        let selected = SelectedOutput {
+            total_len,
+            written_len,
+            payload_offset: if count == 0 || keepalive_garbage {
+                0
+            } else {
+                offset
+            },
+            payload_len: if keepalive_garbage { 0 } else { count },
+            keepalive_garbage,
+        };
         // Only the first timer-entry repair has not charged PRR at selection.
         // Fixed receive-report metadata is journaled along with sender state.
         // FIN/URG outputs retain the existing immutable reservation contract.
@@ -13697,7 +13824,7 @@ impl Connection {
                 p.sent(
                     seq,
                     seq.wrapping_add(length),
-                    size as u32 + u32::from(self.ip_header_len),
+                    total_len as u32 + u32::from(self.ip_header_len),
                     self.ip_header_len,
                     retransmitted,
                 );
@@ -13802,6 +13929,7 @@ impl Connection {
                 seq.distance_from(self.send_base) as usize,
                 count,
             );
+            self.large_send_ring = self.send.entries_storage_bytes() > SEND_RING_RESERVE;
         }
         // Selection validated the clock before planning any output.
         self.commit_checked_time(now);
@@ -13826,7 +13954,7 @@ impl Connection {
             self.pending_rst = None;
             self.reset_echo = None;
             self.reset_reply = false;
-            return Ok(Some(size));
+            return Ok(Some(selected));
         }
         //= https://www.rfc-editor.org/rfc/rfc2883#section-4
         //= reason=Planning/retry does not consume pending report; successful SACK-bearing ACK consumes it once. Second identical report requires fresh duplicate recording.
@@ -13973,7 +14101,7 @@ impl Connection {
             }
             // The ACK satisfies receiver work, but must not re-arm, consume,
             // or otherwise perturb sender work or any protocol timer.
-            return Ok(Some(size));
+            return Ok(Some(selected));
         }
         //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
         //# 2. Advance to SYN-SENT state and update SND.NXT to include the data accordingly.
@@ -14192,7 +14320,7 @@ impl Connection {
                 self.pacing_deadline = Some(now.saturating_add(spacing));
             }
         }
-        Ok(Some(size))
+        Ok(Some(selected))
     }
 
     fn commit_ack_window(&mut self, window: u16, syn: bool, sack_limited: bool) {
@@ -15916,16 +16044,36 @@ mod fast_path_differential_tests {
             let mut out_f = [0xAAu8; 2048];
             let mut out_s = [0xAAu8; 2048];
             let rf = fast.with_local_tx(|c, pool| {
-                c.select_output::<true, false, false>(pool, now, &mut out_f, reserve, None, None, None)
+                c.select_output::<true, false, false>(
+                    pool,
+                    now,
+                    &mut out_f,
+                    usize::MAX,
+                    true,
+                    reserve,
+                    None,
+                    None,
+                    None,
+                )
             });
             let rs = slow.with_local_tx(|c, pool| {
-                c.select_output::<false, false, false>(pool, now, &mut out_s, reserve, None, None, None)
+                c.select_output::<false, false, false>(
+                    pool,
+                    now,
+                    &mut out_s,
+                    usize::MAX,
+                    true,
+                    reserve,
+                    None,
+                    None,
+                    None,
+                )
             });
             assert_eq!(rf, rs, "result mismatch in {label} (reserve={reserve})");
-            if let Ok(Some(len)) = rf {
+            if let Ok(Some(sel)) = rf {
                 assert_eq!(
-                    &out_f[..len],
-                    &out_s[..len],
+                    &out_f[..sel.written_len],
+                    &out_s[..sel.written_len],
                     "wire bytes mismatch in {label} (reserve={reserve})"
                 );
             }

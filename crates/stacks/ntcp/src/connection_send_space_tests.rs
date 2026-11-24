@@ -701,18 +701,14 @@ fn reserved_gso_and_shared_totals_stay_within_c() {
                 test_support::commit_reserved(&mut a, 10);
             }
         } else {
-            let mut gso = vec![0; 8 * Q];
             let n = a
                 .transmit_selected_with_gso(
                     10,
                     &mut bytes,
                     true,
-                    Some(crate::output_reservation::GsoBuffer {
-                        limits: crate::GsoLimits {
-                            max_bytes: 8 * Q,
-                            max_segments: 8,
-                        },
-                        payload: &mut gso,
+                    Some(crate::GsoLimits {
+                        max_bytes: 8 * Q,
+                        max_segments: 8,
                     }),
                 )
                 .unwrap();
@@ -884,18 +880,12 @@ fn reserved_gso_selection_across_pmtu_decrease_blocks_fresh_output() {
     });
     assert_eq!(a.write(&[5; 4 * Q]).unwrap(), 2 * Q);
     let mut bytes = vec![0; 65535];
-    let mut gso = vec![0; 8 * Q];
-    fn gso_buffer(payload: &mut [u8]) -> crate::output_reservation::GsoBuffer<'_> {
-        crate::output_reservation::GsoBuffer {
-            limits: crate::GsoLimits {
-                max_bytes: payload.len(),
-                max_segments: 8,
-            },
-            payload,
-        }
-    }
+    let gso = crate::GsoLimits {
+        max_bytes: 8 * Q,
+        max_segments: 8,
+    };
     assert!(a
-        .transmit_selected_with_gso(10, &mut bytes, true, Some(gso_buffer(&mut gso)))
+        .transmit_selected_with_gso(10, &mut bytes, true, Some(gso))
         .unwrap()
         .is_some());
     assert_eq!(a.last_departure.unwrap().payload, 2 * Q);
@@ -909,7 +899,7 @@ fn reserved_gso_selection_across_pmtu_decrease_blocks_fresh_output() {
     assert_eq!(a.write(&[6]), Err(Error::WouldBlock));
     assert!(a.transmit_selected(11, &mut bytes, true).unwrap().is_none());
     assert!(a
-        .transmit_selected_with_gso(11, &mut bytes, true, Some(gso_buffer(&mut gso)))
+        .transmit_selected_with_gso(11, &mut bytes, true, Some(gso))
         .unwrap()
         .is_none());
     assert_eq!(a.snd_nxt, nxt);

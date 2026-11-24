@@ -292,7 +292,6 @@ fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
                     .min(a.congestion.cwnd())
                     .min(window.saturating_sub(1))
                     .min(12_000);
-                let mut payload = vec![0; 16_384];
                 let mut sent = 0;
                 for _ in 0..20 {
                     let now = a.config.timebase.ticks_from_us(600_000);
@@ -303,12 +302,9 @@ fn early_response_actual_cap_window_mss_and_bounded_early_gso() {
                             now,
                             &mut bytes,
                             true,
-                            Some(crate::output_reservation::GsoBuffer {
-                                limits: GsoLimits {
-                                    max_bytes: 16_384,
-                                    max_segments: 16,
-                                },
-                                payload: &mut payload,
+                            Some(GsoLimits {
+                                max_bytes: 16_384,
+                                max_segments: 16,
                             }),
                         )
                         .unwrap()
@@ -1406,18 +1402,14 @@ fn inventory_tfo_server_early_policy_and_pre_handshake_payload_cap() {
                 let mut grouped = false;
                 for _ in 0..16 {
                     let mut bytes = vec![0; 65535];
-                    let mut payload = vec![0; 65535];
                     let Some(n) = a
                         .transmit_selected_with_gso(
                             10000,
                             &mut bytes,
                             reserved,
-                            Some(crate::output_reservation::GsoBuffer {
-                                limits: GsoLimits {
-                                    max_bytes: 65536,
-                                    max_segments: 16,
-                                },
-                                payload: &mut payload,
+                            Some(GsoLimits {
+                                max_bytes: 65536,
+                                max_segments: 16,
                             }),
                         )
                         .unwrap()

@@ -7,8 +7,8 @@ use ntcp_host::{
     NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
-    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, RxChecksum, TcpSegmentationError,
-    TcpSegmentationRequest, TimestampUnit, TxOutcome,
+    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, RxChecksum,
+    TcpSegmentationRequest, TimestampUnit, TransmitError, TransmitRequest, TxOutcome,
 };
 
 pub(super) struct PendingFrame {
@@ -17,6 +17,9 @@ pub(super) struct PendingFrame {
     context: Option<EgressContext>,
     ticket: Option<SubmissionTicket>,
     ip_len: usize,
+    // Bytes resident in `slot.bytes[offset..]`: the IP header and the
+    // resident TCP bytes (header, plus any keepalive garbage byte).
+    resident_ip_len: usize,
     // Waiting while ARP resolves its next hop: not retried before the
     // Host's wake, and no backend backpressure.
     held: bool,
@@ -43,8 +46,56 @@ impl PendingFrame {
     }
 }
 pub(super) struct TxSlot {
-    pub bytes: Vec<u8>,
+    pub bytes: [u8; 144],
     pub pending: Option<PendingFrame>,
+}
+
+fn transmit_error_to_io(error: TransmitError) -> io::Error {
+    match error {
+        TransmitError::Unsupported => io::Error::new(io::ErrorKind::Unsupported, error),
+        TransmitError::InvalidInput => io::Error::new(io::ErrorKind::InvalidInput, error),
+        TransmitError::Other(error) => error,
+    }
+}
+
+fn scalar_transmit_request(tcp_checksum_offload: bool) -> TransmitRequest {
+    TransmitRequest {
+        tcp_checksum_offload,
+        ..Default::default()
+    }
+}
+
+fn transmit_slot_packet<P: PacketIo>(
+    io: &mut P,
+    header: &[u8],
+    parts: &[ntcp::TxPart<'_>],
+    total_wire_len: usize,
+    minimum: usize,
+    request: TransmitRequest,
+) -> core::result::Result<TxOutcome, TransmitError> {
+    if total_wire_len < minimum {
+        debug_assert!(minimum <= 60);
+        let mut padded = [0u8; 60];
+        padded[..header.len()].copy_from_slice(header);
+        let mut dst = header.len();
+        for part in parts {
+            let src = part.bytes();
+            padded[dst..dst + src.len()].copy_from_slice(src);
+            dst += src.len();
+        }
+        debug_assert_eq!(dst, total_wire_len);
+        let packet = ntcp::TxPacket {
+            header: &padded[..minimum],
+            payload: &[],
+        };
+        io.transmit_packet(&packet, request)
+    } else {
+        let packet = ntcp::TxPacket {
+            header,
+            payload: parts,
+        };
+        io.transmit_packet(&packet, request)
+    }
 }
 enum FreshResult {
     Done(bool),
@@ -388,7 +439,7 @@ impl<P: PacketIo> Network<P> {
                 };
                 let headers = self.config.link.offset() + ip + 60;
                 (
-                    self.aggregate.len().saturating_sub(headers),
+                    self.aggregate_max_len.saturating_sub(headers),
                     capabilities.max_segments,
                 )
             }
@@ -551,18 +602,16 @@ impl<P: PacketIo> Network<P> {
                     offset,
                     if offset == 0 { 0 } else { 60 },
                     resolve,
-                    |wire| match if offload {
-                        io.transmit_tcp_checksum_offload(wire)
-                    } else {
-                        io.transmit(wire)
-                    } {
-                        Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
-                        Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
-                            BackendOutcome::WouldBlock
-                        }
-                        Err(error) => {
-                            failure = Some(error);
-                            BackendOutcome::Unknown
+                    |tx_packet| {
+                        match io.transmit_packet(tx_packet, scalar_transmit_request(offload)) {
+                            Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
+                            Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
+                                BackendOutcome::WouldBlock
+                            }
+                            Err(error) => {
+                                failure = Some(transmit_error_to_io(error));
+                                BackendOutcome::Unknown
+                            }
                         }
                     },
                 )?;
@@ -571,7 +620,11 @@ impl<P: PacketIo> Network<P> {
                     ntcp_host::FreshSubmission::Retained {
                         context, receipt, ..
                     } => {
-                        attempted = Some((context, receipt.ip_packet_len as usize));
+                        attempted = Some((
+                            context,
+                            receipt.ip_packet_len as usize,
+                            selected.header_frame().len() - offset,
+                        ));
                         None
                     }
                 }
@@ -592,7 +645,7 @@ impl<P: PacketIo> Network<P> {
                 Ok(Some(FreshResult::Done(owner_drained)))
             }
             ntcp::FreshPoll::Reserved { more_work, attempt } => {
-                let Some((context, ip_len)) = attempted else {
+                let Some((context, ip_len, resident_ip_len)) = attempted else {
                     return Ok(Some(FreshResult::Reserved(more_work, attempt)));
                 };
                 report.more_work |= !resolve && more_work;
@@ -601,6 +654,7 @@ impl<P: PacketIo> Network<P> {
                     owner: Some(core),
                     context: Some(context),
                     ip_len,
+                    resident_ip_len,
                     ticket: failure
                         .is_none()
                         .then(ntcp_host::SubmissionTicket::connection),
@@ -2246,16 +2300,43 @@ impl<P: PacketIo> Network<P> {
             .endpoint
             .transmit_attempt_packet_ref(attempt)
             .ok_or(Error::InvalidHandle)?;
+        let tcp_resident_len = self
+            .endpoint
+            .transmit_attempt_resident_len(attempt)
+            .ok_or(Error::InvalidHandle)?;
         // Read before the IP header is written around the segment.
         let header = if packet.ip.source.is_ipv4() { 20 } else { 40 };
         let data = packet.len > usize::from(slot.bytes[offset + header + 12] >> 4) * 4;
-        let ip_len = if packet.ip.source.is_ipv4() {
-            self.ipv4_header
-                .encode(&mut slot.bytes[offset..], packet, 0)
+        let (ip_len, resident_ip_len) = if tcp_resident_len == packet.len {
+            let ip_len = if packet.ip.source.is_ipv4() {
+                self.ipv4_header
+                    .encode(&mut slot.bytes[offset..], packet, 0)
+            } else {
+                ntcp_ip6::encode(&mut slot.bytes[offset..], *packet)
+            }
+            .map_err(|e| Error::Host(e.into()))?;
+            (ip_len, ip_len)
         } else {
-            ntcp_ip6::encode(&mut slot.bytes[offset..], *packet)
-        }
-        .map_err(|e| Error::Host(e.into()))?;
+            let resident_ip_len = if packet.ip.source.is_ipv4() {
+                self.ipv4_header.encode_shared_header(
+                    &mut slot.bytes[offset..],
+                    packet,
+                    0,
+                    tcp_resident_len,
+                )
+            } else {
+                ntcp_ip6::encode_shared_header(
+                    &mut slot.bytes[offset..],
+                    *packet,
+                    tcp_resident_len,
+                )
+            }
+            .map_err(|e| Error::Host(e.into()))?;
+            (
+                resident_ip_len + (packet.len - tcp_resident_len),
+                resident_ip_len,
+            )
+        };
         if let Link::Ethernet {
             local_mac,
             next_hop,
@@ -2274,10 +2355,6 @@ impl<P: PacketIo> Network<P> {
                 })
                 .to_be_bytes(),
             );
-            let end = offset + ip_len;
-            if end < 60 {
-                slot.bytes[end..60].fill(0);
-            }
         }
         slot.pending = Some(PendingFrame {
             attempt,
@@ -2285,6 +2362,7 @@ impl<P: PacketIo> Network<P> {
             context: None,
             ticket: None,
             ip_len,
+            resident_ip_len,
             held: false,
             group: None,
             scalar,
@@ -2309,24 +2387,34 @@ impl<P: PacketIo> Network<P> {
             && pending.owner.is_some()
             && (self.segmentation.is_none() || pending.scalar)
         {
-            let ip_end = offset + pending.ip_len;
+            let resident_end = offset + pending.resident_ip_len;
+            let shared_payload_len = pending.ip_len - pending.resident_ip_len;
             if let Some(grant) = self.host.prepare_connected_submission(
                 &mut self.endpoint,
                 pending.attempt,
                 self.now,
-                &slot.bytes[offset..ip_end],
+                &slot.bytes[offset..resident_end],
+                shared_payload_len,
                 !self.control.is_empty(),
             )? {
                 if let Some(address) = grant.address() {
                     slot.bytes[..6].copy_from_slice(&address);
                 }
-                let len = ip_end.max(if offset == 0 { 0 } else { 60 });
-                let wire = &slot.bytes[..len];
-                let result = if self.config.tcp.connection.tcp_checksum_offload {
-                    self.io.transmit_tcp_checksum_offload(wire)
-                } else {
-                    self.io.transmit(wire)
-                };
+                let io = &mut self.io;
+                let request =
+                    scalar_transmit_request(self.config.tcp.connection.tcp_checksum_offload);
+                let total_wire_len = offset + pending.ip_len;
+                let minimum = if offset == 0 { 0 } else { 60 };
+                let result = grant.with_tx_parts(|parts| {
+                    transmit_slot_packet(
+                        io,
+                        &slot.bytes[..resident_end],
+                        parts,
+                        total_wire_len,
+                        minimum,
+                        request,
+                    )
+                });
                 match result {
                     Ok(TxOutcome::Submitted) => {
                         grant.submitted();
@@ -2340,7 +2428,7 @@ impl<P: PacketIo> Network<P> {
                     }
                     Err(error) => {
                         pending.context = Some(grant.context());
-                        return Err(Error::Backend(error));
+                        return Err(Error::Backend(transmit_error_to_io(error)));
                     }
                 }
                 return Ok(None);
@@ -2440,29 +2528,30 @@ impl<P: PacketIo> Network<P> {
         if let Some(group) = pending.group {
             return self.send_group(slot, context, ticket, group, report);
         }
-        let packet = &slot.bytes[offset..offset + pending.ip_len];
-        let wire_len = (offset + pending.ip_len).max(if offset == 0 { 0 } else { 60 });
-        let wire = &slot.bytes[..wire_len];
+        let resident_end = offset + pending.resident_ip_len;
+        let shared_payload_len = pending.ip_len - pending.resident_ip_len;
+        let packet = &slot.bytes[offset..resident_end];
+        let header = &slot.bytes[..resident_end];
+        let total_wire_len = offset + pending.ip_len;
+        let minimum = if offset == 0 { 0 } else { 60 };
         let io = &mut self.io;
-        let offload = self.config.tcp.connection.tcp_checksum_offload;
+        let request = scalar_transmit_request(self.config.tcp.connection.tcp_checksum_offload);
         let mut failure = None;
-        let result = self.host.submit(
+        let result = self.host.submit_parts(
             &mut self.endpoint,
             self.now,
             ticket,
             context,
             packet,
-            0,
-            |_| match if offload {
-                io.transmit_tcp_checksum_offload(wire)
-            } else {
-                io.transmit(wire)
-            } {
-                Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
-                Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => BackendOutcome::WouldBlock,
-                Err(error) => {
-                    failure = Some(error);
-                    BackendOutcome::Unknown
+            shared_payload_len,
+            |_, parts| {
+                match transmit_slot_packet(io, header, parts, total_wire_len, minimum, request) {
+                    Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
+                    Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => BackendOutcome::WouldBlock,
+                    Err(error) => {
+                        failure = Some(transmit_error_to_io(error));
+                        BackendOutcome::Unknown
+                    }
                 }
             },
         );
@@ -2545,8 +2634,7 @@ impl<P: PacketIo> Network<P> {
         let frame = (offset + packet).max(if offset == 0 { 0 } else { 60 });
         let limits = ntcp::TransmitGroupLimits {
             max_bytes: self
-                .aggregate
-                .len()
+                .aggregate_max_len
                 .saturating_sub(offset + ip + s.tcp_header_len),
             max_segments: capabilities
                 .max_segments
@@ -2582,57 +2670,79 @@ impl<P: PacketIo> Network<P> {
         report: &mut DriveReport,
     ) -> Result<Option<ntcp::ConnectionId>> {
         let offset = self.config.link.offset();
-        let header = if self.config.local_address.is_ipv4() {
+        let ip_hdr = if self.config.local_address.is_ipv4() {
             20
         } else {
             40
         };
+        let mut header_buf = [0u8; 144];
         let mut request = TcpSegmentationRequest {
             segment_payload_len: 0,
         };
-        let (mut ip_len, mut segments) = (0, 0);
+        let (mut resident_ip_len, mut payload_len, mut segments) = (0, 0, 0);
         // A stale group is refused by the Host before any backend call.
         if let Some(view) = self.endpoint.transmit_group(group) {
-            let tcp = &mut self.aggregate[offset + header..];
-            let tcp_len = ntcp::wire::encode(view.packet.ip, view.header, view.options, &[], tcp)
-                .map_err(|_| Error::Unsupported("TCP aggregate header"))?;
-            tcp[16..18].fill(0);
-            tcp[tcp_len..tcp_len + view.payload.len()].copy_from_slice(view.payload);
-            ip_len = if view.packet.ip.source.is_ipv4() {
-                ntcp_ip::encode(&mut self.aggregate[offset..], view.packet, 0)
+            let tcp = &mut header_buf[offset + ip_hdr..];
+            let tcp_len = ntcp::wire::encode_header_zero_checksum(
+                view.packet.ip,
+                view.header,
+                view.options,
+                tcp,
+            )
+            .map_err(|_| Error::Unsupported("TCP aggregate header"))?;
+            resident_ip_len = if view.packet.ip.source.is_ipv4() {
+                let len = ntcp_ip::encode_shared_header(
+                    &mut header_buf[offset..],
+                    view.packet,
+                    0,
+                    tcp_len,
+                )
+                .map_err(|e| Error::Host(e.into()))?;
+                header_buf[offset + 10..offset + 12].fill(0);
+                len
             } else {
-                ntcp_ip6::encode(&mut self.aggregate[offset..], view.packet)
-            }
-            .map_err(|e| Error::Host(e.into()))?;
-            if view.packet.ip.source.is_ipv4() {
-                self.aggregate[offset + 10..offset + 12].fill(0);
-            }
-            self.aggregate[..offset].copy_from_slice(&slot.bytes[..offset]);
+                ntcp_ip6::encode_shared_header(&mut header_buf[offset..], view.packet, tcp_len)
+                    .map_err(|e| Error::Host(e.into()))?
+            };
+            header_buf[..offset].copy_from_slice(&slot.bytes[..offset]);
             request.segment_payload_len = view.segment_payload_len;
+            payload_len = view.payload_len;
             segments = view.segment_count;
         }
-        let packet = &self.aggregate[offset..offset + ip_len];
-        let wire = &self.aggregate[..offset + ip_len];
+        let packet = &header_buf[offset..offset + resident_ip_len];
+        let wire_header = &header_buf[..offset + resident_ip_len];
         let io = &mut self.io;
         let mut failure = None;
-        let result =
-            self.host
-                .submit_group(&mut self.endpoint, self.now, context, group, packet, |_| {
-                    match io.transmit_segmented(wire, request) {
-                        Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
-                        Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
-                            BackendOutcome::WouldBlock
-                        }
-                        // Both certify that nothing was submitted.
-                        Err(
-                            TcpSegmentationError::Unsupported | TcpSegmentationError::InvalidInput,
-                        ) => BackendOutcome::NotSubmitted,
-                        Err(TcpSegmentationError::Other(error)) => {
-                            failure = Some(error);
-                            BackendOutcome::Unknown
-                        }
+        let result = self.host.submit_group_parts(
+            &mut self.endpoint,
+            self.now,
+            context,
+            group,
+            packet,
+            payload_len,
+            |_, parts| {
+                let tx_packet = ntcp::TxPacket {
+                    header: wire_header,
+                    payload: parts,
+                };
+                let tx_request = TransmitRequest {
+                    segmentation: Some(request),
+                    ..Default::default()
+                };
+                match io.transmit_packet(&tx_packet, tx_request) {
+                    Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
+                    Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => BackendOutcome::WouldBlock,
+                    // Both certify that nothing was submitted.
+                    Err(TransmitError::Unsupported | TransmitError::InvalidInput) => {
+                        BackendOutcome::NotSubmitted
                     }
-                });
+                    Err(TransmitError::Other(error)) => {
+                        failure = Some(error);
+                        BackendOutcome::Unknown
+                    }
+                }
+            },
+        );
         let pending = slot.pending.as_mut().unwrap();
         let owner = pending.owner.ok_or(Error::InvalidHandle)?;
         match result {
@@ -2784,11 +2894,11 @@ impl<P: PacketIo> Network<P> {
                                 None => Some(pending.attempt),
                                 Some(group) => {
                                     self.endpoint.reject_unsubmitted_group(group)?;
-                                    match self.endpoint.poll_reserved_transmit_for(
+                                    match self.endpoint.poll_transmit_attempt(
                                         self.now,
-                                        core,
                                         &mut slot.bytes,
                                         1,
+                                        Some(core),
                                     ) {
                                         Ok((_, attempt)) => attempt,
                                         // Unfit for a path a Packet Too Big

@@ -1152,7 +1152,6 @@ fn pmtud_cubic_prr_and_rate_cap_keep_original_allocation_and_pacing_debt() {
         packet(&mut a, 40);
         let old_cwnd = a.congestion.cwnd();
         let old_mss = a.mss;
-        let old_allocation = a.scratch.capacity();
         let debt = a.pacer;
         let seq = a.snd_una.0;
         assert!(a.pmtu_feedback(41, seq, 1500, 20, 508).unwrap());
@@ -1160,7 +1159,6 @@ fn pmtud_cubic_prr_and_rate_cap_keep_original_allocation_and_pacing_debt() {
             a.congestion.cwnd(),
             (u64::from(old_cwnd) * a.mss as u64 / old_mss as u64) as u32
         );
-        assert_eq!(a.scratch.capacity(), old_allocation);
         assert_eq!(a.pacer, debt);
         assert_eq!(a.transport_info().mss, 456);
         assert_eq!(a.transmit(41, &mut [0; 2000]), Ok(None));

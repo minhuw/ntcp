@@ -47,7 +47,18 @@ fn limits() -> crate::TransmitGroupLimits {
 
 // The physical segments a backend cuts from the aggregate, as Linux
 // tcp_gso_segment does.
-fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
+fn cut(endpoint: &Endpoint, group: crate::TransmitGroup) -> Vec<Vec<u8>> {
+    let view = endpoint.transmit_group(group).unwrap();
+    let payload = endpoint
+        .with_transmit_group_parts(group, |parts| {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend_from_slice(part.bytes());
+            }
+            out
+        })
+        .unwrap();
+    assert_eq!(payload.len(), view.payload_len);
     let size = view.segment_payload_len;
     (0..view.segment_count)
         .map(|n| {
@@ -64,7 +75,7 @@ fn cut(view: &crate::TransmitGroupView<'_>) -> Vec<Vec<u8>> {
                 view.packet.ip,
                 header,
                 view.options,
-                &view.payload[n * size..((n + 1) * size).min(view.payload.len())],
+                &payload[n * size..((n + 1) * size).min(payload.len())],
                 &mut out,
             )
             .unwrap();
@@ -215,7 +226,7 @@ impl Run {
             if self.output == Output::Grouped
                 && let Some(group) = self.a.prepare_transmit_group(attempt, limits()).unwrap()
             {
-                wire.extend(cut(&self.a.transmit_group(group).unwrap()));
+                wire.extend(cut(&self.a, group));
                 self.groups += 1;
                 assert!(self.a.accept_transmit_group(self.now, group).unwrap());
             } else {
