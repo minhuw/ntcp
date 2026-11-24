@@ -4,6 +4,7 @@ use alloc::{boxed::Box, vec::Vec};
 const SHIFT: u32 = 6;
 const PAGE: usize = 1 << SHIFT;
 const NIL: u32 = u32::MAX;
+const MAX_PAGES: usize = (NIL >> SHIFT) as usize;
 
 /// A counted reference to a chunk in one owner's `ChunkArena`: a slab
 /// index and the generation the slot had when the reference was taken.
@@ -107,12 +108,65 @@ impl ChunkArena {
         self.live
     }
 
-    /// Bytes the arena itself holds (its pages and tables), not the chunks'
-    /// memory, which their owner charges per chunk.
-    pub fn held_bytes(&self) -> usize {
+    /// Pages currently allocated in the arena.
+    pub fn page_count(&self) -> usize {
+        self.present
+    }
+
+    /// Total chunk slots across currently allocated pages.
+    pub fn capacity(&self) -> usize {
+        self.present * PAGE
+    }
+
+    /// Exact heap bytes the arena itself holds (its allocated pages and
+    /// tables), not the chunks' memory, which their owner charges per chunk.
+    pub fn storage_bytes(&self) -> usize {
         self.present * size_of::<[Entry; PAGE]>()
             + self.pages.capacity() * size_of::<Page>()
             + self.empty.capacity() * size_of::<u32>()
+    }
+
+    /// Bytes the arena itself holds (its pages and tables), not the chunks'
+    /// memory, which their owner charges per chunk.
+    pub fn held_bytes(&self) -> usize {
+        self.storage_bytes()
+    }
+
+    /// Peak additional bytes the next `try_insert` will allocate if no free
+    /// slot is available, or `0` when a free slot is ready. Returns
+    /// `usize::MAX` if the arena's index space is exhausted.
+    pub fn growth_bytes(&self) -> usize {
+        if self.free != NIL {
+            return 0;
+        }
+        let mut bytes = size_of::<[Entry; PAGE]>();
+        if self.empty.is_empty() {
+            if self.pages.len() >= MAX_PAGES {
+                return usize::MAX;
+            }
+            let grow_pages = self.pages.len() == self.pages.capacity();
+            let new_cap = if grow_pages {
+                self.next_pages_capacity()
+            } else {
+                self.pages.capacity()
+            };
+            if grow_pages {
+                bytes = bytes.saturating_add(new_cap.saturating_mul(size_of::<Page>()));
+            }
+            if self.empty.capacity() < new_cap {
+                bytes = bytes.saturating_add(new_cap.saturating_mul(size_of::<u32>()));
+            }
+        }
+        bytes
+    }
+
+    fn next_pages_capacity(&self) -> usize {
+        if self.pages.capacity() == 0 {
+            4
+        } else {
+            self.pages.capacity().saturating_mul(2)
+        }
+        .min(MAX_PAGES)
     }
 
     #[inline]
@@ -140,10 +194,12 @@ impl ChunkArena {
         debug_assert_eq!(entry.generation, handle.generation, "stale ChunkRef");
     }
 
-    /// Stores `chunk` with one reference, the returned handle.
-    pub fn insert(&mut self, chunk: TxChunk) -> ChunkRef {
-        if self.free == NIL {
-            self.grow();
+    /// Stores `chunk` with one reference, the returned handle, or returns
+    /// `chunk` untouched if allocating a new page fails or the arena's index
+    /// space is exhausted.
+    pub fn try_insert(&mut self, chunk: TxChunk) -> Result<ChunkRef, TxChunk> {
+        if self.free == NIL && self.try_grow().is_err() {
+            return Err(chunk);
         }
         let index = self.free;
         let entry = self.entry_mut(index);
@@ -154,45 +210,91 @@ impl ChunkArena {
         let generation = entry.generation;
         self.free = next;
         self.live += 1;
-        ChunkRef {
+        Ok(ChunkRef {
             index,
             generation,
             #[cfg(debug_assertions)]
             arena: self.id,
+        })
+    }
+
+    /// Stores `chunk` with one reference, the returned handle.
+    pub fn insert(&mut self, chunk: TxChunk) -> ChunkRef {
+        self.try_insert(chunk)
+            .unwrap_or_else(|_| panic!("chunk arena page allocation failed"))
+    }
+
+    fn alloc_page(base: u32, generation: u32, tail: u32) -> Result<Box<[Entry; PAGE]>, ()> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(PAGE).map_err(|_| ())?;
+        debug_assert_eq!(entries.capacity(), PAGE);
+        for k in 0..PAGE {
+            entries.push(Entry {
+                generation,
+                slot: Slot::Free {
+                    next: if k + 1 < PAGE {
+                        base + k as u32 + 1
+                    } else {
+                        tail
+                    },
+                },
+            });
         }
+        Ok(Box::<[Entry; PAGE]>::try_from(entries.into_boxed_slice())
+            .unwrap_or_else(|_| unreachable!("page has PAGE entries")))
     }
 
     #[cold]
     #[inline(never)]
-    fn grow(&mut self) {
-        let slot = match self.empty.pop() {
-            Some(slot) => slot as usize,
-            None => {
-                self.pages.push(Page {
-                    entries: None,
-                    next_generation: 0,
-                    scratch: 0,
-                });
-                self.pages.len() - 1
-            }
-        };
-        assert!(slot < (NIL >> SHIFT) as usize, "chunk arena index space");
-        let base = (slot << SHIFT) as u32;
-        let generation = self.pages[slot].next_generation;
+    fn try_grow(&mut self) -> Result<(), ()> {
         let free = self.free;
-        let entries = Box::new(core::array::from_fn(|k| Entry {
-            generation,
-            slot: Slot::Free {
-                next: if k + 1 < PAGE {
-                    base + k as u32 + 1
-                } else {
-                    free
-                },
-            },
-        }));
-        self.pages[slot].entries = Some(entries);
+        if let Some(&slot) = self.empty.last() {
+            let slot = slot as usize;
+            let base = (slot << SHIFT) as u32;
+            let generation = self.pages[slot].next_generation;
+            let entries = Self::alloc_page(base, generation, free)?;
+            self.empty.pop();
+            self.pages[slot].entries = Some(entries);
+            self.present += 1;
+            self.free = base;
+            return Ok(());
+        }
+        let slot = self.pages.len();
+        if slot >= MAX_PAGES {
+            return Err(());
+        }
+        let base = (slot << SHIFT) as u32;
+        let entries = Self::alloc_page(base, 0, free)?;
+        let grow_pages = self.pages.len() == self.pages.capacity();
+        let new_cap = if grow_pages {
+            self.next_pages_capacity()
+        } else {
+            self.pages.capacity()
+        };
+        let new_empty = if self.empty.capacity() < new_cap {
+            let mut empty = Vec::new();
+            empty.try_reserve_exact(new_cap).map_err(|_| ())?;
+            Some(empty)
+        } else {
+            None
+        };
+        if grow_pages {
+            self.pages
+                .try_reserve_exact(new_cap - self.pages.len())
+                .map_err(|_| ())?;
+        }
+        if let Some(empty) = new_empty {
+            debug_assert!(self.empty.is_empty());
+            self.empty = empty;
+        }
+        self.pages.push(Page {
+            entries: Some(entries),
+            next_generation: 0,
+            scratch: 0,
+        });
         self.present += 1;
         self.free = base;
+        Ok(())
     }
 
     /// The chunk `handle` references.
@@ -298,6 +400,7 @@ impl ChunkArena {
         }
         self.free = head;
         let mut freed = 0;
+        debug_assert!(self.empty.capacity() >= self.pages.len());
         for (slot, page) in self.pages.iter_mut().enumerate() {
             if page.scratch as usize == PAGE {
                 let entries = page.entries.take().unwrap();
@@ -563,5 +666,100 @@ mod tests {
         }
         assert!(pages_freed > 0, "shrink freed pages");
         assert!(cfg!(miri) || most_live > PAGE, "more than one page in use");
+    }
+
+    #[test]
+    fn try_insert_across_page_boundaries_matches_storage_and_growth_accounting() {
+        let page_bytes = size_of::<[Entry; PAGE]>();
+        let mut arena = ChunkArena::new();
+        assert_eq!(
+            (
+                arena.live(),
+                arena.page_count(),
+                arena.capacity(),
+                arena.storage_bytes(),
+                arena.held_bytes(),
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        // First insert allocates page 0 plus initial table capacity (4) for pages & empty.
+        assert_eq!(
+            arena.growth_bytes(),
+            page_bytes + 4 * size_of::<Page>() + 4 * size_of::<u32>()
+        );
+
+        let mut handles = Vec::new();
+        // Fill pages 0..4 (4 * PAGE entries).
+        for page in 0..4 {
+            let expected_growth = if page == 0 {
+                page_bytes + 4 * size_of::<Page>() + 4 * size_of::<u32>()
+            } else {
+                page_bytes
+            };
+            let before = arena.storage_bytes();
+            assert_eq!(arena.growth_bytes(), expected_growth);
+            for k in 0..PAGE {
+                let h = arena.try_insert(chunk(&[(page * PAGE + k) as u8])).unwrap();
+                handles.push(h);
+                if k + 1 < PAGE {
+                    assert_eq!(arena.growth_bytes(), 0);
+                }
+            }
+            assert_eq!(arena.page_count(), page + 1);
+            assert_eq!(arena.capacity(), (page + 1) * PAGE);
+            assert_eq!(arena.live(), (page + 1) * PAGE);
+            assert_eq!(arena.storage_bytes(), arena.held_bytes());
+            assert_eq!(arena.storage_bytes(), before + expected_growth);
+        }
+
+        // Page 4 (5th page) doubles table capacity from 4 to 8.
+        let before = arena.storage_bytes();
+        let expected_peak = page_bytes + 8 * size_of::<Page>() + 8 * size_of::<u32>();
+        assert_eq!(arena.growth_bytes(), expected_peak);
+        let first_on_fifth = arena.try_insert(chunk(&[99])).unwrap();
+        assert_eq!(arena.growth_bytes(), 0);
+        assert_eq!(arena.page_count(), 5);
+        assert_eq!(arena.capacity(), 5 * PAGE);
+        assert_eq!(arena.live(), 4 * PAGE + 1);
+        let expected_net = page_bytes + 4 * size_of::<Page>() + 4 * size_of::<u32>();
+        assert_eq!(arena.storage_bytes(), before + expected_net);
+        assert!(arena.storage_bytes() <= before + expected_peak);
+        assert_eq!(arena.get(&first_on_fifth).bytes(0..1), &[99]);
+
+        // Release everything and shrink: storage_bytes drops by exactly 5 pages,
+        // with no hidden allocation in `empty`.
+        assert!(arena.release(first_on_fifth).is_some());
+        for h in handles {
+            assert!(arena.release(h).is_some());
+        }
+        assert_eq!(arena.live(), 0);
+        let before_shrink = arena.storage_bytes();
+        assert_eq!(arena.shrink(), 5);
+        assert_eq!(arena.page_count(), 0);
+        assert_eq!(arena.capacity(), 0);
+        assert_eq!(arena.storage_bytes(), before_shrink - 5 * page_bytes);
+        assert_eq!(
+            arena.storage_bytes(),
+            8 * size_of::<Page>() + 8 * size_of::<u32>()
+        );
+
+        // Regrowing from `empty` allocates only one page (tables already sized).
+        assert_eq!(arena.growth_bytes(), page_bytes);
+        let before_regrow = arena.storage_bytes();
+        let h = arena.try_insert(chunk(&[42])).unwrap();
+        assert_eq!(arena.page_count(), 1);
+        assert_eq!(arena.capacity(), PAGE);
+        assert_eq!(arena.storage_bytes(), before_regrow + page_bytes);
+        assert_eq!(arena.growth_bytes(), 0);
+        assert_eq!(arena.get(&h).bytes(0..1), &[42]);
+        assert!(arena.release(h).is_some());
+    }
+
+    #[test]
+    fn max_pages_keeps_every_slot_index_below_nil() {
+        let last_base = ((MAX_PAGES - 1) << SHIFT) as u32;
+        let last_index = last_base + (PAGE as u32 - 1);
+        assert!(last_index < NIL);
+        assert_eq!(last_index, NIL - PAGE as u32);
     }
 }

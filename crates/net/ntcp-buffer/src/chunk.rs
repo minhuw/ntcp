@@ -44,7 +44,7 @@ static HEAP: TxChunkVtable = TxChunkVtable {
 };
 
 // SAFETY (caller): context and token are a `Vec<u8>`'s pointer and
-// capacity, given up by `TxChunk::heap`.
+// capacity, given up by `TxChunk::try_heap`.
 unsafe fn release_heap(context: *mut (), token: usize) {
     drop(unsafe { Vec::from_raw_parts(context.cast::<u8>(), 0, token) });
 }
@@ -76,24 +76,33 @@ impl TxChunk {
         }
     }
 
-    /// An empty heap chunk of `capacity` bytes, left uninitialized: only
-    /// `append` writes it.
-    pub fn heap(capacity: usize) -> Self {
-        let capacity = u32::try_from(capacity).expect("a chunk is below 4 GiB");
-        let mut memory = ManuallyDrop::new(Vec::<u8>::with_capacity(capacity as usize));
+    /// Fallible version of [`Self::heap`]: returns `None` when `capacity`
+    /// exceeds `u32::MAX` or the allocation fails.
+    pub fn try_heap(capacity: usize) -> Option<Self> {
+        let capacity = u32::try_from(capacity).ok()?;
+        let mut memory = Vec::<u8>::new();
+        memory.try_reserve_exact(capacity as usize).ok()?;
+        let mut memory = ManuallyDrop::new(memory);
         let data = memory.as_mut_ptr();
-        // SAFETY: a Vec's pointer is never null and its capacity is
-        // writable; the chunk now owns the allocation, which only
-        // release_heap frees.
+        // SAFETY: a Vec's pointer is never null and its capacity is at least
+        // `capacity` and writable; the chunk now owns the allocation, which
+        // only release_heap frees using `memory.capacity()`.
         unsafe {
-            Self::from_raw_parts(
+            Some(Self::from_raw_parts(
                 NonNull::new_unchecked(data),
                 capacity,
                 &HEAP,
                 data.cast(),
                 memory.capacity(),
-            )
+            ))
         }
+    }
+
+    /// An empty heap chunk of `capacity` bytes, left uninitialized: only
+    /// `append` writes it.
+    pub fn heap(capacity: usize) -> Self {
+        assert!(u32::try_from(capacity).is_ok(), "a chunk is below 4 GiB");
+        Self::try_heap(capacity).expect("heap chunk allocation failed")
     }
 
     pub fn capacity(&self) -> usize {
@@ -107,6 +116,10 @@ impl TxChunk {
 
     pub fn is_empty(&self) -> bool {
         self.filled == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.filled == self.capacity
     }
 
     /// Room left past the filled prefix.
@@ -274,7 +287,7 @@ impl TxChunkSource for HeapChunkSource {
         self.chunk_size
     }
     fn allocate(&mut self) -> Option<TxChunk> {
-        Some(TxChunk::heap(self.chunk_size))
+        TxChunk::try_heap(self.chunk_size)
     }
 }
 
@@ -291,10 +304,13 @@ mod tests {
             (0, 8, 8)
         );
         assert!(chunk.is_empty());
+        assert!(!chunk.is_full());
         assert_eq!(chunk.append(&[1, 2, 3]), 3);
+        assert!(!chunk.is_full());
         let base = chunk.as_ptr();
         assert_eq!(chunk.bytes(0..3), &[1, 2, 3]);
         assert_eq!(chunk.append(&[4, 5, 6, 7, 8, 9, 10]), 5);
+        assert!(chunk.is_full());
         assert_eq!(chunk.append(&[11]), 0);
         assert_eq!(chunk.remaining(), 0);
         assert_eq!(chunk.as_ptr(), base, "a chunk never moves");
@@ -331,5 +347,20 @@ mod tests {
         assert_eq!(small.allocate().unwrap().capacity(), 4);
         let boxed: alloc::boxed::Box<dyn TxChunkSource> = alloc::boxed::Box::new(small);
         assert_eq!(boxed.chunk_size(), 4);
+    }
+
+    #[test]
+    fn try_heap_allocates_and_rejects_oversized_capacity() {
+        let mut chunk = TxChunk::try_heap(8).unwrap();
+        assert_eq!(chunk.capacity(), 8);
+        assert_eq!(chunk.append(&[1, 2, 3]), 3);
+        assert_eq!(chunk.bytes(0..3), &[1, 2, 3]);
+
+        let zero = TxChunk::try_heap(0).unwrap();
+        assert_eq!((zero.len(), zero.capacity()), (0, 0));
+        assert!(zero.is_full());
+
+        assert!(TxChunk::try_heap(usize::MAX).is_none());
+        assert!(HeapChunkSource::new(usize::MAX).allocate().is_none());
     }
 }

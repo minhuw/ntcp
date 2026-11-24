@@ -1,6 +1,6 @@
 pub use ntcp_buffer::{
     ChunkSlice, HeapChunkSource, Payload, PayloadSlice, RxFrame, RxFrameCount, RxFrameVtable,
-    StablePayloadStorage, TxChunk, TxChunkSource, TxChunkVtable,
+    StablePayloadStorage, TxChunk, TxChunkSource, TxChunkVtable, TxPacket, TxPart,
 };
 use std::io;
 
@@ -23,51 +23,6 @@ impl OwnedPacket {
 pub struct ZeroCopyCapabilities {
     pub max_payload_segments: usize,
     pub max_packet_len: usize,
-}
-
-/// One packet to transmit, borrowed for the call: the header bytes the
-/// caller built, then the payload in order, as ranges of transmit chunks
-/// and shared payloads. A backend copies what it sends before it returns,
-/// or takes its own reference on a part's memory (a device reference on a
-/// chunk, `PayloadSlice::to_payload`) and keeps it until the device is done
-/// with it; it keeps no borrow.
-#[derive(Clone, Copy, Debug)]
-pub struct TxPacket<'a> {
-    pub header: &'a [u8],
-    pub payload: &'a [TxPart<'a>],
-}
-impl TxPacket<'_> {
-    pub fn checked_len(&self) -> Option<usize> {
-        self.payload
-            .iter()
-            .try_fold(self.header.len(), |n, p| n.checked_add(p.len()))
-    }
-}
-
-/// A payload range of a `TxPacket`.
-#[derive(Clone, Copy, Debug)]
-pub enum TxPart<'a> {
-    /// Bytes a copying write put in a transmit chunk.
-    Chunk(ChunkSlice<'a>),
-    /// Bytes of a payload the application shared.
-    Shared(PayloadSlice<'a>),
-}
-impl<'a> TxPart<'a> {
-    pub fn bytes(&self) -> &'a [u8] {
-        match self {
-            Self::Chunk(slice) => slice.bytes(),
-            Self::Shared(slice) => slice.bytes(),
-        }
-    }
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Chunk(slice) => slice.len(),
-            Self::Shared(slice) => slice.len(),
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 /// How `transmit_packet` hands a packet to the device: the options the

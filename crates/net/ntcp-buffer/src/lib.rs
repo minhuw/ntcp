@@ -194,6 +194,51 @@ impl fmt::Debug for PayloadSlice<'_> {
     }
 }
 
+/// One packet to transmit, borrowed for the call: the header bytes the
+/// caller built, then the payload in order, as ranges of transmit chunks
+/// and shared payloads. A backend copies what it sends before it returns,
+/// or takes its own reference on a part's memory (a device reference on a
+/// chunk, `PayloadSlice::to_payload`) and keeps it until the device is done
+/// with it; it keeps no borrow.
+#[derive(Clone, Copy, Debug)]
+pub struct TxPacket<'a> {
+    pub header: &'a [u8],
+    pub payload: &'a [TxPart<'a>],
+}
+impl TxPacket<'_> {
+    pub fn checked_len(&self) -> Option<usize> {
+        self.payload
+            .iter()
+            .try_fold(self.header.len(), |n, p| n.checked_add(p.len()))
+    }
+}
+
+/// A payload range of a `TxPacket`.
+#[derive(Clone, Copy, Debug)]
+pub enum TxPart<'a> {
+    /// Bytes a copying write put in a transmit chunk.
+    Chunk(ChunkSlice<'a>),
+    /// Bytes of a payload the application shared.
+    Shared(PayloadSlice<'a>),
+}
+impl<'a> TxPart<'a> {
+    pub fn bytes(&self) -> &'a [u8] {
+        match self {
+            Self::Chunk(slice) => slice.bytes(),
+            Self::Shared(slice) => slice.bytes(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Chunk(slice) => slice.len(),
+            Self::Shared(slice) => slice.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -302,5 +347,36 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 0);
         drop(second);
         assert_eq!(count.load(Ordering::SeqCst), 11);
+    }
+
+    #[test]
+    fn tx_packet_and_tx_parts_expose_borrowed_ranges_and_checked_len() {
+        let mut chunk = TxChunk::heap(16);
+        chunk.append(&[10, 11, 12, 13]);
+        let shared = Payload::from_vec(vec![20, 21, 22]);
+        let chunk_part = TxPart::Chunk(ChunkSlice::new(&chunk, 1..3).unwrap());
+        let shared_part = TxPart::Shared(PayloadSlice::new(&shared, 0..2).unwrap());
+        let empty_chunk = TxPart::Chunk(ChunkSlice::new(&chunk, 4..4).unwrap());
+        let empty_shared = TxPart::Shared(PayloadSlice::new(&shared, 3..3).unwrap());
+
+        assert_eq!((chunk_part.bytes(), chunk_part.len(), chunk_part.is_empty()), (&[11, 12][..], 2, false));
+        assert_eq!((shared_part.bytes(), shared_part.len(), shared_part.is_empty()), (&[20, 21][..], 2, false));
+        assert!(empty_chunk.is_empty());
+        assert!(empty_shared.is_empty());
+        assert_eq!(empty_chunk.bytes(), &[]);
+        assert_eq!(empty_shared.bytes(), &[]);
+
+        let parts = [chunk_part, empty_chunk, shared_part, empty_shared];
+        let packet = TxPacket {
+            header: &[1, 2, 3],
+            payload: &parts,
+        };
+        assert_eq!(packet.checked_len(), Some(7));
+
+        let header_only = TxPacket {
+            header: &[9; 5],
+            payload: &[],
+        };
+        assert_eq!(header_only.checked_len(), Some(5));
     }
 }
