@@ -165,7 +165,7 @@ fn a_writable_connection_refused_memory_is_woken_by_a_return_and_writes() {
     let data: Vec<u8> = (0..1 << 16).map(|i: u32| (i * 7 % 251) as u8).collect();
     // The charge once `bulk` filled its send buffer, unacknowledged, with
     // room to spare; then a cap 64 KiB above it, which `bulk`'s growth
-    // peaks fit and the waiter's 64 KiB ring does not.
+    // peaks fit and the waiter's full 64 KiB write does not.
     let run = |cap: Option<usize>| -> usize {
         let (near, far) = wires();
         let mut server = match cap {
@@ -202,8 +202,9 @@ fn a_writable_connection_refused_memory_is_woken_by_a_return_and_writes() {
         }
         let (bulk, waiter) = (accepted[0], accepted[1]);
         // A fixed send limit, as SO_SNDBUF sets: pressure does not moderate
-        // it to what the waiter queued.
-        server.set_send_buffer(waiter, 65536).unwrap();
+        // it to what the waiter queued. 128 KiB keeps any partial write of
+        // `data` (64 KiB) below half of SO_SNDBUF so Linux's rule stays writable.
+        server.set_send_buffer(waiter, 131072).unwrap();
         // The client reads nothing yet: `bulk`'s data stays queued.
         let mut sent = 0;
         while let Ok(receipt) = server.try_write(bulk, &data[sent..], WriteOptions::default()) {
@@ -272,7 +273,7 @@ fn a_writable_connection_refused_memory_is_woken_by_a_return_and_writes() {
 fn a_refused_writer_gets_no_writable_until_a_return_fits_its_growth() {
     let (server_ip, client_ip): (IpAddr, IpAddr) =
         ("198.18.0.1".parse().unwrap(), "198.18.0.2".parse().unwrap());
-    let request: Vec<u8> = (0..16384).map(|i: u32| (i * 7 % 251) as u8).collect();
+    let request: Vec<u8> = (0..32768).map(|i: u32| (i * 7 % 251) as u8).collect();
     // The server's charge once it holds `request` unread; then a cap 1000
     // bytes above it, less than a send ring.
     let run = |cap: Option<usize>| -> usize {

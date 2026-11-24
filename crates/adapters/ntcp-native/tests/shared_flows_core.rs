@@ -1123,8 +1123,8 @@ fn memory_an_open_returns_outside_drive_wakes_another_members_writer() {
     preload(&mut lan, id);
     let charged = flows.buffer_memory().unwrap().buffer_bytes();
     drop((lan, flows));
-    // Room for member 0's open, not for member 1's ring to double.
-    let high = charged + (64 << 10);
+    // Room for member 0's open, not for member 1's next send chunk.
+    let high = charged + (8 << 10);
     let memory = ntcp::BufferMemory {
         low: high / 2,
         pressure: high,
