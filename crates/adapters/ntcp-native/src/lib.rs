@@ -7,6 +7,8 @@ mod config;
 mod driver;
 mod flows;
 #[cfg(test)]
+mod fast_path_tests;
+#[cfg(test)]
 mod handle_tests;
 mod inbox;
 mod shared;
@@ -18,7 +20,7 @@ pub use ntcp_host::{IcmpOutputCounters, IcmpRateLimits, ReassemblyCounters};
 pub use shared::{SharedNeighborLimits, SharedNeighbors};
 pub use types::*;
 
-use ntcp::{AddressValidation, Endpoint, EndpointError, Tuple};
+use ntcp::{Endpoint, EndpointError, Tuple};
 use ntcp_host::{Host, IngressContext, path};
 use ntcp_io::PacketIo;
 use std::{
@@ -126,10 +128,10 @@ struct Raised {
 impl Connection {
     // What a refresh of this connection raises, the core's state now
     // `state`. Shared by the refresh and its debug-build cross-check.
-    fn raised(&self, endpoint: &Endpoint, state: State) -> Raised {
+    fn raised(&self, stream: ntcp::StreamState<'_>) -> Raised {
+        let state = stream.state();
         let readable = (self.read_waiting || self.arrived).then(|| {
-            endpoint.readable_bytes(self.core).unwrap_or(0) != 0
-                || endpoint.terminal_readable_bytes(self.core).unwrap_or(0) != 0
+            stream.readable_bytes() != 0
                 || matches!(
                     state,
                     State::CloseWait
@@ -211,6 +213,9 @@ pub struct Network<P: PacketIo> {
     free_listeners: Vec<usize>,
     events: VecDeque<Event>,
     event_capacity: usize,
+    // Last stream observed empty by a read at this clock. Cleared on any
+    // drive, push, clock advance, stop, or state/slot transition.
+    empty_reader: Option<ConnId>,
     // Connection slots, then listener slots at `max_connections + slot`,
     // whose events a change may have raised since drain_events last looked.
     ready: SlotQueue,
@@ -252,6 +257,7 @@ pub struct Network<P: PacketIo> {
     // The held flows whose connections left TIME-WAIT records.
     time_wait_flows: TimeWaitFlows,
     tx_cursor: usize,
+    ipv4_header: ntcp_ip::TcpHeaderCache,
     // How the backend completes frames (`PacketIo::tx_completion`), for
     // autocorking, and where its transmission stands: drives begun
     // (NextPoll) and frames submitted (Counter).
@@ -375,8 +381,13 @@ fn occupied<T>(slots: &[Slot<T>]) -> impl Iterator<Item = usize> + '_ {
 // installed before `maintain_connections` frees its predecessor's, the
 // predecessor is displaced: `displaced` counts those, found by their `core`.
 struct CoreSlots {
-    slots: Vec<Option<(ntcp::ConnectionId, usize)>>,
+    slots: Vec<CoreSlot>,
     displaced: usize,
+}
+#[derive(Clone, Copy, Default)]
+struct CoreSlot {
+    generation: u64, // Zero until installed, and once forgotten.
+    slot: usize,
 }
 impl CoreSlots {
     fn new(capacity: usize) -> Result<Self> {
@@ -384,17 +395,19 @@ impl CoreSlots {
         slots
             .try_reserve_exact(capacity)
             .map_err(|_| Error::Capacity)?;
-        slots.resize(capacity, None);
+        slots.resize(capacity, CoreSlot::default());
         Ok(Self {
             slots,
             displaced: 0,
         })
     }
-    // Records `core` installed in `slot`; returns the connection it displaced.
-    fn insert(&mut self, core: ntcp::ConnectionId, slot: usize) -> Option<ntcp::ConnectionId> {
-        let earlier = self.slots[core.index()]
-            .replace((core, slot))
-            .map(|(id, _)| id);
+    // Records `core` installed in `slot`; returns the slot it displaced.
+    fn insert(&mut self, core: ntcp::ConnectionId, slot: usize) -> Option<usize> {
+        let generation = core.generation();
+        debug_assert_ne!(generation, 0);
+        let entry = &mut self.slots[core.index()];
+        let earlier = (entry.generation != 0).then_some(entry.slot);
+        *entry = CoreSlot { generation, slot };
         self.displaced += usize::from(earlier.is_some());
         earlier
     }
@@ -404,10 +417,13 @@ impl CoreSlots {
         live: &[usize],
         connections: &[Slot<Connection>],
     ) -> Option<usize> {
-        match self.slots[core.index()] {
-            Some((id, slot)) if id == core => Some(slot),
-            _ if self.displaced != 0 => displaced_slot(core, live, connections),
-            _ => None,
+        let entry = self.slots[core.index()];
+        if entry.generation == core.generation() {
+            Some(entry.slot)
+        } else if self.displaced != 0 {
+            displaced_slot(core, live, connections)
+        } else {
+            None
         }
     }
     // Forgets `core`, returning its slot.
@@ -418,17 +434,15 @@ impl CoreSlots {
         connections: &[Slot<Connection>],
     ) -> Option<usize> {
         let entry = &mut self.slots[core.index()];
-        match *entry {
-            Some((id, slot)) if id == core => {
-                *entry = None;
-                Some(slot)
-            }
-            _ if self.displaced != 0 => {
-                let slot = displaced_slot(core, live, connections);
-                self.displaced -= usize::from(slot.is_some());
-                slot
-            }
-            _ => None,
+        if entry.generation == core.generation() {
+            entry.generation = 0;
+            Some(entry.slot)
+        } else if self.displaced != 0 {
+            let slot = displaced_slot(core, live, connections);
+            self.displaced -= usize::from(slot.is_some());
+            slot
+        } else {
+            None
         }
     }
 }
@@ -452,37 +466,51 @@ fn displaced_slot(
 // takes, so a change that left nothing to do costs one check, and a slot
 // freed or reused while queued needs no removal.
 struct SlotQueue {
-    order: VecDeque<usize>,
+    // Allocated slot indexes are always smaller than usize::MAX.
+    first: usize,
+    rest: VecDeque<usize>,
     queued: Vec<bool>,
 }
 impl SlotQueue {
     fn new(slots: usize) -> Result<Self> {
-        let mut order = VecDeque::new();
-        order
-            .try_reserve_exact(slots)
+        let mut rest = VecDeque::new();
+        rest.try_reserve_exact(slots.saturating_sub(1))
             .map_err(|_| Error::Capacity)?;
         let mut queued = Vec::new();
         queued
             .try_reserve_exact(slots)
             .map_err(|_| Error::Capacity)?;
         queued.resize(slots, false);
-        Ok(Self { order, queued })
+        Ok(Self {
+            first: usize::MAX,
+            rest,
+            queued,
+        })
     }
     fn push(&mut self, slot: usize) {
-        if !std::mem::replace(&mut self.queued[slot], true) {
-            self.order.push_back(slot);
+        debug_assert!(slot < self.queued.len());
+        if self.first == usize::MAX {
+            self.first = slot;
+        } else if self.first != slot && !std::mem::replace(&mut self.queued[slot], true) {
+            self.rest.push_back(slot);
         }
     }
     fn pop(&mut self) -> Option<usize> {
-        let slot = self.order.pop_front()?;
-        self.queued[slot] = false;
+        let slot = self.first;
+        if slot == usize::MAX {
+            return None;
+        }
+        self.first = self.rest.pop_front().map_or(usize::MAX, |next| {
+            self.queued[next] = false;
+            next
+        });
         Some(slot)
     }
     fn len(&self) -> usize {
-        self.order.len()
+        usize::from(self.first != usize::MAX) + self.rest.len()
     }
     fn is_empty(&self) -> bool {
-        self.order.is_empty()
+        self.first == usize::MAX
     }
 }
 // How a slot came by its local port, as Linux's bind bucket tells the
@@ -911,18 +939,7 @@ impl<P: PacketIo> Network<P> {
             }
             _ => Self::fixed_link(&mut host, &config, receive)?,
         };
-        let mut endpoint =
-            Endpoint::new(
-                config.tcp.clone(),
-                secret,
-                now,
-                move |request| match request {
-                    AddressValidation::Bind { local: address }
-                    | AddressValidation::Open { local: address, .. } => address == local,
-                    AddressValidation::Incoming { destination, .. } => destination == local,
-                    AddressValidation::Route { source, .. } => source == local,
-                },
-            )?;
+        let mut endpoint = Endpoint::for_local_address(config.tcp.clone(), secret, now, local)?;
         host.attach(&mut endpoint)?;
         // A member charges its group's buffer memory, its output
         // reservations included.
@@ -1056,6 +1073,7 @@ impl<P: PacketIo> Network<P> {
             free_listeners,
             events,
             event_capacity,
+            empty_reader: None,
             ready,
             maintain,
             stamped,
@@ -1075,6 +1093,7 @@ impl<P: PacketIo> Network<P> {
             holding: 0,
             time_wait_flows: TimeWaitFlows::default(),
             tx_cursor: 0,
+            ipv4_header: Default::default(),
             tx_completion,
             tx_epoch: 1,
             tx_submitted: 0,
@@ -1327,9 +1346,22 @@ impl<P: PacketIo> Network<P> {
     // Advances logical time without servicing timers or touching packet I/O.
     pub fn advance_time(&mut self, now: Instant) -> Result<()> {
         self.running()?;
+        self.empty_reader = None;
         self.endpoint.advance_clock(now)?;
         self.now = now;
         Ok(())
+    }
+    #[inline]
+    fn clear_empty_reader(&mut self, id: ConnId) {
+        if self.empty_reader == Some(id) {
+            self.empty_reader = None;
+        }
+    }
+    #[inline]
+    fn clear_empty_reader_slot(&mut self, slot: usize) {
+        if self.empty_reader.is_some_and(|id| id.slot == slot) {
+            self.empty_reader = None;
+        }
     }
     fn running(&self) -> Result<()> {
         if self.stopped {
@@ -1443,7 +1475,13 @@ impl<P: PacketIo> Network<P> {
         occupy(&mut self.live_connections, slot);
         self.ports.take(tuple.local.port(), binding);
         let earlier = self.core_slots.insert(core, slot);
-        debug_assert!(earlier.is_none_or(|e| e != core && !self.endpoint.connection_exists(e)));
+        debug_assert!(earlier.is_none_or(|s| {
+            self.connections[s]
+                .value
+                .as_ref()
+                .is_some_and(|c| c.core != core && !self.endpoint.connection_exists(c.core))
+        }));
+        self.clear_empty_reader_slot(slot);
         self.touch(slot);
         self.check_live();
         Ok(self.conn_id(slot))
@@ -1753,10 +1791,8 @@ impl<P: PacketIo> Network<P> {
         // The endpoint's own state, not the one events were derived from: a
         // FIN sent or acknowledged, or TIME-WAIT ending, raises no event. A
         // released connection, or one of a stopped network, keeps its last.
-        let (state, reason) = match self.endpoint.state(c.core) {
-            Ok(state) if !c.released && !self.stopped => {
-                (state, self.endpoint.close_reason(c.core).ok().flatten())
-            }
+        let (state, reason) = match self.endpoint.stream_state(c.core) {
+            Ok(stream) if !c.released && !self.stopped => (stream.state(), stream.close_reason()),
             _ => (c.state, c.reason),
         };
         Ok(ConnectionInfo {
@@ -1790,7 +1826,8 @@ impl<P: PacketIo> Network<P> {
             return Err(Error::InvalidHandle);
         }
         let core = c.core;
-        let state = self.endpoint.state(core)?;
+        let stream = self.endpoint.stream_state(core)?;
+        let state = stream.state();
         let read_closed = matches!(
             state,
             State::CloseWait | State::Closing | State::LastAck | State::TimeWait | State::Closed
@@ -1801,11 +1838,9 @@ impl<P: PacketIo> Network<P> {
         );
         // As refresh_connection raises Readable, and next_connection_event
         // Writable.
-        let readable = read_closed
-            || self.endpoint.readable_bytes(core).unwrap_or(0) != 0
-            || self.endpoint.terminal_readable_bytes(core).unwrap_or(0) != 0;
+        let readable = read_closed || stream.readable_bytes() != 0;
         let open = matches!(state, State::Established | State::CloseWait);
-        let writable = open && writable(&self.endpoint, core, TxTimestampRequest::default());
+        let writable = open && stream.writable(None, TxTimestampRequest::default());
         let c = self.conn_mut(id)?;
         if !readable {
             c.read_waiting = true;
@@ -1850,7 +1885,7 @@ impl<P: PacketIo> Network<P> {
         }
         Ok(self.endpoint.transport_info(c.core)?)
     }
-    fn writable_core(&self, id: ConnId) -> Result<ntcp::ConnectionId> {
+    fn writing_core(&self, id: ConnId) -> Result<ntcp::ConnectionId> {
         self.running()?;
         let c = self.conn(id)?;
         if c.close_requested || c.abort_requested || c.released {
@@ -1858,10 +1893,13 @@ impl<P: PacketIo> Network<P> {
                 ntcp::Error::InvalidState,
             )));
         }
-        match self.endpoint.state(c.core)? {
+        Ok(c.core)
+    }
+    fn write_position(stream: ntcp::StreamState<'_>) -> Result<u64> {
+        match stream.state() {
             State::SynSent | State::SynReceived => Err(Error::WouldBlock(BlockReason::Connecting)),
-            State::Established | State::CloseWait => Ok(c.core),
-            _ => Err(Error::ConnectionClosed(self.endpoint.close_reason(c.core)?)),
+            State::Established | State::CloseWait => Ok(stream.queued_end()),
+            _ => Err(Error::ConnectionClosed(stream.close_reason())),
         }
     }
     /// Queues `data` on connection `id`, PUSH on its last byte; it is sent
@@ -1878,8 +1916,9 @@ impl<P: PacketIo> Network<P> {
         if options.timestamps.software_transmit || options.timestamps.hardware_transmit {
             return Err(Error::Unsupported("native backend transmit timestamps"));
         }
-        let core = self.writable_core(id)?;
-        let before = self.endpoint.send_progress(core)?.queued_end;
+        let core = self.writing_core(id)?;
+        let stream = self.endpoint.stream_io(core)?;
+        let before = Self::write_position(stream.state())?;
         if data.is_empty() {
             return Ok(WriteReceipt {
                 accepted: 0,
@@ -1896,19 +1935,25 @@ impl<P: PacketIo> Network<P> {
                 "requested timestamp phases exceed the configured capacity",
             ));
         }
-        if phases
-            > self
-                .config
-                .tx_timestamp_phases
-                .saturating_sub(self.conn(id)?.trace_count)
-        {
-            self.conn_mut(id)?.write_waiting = Some(options.timestamps);
-            return Err(Error::WouldBlock(BlockReason::TimestampCapacity));
+        if phases != 0 {
+            let Some(connection) = self
+                .connections
+                .get_mut(id.slot)
+                .and_then(|s| s.value.as_mut())
+            else {
+                return Err(Error::InvalidHandle);
+            };
+            if phases
+                > self
+                    .config
+                    .tx_timestamp_phases
+                    .saturating_sub(connection.trace_count)
+            {
+                connection.write_waiting = Some(options.timestamps);
+                return Err(Error::WouldBlock(BlockReason::TimestampCapacity));
+            }
         }
-        let result =
-            self.endpoint
-                .write_with_timestamp(core, data, false, false, None, options.timestamps);
-        let accepted = match result {
+        let accepted = match stream.write(data, (phases != 0).then_some(options.timestamps)) {
             Ok(n) => n,
             Err(EndpointError::Connection(ntcp::Error::WouldBlock)) => {
                 self.conn_mut(id)?.write_waiting = Some(options.timestamps);
@@ -1916,7 +1961,9 @@ impl<P: PacketIo> Network<P> {
             }
             Err(e) => return Err(e.into()),
         };
-        self.conn_mut(id)?.trace_count += phases;
+        if phases != 0 {
+            self.conn_mut(id)?.trace_count += phases;
+        }
         Ok(WriteReceipt {
             accepted,
             range: TxStreamRange {
@@ -1948,8 +1995,8 @@ impl<P: PacketIo> Network<P> {
         id: ConnId,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Result<WriteReceipt> {
-        let core = self.writable_core(id)?;
-        let start = self.endpoint.send_progress(core)?.queued_end;
+        let core = self.writing_core(id)?;
+        let start = Self::write_position(self.endpoint.stream_state(core)?)?;
         let last = bufs.iter().rposition(|b| !b.is_empty());
         let mut accepted = 0;
         // Whether the bytes taken end without PUSH: a slice written as
@@ -2067,54 +2114,77 @@ impl<P: PacketIo> Network<P> {
             return Ok(ReadOutcome::EmptyBuffer);
         }
         let core = c.core;
-        let state = self.endpoint.state(core)?;
+        let start = c.read_cursor;
+        if self.empty_reader == Some(id) {
+            debug_assert!(
+                self.endpoint
+                    .stream_io(core)
+                    .is_ok_and(|stream| stream.read_available().is_none())
+            );
+            let c = self.conn_mut(id)?;
+            c.readable_event = false;
+            c.read_waiting = true;
+            *drained = true;
+            return Err(Error::WouldBlock(BlockReason::Receive));
+        }
+        let reader = self.endpoint.stream_io(core)?;
+        let stream = reader.state();
+        let state = stream.state();
         if matches!(state, State::SynSent | State::SynReceived) {
             return Err(Error::WouldBlock(BlockReason::Connecting));
         }
-        let start = c.read_cursor;
-        self.conn_mut(id)?.readable_event = false;
-        self.conn_mut(id)?.read_waiting = true;
-        let terminal = state == State::Closed;
-        let available = if terminal {
-            self.endpoint.terminal_readable_bytes(core)?
-        } else {
-            self.endpoint.readable_bytes(core)?
+        let Some(c) = self
+            .connections
+            .get_mut(id.slot)
+            .and_then(|s| s.value.as_mut())
+        else {
+            return Err(Error::InvalidHandle);
         };
+        c.readable_event = false;
+        c.read_waiting = true;
+        let terminal = state == State::Closed;
+        let Some(available) = reader.read_available() else {
+            self.empty_reader = Some(id);
+            *drained = true;
+            return Err(Error::WouldBlock(BlockReason::Receive));
+        };
+        let reason = stream.close_reason();
         let count = out.len().min(available);
         // Without RX timestamp ranges no connection records any (its
         // capacity is the configuration's), so there is nothing to report.
         let metadata = if count != 0 && self.config.rx_timestamp_ranges != 0 {
-            self.endpoint.peek_rx_timestamps(core, count)?
+            reader.peek_timestamps(count)?
         } else {
             None
         };
         let result = if terminal {
-            self.endpoint.read_terminal(core, out)
+            reader.read_terminal(out).map(|len| (len, false))
         } else {
-            self.endpoint.read(core, out)
+            reader.read_with_wait(out)
         };
-        let len = match result {
+        let (len, waiting) = match result {
             Ok(n) => n,
             Err(EndpointError::Connection(ntcp::Error::WouldBlock)) => {
                 *drained = state == State::Established && available == 0;
                 return Err(Error::WouldBlock(BlockReason::Receive));
             }
             Err(EndpointError::Connection(ntcp::Error::InvalidState))
-                if terminal
-                    && count == 0
-                    && self.endpoint.close_reason(core)? == Some(CloseReason::Normal) =>
+                if terminal && count == 0 && reason == Some(CloseReason::Normal) =>
             {
-                0
+                (0, false)
             }
             Err(e) => return Err(e.into()),
         };
+        if waiting {
+            self.empty_reader = Some(id);
+        }
         if len == 0 {
-            if terminal && self.endpoint.close_reason(core)? != Some(CloseReason::Normal) {
-                return Err(Error::ConnectionClosed(self.endpoint.close_reason(core)?));
+            if terminal && reason != Some(CloseReason::Normal) {
+                return Err(Error::ConnectionClosed(reason));
             }
             return Ok(ReadOutcome::Eof);
         }
-        self.conn_mut(id)?.read_cursor += len as u64;
+        c.read_cursor += len as u64;
         *drained = state == State::Established && len == available;
         Ok(ReadOutcome::Data {
             len,
@@ -2128,8 +2198,8 @@ impl<P: PacketIo> Network<P> {
     // Shared admission retains immutable storage in TCP. The packet backend
     // may still copy it; the remaining suffix stays in the caller's Payload.
     pub fn try_write_shared(&mut self, id: ConnId, payload: &mut Payload) -> Result<WriteReceipt> {
-        let core = self.writable_core(id)?;
-        let start = self.endpoint.send_progress(core)?.queued_end;
+        let core = self.writing_core(id)?;
+        let start = Self::write_position(self.endpoint.stream_state(core)?)?;
         if payload.is_empty() {
             return Ok(WriteReceipt {
                 accepted: 0,
@@ -2220,6 +2290,7 @@ impl<P: PacketIo> Network<P> {
         self.running()?;
         let core = self.open_core(id)?;
         let bytes = receive_size(bytes)?;
+        self.clear_empty_reader(id);
         let result = self.endpoint.set_receive_buffer(core, bytes);
         self.wake_members_for_memory();
         Ok(result?)
@@ -2288,7 +2359,9 @@ impl<P: PacketIo> Network<P> {
         if c.close_requested || c.abort_requested || c.released {
             return Err(Error::InvalidHandle);
         }
-        match self.endpoint.shutdown(c.core) {
+        let core = c.core;
+        self.clear_empty_reader(id);
+        match self.endpoint.shutdown(core) {
             Ok(()) => {}
             // Still connecting, the shutdown ends the connection, which
             // waits for its reservation: done by the drive that finds it
@@ -2309,6 +2382,7 @@ impl<P: PacketIo> Network<P> {
         c.read_waiting = false;
         c.arrived = false;
         c.write_waiting = None;
+        self.clear_empty_reader(id);
         self.touch(id.slot);
         Ok(())
     }
@@ -2320,6 +2394,7 @@ impl<P: PacketIo> Network<P> {
         c.read_waiting = false;
         c.arrived = false;
         c.write_waiting = None;
+        self.clear_empty_reader(id);
         self.touch(id.slot);
         Ok(())
     }
@@ -2334,12 +2409,13 @@ impl<P: PacketIo> Network<P> {
         if c.released {
             return;
         }
-        if let Ok(state) = self.endpoint.state(c.core) {
-            let raised = c.raised(&self.endpoint, state);
+        if let Ok(stream) = self.endpoint.stream_state(c.core) {
+            let raised = c.raised(stream);
+            let state = stream.state();
             c.connected_event |= raised.connected;
             c.closed_event |= raised.closed;
             c.state = state;
-            c.reason = self.endpoint.close_reason(c.core).ok().flatten();
+            c.reason = stream.close_reason();
             if let Some(readable) = raised.readable {
                 c.arrived = false;
                 c.readable_event = readable;
@@ -2357,17 +2433,41 @@ impl<P: PacketIo> Network<P> {
     #[inline(never)]
     fn collect_events_pass(&mut self) {
         while self.events.len() < self.event_capacity {
-            match self.endpoint.next_event() {
-                Some(ntcp::Event::Connection(core, events)) => {
+            match self.endpoint.next_event_with_state(|e, stream| {
+                let arrived = e.readable || e.half_closed;
+                let idle_reader = !arrived
+                    && stream.state() == State::Established
+                    && stream.readable_bytes() == 0;
+                (arrived, idle_reader, e.tx_timestamps)
+            }) {
+                Some(ntcp::Event::Connection(core, (arrived, idle_reader, timestamps))) => {
                     if let Some(slot) = self.connection_slot(core) {
-                        if (events.readable || events.half_closed)
-                            && let Some(c) = self.connections[slot].value.as_mut()
-                            && !(c.close_requested || c.abort_requested || c.released)
-                        {
+                        let Some(c) = self.connections[slot].value.as_mut() else {
+                            continue;
+                        };
+                        let closing = c.close_requested || c.abort_requested;
+                        if arrived && !closing && !c.released {
                             c.arrived = true;
                         }
-                        self.touch(slot);
-                        if events.tx_timestamps {
+                        // An ACK of sent bytes can raise core writable and
+                        // acknowledged signals while both streams have the
+                        // same established state. With no waiting writer or
+                        // readable bytes there is no native wake to deliver.
+                        if !idle_reader
+                            || c.state != State::Established
+                            || closing
+                            || c.released
+                            || c.write_waiting.is_some()
+                            || c.readable_event
+                            || c.connected_event
+                            || c.closed_event
+                        {
+                            self.ready.push(slot);
+                        }
+                        if closing && !c.released {
+                            self.maintain.push(slot);
+                        }
+                        if timestamps {
                             self.stamped.push(slot);
                         }
                     }
@@ -2460,8 +2560,21 @@ impl<P: PacketIo> Network<P> {
     /// of this connection or another, nor another's `close`. Another
     /// `try_read` of the connection decides again, and its `close` or
     /// `abort` drops it.
+    #[inline]
     pub fn drain_events(&mut self, out: &mut [Event]) -> DrainReport {
         self.collect_core_events();
+        if self.ready.is_empty() && self.events.is_empty() && !self.stopped_event {
+            self.check_live();
+            self.check_ready();
+            return DrainReport {
+                written: 0,
+                more: false,
+            };
+        }
+        self.drain_ready_events(out)
+    }
+
+    fn drain_ready_events(&mut self, out: &mut [Event]) -> DrainReport {
         let mut written = 0;
         while written < out.len() {
             let Some(event) = self.events.pop_front() else {
@@ -2558,10 +2671,10 @@ impl<P: PacketIo> Network<P> {
         if c.released {
             return false;
         }
-        let Ok(state) = self.endpoint.state(c.core) else {
+        let Ok(stream) = self.endpoint.stream_state(c.core) else {
             return false;
         };
-        let raised = c.raised(&self.endpoint, state);
+        let raised = c.raised(stream);
         raised.connected
             || raised.closed
             || raised.readable == Some(true)

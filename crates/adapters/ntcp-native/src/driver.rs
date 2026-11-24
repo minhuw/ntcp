@@ -34,6 +34,10 @@ pub(super) struct TxSlot {
     pub bytes: Vec<u8>,
     pub pending: Option<PendingFrame>,
 }
+enum FreshResult {
+    Done(bool),
+    Reserved(bool, ntcp::TransmitAttempt),
+}
 // A SYN a member takes in itself (`take_syn`): its flow, whether the member
 // holds that for its owner, and what a handoff of it carries.
 struct Syn {
@@ -62,6 +66,7 @@ impl<P: PacketIo> Network<P> {
     fn stop_with_error(&mut self, error: io::Error) -> Error {
         self.stopped = true;
         self.stopped_event = true;
+        self.empty_reader = None;
         for (index, slot) in self.connections.iter_mut().enumerate() {
             if let Some(c) = &mut slot.value {
                 // Observation cancellation does not certify non-submission.
@@ -146,6 +151,7 @@ impl<P: PacketIo> Network<P> {
         // After the wake is taken: memory another member returned since
         // wakes this member's waiting writers.
         self.endpoint.poll_shared_memory();
+        self.empty_reader = None;
         match self.advance_time(now) {
             Ok(()) => {}
             Err(error @ Error::Tcp(EndpointError::Connection(ntcp::Error::AmbiguousTimeJump))) => {
@@ -154,16 +160,9 @@ impl<P: PacketIo> Network<P> {
             Err(error) => return Err(error),
         }
         let mut report = DriveReport::default();
-        // Take reusable scratch out of the owner while processed datagrams
-        // borrow it. They never survive a call unless copied into the bounded
-        // retained-input pool with their exact Host envelope.
-        let mut rx = std::mem::take(&mut self.rx);
-        let mut completed = std::mem::take(&mut self.completed);
         let discarded = self.drop_total();
-        let result = self.drive_inner(now, budget, &mut rx, &mut completed, &mut report);
+        let result = self.drive_inner(now, budget, &mut report);
         report.discarded = (self.drop_total() - discarded) as usize;
-        self.rx = rx;
-        self.completed = completed;
         self.wake_members_for_memory();
         self.counters.received += report.received as u64;
         self.counters.transmitted += report.transmitted as u64;
@@ -241,6 +240,7 @@ impl<P: PacketIo> Network<P> {
             return Err(Error::InvalidHandle);
         }
         let core = c.core;
+        self.empty_reader = None;
         match self.advance_time(now) {
             Ok(()) => {}
             Err(error @ Error::Tcp(EndpointError::Connection(ntcp::Error::AmbiguousTimeJump))) => {
@@ -249,10 +249,9 @@ impl<P: PacketIo> Network<P> {
             Err(error) => return Err(error),
         }
         let mut report = DriveReport::default();
-        let changes = self.host.output_changes_pending();
         let result = match self.autocork(id, core) {
             Ok(Some(held)) => return Ok(held),
-            Ok(None) => self.push_inner(core, now, changes, &mut report),
+            Ok(None) => self.push_inner(core, now, self.host.output_changes_pending(), &mut report),
             Err(error) => Err(error),
         };
         self.wake_members_for_memory();
@@ -442,7 +441,7 @@ impl<P: PacketIo> Network<P> {
             frames += 1;
             let mut tx = std::mem::take(&mut self.tx);
             let slot = &mut tx[index];
-            let result = self.push_slot(slot, core, report);
+            let result = self.transmit_slot(slot, Some(core), frames < PUSH_FRAMES, report);
             let waiting = slot.pending.as_ref().map(|p| p.held);
             self.tx = tx;
             if let Some(held) = waiting {
@@ -453,7 +452,10 @@ impl<P: PacketIo> Network<P> {
                     self.tx_pending += 1;
                 }
             }
-            if result? || waiting.is_some() {
+            if result?
+                || waiting.is_some()
+                || frames < PUSH_FRAMES && self.endpoint.finish_idle_output(core)
+            {
                 break;
             }
         }
@@ -489,26 +491,118 @@ impl<P: PacketIo> Network<P> {
             debug_assert_eq!(member.epoch(), probe.epoch());
         }
     }
-    // One frame of `core`'s output polled into empty `slot` and tried, and
-    // the segments polled again, one at a time, of an aggregate the backend
-    // refused; true when the connection had nothing to select.
-    fn push_slot(
+    // Offer one connection's scalar output before capturing a reservation.
+    // A blocked submission retains its packet and egress context in the slot.
+    fn offer_fresh(
         &mut self,
         slot: &mut TxSlot,
         core: ntcp::ConnectionId,
+        finish_owner: bool,
         report: &mut DriveReport,
-    ) -> Result<bool> {
-        if self.fill(slot, Some(core), false, report)?.is_some() {
-            return Ok(true);
-        }
-        loop {
-            match self.send(slot, report)? {
-                Some(owner) => {
-                    if self.fill(slot, Some(owner), true, report)?.is_some() {
-                        return Ok(true);
+    ) -> Result<Option<FreshResult>> {
+        let offset = self.config.link.offset();
+        let ipv4 = self.config.local_address.is_ipv4();
+        let ip_header = if ipv4 { 20 } else { 40 };
+        let headroom = offset + ip_header;
+        let resolve = !self.control.is_empty();
+        let mut attempted = None;
+        let mut failure = None;
+        let track_completion = self.tx_completion != ntcp_io::TxCompletion::Synchronous;
+        let mut data_in_device = false;
+        let now = self.now;
+        let poll = self.endpoint.offer_fresh_transmit(
+            now,
+            core,
+            &mut slot.bytes,
+            headroom,
+            finish_owner,
+            |selected| {
+                if let Link::Ethernet {
+                    local_mac,
+                    next_hop,
+                } = self.config.link
+                {
+                    let head = selected.headroom();
+                    if let EthernetNextHop::Fixed(mac) = next_hop {
+                        head[..6].copy_from_slice(&mac);
+                    }
+                    head[6..12].copy_from_slice(&local_mac);
+                    head[12..14]
+                        .copy_from_slice(&(if ipv4 { 0x0800u16 } else { 0x86dd }).to_be_bytes());
+                }
+                data_in_device = track_completion && selected.carries_payload();
+                let io = &mut self.io;
+                let offload = self.config.tcp.connection.tcp_checksum_offload;
+                let submission = self.host.submit_fresh_tcp(
+                    selected,
+                    now,
+                    offset,
+                    if offset == 0 { 0 } else { 60 },
+                    resolve,
+                    |wire| match if offload {
+                        io.transmit_tcp_checksum_offload(wire)
+                    } else {
+                        io.transmit(wire)
+                    } {
+                        Ok(TxOutcome::Submitted) => BackendOutcome::Submitted,
+                        Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
+                            BackendOutcome::WouldBlock
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            BackendOutcome::Unknown
+                        }
+                    },
+                )?;
+                match submission {
+                    ntcp_host::FreshSubmission::Submitted(receipt) => Some(receipt),
+                    ntcp_host::FreshSubmission::Retained {
+                        context, receipt, ..
+                    } => {
+                        attempted = Some((context, receipt.ip_packet_len as usize));
+                        None
                     }
                 }
-                None => return Ok(false),
+            },
+        )?;
+        match poll {
+            ntcp::FreshPoll::Unavailable => Ok(None),
+            ntcp::FreshPoll::Empty { more_work } => {
+                report.more_work |= more_work;
+                Ok(Some(FreshResult::Done(true)))
+            }
+            ntcp::FreshPoll::Submitted {
+                more_work,
+                owner_drained,
+            } => {
+                report.more_work |= !resolve && more_work;
+                self.note_submitted(Some(core), data_in_device, report);
+                Ok(Some(FreshResult::Done(owner_drained)))
+            }
+            ntcp::FreshPoll::Reserved { more_work, attempt } => {
+                let Some((context, ip_len)) = attempted else {
+                    return Ok(Some(FreshResult::Reserved(more_work, attempt)));
+                };
+                report.more_work |= !resolve && more_work;
+                slot.pending = Some(PendingFrame {
+                    attempt,
+                    owner: Some(core),
+                    context: Some(context),
+                    ip_len,
+                    ticket: failure
+                        .is_none()
+                        .then(ntcp_host::SubmissionTicket::connection),
+                    held: false,
+                    group: None,
+                    scalar: false,
+                    data: data_in_device,
+                });
+                if let Some(error) = failure {
+                    return Err(Error::Backend(error));
+                }
+                report.tx_blocked = true;
+                self.counters.backend_backpressure += 1;
+                Ok(Some(FreshResult::Done(false)))
             }
         }
     }
@@ -558,8 +652,6 @@ impl<P: PacketIo> Network<P> {
         &mut self,
         now: Instant,
         budget: WorkBudget,
-        rx: &mut [u8],
-        completed: &mut [u8],
         report: &mut DriveReport,
     ) -> Result<()> {
         self.begin_member();
@@ -569,6 +661,93 @@ impl<P: PacketIo> Network<P> {
         if let Some(error) = changes.first_error {
             return Err(error.into());
         }
+        let has_receive_work = !self.retained.is_empty()
+            || self.inlet.as_ref().is_some_and(|i| i.pending())
+            || (budget.receive != 0 && !self.receive_free.is_empty());
+        if has_receive_work {
+            // Most devices hand over an owned frame. Move a scratch
+            // vector out of the network only when its bytes must be
+            // borrowed across protocol input, and keep it for the burst.
+            let mut rx = None;
+            let mut completed = None;
+            let received = self.drive_receive(now, budget, &mut rx, &mut completed, report);
+            if let Some(rx) = rx {
+                self.rx = rx;
+            }
+            if let Some(completed) = completed {
+                self.completed = completed;
+            }
+            received?;
+        }
+        // With no endpoint or ICMP output, only a pending resolution
+        // or a neighbor wake can give egress work. Poll the shared table
+        // once at this instant; an idle poll also advances this member's
+        // clock. A later change by another member wakes the next drive.
+        let quiet = !self.endpoint.has_pending_output()
+            && !self.icmp_due()
+            && if self.shared_neighbors {
+                self.member_probe.as_ref().and_then(|p| p.idle(now)) == Some(false)
+            } else {
+                self.control.is_empty()
+            };
+        if !quiet {
+            self.drive_egress(now, budget.transmit, report)?;
+        }
+        if budget.reclaim != 0 {
+            report.reclaimed = self
+                .io
+                .reclaim_transmit(budget.reclaim)
+                .map_err(Error::Backend)?;
+        }
+        self.collect_core_events();
+        self.maintain_connections()?;
+        self.host.collect(&self.endpoint)?;
+        self.check_live();
+        debug_assert_eq!(
+            self.tx_pending,
+            self.tx
+                .iter()
+                .filter(|s| s.pending.as_ref().is_some_and(|p| !p.held))
+                .count()
+        );
+        debug_assert_eq!(
+            self.tx_held,
+            self.tx
+                .iter()
+                .filter(|s| s.pending.as_ref().is_some_and(|p| p.held))
+                .count()
+        );
+        report.tx_blocked |= self.tx_pending != 0;
+        // A held frame's reservation waits for its wake, not for a poll.
+        if if self.tx_held == 0 {
+            self.endpoint.has_pending_output()
+        } else {
+            self.tx_pending != 0 || self.endpoint.has_queued_output()
+        } {
+            report.more_work = true;
+        }
+        // `next_deadline` is the deadline drives reported until it was
+        // asked for instead (`timer_deadline`, which this drive found)
+        // whenever the drive reports no more work: work it would report
+        // at once is more work. The deadline of a member of a shared
+        // neighbor table can move meanwhile (another member's wake).
+        if cfg!(debug_assertions) && !report.more_work {
+            debug_assert!(!self.work_pending());
+            if !self.shared_neighbors {
+                debug_assert_eq!(self.next_deadline(), self.timer_deadline());
+            }
+        }
+        Ok(())
+    }
+
+    fn drive_receive(
+        &mut self,
+        now: Instant,
+        budget: WorkBudget,
+        rx: &mut Option<Vec<u8>>,
+        completed: &mut Option<Vec<u8>>,
+        report: &mut DriveReport,
+    ) -> Result<()> {
         let mut receive_work = 0;
         let retained = self.retained.len().min(budget.receive);
         for _ in 0..retained {
@@ -639,8 +818,9 @@ impl<P: PacketIo> Network<P> {
         }
         while receive_work < budget.receive && !self.receive_free.is_empty() {
             let mut arrival = None;
-            let packet = match self.receive_packet(rx, &mut arrival) {
-                Ok(Some(packet)) => packet,
+            let received = self.receive_packet(rx, &mut arrival);
+            let packet = match received {
+                Ok(Some(ref packet)) => packet,
                 Ok(None) => break,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e)
@@ -671,6 +851,7 @@ impl<P: PacketIo> Network<P> {
                 // loop calls keeps the slice.
                 Some(frame) => unsafe { core::slice::from_raw_parts(frame.as_ptr(), frame.len()) },
                 None => {
+                    let rx = rx.get_or_insert_with(|| std::mem::take(&mut self.rx));
                     if packet.len > rx.len() {
                         return Err(Error::Backend(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -681,11 +862,36 @@ impl<P: PacketIo> Network<P> {
                 }
             };
             let frame = if self.io.layer() == PacketLayer::Ethernet {
+                let Link::Ethernet { local_mac, .. } = self.config.link else {
+                    unreachable!()
+                };
+                // A complete IPv4/TCP datagram with exact Ethernet bounds
+                // proves the link framing and the IP checks together. A
+                // packet that can be handed off or retained still goes
+                // through the owner and reservation checks below.
+                if self.inlet.is_none()
+                    && !self.endpoint.has_output_reservations()
+                    && let Some((header, ip)) = bytes.split_first_chunk::<14>()
+                    && header[12..] == ntcp_ethernet::ETHERTYPE_IPV4.to_be_bytes()
+                    && header[..6] == local_mac
+                    && let Some(tcp) = ntcp_ip::PlainTcp::parse(ip)
+                {
+                    let metadata = self.receive_metadata(packet);
+                    if let Err(error) = self.host.receive_plain_tcp(
+                        &mut self.endpoint,
+                        self.ingress,
+                        now,
+                        tcp,
+                        &mut arrival,
+                        metadata,
+                        self.config.tcp.dscp,
+                    ) {
+                        self.input_failed(&error.into(), ip);
+                    }
+                    continue;
+                }
                 match ntcp_ethernet::parse_ethernet_fragment(bytes) {
                     Ok(frame) => {
-                        let Link::Ethernet { local_mac, .. } = self.config.link else {
-                            unreachable!()
-                        };
                         if frame.destination != local_mac {
                             self.drop_received(DropReason::OtherHost, bytes);
                             continue;
@@ -750,13 +956,14 @@ impl<P: PacketIo> Network<P> {
                     syn = Some((local, remote, route.held));
                 }
             }
+            let completed = completed.get_or_insert_with(|| std::mem::take(&mut self.completed));
             let result = match syn {
                 Some((local, remote, held)) => {
                     let syn = Syn {
                         local,
                         remote,
                         held,
-                        packet,
+                        packet: *packet,
                         reassembled: None,
                     };
                     self.take_syn(syn, frame, |network| {
@@ -781,19 +988,22 @@ impl<P: PacketIo> Network<P> {
         if !self.retained.is_empty() || handoffs {
             report.more_work = true;
         }
+        Ok(())
+    }
+
+    fn drive_egress(&mut self, now: Instant, limit: usize, report: &mut DriveReport) -> Result<()> {
         // Control frames due now take at most half the transmit budget,
         // rounded up, before data, so data cannot starve them nor they data.
         let mut control = 0;
         if self.shared_neighbors {
             let woken;
-            (control, woken) =
-                self.shared_output(now, budget.transmit.div_ceil(2), true, report)?;
+            (control, woken) = self.shared_output(now, limit.div_ceil(2), true, report)?;
             if woken {
                 self.settle_member(now)?;
             }
         } else if !self.control.is_empty() {
             self.service_neighbors(now)?;
-            control = self.control_output(now, budget.transmit.div_ceil(2), report)?;
+            control = self.control_output(now, limit.div_ceil(2), report)?;
         }
         // The Host's ICMP messages, queued by this drive's input or by
         // reassembly expiry, take at most half of what is left, so that
@@ -802,12 +1012,8 @@ impl<P: PacketIo> Network<P> {
         // nothing in between queues one.
         let mut icmp_left = false;
         if self.icmp_due() {
-            control += self.drain_icmp_output(
-                now,
-                (budget.transmit - control).div_ceil(2),
-                false,
-                report,
-            )?;
+            control +=
+                self.drain_icmp_output(now, (limit - control).div_ceil(2), false, report)?;
             icmp_left = self.host.icmp_output_pending() != 0;
         }
         let mut data = 0;
@@ -815,7 +1021,7 @@ impl<P: PacketIo> Network<P> {
         // further polls at this instant cannot transmit anything. A held
         // frame is not retried before its wake.
         let mut exhausted = false;
-        for _ in control..budget.transmit {
+        for _ in control..limit {
             if exhausted && self.tx_pending == 0 || self.tx_held == self.tx.len() {
                 break;
             }
@@ -839,7 +1045,8 @@ impl<P: PacketIo> Network<P> {
             let was_pending = slot.pending.is_some();
             let was_held = slot.pending.as_ref().is_some_and(|p| p.held);
             let owner = slot.pending.as_ref().and_then(|p| p.owner);
-            let result = self.transmit_slot(slot, report);
+            let sent = report.transmitted;
+            let result = self.transmit_slot(slot, None, control + data < limit, report);
             let still_pending = slot.pending.is_some();
             let still_held = slot.pending.as_ref().is_some_and(|p| p.held);
             self.tx = tx;
@@ -867,62 +1074,23 @@ impl<P: PacketIo> Network<P> {
             }
             // A settled retry may release output, so poll again after it.
             let idle = result?;
+            // A synchronous submission may also have consumed the next
+            // poll of the same, now drained owner. Count that empty turn
+            // against the same data budget as an explicit poll.
+            if idle && sent != report.transmitted {
+                data += 1;
+            }
             exhausted = idle || exhausted && was_pending && still_pending;
         }
         // ICMP messages within what data left, then requests for next hops
         // data or ICMP output just began resolving, within what is left.
         if icmp_left {
-            control +=
-                self.drain_icmp_output(now, budget.transmit - control - data, true, report)?;
+            control += self.drain_icmp_output(now, limit - control - data, true, report)?;
         }
         if self.shared_neighbors {
-            self.shared_output(now, budget.transmit - control - data, false, report)?;
+            self.shared_output(now, limit - control - data, false, report)?;
         } else if !self.control.is_empty() {
-            self.control_output(now, budget.transmit - control - data, report)?;
-        }
-        if budget.reclaim != 0 {
-            report.reclaimed = self
-                .io
-                .reclaim_transmit(budget.reclaim)
-                .map_err(Error::Backend)?;
-        }
-        self.collect_core_events();
-        self.maintain_connections()?;
-        self.host.collect(&self.endpoint)?;
-        self.check_live();
-        debug_assert_eq!(
-            self.tx_pending,
-            self.tx
-                .iter()
-                .filter(|s| s.pending.as_ref().is_some_and(|p| !p.held))
-                .count()
-        );
-        debug_assert_eq!(
-            self.tx_held,
-            self.tx
-                .iter()
-                .filter(|s| s.pending.as_ref().is_some_and(|p| p.held))
-                .count()
-        );
-        report.tx_blocked |= self.tx_pending != 0;
-        // A held frame's reservation waits for its wake, not for a poll.
-        if if self.tx_held == 0 {
-            self.endpoint.has_pending_output()
-        } else {
-            self.tx_pending != 0 || self.endpoint.has_queued_output()
-        } {
-            report.more_work = true;
-        }
-        // `next_deadline` is the deadline drives reported until it was
-        // asked for instead (`timer_deadline`, which this drive found)
-        // whenever the drive reports no more work: work it would report
-        // at once is more work. The deadline of a member of a shared
-        // neighbor table can move meanwhile (another member's wake).
-        if cfg!(debug_assertions) && !report.more_work {
-            debug_assert!(!self.work_pending());
-            if !self.shared_neighbors {
-                debug_assert_eq!(self.next_deadline(), self.timer_deadline());
-            }
+            self.control_output(now, limit - control - data, report)?;
         }
         Ok(())
     }
@@ -1304,7 +1472,7 @@ impl<P: PacketIo> Network<P> {
         }
         Ok(())
     }
-    fn receive_metadata(&mut self, packet: ReceivedPacket) -> ntcp::RxPacketMetadata {
+    fn receive_metadata(&mut self, packet: &ReceivedPacket) -> ntcp::RxPacketMetadata {
         // Only the device's Good is trusted (Linux's CHECKSUM_UNNECESSARY);
         // Bad and Unknown are verified in software. The Host takes it back
         // from a datagram that is not the packet as it arrived.
@@ -1381,11 +1549,13 @@ impl<P: PacketIo> Network<P> {
     #[inline]
     fn receive_packet(
         &mut self,
-        rx: &mut [u8],
+        rx: &mut Option<Vec<u8>>,
         arrival: &mut Option<RxFrame>,
     ) -> io::Result<Option<ReceivedPacket>> {
         match self.frame_threshold {
-            None => self.io.receive_with_metadata(rx),
+            None => self
+                .io
+                .receive_with_metadata(rx.as_deref_mut().unwrap_or(&mut self.rx)),
             Some(threshold) => self.receive_held(rx, threshold, arrival),
         }
     }
@@ -1396,18 +1566,19 @@ impl<P: PacketIo> Network<P> {
     // page_pool falls back to the page allocator).
     fn receive_held(
         &mut self,
-        rx: &mut [u8],
+        rx: &mut Option<Vec<u8>>,
         threshold: usize,
         arrival: &mut Option<RxFrame>,
     ) -> io::Result<Option<ReceivedPacket>> {
         // Matched in place: `?` would first move the whole result (the
         // metadata is over 128 bytes, so a memcpy call), on every receive,
         // the empty ones included. The frame is put in `arrival` itself.
-        let metadata = match self.io.receive_frame(rx, arrival) {
-            Ok(Some(metadata)) => metadata,
-            Ok(None) => return Ok(None),
-            Err(error) => return Err(error),
-        };
+        let received = self
+            .io
+            .receive_frame(rx.as_deref_mut().unwrap_or(&mut self.rx), arrival);
+        if !matches!(received, Ok(Some(_))) {
+            return received;
+        }
         let Some(frame) = arrival else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1442,20 +1613,35 @@ impl<P: PacketIo> Network<P> {
             }
             self.frame_slack = threshold.saturating_sub(out);
         }
-        Ok(Some(metadata))
+        received
     }
     // `fragment`: a member of shared flows keyed the packet as a fragment.
     // `held`: the frame `frame` lies in, if the backend handed one over.
     fn input(
         &mut self,
         frame: &[u8],
-        packet: ReceivedPacket,
+        packet: &ReceivedPacket,
         fragment: bool,
         completed: &mut [u8],
         held: &mut Option<RxFrame>,
     ) -> Result<()> {
         let metadata = self.receive_metadata(packet);
         if !fragment {
+            if self
+                .host
+                .receive_tcp_frame(
+                    &mut self.endpoint,
+                    self.ingress,
+                    self.now,
+                    frame,
+                    held,
+                    metadata,
+                    self.config.tcp.dscp,
+                )?
+                .is_some()
+            {
+                return Ok(());
+            }
             if let Some(processed) = self.host.receive_processed(
                 self.ingress,
                 self.now,
@@ -1502,7 +1688,7 @@ impl<P: PacketIo> Network<P> {
                     local,
                     remote,
                     held: route.held,
-                    packet,
+                    packet: *packet,
                     reassembled: Some(datagram.envelope()),
                 };
                 return self.take_syn(syn, datagram.bytes(), |network| {
@@ -1686,12 +1872,12 @@ impl<P: PacketIo> Network<P> {
         let Some(envelope) = handoff.reassembled else {
             return match syn {
                 Some(syn) => self.take_syn(syn, bytes, |network| {
-                    network.input(bytes, packet, false, completed, held)
+                    network.input(bytes, &packet, false, completed, held)
                 }),
-                None => self.input(bytes, packet, handoff.fragment, completed, held),
+                None => self.input(bytes, &packet, handoff.fragment, completed, held),
             };
         };
-        let metadata = self.receive_metadata(packet);
+        let metadata = self.receive_metadata(&packet);
         let datagram = envelope.datagram(bytes).ok_or(Error::Unsupported(
             "a handed-over datagram of another length",
         ))?;
@@ -1709,11 +1895,12 @@ impl<P: PacketIo> Network<P> {
     // more may wait. A drain that stops short found the inbox empty, or
     // its next packet still being copied in, whose handoff wakes the
     // member then.
-    fn take_handoffs(&mut self, limit: usize, completed: &mut [u8]) -> (usize, bool) {
+    fn take_handoffs(&mut self, limit: usize, completed: &mut Option<Vec<u8>>) -> (usize, bool) {
         let Some(inlet) = self.inlet.take() else {
             return (0, false);
         };
         let limit = limit.min(self.receive_free.len());
+        let completed = completed.get_or_insert_with(|| std::mem::take(&mut self.completed));
         let taken = inlet.drain(limit, |packet, handoff| match packet {
             Handed::Bytes(packet) => {
                 if let Err(error) = self.take_handoff(packet, handoff, completed, &mut None) {
@@ -1937,19 +2124,45 @@ impl<P: PacketIo> Network<P> {
     // Ok(true): the endpoint was polled and has nothing left to offer at this
     // instant. A poll that skipped an idle ready-queue entry still reports
     // more work, and the next connection may have a packet.
-    fn transmit_slot(&mut self, slot: &mut TxSlot, report: &mut DriveReport) -> Result<bool> {
-        if slot.pending.is_none()
-            && let Some(idle) = self.fill(slot, None, false, report)?
-        {
-            return Ok(idle);
+    fn transmit_slot(
+        &mut self,
+        slot: &mut TxSlot,
+        owner: Option<ntcp::ConnectionId>,
+        finish_owner: bool,
+        report: &mut DriveReport,
+    ) -> Result<bool> {
+        if slot.pending.is_none() {
+            let fresh = if self.tx_held == 0
+                && self.segmentation.is_none()
+                && let Some(core) = owner.or_else(|| self.endpoint.next_fresh_connection())
+            {
+                let follow =
+                    finish_owner && (owner.is_some() || self.endpoint.follows_own_output(core));
+                self.offer_fresh(slot, core, follow, report)?
+            } else {
+                None
+            };
+            match fresh {
+                Some(FreshResult::Done(idle)) => {
+                    return Ok(idle && (owner.is_some() || !self.endpoint.has_pending_output()));
+                }
+                Some(FreshResult::Reserved(more, attempt)) => {
+                    self.fill_selected(slot, owner, false, report, more, Some(attempt))?;
+                }
+                None => {
+                    if let Some(idle) = self.fill(slot, owner, false, report)? {
+                        return Ok(owner.is_some() || idle);
+                    }
+                }
+            }
         }
         loop {
             match self.send(slot, report)? {
-                // The backend refused the aggregate, which the endpoint
-                // took back: its first segment goes out alone, in this turn.
-                Some(owner) => {
-                    if let Some(idle) = self.fill(slot, Some(owner), true, report)? {
-                        return Ok(idle);
+                // The backend refused the aggregate. Its first scalar
+                // segment gets the rest of this same turn.
+                Some(retry) => {
+                    if let Some(idle) = self.fill(slot, Some(retry), true, report)? {
+                        return Ok(owner.is_some() || idle);
                     }
                 }
                 None => return Ok(false),
@@ -1969,90 +2182,103 @@ impl<P: PacketIo> Network<P> {
         report: &mut DriveReport,
     ) -> Result<Option<bool>> {
         let offset = self.config.link.offset();
-        {
-            let header = if self.config.local_address.is_ipv4() {
-                20
-            } else {
-                40
-            };
-            let out = &mut slot.bytes[offset + header..];
-            let polled = self.endpoint.poll_transmit_attempt(self.now, out, 1, owner);
-            let (more_work, attempt) = match polled {
-                Ok(result) => result,
-                Err(EndpointError::OutputReserved) => {
-                    report.tx_blocked = true;
-                    return Ok(Some(true));
-                }
-                // A held packet that cannot be cut for its path's budget,
-                // which a Packet Too Big lowered: the poll failed its owner
-                // alone, whose Closed event the drive collects.
-                Err(EndpointError::ReservationMtuTooSmall) => {
-                    report.more_work = true;
-                    return Ok(Some(false));
-                }
-                Err(e) => return Err(e.into()),
-            };
-            // Held frames' reservations are not output to poll for. On a
-            // resolving link the poll's view, taken before its packet may
-            // be held, is left to the drive's final account.
-            let more_work = if self.tx_held == 0 {
-                more_work
-            } else {
-                self.tx_pending != 0 || self.endpoint.has_queued_output()
-            };
-            if attempt.is_none() || self.control.is_empty() {
-                report.more_work |= more_work;
+        let header = if self.config.local_address.is_ipv4() {
+            20
+        } else {
+            40
+        };
+        let out = &mut slot.bytes[offset + header..];
+        let polled = self.endpoint.poll_transmit_attempt(self.now, out, 1, owner);
+        let (more_work, attempt) = match polled {
+            Ok(result) => result,
+            Err(EndpointError::OutputReserved) => {
+                report.tx_blocked = true;
+                return Ok(Some(true));
             }
-            let Some(attempt) = attempt else {
-                return Ok(Some(owner.is_none() && !more_work));
-            };
-            let packet = self
-                .endpoint
-                .transmit_attempt_packet_ref(attempt)
-                .ok_or(Error::InvalidHandle)?;
-            // Read before the IP header is written around the segment.
-            let data = packet.len > usize::from(out[12] >> 4) * 4;
-            let ip_len = if packet.ip.source.is_ipv4() {
-                ntcp_ip::encode(&mut slot.bytes[offset..], *packet, 0)
-            } else {
-                ntcp_ip6::encode(&mut slot.bytes[offset..], *packet)
+            // A held packet that cannot be cut for its path's budget,
+            // which a Packet Too Big lowered: the poll failed its owner
+            // alone, whose Closed event the drive collects.
+            Err(EndpointError::ReservationMtuTooSmall) => {
+                report.more_work = true;
+                return Ok(Some(false));
             }
-            .map_err(|e| Error::Host(e.into()))?;
-            if let Link::Ethernet {
-                local_mac,
-                next_hop,
-            } = self.config.link
-            {
-                // An ARP-resolved destination is written once resolved.
-                if let EthernetNextHop::Fixed(next_hop_mac) = next_hop {
-                    slot.bytes[..6].copy_from_slice(&next_hop_mac);
-                }
-                slot.bytes[6..12].copy_from_slice(&local_mac);
-                slot.bytes[12..14].copy_from_slice(
-                    &(if packet.ip.source.is_ipv4() {
-                        0x0800u16
-                    } else {
-                        0x86ddu16
-                    })
-                    .to_be_bytes(),
-                );
-                let end = offset + ip_len;
-                if end < 60 {
-                    slot.bytes[end..60].fill(0);
-                }
-            }
-            slot.pending = Some(PendingFrame {
-                attempt,
-                owner: packet.connection,
-                context: None,
-                ticket: None,
-                ip_len,
-                held: false,
-                group: None,
-                scalar,
-                data,
-            });
+            Err(e) => return Err(e.into()),
+        };
+        self.fill_selected(slot, owner, scalar, report, more_work, attempt)
+    }
+
+    fn fill_selected(
+        &mut self,
+        slot: &mut TxSlot,
+        owner: Option<ntcp::ConnectionId>,
+        scalar: bool,
+        report: &mut DriveReport,
+        more_work: bool,
+        attempt: Option<ntcp::TransmitAttempt>,
+    ) -> Result<Option<bool>> {
+        let offset = self.config.link.offset();
+        // Held frames' reservations are not output to poll for. On a
+        // resolving link the poll's view, taken before its packet may
+        // be held, is left to the drive's final account.
+        let more_work = if self.tx_held == 0 {
+            more_work
+        } else {
+            self.tx_pending != 0 || self.endpoint.has_queued_output()
+        };
+        if attempt.is_none() || self.control.is_empty() {
+            report.more_work |= more_work;
         }
+        let Some(attempt) = attempt else {
+            return Ok(Some(owner.is_none() && !more_work));
+        };
+        let packet = self
+            .endpoint
+            .transmit_attempt_packet_ref(attempt)
+            .ok_or(Error::InvalidHandle)?;
+        // Read before the IP header is written around the segment.
+        let header = if packet.ip.source.is_ipv4() { 20 } else { 40 };
+        let data = packet.len > usize::from(slot.bytes[offset + header + 12] >> 4) * 4;
+        let ip_len = if packet.ip.source.is_ipv4() {
+            self.ipv4_header
+                .encode(&mut slot.bytes[offset..], packet, 0)
+        } else {
+            ntcp_ip6::encode(&mut slot.bytes[offset..], *packet)
+        }
+        .map_err(|e| Error::Host(e.into()))?;
+        if let Link::Ethernet {
+            local_mac,
+            next_hop,
+        } = self.config.link
+        {
+            // An ARP-resolved destination is written once resolved.
+            if let EthernetNextHop::Fixed(next_hop_mac) = next_hop {
+                slot.bytes[..6].copy_from_slice(&next_hop_mac);
+            }
+            slot.bytes[6..12].copy_from_slice(&local_mac);
+            slot.bytes[12..14].copy_from_slice(
+                &(if packet.ip.source.is_ipv4() {
+                    0x0800u16
+                } else {
+                    0x86ddu16
+                })
+                .to_be_bytes(),
+            );
+            let end = offset + ip_len;
+            if end < 60 {
+                slot.bytes[end..60].fill(0);
+            }
+        }
+        slot.pending = Some(PendingFrame {
+            attempt,
+            owner: packet.connection,
+            context: None,
+            ticket: None,
+            ip_len,
+            held: false,
+            group: None,
+            scalar,
+            data,
+        });
         Ok(None)
     }
     // One physical attempt of `slot`'s frame. Some(owner): the backend
@@ -2068,15 +2294,60 @@ impl<P: PacketIo> Network<P> {
         if pending.held {
             return Ok(None);
         }
-        let context = match pending.context {
-            Some(context) => context,
-            None => match self
-                .host
-                .egress_context(&mut self.endpoint, pending.attempt)
-            {
-                Ok(context) => {
+        if pending.context.is_none()
+            && pending.owner.is_some()
+            && (self.segmentation.is_none() || pending.scalar)
+        {
+            let ip_end = offset + pending.ip_len;
+            if let Some(grant) = self.host.prepare_connected_submission(
+                &mut self.endpoint,
+                pending.attempt,
+                self.now,
+                &slot.bytes[offset..ip_end],
+                !self.control.is_empty(),
+            )? {
+                if let Some(address) = grant.address() {
+                    slot.bytes[..6].copy_from_slice(&address);
+                }
+                let len = ip_end.max(if offset == 0 { 0 } else { 60 });
+                let wire = &slot.bytes[..len];
+                let result = if self.config.tcp.connection.tcp_checksum_offload {
+                    self.io.transmit_tcp_checksum_offload(wire)
+                } else {
+                    self.io.transmit(wire)
+                };
+                match result {
+                    Ok(TxOutcome::Submitted) => {
+                        grant.submitted();
+                        self.submitted_frame(slot, report);
+                    }
+                    Ok(TxOutcome::WouldBlock | TxOutcome::Rejected) => {
+                        pending.context = Some(grant.context());
+                        pending.ticket = Some(ntcp_host::SubmissionTicket::connection());
+                        report.tx_blocked = true;
+                        self.counters.backend_backpressure += 1;
+                    }
+                    Err(error) => {
+                        pending.context = Some(grant.context());
+                        return Err(Error::Backend(error));
+                    }
+                }
+                return Ok(None);
+            }
+        }
+        let (context, address) = match pending.context {
+            Some(context) => (context, None),
+            None => match if self.control.is_empty() {
+                self.host
+                    .egress_context(&mut self.endpoint, pending.attempt)
+                    .map(|context| (context, None))
+            } else {
+                self.host
+                    .ethernet_egress_context(&mut self.endpoint, pending.attempt, self.now)
+            } {
+                Ok((context, address)) => {
                     pending.context = Some(context);
-                    context
+                    (context, address)
                 }
                 // No path lease is free for a stateless reply's destination
                 // (a full path table, `Path(Capacity)` as the Host's own
@@ -2102,7 +2373,11 @@ impl<P: PacketIo> Network<P> {
         // keeps its ticket and the destination resolved for it.
         if pending.ticket.is_none() && !self.control.is_empty() {
             let owner = pending.owner.map_or(Owner::Stateless, Owner::Tcp);
-            match self.host.resolve_neighbor(context, owner, self.now) {
+            let hop = match address {
+                Some(mac) => Ok(ntcp_host::NeighborHop::Resolved(mac)),
+                None => self.host.resolve_neighbor(context, owner, self.now),
+            };
+            match hop {
                 Ok(NeighborHop::Resolved(mac)) => slot.bytes[..6].copy_from_slice(&mac),
                 // The frame stays in its owner's slot, the latest of that
                 // owner's output, and is sent once its wake retries it.
@@ -2133,6 +2408,7 @@ impl<P: PacketIo> Network<P> {
         }
         let ticket = match pending.ticket.take() {
             Some(ticket) => ticket,
+            None if pending.owner.is_some() => ntcp_host::SubmissionTicket::connection(),
             None => self.host.submission_ticket(&mut self.endpoint, context)?,
         };
         if pending.group.is_none()
@@ -2180,16 +2456,7 @@ impl<P: PacketIo> Network<P> {
             },
         );
         match result {
-            Ok(Submission::Submitted) => {
-                let (owner, data) = (pending.owner, pending.data);
-                slot.pending = None;
-                report.transmitted += 1;
-                self.tcp_segments += 1;
-                self.tx_submitted += 1;
-                if data && let Some(owner) = owner {
-                    self.mark_in_device(owner);
-                }
-            }
+            Ok(Submission::Submitted) => self.submitted_frame(slot, report),
             Ok(Submission::Blocked(ticket) | Submission::Rejected(ticket)) => {
                 pending.ticket = Some(ticket);
                 report.tx_blocked = true;
@@ -2224,6 +2491,27 @@ impl<P: PacketIo> Network<P> {
     // CE go out one at a time: no backend copies an IP ECN codepoint into
     // the segments it cuts (DPDK refuses it), so such an aggregate would
     // only be built to be refused. `ecn`: the attempt's codepoint.
+    fn submitted_frame(&mut self, slot: &mut TxSlot, report: &mut DriveReport) {
+        debug_assert!(slot.pending.is_some());
+        if let Some(pending) = slot.pending.take() {
+            self.note_submitted(pending.owner, pending.data, report);
+        }
+    }
+
+    fn note_submitted(
+        &mut self,
+        owner: Option<ntcp::ConnectionId>,
+        data: bool,
+        report: &mut DriveReport,
+    ) {
+        report.transmitted += 1;
+        self.tcp_segments += 1;
+        self.tx_submitted += 1;
+        if data && let Some(owner) = owner {
+            self.mark_in_device(owner);
+        }
+    }
+
     fn prepare_group(
         &mut self,
         capabilities: ntcp_io::TcpSegmentationCapabilities,
@@ -2538,6 +2826,7 @@ impl<P: PacketIo> Network<P> {
             {
                 self.endpoint.release(core)?;
                 c.released = true;
+                self.clear_empty_reader_slot(index);
             }
         }
         // The released connections the endpoint reclaimed since the last
@@ -2577,6 +2866,9 @@ impl<P: PacketIo> Network<P> {
                 {
                     let c = self.connections[index].value.take().unwrap();
                     debug_assert!(c.released);
+                    if self.empty_reader.is_some_and(|id| id.slot == index) {
+                        self.empty_reader = None;
+                    }
                     vacate(&mut self.live_connections, index);
                     give_back(&mut self.free_connections, &self.connections, index);
                     self.ports.give(c.local.port(), c.binding);
@@ -2594,6 +2886,7 @@ impl<P: PacketIo> Network<P> {
                 self.core_slots
                     .forget(core, &self.live_connections, &self.connections);
                 self.connections[index].value = None;
+                self.clear_empty_reader_slot(index);
                 vacate(&mut self.live_connections, index);
                 give_back(&mut self.free_connections, &self.connections, index);
                 self.ports.give(port, binding);
