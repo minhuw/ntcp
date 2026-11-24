@@ -72,6 +72,42 @@ impl ConnectionId {
         self.slot
     }
 }
+
+/// A read-only view of one live stream. An adapter inspecting several
+/// readiness conditions can validate the handle once for the whole poll.
+#[derive(Clone, Copy)]
+pub struct StreamState<'a>(&'a Connection);
+
+impl StreamState<'_> {
+    pub fn state(self) -> State {
+        self.0.state()
+    }
+
+    pub fn close_reason(self) -> Option<crate::CloseReason> {
+        self.0.close_reason()
+    }
+
+    /// Bytes available to a stream reader, including terminal draining.
+    pub fn readable_bytes(self) -> usize {
+        if self.state() == State::Closed {
+            self.0.terminal_readable_bytes()
+        } else {
+            self.0.open_readable_bytes()
+        }
+    }
+
+    pub fn writable(self, lowat: Option<u32>, request: TxTimestampRequest) -> bool {
+        self.0.writable(lowat, request)
+    }
+
+    pub fn queued_end(self) -> u64 {
+        self.0.queued_end()
+    }
+
+    pub fn send_progress(self) -> SendProgress {
+        self.0.send_progress()
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ListenerId {
     slot: usize,
@@ -365,8 +401,8 @@ impl From<Error> for EndpointError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    Connection(ConnectionId, ConnectionEvents),
+pub enum Event<C = ConnectionEvents> {
+    Connection(ConnectionId, C),
     Acceptable(ListenerId),
     RouteAdvice(Tuple),
     PassiveError {
@@ -832,7 +868,7 @@ pub struct Endpoint {
     drops: crate::DropRecorder,
     // `set_local_transmit_refusals`.
     local_refusals: bool,
-    passive_errors: VecDeque<Event>,
+    passive_errors: VecDeque<(ListenerId, Tuple, crate::NetworkError)>,
     control_epoch: Instant,
     control_count: usize,
     control_turn: bool,
@@ -1766,8 +1802,8 @@ impl Endpoint {
     // pressure held back grow again. A wake visits only the waiters it
     // wakes and one more, so a return with none waiting costs one check.
     fn uncharge(&mut self, bytes: usize) {
-        let memory = self.memory();
-        self.budget.reduce(bytes, self.now, memory);
+        self.budget
+            .reduce(bytes, self.now, self.config.buffer_memory().low);
         self.wake_memory_waiters();
     }
 
@@ -4235,12 +4271,11 @@ impl Endpoint {
                 });
             let authorization =
                 authority.map(|id| self.crossing_syn_authorization(id, tuple, segment));
-            let receive_room =
-                self.receive_growth_room(&self.slots[index].as_ref().unwrap().connection);
-            let receive_memory_low = self.budget.allocated() < self.memory().low;
+            let (receive_room, receive_memory_low, memory_pressure) =
+                self.receive_budget(&self.slots[index].as_ref().unwrap().connection);
             let slot = self.slots[index].as_mut().unwrap();
             slot.connection.hold_establishment = hold;
-            slot.connection.memory_pressure = self.budget.under_pressure();
+            slot.connection.memory_pressure = memory_pressure;
             slot.connection.receive_room = receive_room;
             slot.connection.receive_memory_low = receive_memory_low;
             slot.received_dscp = Some(traffic_class >> 2);
@@ -4803,15 +4838,35 @@ impl Endpoint {
     fn send_growth_room(&self, connection: &Connection, charge: usize) -> usize {
         self.growth_room(
             connection.send_tuned() && !connection.send_below_min(),
-            charge,
+            || charge,
         )
     }
 
     // The budget's room for a connection's receive memory: Linux's
     // __sk_mem_raise_allocated for SK_MEM_RECV, which grants a socket below
     // tcp_rmem[0] whatever pressure.
-    fn receive_growth_room(&self, connection: &Connection) -> usize {
-        self.growth_room(!connection.receive_below_min(), connection.buffer_charge())
+    fn receive_budget(&self, connection: &Connection) -> (usize, bool, bool) {
+        let memory = self.memory();
+        let allocated = self.budget.allocated();
+        let pressure = self.budget.under_pressure();
+        let mut room = memory.high.saturating_sub(allocated);
+        if !connection.receive_below_min() {
+            let sockets = self.budget.sockets();
+            // A connection's charged storage is part of this endpoint's
+            // charge even in a shared group. Walk the socket's allocations
+            // only if this upper bound could reach its fair share.
+            debug_assert!(connection.buffer_charge() <= self.budget.charged());
+            if self.budget.charged().saturating_mul(sockets) >= memory.high
+                && connection.buffer_charge().saturating_mul(sockets) >= memory.high
+            {
+                room = if pressure {
+                    0
+                } else {
+                    room.min(memory.pressure.saturating_sub(allocated))
+                };
+            }
+        }
+        (room, allocated < memory.low, pressure)
     }
 
     // Counts what a connection's receive memory rules did, and records the
@@ -4840,13 +4895,13 @@ impl Endpoint {
 
     // What the hard cap leaves, and when `pressured`, Linux's limits past
     // tcp_mem[1] for a connection charged `charge` that holds its fair share.
-    fn growth_room(&self, pressured: bool, charge: usize) -> usize {
+    fn growth_room(&self, pressured: bool, charge: impl FnOnce() -> usize) -> usize {
         let room = self.buffer_room();
         if !pressured {
             return room;
         }
         let memory = self.memory();
-        if charge.saturating_mul(self.budget.sockets()) < memory.high {
+        if charge().saturating_mul(self.budget.sockets()) < memory.high {
             room
         } else if self.budget.under_pressure() {
             0
@@ -5561,11 +5616,7 @@ impl Endpoint {
             && self.config.error_reports
             && let Some(listener) = listener
         {
-            self.passive_errors.push_back(Event::PassiveError {
-                listener,
-                tuple,
-                error,
-            });
+            self.passive_errors.push_back((listener, tuple, error));
         }
         self.refresh(index);
         Ok(accepted)
@@ -6106,8 +6157,33 @@ impl Endpoint {
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
     //# However, the conditions that are reported asynchronously to the application MUST include:
     pub fn next_event(&mut self) -> Option<Event> {
-        if let Some(event) = self.passive_errors.pop_front() {
-            return Some(event);
+        self.next_event_with(core::convert::identity)
+    }
+
+    /// Takes the next event, projecting its connection signals into the
+    /// consumer's representation. Filtering errors and clearing pending
+    /// signals follow the same rules as `next_event`.
+    #[inline]
+    pub fn next_event_with<C>(
+        &mut self,
+        connection: impl FnOnce(ConnectionEvents) -> C,
+    ) -> Option<Event<C>> {
+        self.next_event_with_state(|events, _| connection(events))
+    }
+
+    /// Inspect the stream that raised a notification while its slot is in
+    /// hand. An embedding can check reader and writer interest at this point.
+    #[inline]
+    pub fn next_event_with_state<C>(
+        &mut self,
+        connection: impl FnOnce(ConnectionEvents, StreamState<'_>) -> C,
+    ) -> Option<Event<C>> {
+        if let Some((listener, tuple, error)) = self.passive_errors.pop_front() {
+            return Some(Event::PassiveError {
+                listener,
+                tuple,
+                error,
+            });
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.3
         //# When the number of transmissions of the same segment reaches or
@@ -6125,11 +6201,7 @@ impl Endpoint {
         // other: what they tell of (data to read, room to write, a state
         // reached) is the application's to act on now, its wire work alone
         // waiting for the reservation's end.
-        loop {
-            let Some(index) = self.events.iter().next() else {
-                break;
-            };
-            self.events.remove(index);
+        while let Some(index) = self.events.pop() {
             if index >= self.config.max_connections {
                 let slot = index - self.config.max_connections;
                 let listener = self.listeners[slot].as_ref()?;
@@ -6149,18 +6221,18 @@ impl Endpoint {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.2.2
             //# SHOULD make the information available to the application (SHLD-25).
 
-            let mut events = slot.connection.take_events();
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.8
             //# However, an application program that does not want to receive such
             //# ERROR_REPORT calls SHOULD be able to effectively disable these calls
             //# (SHLD-20).
-            if !self.config.error_reports {
-                events.network_error = None;
-                events.retransmission_warning = false;
-                events.urgent = None;
-            }
-            if !events.is_empty() {
-                return Some(Event::Connection(id, events));
+            if let Some(events) = slot
+                .connection
+                .take_reported_events(self.config.error_reports)
+            {
+                return Some(Event::Connection(
+                    id,
+                    connection(events, StreamState(&slot.connection)),
+                ));
             }
         }
         None
@@ -7815,11 +7887,7 @@ impl Endpoint {
             && self.passive_errors.len() < self.config.max_connections
         {
             let tuple = self.retained_slot(id)?.connection.tuple();
-            self.passive_errors.push_back(Event::PassiveError {
-                listener,
-                tuple,
-                error,
-            });
+            self.passive_errors.push_back((listener, tuple, error));
         }
         self.refresh(id.slot);
         Ok(true)

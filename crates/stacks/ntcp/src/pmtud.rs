@@ -1,3 +1,6 @@
+use alloc::{boxed::Box, vec::Vec};
+use core::ops::{Deref, DerefMut};
+
 use crate::{
     Error, Instant, Ipv4Plateaus, PmtudConfig, PmtudPolicy,
     pmtud_config::{default_search_low, min_mtu},
@@ -166,8 +169,27 @@ pub(crate) struct ProbeOutcome {
     pub isolated: bool,
 }
 
+// Discovery includes a history of transmitted packets. Only sockets that
+// enable discovery need the state. Allocate it fallibly during construction.
 #[derive(Debug)]
-pub(crate) struct Pmtud {
+pub(crate) struct Pmtud(Box<[DiscoveryState; 1]>);
+
+impl Deref for Pmtud {
+    type Target = DiscoveryState;
+
+    fn deref(&self) -> &DiscoveryState {
+        &self.0[0]
+    }
+}
+
+impl DerefMut for Pmtud {
+    fn deref_mut(&mut self) -> &mut DiscoveryState {
+        &mut self.0[0]
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscoveryState {
     pub info: PathMtuInfo,
     pub bound: u32,
     ipv4: bool,
@@ -271,7 +293,9 @@ impl Pmtud {
 
     pub fn new(config: PmtudConfig, bound: u32, ipv4: bool, hold: u64) -> Result<Self, Error> {
         let (mtu, low, high) = config.initial_values(bound, ipv4)?;
-        Ok(Self {
+        let mut state = Vec::new();
+        state.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
+        state.push(DiscoveryState {
             info: PathMtuInfo {
                 first_hop_mtu: config.first_hop_mtu,
                 route_mtu: config.route_mtu,
@@ -312,9 +336,12 @@ impl Pmtud {
             admin_search: None,
             policy: 0,
             disabled: false,
-        })
+        });
+        Ok(Self(state.into_boxed_slice().try_into().unwrap()))
     }
+}
 
+impl DiscoveryState {
     pub fn constrain(&mut self, bound: u32) {
         self.constrain_inner(bound, false);
     }
@@ -2896,6 +2923,20 @@ mod tests {
         p.set_shared_estimate(Some(1500));
         let head = deliver(&mut p, head, 768, 600_000_500);
         assert_eq!(full_stop(&mut p, head, 1..=3, 600_000_600)[2], (1024, 1024));
+    }
+
+    #[test]
+    fn option_pmtud_is_pointer_sized_and_new_handles_allocation_failure() {
+        assert_eq!(
+            core::mem::size_of::<Option<Pmtud>>(),
+            core::mem::size_of::<usize>()
+        );
+        assert!(core::mem::size_of::<DiscoveryState>() > 1024);
+
+        let result = crate::allocation_tests::fail_after(0, || {
+            Pmtud::new(PmtudConfig::new(1500), 1500, true, 600_000_000)
+        });
+        assert_eq!(result.unwrap_err(), Error::NoMemory);
     }
 }
 

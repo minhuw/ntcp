@@ -99,16 +99,91 @@ impl ConfirmedProbe {
 /// Connection-local publication state: one pending provenance and one
 /// unpublished result of each kind. Newer results replace older ones; this is
 /// never a queue.
+///
+/// The physical receipts and path snapshots of discovery belong only to sockets
+/// with a discovery engine. Reserve their space when the engine is created so
+/// applying feedback or committing physical submission never allocates.
+#[derive(Debug, Default)]
+pub(crate) struct ManagedResults(Option<Box<[Publications; 1]>>);
+
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ManagedResults {
+pub(crate) struct Publications {
     pub(crate) pending: Option<(u64, PendingPmtuApplied)>,
     pub(crate) applied: Option<PendingPmtuApplied>,
     pub(crate) receipt: Option<((Seq, Seq, u32), crate::DiscoveryIntent, PhysicalReceipt)>,
     pub(crate) confirmed: Option<ConfirmedProbe>,
 }
+
 impl ManagedResults {
+    pub(crate) fn new(enabled: bool) -> Result<Self, Error> {
+        if !enabled {
+            return Ok(Self(None));
+        }
+        let mut results = Vec::new();
+        results.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
+        results.push(Publications::default());
+        Ok(Self(Some(results.into_boxed_slice().try_into().unwrap())))
+    }
+
+    pub(crate) fn active_mut(&mut self) -> Option<&mut Publications> {
+        self.0.as_mut().map(|state| &mut state[0])
+    }
+
     pub(crate) fn unpublished(&self) -> bool {
-        self.applied.is_some() || self.confirmed.is_some()
+        self.0
+            .as_ref()
+            .is_some_and(|state| state[0].applied.is_some() || state[0].confirmed.is_some())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if let Some(results) = self.active_mut() {
+            *results = Publications::default();
+        }
+    }
+
+    pub(crate) fn clear_probe(&mut self) {
+        if let Some(results) = self.active_mut() {
+            results.receipt = None;
+            results.confirmed = None;
+        }
+    }
+
+    pub(crate) fn set_pending(&mut self, pending: Option<(u64, PendingPmtuApplied)>) {
+        if let Some(results) = self.active_mut() {
+            results.pending = pending;
+        }
+    }
+
+    pub(crate) fn set_receipt(
+        &mut self,
+        receipt: ((Seq, Seq, u32), crate::DiscoveryIntent, PhysicalReceipt),
+    ) {
+        if let Some(results) = self.active_mut() {
+            results.receipt = Some(receipt);
+        }
+    }
+
+    pub(crate) fn take_applied(&mut self) -> Option<PendingPmtuApplied> {
+        self.active_mut().and_then(|results| results.applied.take())
+    }
+
+    pub(crate) fn take_confirmed(&mut self) -> Option<ConfirmedProbe> {
+        self.active_mut()
+            .and_then(|results| results.confirmed.take())
+    }
+}
+
+impl core::ops::Deref for ManagedResults {
+    type Target = Publications;
+
+    fn deref(&self) -> &Publications {
+        const EMPTY: Publications = Publications {
+            pending: None,
+            applied: None,
+            receipt: None,
+            confirmed: None,
+        };
+        self.0.as_ref().map_or(&EMPTY, |state| &state[0])
     }
 }
 
@@ -188,8 +263,7 @@ impl Endpoint {
             .unwrap()
             .connection
             .managed_results
-            .applied
-            .take())
+            .take_applied())
     }
 
     /// Whether a live owner generation holds a result to take
@@ -271,8 +345,7 @@ impl Endpoint {
             .unwrap()
             .connection
             .managed_results
-            .confirmed
-            .take())
+            .take_confirmed())
     }
 
     /// `accept_transmit` for a backend outcome of definitely Submitted. The
@@ -1091,5 +1164,175 @@ impl Endpoint {
         }
         r.departure.as_ref()?;
         r.discovery.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod managed_results_tests {
+    use super::*;
+
+    fn sample_prepared_path() -> PreparedPath {
+        use ntcp_path::{
+            ContextId, Dscp, InterfaceKey, IpPrefix, Limits, NextHop, PathRequest, PathService,
+            Route, ScopedAddress,
+        };
+        let mut service = PathService::new(
+            ContextId::new(101),
+            Limits {
+                links: 1,
+                sources: 1,
+                source_owners: 1,
+                routes: 1,
+                paths: 1,
+                clients: 1,
+            },
+            [1; 16],
+        )
+        .unwrap();
+        let link = service.register_link(InterfaceKey(1), 1500).unwrap();
+        let source = service
+            .register_source(
+                ScopedAddress::new(IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 1)), None)
+                    .unwrap(),
+                link,
+            )
+            .unwrap();
+        service
+            .add_route(Route {
+                destination: IpPrefix::new(IpAddr::V4(core::net::Ipv4Addr::UNSPECIFIED), 0)
+                    .unwrap(),
+                source: None,
+                dscp: None,
+                link,
+                next_hop: NextHop::OnLink,
+                metric: 0,
+            })
+            .unwrap();
+        let (client, snapshot) = service
+            .acquire(PathRequest {
+                source,
+                destination: ScopedAddress::new(
+                    IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 2)),
+                    None,
+                )
+                .unwrap(),
+                dscp: Dscp::new(0).unwrap(),
+            })
+            .unwrap();
+        PreparedPath { client, snapshot }
+    }
+
+    #[test]
+    fn inactive_managed_results_reads_and_writes_do_not_panic() {
+        assert_eq!(
+            core::mem::size_of::<ManagedResults>(),
+            core::mem::size_of::<usize>()
+        );
+        let mut results = ManagedResults::new(false).unwrap();
+        assert!(results.active_mut().is_none());
+        assert!(!results.unpublished());
+        assert!(results.pending.is_none());
+        assert!(results.applied.is_none());
+        assert!(results.receipt.is_none());
+        assert!(results.confirmed.is_none());
+
+        let binding = sample_prepared_path();
+        let report = CorrelatedPmtu {
+            segment: CorrelatedSegment {
+                start: 1,
+                end: 1401,
+                ip_packet_len: 1440,
+                ip_header_len: 20,
+            },
+            quoted_packet_len: 1440,
+            candidate_mtu: 1200,
+            current_path: true,
+            path_estimate: Some(1500),
+        };
+        let pending = PendingPmtuApplied {
+            binding,
+            report,
+            host_estimate: 1500,
+            applied_mtu: 1200,
+        };
+        let intent = crate::DiscoveryIntent {
+            binding,
+            ip_packet_len: 1440,
+            selected_at: 10,
+        };
+        let receipt = PhysicalReceipt {
+            ip_packet_len: 1440,
+            dont_fragment: true,
+        };
+
+        // None of these writes may panic when storage is inactive.
+        results.set_pending(Some((1, pending)));
+        results.set_receipt(((Seq(1), Seq(1401), 1440), intent, receipt));
+        results.clear_probe();
+        results.clear();
+        assert_eq!(results.take_applied(), None);
+        assert_eq!(results.take_confirmed(), None);
+        assert!(!results.unpublished());
+        assert!(results.pending.is_none());
+        assert!(results.receipt.is_none());
+    }
+
+    #[test]
+    fn active_managed_results_stores_clears_and_handles_oom() {
+        let oom = crate::allocation_tests::fail_after(0, || ManagedResults::new(true));
+        assert_eq!(oom.unwrap_err(), Error::NoMemory);
+
+        let binding = sample_prepared_path();
+        let report = CorrelatedPmtu {
+            segment: CorrelatedSegment {
+                start: 1,
+                end: 1401,
+                ip_packet_len: 1440,
+                ip_header_len: 20,
+            },
+            quoted_packet_len: 1440,
+            candidate_mtu: 1200,
+            current_path: true,
+            path_estimate: Some(1500),
+        };
+        let applied = PendingPmtuApplied {
+            binding,
+            report,
+            host_estimate: 1500,
+            applied_mtu: 1200,
+        };
+        let intent = crate::DiscoveryIntent {
+            binding,
+            ip_packet_len: 1440,
+            selected_at: 10,
+        };
+        let receipt = PhysicalReceipt {
+            ip_packet_len: 1440,
+            dont_fragment: true,
+        };
+        let confirmed = ConfirmedProbe { intent, receipt };
+
+        let mut results = ManagedResults::new(true).unwrap();
+        results.set_pending(Some((7, applied)));
+        results.set_receipt(((Seq(1), Seq(1401), 1440), intent, receipt));
+        results.active_mut().unwrap().applied = Some(applied);
+        results.active_mut().unwrap().confirmed = Some(confirmed);
+        assert!(results.unpublished());
+        assert_eq!(results.pending.map(|(id, _)| id), Some(7));
+
+        // `clear_probe` leaves pending/applied intact.
+        results.clear_probe();
+        assert!(results.receipt.is_none());
+        assert!(results.confirmed.is_none());
+        assert!(results.unpublished());
+        assert_eq!(results.take_applied(), Some(applied));
+        assert!(!results.unpublished());
+
+        // `clear` resets all fields while keeping the boxed storage alive.
+        results.active_mut().unwrap().confirmed = Some(confirmed);
+        results.clear();
+        assert!(results.active_mut().is_some());
+        assert!(results.pending.is_none());
+        assert_eq!(results.take_confirmed(), None);
     }
 }

@@ -343,8 +343,10 @@ struct Share {
     // Charged and not yet published: as per_cpu_fw_alloc, within
     // (-batch, batch).
     reserve: isize,
-    // What this member added to summed thresholds.
-    contributed: Option<BufferMemory>,
+    // Fixed group limits, or this member's contribution to summed limits.
+    limits: BufferMemory,
+    // Only summed limits on a group with other owners can change under us.
+    changing_limits: bool,
     // The group's `returns` this member last looked at, and whether it
     // returned memory itself since `take_returned`.
     seen: u64,
@@ -360,6 +362,8 @@ pub(crate) struct Budget {
     charged: usize,
     // Live connections.
     sockets: usize,
+    // Other owners can publish charges and open or close sockets.
+    shared_counts: bool,
     // When the current pressure began (Linux keeps it in
     // tcp_memory_pressure), entries into pressure, and the caller ticks of
     // the pressures that ended: the endpoint's own, unless it shares.
@@ -374,6 +378,7 @@ impl Budget {
         Self {
             charged: 0,
             sockets: 0,
+            shared_counts: false,
             pressure_since: None,
             pressures: 0,
             pressure_ticks: 0,
@@ -395,23 +400,27 @@ impl Budget {
             || group
                 .owners
                 .get(owner)
-                .is_none_or(|o| o.taken.swap(true, Ordering::Relaxed))
+                .is_none_or(|o| o.taken.swap(true, Ordering::Acquire))
         {
             return Err(crate::Error::InvalidArgument);
         }
-        let contributed = group.summed.then(|| {
+        let limits = if group.summed {
             group.low.fetch_add(own.low, Ordering::Relaxed);
             group.pressure.fetch_add(own.pressure, Ordering::Relaxed);
             group.high.fetch_add(own.high, Ordering::Relaxed);
             own
-        });
+        } else {
+            group.memory()
+        };
         group.allocated.fetch_add(self.charged, Ordering::Relaxed);
         group.sockets.fetch_add(self.sockets, Ordering::Relaxed);
+        self.shared_counts = group.owners.len() > 1;
         self.share = Some(Share {
             group: group.clone(),
             owner,
             reserve: 0,
-            contributed,
+            limits,
+            changing_limits: group.summed && self.shared_counts,
             seen: group.returns.load(Ordering::SeqCst),
             returned: false,
             waiting: false,
@@ -429,36 +438,47 @@ impl Budget {
 
     // The thresholds in force: the group's, or `own`.
     pub(crate) fn memory(&self, own: BufferMemory) -> BufferMemory {
-        self.share
-            .as_ref()
-            .map_or(own, |share| share.group.memory())
+        match &self.share {
+            Some(share) if share.changing_limits => share.group.memory(),
+            Some(share) => share.limits,
+            None => own,
+        }
     }
 
     // The hard cap in force: the group's, or `own`.
     pub(crate) fn high(&self, own: usize) -> usize {
-        self.share
-            .as_ref()
-            .map_or(own, |share| share.group.high.load(Ordering::Relaxed))
+        match &self.share {
+            Some(share) if share.changing_limits => share.group.high.load(Ordering::Relaxed),
+            Some(share) => share.limits.high,
+            None => own,
+        }
     }
 
     // The bytes charged against the thresholds: the group's as this member
     // sees it (published plus its own reserve), or its own.
     pub(crate) fn allocated(&self) -> usize {
-        match &self.share {
-            Some(share) => share
-                .group
-                .allocated
-                .load(Ordering::Relaxed)
-                .saturating_add_signed(share.reserve),
-            None => self.charged,
+        if !self.shared_counts {
+            return self.charged;
         }
+        let share = self.share.as_ref().unwrap();
+        share
+            .group
+            .allocated
+            .load(Ordering::Relaxed)
+            .saturating_add_signed(share.reserve)
     }
 
     // Live connections counted for the fair share: the group's, or its own.
     pub(crate) fn sockets(&self) -> usize {
-        match &self.share {
-            Some(share) => share.group.sockets.load(Ordering::Relaxed),
-            None => self.sockets,
+        if self.shared_counts {
+            self.share
+                .as_ref()
+                .unwrap()
+                .group
+                .sockets
+                .load(Ordering::Relaxed)
+        } else {
+            self.sockets
         }
     }
 
@@ -508,7 +528,12 @@ impl Budget {
 
     // Return `bytes` at `now`: as __sk_mem_reduce_allocated, pressure ends
     // once the charge falls to `memory.low`.
-    pub(crate) fn reduce(&mut self, bytes: usize, now: Instant, memory: BufferMemory) {
+    pub(crate) fn reduce(&mut self, bytes: usize, now: Instant, own_low: usize) {
+        let low = match &self.share {
+            Some(share) if share.changing_limits => share.group.low.load(Ordering::Relaxed),
+            Some(share) => share.limits.low,
+            None => own_low,
+        };
         self.charged -= bytes;
         if let Some(share) = &mut self.share {
             // sk_memory_allocated_sub: a reserve this far below zero goes
@@ -524,7 +549,7 @@ impl Budget {
                 share.returned = true;
             }
         }
-        if self.allocated() <= memory.low {
+        if self.allocated() <= low {
             self.leave(now);
         }
     }
@@ -637,18 +662,299 @@ impl Budget {
         let published = self.charged.checked_add_signed(-share.reserve).unwrap();
         group.allocated.fetch_sub(published, Ordering::Relaxed);
         group.sockets.fetch_sub(self.sockets, Ordering::Relaxed);
-        if let Some(own) = share.contributed {
+        self.shared_counts = false;
+        if group.summed {
+            let own = share.limits;
             group.low.fetch_sub(own.low, Ordering::Relaxed);
             group.pressure.fetch_sub(own.pressure, Ordering::Relaxed);
             group.high.fetch_sub(own.high, Ordering::Relaxed);
         }
         let owner = &group.owners[share.owner];
         owner.waiting.store(false, Ordering::SeqCst);
-        owner.taken.store(false, Ordering::Relaxed);
+        owner.taken.store(false, Ordering::Release);
         if group.allocated.load(Ordering::Relaxed) <= group.low.load(Ordering::Relaxed) {
             group.leave(now);
         }
         group.returned();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    #[test]
+    fn share_and_budget_sizes_stay_compact() {
+        assert_eq!(
+            core::mem::size_of::<Share>(),
+            core::mem::size_of::<Option<Share>>()
+        );
+        assert!(core::mem::size_of::<Share>() <= 8 * core::mem::size_of::<usize>());
+        assert!(core::mem::size_of::<Budget>() <= 16 * core::mem::size_of::<usize>());
+    }
+
+    #[test]
+    fn sole_owner_fast_path_and_reduce_thresholds() {
+        for fixed in [
+            Some(BufferMemory {
+                low: 200,
+                pressure: 400,
+                high: 600,
+            }),
+            None,
+        ] {
+            let own = BufferMemory {
+                low: 300,
+                pressure: 500,
+                high: 900,
+            };
+            let expected = fixed.unwrap_or(own);
+            let shared = SharedBufferMemory::new(1, fixed, 64).unwrap();
+            let mut budget = Budget::new();
+
+            budget.open_socket();
+            budget.raise(150, 1, own);
+            assert_eq!(budget.allocated(), 150);
+            assert_eq!(budget.sockets(), 1);
+
+            budget.share(&shared, 0, own, 2).unwrap();
+            assert!(!budget.shared_counts);
+            assert!(!budget.share.as_ref().unwrap().changing_limits);
+            assert_eq!(budget.memory(own), expected);
+            assert_eq!(budget.high(own.high), expected.high);
+            assert_eq!(budget.allocated(), budget.charged());
+            assert_eq!(budget.sockets(), 1);
+
+            // Cross pressure, then reduce step-by-step past `expected.low`.
+            budget.open_socket();
+            budget.raise(400, 10, expected);
+            assert_eq!(budget.allocated(), budget.charged());
+            assert_eq!(budget.allocated(), 550);
+            assert_eq!(budget.sockets(), 2);
+            assert!(budget.under_pressure());
+
+            // Pass a bogus own_low to prove shared fixed/sole limits are used.
+            let above_low = 550 - (expected.low + 1);
+            budget.reduce(above_low, 20, usize::MAX);
+            assert_eq!(budget.allocated(), budget.charged());
+            assert!(budget.under_pressure());
+
+            budget.reduce(1, 30, 0);
+            assert_eq!(budget.allocated(), budget.charged());
+            assert_eq!(budget.allocated(), expected.low);
+            assert!(!budget.under_pressure());
+
+            budget.close_socket();
+            assert_eq!(budget.sockets(), 1);
+            assert!(budget.leave_group(40));
+            assert!(!budget.shared_counts);
+            assert_eq!(shared.buffer_bytes(), 0);
+            assert_eq!(shared.connections(), 0);
+
+            // Unshared budget falls back to `own_low`.
+            budget.raise(400, 50, own);
+            assert!(budget.under_pressure());
+            budget.reduce(budget.charged() - own.low, 60, own.low);
+            assert!(!budget.under_pressure());
+        }
+    }
+
+    #[test]
+    fn two_thread_owner_handoff_and_shared_group_quiescence() {
+        for summed in [false, true] {
+            let fixed = (!summed).then_some(BufferMemory {
+                low: 400,
+                pressure: 800,
+                high: 1600,
+            });
+            let shared = SharedBufferMemory::new(2, fixed, 128).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let published_state = Arc::new(Mutex::new([(0usize, 0isize, 0usize); 2]));
+
+            // Phase 1: two concurrent members operate on owners 0 and 1,
+            // synchronize at quiescence points, and verify accounting invariants.
+            thread::scope(|scope| {
+                for tid in 0..2usize {
+                    let shared = shared.clone();
+                    let barrier = barrier.clone();
+                    let published_state = published_state.clone();
+                    scope.spawn(move || {
+                        let own = BufferMemory {
+                            low: 200 + tid * 100,
+                            pressure: 400 + tid * 100,
+                            high: 800 + tid * 200,
+                        };
+                        let mut budget = Budget::new();
+                        budget.open_socket();
+                        budget.raise(50 + tid * 20, 1, own);
+                        budget.share(&shared, tid, own, 2).unwrap();
+                        assert!(budget.shared_counts);
+                        assert_eq!(budget.share.as_ref().unwrap().changing_limits, summed);
+
+                        let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ (tid as u64 + 1);
+                        let mut next = || {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            seed
+                        };
+
+                        for round in 0..16u64 {
+                            for step in 0..64u64 {
+                                let now = round * 100 + step + 10;
+                                match next() % 4 {
+                                    0 => {
+                                        let bytes = (next() % 200) as usize + 1;
+                                        let mem = budget.memory(own);
+                                        budget.raise(bytes, now, mem);
+                                    }
+                                    1 => {
+                                        if budget.charged() > 0 {
+                                            let bytes =
+                                                ((next() % 200) as usize + 1).min(budget.charged());
+                                            budget.reduce(bytes, now, own.low);
+                                        }
+                                    }
+                                    2 => {
+                                        budget.open_socket();
+                                    }
+                                    _ => {
+                                        if budget.sockets > 0 {
+                                            budget.close_socket();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Quiescence check across both threads.
+                            barrier.wait();
+                            {
+                                let reserve = budget.share.as_ref().unwrap().reserve;
+                                published_state.lock().unwrap()[tid] =
+                                    (budget.charged(), reserve, budget.sockets);
+                            }
+                            barrier.wait();
+                            if tid == 0 {
+                                let state = *published_state.lock().unwrap();
+                                let sum_published: usize = state
+                                    .iter()
+                                    .map(|&(charged, reserve, _)| {
+                                        charged.checked_add_signed(-reserve).unwrap()
+                                    })
+                                    .sum();
+                                let sum_sockets: usize =
+                                    state.iter().map(|&(_, _, socks)| socks).sum();
+                                assert_eq!(sum_published, shared.buffer_bytes());
+                                assert_eq!(sum_sockets, shared.connections());
+                                if summed {
+                                    assert_eq!(
+                                        shared.buffer_memory(),
+                                        BufferMemory {
+                                            low: 500,
+                                            pressure: 900,
+                                            high: 1800,
+                                        }
+                                    );
+                                } else {
+                                    assert_eq!(shared.buffer_memory(), fixed.unwrap());
+                                }
+                            }
+                            barrier.wait();
+                        }
+
+                        assert!(budget.leave_group(10_000));
+                        assert!(!budget.shared_counts);
+                    });
+                }
+            });
+
+            assert_eq!(shared.buffer_bytes(), 0);
+            assert_eq!(shared.connections(), 0);
+            if summed {
+                assert_eq!(
+                    shared.buffer_memory(),
+                    BufferMemory {
+                        low: 0,
+                        pressure: 0,
+                        high: 0,
+                    }
+                );
+            }
+        }
+
+        // Phase 2: two threads directly contend on and hand off owner slot 0
+        // through `taken` (Acquire/Release) with no external synchronization,
+        // exercising the sole-owner fast path.
+        for summed in [false, true] {
+            let fixed = (!summed).then_some(BufferMemory {
+                low: 256,
+                pressure: 512,
+                high: 1024,
+            });
+            let shared = SharedBufferMemory::new(1, fixed, 64).unwrap();
+            const ROUNDS: usize = 200;
+
+            thread::scope(|scope| {
+                for tid in 0..2usize {
+                    let shared = shared.clone();
+                    scope.spawn(move || {
+                        let own = BufferMemory {
+                            low: 128 + tid * 64,
+                            pressure: 384 + tid * 64,
+                            high: 768 + tid * 128,
+                        };
+                        for round in 0..ROUNDS {
+                            let now = (round * 4 + tid) as u64;
+                            let mut budget = Budget::new();
+                            budget.open_socket();
+                            let initial = 30 + tid * 17;
+                            budget.raise(initial, now, own);
+                            // Acquire exclusive ownership of slot 0 solely via `taken`.
+                            while budget.share(&shared, 0, own, now).is_err() {
+                                thread::yield_now();
+                            }
+                            assert!(!budget.shared_counts);
+                            assert_eq!(budget.allocated(), budget.charged());
+                            assert_eq!(shared.buffer_bytes(), initial);
+                            assert_eq!(budget.sockets(), 1);
+                            assert_eq!(shared.connections(), 1);
+                            if summed {
+                                assert_eq!(shared.buffer_memory(), own);
+                                assert_eq!(budget.memory(own), own);
+                            } else {
+                                assert_eq!(budget.memory(own), fixed.unwrap());
+                            }
+
+                            let mem = budget.memory(own);
+                            budget.raise(450, now + 1, mem);
+                            assert_eq!(budget.allocated(), budget.charged());
+                            budget.reduce(400, now + 2, own.low);
+                            assert_eq!(budget.allocated(), budget.charged());
+                            budget.close_socket();
+                            assert_eq!(budget.sockets(), 0);
+                            assert_eq!(shared.connections(), 0);
+
+                            assert!(budget.leave_group(now + 3));
+                        }
+                    });
+                }
+            });
+
+            assert_eq!(shared.buffer_bytes(), 0);
+            assert_eq!(shared.connections(), 0);
+            if summed {
+                assert_eq!(
+                    shared.buffer_memory(),
+                    BufferMemory {
+                        low: 0,
+                        pressure: 0,
+                        high: 0,
+                    }
+                );
+            }
+        }
     }
 }

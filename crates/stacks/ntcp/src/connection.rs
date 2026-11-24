@@ -828,6 +828,9 @@ pub struct ConnectionEvents {
     pub tx_timestamps: bool,
 }
 
+use crate::connection_events::{PendingEvents, Signal};
+
+#[cfg(test)]
 impl ConnectionEvents {
     pub(crate) fn is_empty(&self) -> bool {
         self == &Self::default()
@@ -920,7 +923,7 @@ pub(crate) struct Connection {
     config: ConnectionConfig,
     state: State,
     reason: Option<CloseReason>,
-    events: ConnectionEvents,
+    events: PendingEvents,
     now: Instant,
     send: SendBuffer,
     receive: RxQueue,
@@ -1392,7 +1395,7 @@ impl Connection {
             }),
             managed_path,
             send_space_cache: core::cell::Cell::new((0, 0, 0)),
-            managed_results: crate::endpoint::ManagedResults::default(),
+            managed_results: crate::endpoint::ManagedResults::new(pmtud.is_some())?,
             tuple,
             zone: None,
             peer_mss: config.mss,
@@ -1405,7 +1408,7 @@ impl Connection {
             config,
             state: State::SynSent,
             reason: None,
-            events: ConnectionEvents::default(),
+            events: PendingEvents::default(),
             now,
             send,
             receive: RxQueue::new(Seq(0)),
@@ -1892,10 +1895,13 @@ impl Connection {
     // A setter's writability: an open send direction that is
     // `stream_writable`.
     fn refresh_writable(&mut self) {
-        self.events.writable = !self.shutdown
-            && !self.read_closed
-            && matches!(self.state, State::Established | State::CloseWait)
-            && self.stream_writable(None);
+        self.events.set(
+            Signal::Writable,
+            !self.shutdown
+                && !self.read_closed
+                && matches!(self.state, State::Established | State::CloseWait)
+                && self.stream_writable(None),
+        );
     }
 
     pub(crate) fn tuple(&self) -> Tuple {
@@ -2035,8 +2041,9 @@ impl Connection {
         self.fast_open = cookie;
         self.fast_open_early = early;
         if early {
-            self.events.readable = self.receive.readable() != 0;
-            if self.events.readable {
+            let readable = self.receive.readable() != 0;
+            self.events.set(Signal::Readable, readable);
+            if readable {
                 self.received_syn_data_start = self.irs.map(|irs| irs.wrapping_add(1));
             }
         }
@@ -2834,10 +2841,14 @@ impl Connection {
         self.config.send_capacity
     }
 
+    pub(crate) fn queued_end(&self) -> u64 {
+        self.acknowledged + self.send.len() as u64
+    }
+
     pub(crate) fn send_progress(&self) -> SendProgress {
         SendProgress {
             acknowledged: self.acknowledged,
-            queued_end: self.acknowledged + self.send.len() as u64,
+            queued_end: self.queued_end(),
             unacknowledged_sequence: self.snd_una.0,
             next_write_sequence: self.send_base.wrapping_add(self.send.len() as u32).0,
         }
@@ -2929,10 +2940,15 @@ impl Connection {
     pub(crate) fn events_pending(&self) -> bool {
         !self.events.is_empty() || self.tx_timestamps.signalled()
     }
+    #[cfg(test)]
     pub(crate) fn take_events(&mut self) -> ConnectionEvents {
-        let mut events = core::mem::take(&mut self.events);
-        events.tx_timestamps = self.tx_timestamps.take_signal();
-        events
+        self.take_reported_events(true).unwrap_or_default()
+    }
+
+    #[inline]
+    pub(crate) fn take_reported_events(&mut self, errors: bool) -> Option<ConnectionEvents> {
+        self.events
+            .take(self.acknowledged, self.tx_timestamps.take_signal(), errors)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
@@ -2949,14 +2965,21 @@ impl Connection {
     }
 
     pub(crate) fn readable_bytes(&self) -> usize {
-        if self.read_closed
-            || self.handshake_pending() && !self.fast_open_early
-            || self.state == State::Closed
-                && (self.reason != Some(CloseReason::Normal) || !self.receive.eof())
+        if self.state == State::Closed
+            && (self.reason != Some(CloseReason::Normal) || !self.receive.eof())
         {
-            return 0;
+            0
+        } else {
+            self.open_readable_bytes()
         }
-        self.receive.readable()
+    }
+
+    pub(crate) fn open_readable_bytes(&self) -> usize {
+        if self.read_closed || self.handshake_pending() && !self.fast_open_early {
+            0
+        } else {
+            self.receive.readable()
+        }
     }
 
     pub(crate) fn terminal_readable_bytes(&self) -> usize {
@@ -3133,7 +3156,7 @@ impl Connection {
         //# Since these Unreachable messages indicate soft error conditions, a
         //# TCP implementation MUST NOT abort the connection (MUST-56), and it
         //# SHOULD make the information available to the application (SHLD-25).
-        self.events.network_error = Some(error);
+        self.events.network_error(error);
         if let Some(p) = &mut self.pmtud {
             p.network_error();
         }
@@ -3829,12 +3852,11 @@ impl Connection {
         }
         if replaced || rebound {
             // Results and provenance describe only the binding they arose on.
-            self.managed_results = crate::endpoint::ManagedResults::default();
+            self.managed_results.clear();
         } else if negative {
             // Newer negative evidence makes earlier delivery proof stale. An
             // applied decrease stays: the Host discards it once subsumed.
-            self.managed_results.receipt = None;
-            self.managed_results.confirmed = None;
+            self.managed_results.clear_probe();
         }
         self.managed_packet_budget = path.snapshot.ip_packet_budget().unwrap_or(0);
         self.managed_path = Some(path);
@@ -3864,7 +3886,9 @@ impl Connection {
         let Some(p) = &mut self.pmtud else {
             return;
         };
-        let results = &mut self.managed_results;
+        let Some(results) = self.managed_results.active_mut() else {
+            return;
+        };
         if let Some((id, mtu)) = p.take_applied_pending()
             && let Some((pending, mut result)) = results.pending.take()
             && pending == id
@@ -3940,7 +3964,7 @@ impl Connection {
             && selected.negative_revision() == binding.snapshot.negative_revision()
             && intent.selected_at >= binding.snapshot.retry_not_before()
         {
-            self.managed_results.receipt = Some((probe, intent, receipt));
+            self.managed_results.set_receipt((probe, intent, receipt));
         }
     }
 
@@ -4182,21 +4206,25 @@ impl Connection {
         if id != self.managed_results.pending.map(|(id, _)| id) {
             // This report replaced the pending one (or none is pending): only
             // its own provenance, never the replaced report's, may describe it.
-            self.managed_results.pending =
+            self.managed_results.set_pending(
                 match (outcome.feedback, id, host_estimate, self.managed_path) {
-                    (crate::PmtuFeedback::Deferred, Some(id), Some(host_estimate), Some(binding)) => {
-                        Some((
-                            id,
-                            crate::PendingPmtuApplied {
-                                binding,
-                                report,
-                                host_estimate,
-                                applied_mtu: 0,
-                            },
-                        ))
-                    }
+                    (
+                        crate::PmtuFeedback::Deferred,
+                        Some(id),
+                        Some(host_estimate),
+                        Some(binding),
+                    ) => Some((
+                        id,
+                        crate::PendingPmtuApplied {
+                            binding,
+                            report,
+                            host_estimate,
+                            applied_mtu: 0,
+                        },
+                    )),
                     _ => None,
-                };
+                },
+            );
         }
         self.accept_pmtu_report(outcome.feedback, (start, end));
         Ok(outcome)
@@ -4417,8 +4445,10 @@ impl Connection {
         // A new segment size moves C; reopened room is writable as after an ACK.
         if blocked && self.stream_writable(None) {
             self.send_backpressured = false;
-            self.events.writable |=
-                !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
+            self.events.raise_if(
+                Signal::Writable,
+                !self.shutdown && matches!(self.state, State::Established | State::CloseWait),
+            );
         }
         if self.pmtud.is_some() || self.managed_path.is_some() {
             self.congestion.set_path_mss(effective as u32);
@@ -4755,7 +4785,7 @@ impl Connection {
         if let Some(scale) = syn.options.invalid_window_scale
             && !self.invalid_scale_reported
         {
-            self.events.invalid_window_scale = Some(scale);
+            self.events.invalid_scale(scale);
             self.invalid_scale_reported = true;
         }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
@@ -5048,18 +5078,25 @@ impl Connection {
             self.state = State::Established;
         }
         self.syn_pending = false;
-        self.events.connected = true;
-        self.events.writable = !self.shutdown && self.stream_writable(None);
-        self.events.readable =
-            !self.read_closed && (self.receive.readable() != 0 || self.receive.eof());
-        self.events.pushed |= self.receive.take_push();
+        self.events.raise(Signal::Connected);
+        self.events.set(
+            Signal::Writable,
+            !self.shutdown && self.stream_writable(None),
+        );
+        self.events.set(
+            Signal::Readable,
+            !self.read_closed && (self.receive.readable() != 0 || self.receive.eof()),
+        );
+        self.events
+            .raise_if(Signal::Pushed, self.receive.take_push());
         // An admitted active opener already published its urgent endpoint with
         // the early receive prefix. Establishment must not notify it again.
         if self.passive_open || !self.fast_open_early {
-            self.events.urgent = if self.read_closed { None } else { self.rcv_up };
+            self.events
+                .urgent(if self.read_closed { None } else { self.rcv_up });
         }
         if self.receive.eof() {
-            self.events.half_closed = true;
+            self.events.raise(Signal::HalfClosed);
             if self.state == State::Established {
                 self.state = State::CloseWait;
             } else if self.state == State::FinWait1 {
@@ -5130,7 +5167,7 @@ impl Connection {
         self.deferred_tfo_push = false;
         self.reason = Some(reason);
         self.send.release_shared();
-        self.events.closed = Some(reason);
+        self.events.closed(reason);
         if reason != CloseReason::Aborted {
             self.pending_rst = None;
         }
@@ -5722,8 +5759,10 @@ impl Connection {
     pub(crate) fn memory_released(&mut self) {
         if core::mem::take(&mut self.send_memory_waiting) && self.stream_writable(None) {
             self.send_backpressured = false;
-            self.events.writable |=
-                !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
+            self.events.raise_if(
+                Signal::Writable,
+                !self.shutdown && matches!(self.state, State::Established | State::CloseWait),
+            );
         }
     }
 
@@ -5806,8 +5845,10 @@ impl Connection {
         self.sndbuf_expand();
         if self.stream_writable(None) {
             self.send_backpressured = false;
-            self.events.writable |=
-                !self.shutdown && matches!(self.state, State::Established | State::CloseWait);
+            self.events.raise_if(
+                Signal::Writable,
+                !self.shutdown && matches!(self.state, State::Established | State::CloseWait),
+            );
         }
     }
 
@@ -6404,7 +6445,7 @@ impl Connection {
         }
         if discarded != 0 && self.stream_writable(None) {
             self.send_backpressured = false;
-            self.events.writable = true;
+            self.events.raise(Signal::Writable);
         }
         self.arm_work();
         Ok(discarded)
@@ -6440,10 +6481,10 @@ impl Connection {
         // Closing the reader after write shutdown must not send a second FIN;
         // unread accepted bytes still take the existing data-loss abort path.
         self.read_closed = true;
-        self.events.readable = false;
-        self.events.pushed = false;
-        self.events.urgent = None;
-        self.events.writable = false;
+        self.events.set(Signal::Readable, false);
+        self.events.set(Signal::Pushed, false);
+        self.events.urgent(None);
+        self.events.set(Signal::Writable, false);
         if self.receive.has_data() {
             self.abort();
             Ok(())
@@ -7326,10 +7367,15 @@ impl Connection {
                 self.fast_open_response = response;
                 self.fast_open_early = early;
                 if early {
-                    self.events.readable = self.receive.readable() != 0 || self.receive.eof();
-                    self.events.pushed |= self.receive.take_push();
-                    self.events.half_closed = self.receive.eof();
-                    self.events.urgent = if self.read_closed { None } else { self.rcv_up };
+                    self.events.set(
+                        Signal::Readable,
+                        self.receive.readable() != 0 || self.receive.eof(),
+                    );
+                    self.events
+                        .raise_if(Signal::Pushed, self.receive.take_push());
+                    self.events.set(Signal::HalfClosed, self.receive.eof());
+                    self.events
+                        .urgent(if self.read_closed { None } else { self.rcv_up });
                     if self.receive.readable() != 0 {
                         self.received_syn_data_start = self.irs.map(|irs| irs.wrapping_add(1));
                     }
@@ -7743,7 +7789,7 @@ impl Connection {
                     self.handshake_pending() && self.passive_open && !self.fast_open_early;
                 self.terminal(CloseReason::Reset);
                 if passive {
-                    self.events = ConnectionEvents::default();
+                    self.events.clear();
                 }
             } else {
                 self.challenge_ack();
@@ -7765,7 +7811,7 @@ impl Connection {
                 // early children may already be application-owned.
                 self.terminal(CloseReason::Reset);
                 if !self.fast_open_early {
-                    self.events = ConnectionEvents::default();
+                    self.events.clear();
                 }
             } else {
                 self.challenge_ack();
@@ -8813,7 +8859,7 @@ impl Connection {
             self.refresh_work |= self.send_expand_pending;
             self.send_base = self.send_base.wrapping_add(bytes);
             self.acknowledged = self.acknowledged.saturating_add(bytes as u64);
-            self.events.acknowledged = Some(self.acknowledged);
+            self.events.raise(Signal::Acknowledged);
             self.tx_timestamps.observe(
                 TxStreamRange {
                     start: 0,
@@ -8828,7 +8874,7 @@ impl Connection {
             // told, once the space the ACK freed makes it writable.
             if self.stream_writable(None) {
                 self.send_backpressured = false;
-                self.events.writable |= !self.shutdown;
+                self.events.raise_if(Signal::Writable, !self.shutdown);
             }
         }
         self.snd_una = ack;
@@ -9167,7 +9213,7 @@ impl Connection {
                 //# previously no pending urgent data, or whenever the urgent pointer
                 //# advances in the data stream.
                 self.rcv_up = Some(end);
-                self.events.urgent = Some(end);
+                self.events.urgent(Some(end));
             }
         }
         let skip = if next.after(seq) {
@@ -9266,10 +9312,10 @@ impl Connection {
             self.receive.clear_dsack();
         }
         if self.read_closed && outcome.new_bytes != 0 {
-            self.events.readable = false;
-            self.events.pushed = false;
-            self.events.urgent = None;
-            self.events.writable = false;
+            self.events.set(Signal::Readable, false);
+            self.events.set(Signal::Pushed, false);
+            self.events.urgent(None);
+            self.events.set(Signal::Writable, false);
             // RFC 9293 3.6.1: new text after half-duplex CLOSE loses data.
             // This is a segment-triggered reset, not the local ABORT of 3.10.5.
             // PAWS, sequence, controls, handshake and ACK bounds were checked
@@ -9294,13 +9340,14 @@ impl Connection {
         if self.config.adaptive_ack && outcome.new_bytes != 0 && outcome.advanced {
             self.adaptive_receive();
         }
-        self.events.pushed |= self.receive.take_push();
+        self.events
+            .raise_if(Signal::Pushed, self.receive.take_push());
         let advanced = self.receive.next().distance_from(next);
         self.received_total = self
             .received_total
             .saturating_add(advanced.saturating_sub(u32::from(outcome.fin)) as u64);
         if outcome.advanced {
-            self.events.readable = !self.read_closed;
+            self.events.set(Signal::Readable, !self.read_closed);
             if self.state == State::FinWait2 {
                 self.progress_at = self.now;
             }
@@ -9394,7 +9441,7 @@ impl Connection {
             }
         }
         if outcome.fin {
-            self.events.half_closed = true;
+            self.events.raise(Signal::HalfClosed);
             match self.state {
                 State::Established => self.state = State::CloseWait,
                 State::FinWait1 => self.state = State::Closing,
@@ -12882,7 +12929,7 @@ impl Connection {
             //# The value of R1 SHOULD correspond to at least 3 retransmissions, at the
             //# current RTO (SHLD-10).
             if self.consecutive_timeouts == 3 {
-                self.events.retransmission_warning = true;
+                self.events.raise(Signal::RetransmissionWarning);
                 self.route_advice_pending = true;
                 self.refresh_work = true;
             }

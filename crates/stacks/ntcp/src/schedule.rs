@@ -3,8 +3,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 // A slot index always fits below END, since Rust's Vec length is bounded by
-// `isize::MAX` (so `usize::MAX` is never a valid index). An unqueued slot
-// links to itself as its predecessor.
+// `isize::MAX` (so `usize::MAX` is never a valid index). The head and every
+// unqueued slot link to themselves as predecessors. A singleton also has
+// no successor, so it needs no slot write to arrive or leave.
 const END: usize = usize::MAX;
 
 #[derive(Clone, Copy)]
@@ -46,41 +47,45 @@ impl ReadyQueue {
         (self.first != END).then_some(self.first)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn sole(&self, index: usize) -> bool {
+        self.first == index && self.last == index
+    }
+
     pub(crate) fn next_of(&self, index: usize) -> Option<usize> {
         let next = self.links[index].next;
         (next != END).then_some(next)
     }
 
     pub(crate) fn contains(&self, index: usize) -> bool {
-        self.links[index].previous != index
+        self.first == index || self.first != END && self.links[index].previous != index
     }
 
     pub(crate) fn push(&mut self, index: usize) {
-        if self.contains(index) {
-            return;
-        }
-        self.links[index] = Links {
-            previous: self.last,
-            next: END,
-        };
-        if self.last == END {
+        debug_assert!(index < self.links.len());
+        if self.first == END {
             self.first = index;
-        } else {
+            self.last = index;
+        } else if self.first != index && self.links[index].previous == index {
             self.links[self.last].next = index;
+            self.links[index].previous = self.last;
+            self.last = index;
         }
-        self.last = index;
     }
 
     pub(crate) fn remove(&mut self, index: usize) {
+        if self.first == index {
+            self.pop();
+            return;
+        }
+        if self.first == END {
+            return;
+        }
         let Links { previous, next } = self.links[index];
         if previous == index {
             return;
         }
-        if previous == END {
-            self.first = next;
-        } else {
-            self.links[previous].next = next;
-        }
+        self.links[previous].next = next;
         if next == END {
             self.last = previous;
         } else {
@@ -92,9 +97,24 @@ impl ReadyQueue {
         };
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn move_to_back(&mut self, index: usize) {
+        if self.last != index {
+            self.remove(index);
+            self.push(index);
+        }
+    }
+
     pub(crate) fn pop(&mut self) -> Option<usize> {
         let index = self.first()?;
-        self.remove(index);
+        if index == self.last {
+            self.first = END;
+            self.last = END;
+        } else {
+            let next = core::mem::replace(&mut self.links[index].next, END);
+            self.links[next].previous = next;
+            self.first = next;
+        }
         Some(index)
     }
 }
@@ -117,6 +137,11 @@ impl Deadlines {
     #[inline]
     pub(crate) fn first(&self) -> Option<(u64, usize)> {
         self.heap.first().copied()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn time(&self, index: usize) -> Option<u64> {
+        self.positions[index].map(|position| self.heap[position].0)
     }
 
     fn first_except(&self, index: usize) -> Option<(u64, usize)> {
@@ -239,7 +264,12 @@ impl ConnectionTimers {
 
     #[inline]
     pub(crate) fn first(&self) -> Option<(u64, usize)> {
-        match (self.deadline, self.other) {
+        self.first_with(self.deadline)
+    }
+
+    #[inline]
+    pub(crate) fn first_with(&self, deadline: Option<u64>) -> Option<(u64, usize)> {
+        match (deadline, self.other) {
             (Some(at), Some(other)) => Some(other.min((at, self.current))),
             (Some(at), None) => Some((at, self.current)),
             (None, other) => other,
@@ -460,5 +490,166 @@ mod tests {
             assert!(deadlines.heap == heap);
             assert!(deadlines.positions == positions);
         }
+    }
+
+    fn assert_ready_queue_invariants(
+        queue: &ReadyQueue,
+        model: &alloc::collections::VecDeque<usize>,
+    ) {
+        assert_eq!(queue.is_empty(), model.is_empty());
+        assert_eq!(queue.first(), model.front().copied());
+        if model.is_empty() {
+            assert_eq!(queue.first, END);
+            assert_eq!(queue.last, END);
+        } else {
+            let head = *model.front().unwrap();
+            let tail = *model.back().unwrap();
+            assert_eq!(queue.first, head);
+            assert_eq!(queue.last, tail);
+            assert_eq!(queue.links[head].previous, head);
+            assert_eq!(queue.links[tail].next, END);
+        }
+        let items: Vec<usize> = queue.iter().collect();
+        let expected: Vec<usize> = model.iter().copied().collect();
+        assert_eq!(items, expected);
+        for slot in 0..queue.links.len() {
+            let present = model.contains(&slot);
+            assert_eq!(queue.contains(slot), present, "contains({slot})");
+            assert_eq!(
+                queue.sole(slot),
+                model.len() == 1 && model.front() == Some(&slot),
+                "sole({slot})"
+            );
+            if !present {
+                assert_eq!(queue.links[slot].previous, slot);
+                assert_eq!(queue.links[slot].next, END);
+            }
+        }
+    }
+
+    #[test]
+    fn ready_queue_differential_model_against_vecdeque() {
+        use alloc::collections::VecDeque;
+
+        // Deterministic edge cases: singleton, head, middle, tail, unqueued.
+        let mut queue = ReadyQueue::new(5).unwrap();
+        let mut model = VecDeque::new();
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Remove from empty.
+        queue.remove(0);
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Singleton push, sole, duplicate push, move_to_back, remove, pop.
+        queue.push(2);
+        model.push_back(2);
+        assert!(queue.sole(2));
+        assert_ready_queue_invariants(&queue, &model);
+
+        queue.push(2);
+        assert_ready_queue_invariants(&queue, &model);
+
+        queue.move_to_back(2);
+        assert_ready_queue_invariants(&queue, &model);
+
+        queue.remove(2);
+        model.pop_front();
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Build [0, 1, 2, 3]: remove head (0), middle (2), tail (3), singleton (1).
+        for s in 0..4 {
+            queue.push(s);
+            model.push_back(s);
+        }
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Remove head.
+        queue.remove(0);
+        model.retain(|&x| x != 0);
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Remove middle.
+        queue.remove(2);
+        model.retain(|&x| x != 2);
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Remove tail.
+        queue.remove(3);
+        model.retain(|&x| x != 3);
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Remaining singleton (1).
+        assert!(queue.sole(1));
+        assert_eq!(queue.pop(), model.pop_front());
+        assert_ready_queue_invariants(&queue, &model);
+
+        // Randomized differential test across small and medium capacities.
+        for cap in [1usize, 2, 3, 7, 19] {
+            let mut queue = ReadyQueue::new(cap).unwrap();
+            let mut model = VecDeque::new();
+            let mut seed = 0x1234_5678_9abc_def0u64 ^ (cap as u64);
+            let mut next = || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                seed
+            };
+
+            for _ in 0..4000 {
+                let slot = (next() >> 32) as usize % cap;
+                match (next() >> 16) % 5 {
+                    0 | 1 => {
+                        queue.push(slot);
+                        if !model.contains(&slot) {
+                            model.push_back(slot);
+                        }
+                    }
+                    2 => {
+                        queue.remove(slot);
+                        if let Some(pos) = model.iter().position(|&x| x == slot) {
+                            model.remove(pos);
+                        }
+                    }
+                    3 => {
+                        queue.move_to_back(slot);
+                        if model.back() != Some(&slot) {
+                            if let Some(pos) = model.iter().position(|&x| x == slot) {
+                                model.remove(pos);
+                            }
+                            model.push_back(slot);
+                        }
+                    }
+                    _ => {
+                        assert_eq!(queue.pop(), model.pop_front());
+                    }
+                }
+                assert_ready_queue_invariants(&queue, &model);
+            }
+            while let Some(expected) = model.pop_front() {
+                assert_eq!(queue.pop(), Some(expected));
+                assert_ready_queue_invariants(&queue, &model);
+            }
+            assert_eq!(queue.pop(), None);
+        }
+    }
+
+    #[test]
+    fn deadlines_time_and_connection_timers_first_with() {
+        let mut deadlines = Deadlines::new(4).unwrap();
+        assert_eq!(deadlines.time(0), None);
+        deadlines.set(1, Some(50));
+        deadlines.set(2, Some(20));
+        assert_eq!(deadlines.time(0), None);
+        assert_eq!(deadlines.time(1), Some(50));
+        assert_eq!(deadlines.time(2), Some(20));
+        deadlines.set(2, None);
+        assert_eq!(deadlines.time(2), None);
+
+        let mut timers = ConnectionTimers::new(4).unwrap();
+        timers.set(0, Some(100));
+        timers.set(1, Some(40));
+        // Current owner is 1, other minimum is (100, 0).
+        assert_eq!(timers.first_with(Some(25)), Some((25, 1)));
+        assert_eq!(timers.first_with(Some(100)), Some((100, 0)));
+        assert_eq!(timers.first_with(Some(200)), Some((100, 0)));
+        assert_eq!(timers.first_with(None), Some((100, 0)));
     }
 }

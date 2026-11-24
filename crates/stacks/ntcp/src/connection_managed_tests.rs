@@ -566,7 +566,10 @@ fn pending_report_applied_at_its_timeout_yields_exactly_one_result() {
         assert_eq!(a.path_mtu_info().unwrap().current_mtu, before);
         assert!(a.managed_results.applied.is_none());
         rto(&mut a);
-        let applied = a.managed_results.applied.take().expect("applied pending report");
+        let applied = a
+            .managed_results
+            .take_applied()
+            .expect("applied pending report");
         assert_eq!(applied.binding(), binding);
         assert_eq!(applied.report(), report);
         assert_eq!(applied.host_estimate(), 1100);
@@ -604,7 +607,7 @@ fn replaced_cancelled_rebound_or_unattributed_pending_reports_yield_nothing() {
             Ok(crate::PmtuFeedback::Deferred)
         );
         rto(&mut a);
-        assert_eq!(a.managed_results.applied.take().unwrap().report(), report);
+        assert_eq!(a.managed_results.take_applied().unwrap().report(), report);
 
         if ipv4 {
             // A lower report without provenance replaces it: nothing publishes.
@@ -620,7 +623,7 @@ fn replaced_cancelled_rebound_or_unattributed_pending_reports_yield_nothing() {
             a.correlated_pmtu_feedback(21, report, Some(1100)).unwrap();
             a.correlated_pmtu_feedback(22, lower(report), Some(950)).unwrap();
             rto(&mut a);
-            let applied = a.managed_results.applied.take().unwrap();
+            let applied = a.managed_results.take_applied().unwrap();
             assert_eq!((applied.report(), applied.host_estimate()), (lower(report), 950));
         }
 
@@ -722,7 +725,7 @@ fn confirmed_probe_requires_exact_definitely_submitted_receipt() {
                 // Submission alone confirms nothing: only the probe's ACK does.
                 assert!(a.managed_results.confirmed.is_none());
                 deliver(&mut b, &mut a, now + 2);
-                let confirmed = a.managed_results.confirmed.take();
+                let confirmed = a.managed_results.take_confirmed();
                 let expected = receipt == Receipt::Exact || receipt == Receipt::Fragmentable && !ipv4;
                 assert_eq!(confirmed.is_some(), expected, "ipv4={ipv4} converged={converged}");
                 let Some(confirmed) = confirmed else { continue };

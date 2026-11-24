@@ -20,6 +20,7 @@ mod buffer_sizes;
 mod rx_queue;
 pub use buffer_sizes::{BufferSizes, Buffers};
 mod connection;
+mod connection_events;
 mod cubic;
 mod drop;
 pub use drop::{DropCounts, DropEvent, DropReason, DropRecorder, DropSubject, drain_drop_events};
@@ -85,7 +86,7 @@ pub use endpoint::{
     ActiveOpenOptions, AddressValidation, ConfirmedProbe, ConnectedIpHeader, ConnectionId,
     CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError, Event,
     InputDisposition, IpHeader, ListenerId, PendingPmtuApplied, PhysicalReceipt, PollTransmit,
-    Transmit,
+    StreamState, Transmit,
 };
 pub use ipv4_options::{
     EncodedIpv4Options, ExpectedRegistrations, ExpectedTimestamps, Ipv4Options, Ipv4OptionsError,
