@@ -8639,6 +8639,7 @@ impl Connection {
         self.keepalive_probes = 0;
         self.keepalive_pending = false;
         self.keepalive_deadline = None;
+        debug_assert!(!IN_ORDER || (!response_handshake && h.flags & !PSH == ACK));
         //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.1
         //= reason=Negotiated receive commitment gates CE handling after sequence/control/ACK validation, including exact-sequence zero-window probes without receive credit. Tests cover normal CE, repeated feedback, fallback commitment, invalid packets and ECN-off receive.
         //# * If a host has sent at least one ECN-setup SYN or ECN-setup SYN-
@@ -8682,8 +8683,10 @@ impl Connection {
         // ECN never bypasses sequence, RST/SYN, or ACK-range validation.
         // Old ACKs cannot signal sender congestion, but their accepted duplex
         // data still carries receive-side CE/CWR (RFC 3168 section 6.1.3).
-        debug_assert!(!IN_ORDER || (!response_handshake && h.flags & !PSH == ACK));
-        let ece = !IN_ORDER && h.flags & ECE != 0 && self.ecn_feedback() && ack.at_or_after(self.snd_una);
+        let ece = self.ecn_feedback()
+            && !IN_ORDER
+            && h.flags & ECE != 0
+            && ack.at_or_after(self.snd_una);
         if (!IN_ORDER || traffic_class & 3 == 3) && self.ecn_feedback() {
             if !IN_ORDER
                 && h.flags & CWR != 0
