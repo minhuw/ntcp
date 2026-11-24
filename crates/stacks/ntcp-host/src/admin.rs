@@ -485,7 +485,10 @@ impl Host {
                 snapshot,
             };
             if endpoint.apply_path_budget(owner, prepared).is_ok() {
-                self.bindings[index].as_mut().unwrap().prepared = prepared;
+                self.bindings[index]
+                    .as_mut()
+                    .unwrap()
+                    .rebind(prepared, self.now);
                 let _ = self.paths.acknowledge(prepared.client, snapshot.stamp());
             }
         }

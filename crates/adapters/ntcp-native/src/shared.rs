@@ -569,6 +569,28 @@ impl Member {
             }
         }
     }
+    // The shared table needs this confirmation to change or extend
+    // reachability. A current front entry normally settles it locally.
+    #[inline(never)]
+    fn confirm_shared(
+        &mut self,
+        address: Ipv4Addr,
+        carried_at: Instant,
+        now: Instant,
+        entropy: Option<&mut Entropy>,
+    ) -> HostResult<bool> {
+        let (confirmed, mapping) = self.locked(now, false, |table, now, _| {
+            let confirmed = table
+                .cache
+                .confirm((), address, carried_at, now, &mut draw(entropy));
+            (confirmed, table.cache.mapping((), address, now))
+        });
+        if confirmed.is_ok() && self.front.iter().any(|f| f.address == address) {
+            self.remember(address, mapping);
+        }
+        confirmed.map_err(host_error)
+    }
+
     fn usable(&self, address: Ipv4Addr, now: Instant) -> Option<&Front> {
         self.front
             .iter()
@@ -667,6 +689,10 @@ impl Ipv4NeighborTable for Member {
             table.cache.add_permanent((), address, mac, now)
         })
         .map_err(host_error)
+    }
+    fn cached_resolution(&self, link: LinkId, address: Ipv4Addr, now: Instant) -> Option<[u8; 6]> {
+        self.check(link).ok()?;
+        self.usable(address, self.local.advance(now)).map(|f| f.mac)
     }
     fn resolve(
         &mut self,
@@ -790,21 +816,293 @@ impl Ipv4NeighborTable for Member {
                 _ => {}
             }
         }
-        let (confirmed, mapping) = self.locked(now, false, |table, now, _| {
-            let confirmed = table
-                .cache
-                .confirm((), address, carried_at, now, &mut draw(entropy));
-            (confirmed, table.cache.mapping((), address, now))
-        });
-        if confirmed.is_ok() && self.front.iter().any(|f| f.address == address) {
-            self.remember(address, mapping);
-        }
-        confirmed.map_err(host_error)
+        self.confirm_shared(address, carried_at, now, entropy)
     }
     fn counters(&self) -> ArpCounters {
         self.shared.lock().cache.counters()
     }
     fn entry(&self, _: LinkId, address: Ipv4Addr) -> Option<(ArpState, Option<[u8; 6]>)> {
         self.shared.lock().cache.entry((), address)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::net::{IpAddr, SocketAddr};
+    use ntcp::{
+        ActiveOpenOptions, Endpoint, EndpointConfig, ManagedOpenOptions, OutgoingIpv4Options,
+        TransmitAttempt,
+    };
+    use ntcp_arp::Operation;
+    use ntcp_host::{
+        AddressState, Ipv4Receive, Ipv6Receive, NdPort, NeighborHop, Owner, ReceiveCapabilities,
+        managed_limits,
+        path::{ContextId, InterfaceKey, IpPrefix, NextHop, Route, ScopedAddress},
+    };
+
+    const SECOND: u64 = 1_000_000;
+    const PORT_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+    const PEER_MAC_1: [u8; 6] = [2, 0, 0, 0, 0, 0x11];
+    const PEER_MAC_2: [u8; 6] = [2, 0, 0, 0, 0, 0x22];
+    const STATIC_MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x33];
+    const LOCAL_A: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+    const LOCAL_B: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const PEER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 100);
+    const STATIC_PEER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 101);
+    const UNKNOWN: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 200);
+
+    fn arp_reply(sender_mac: [u8; 6], sender_ip: Ipv4Addr, target_ip: Ipv4Addr) -> Arp {
+        Arp {
+            operation: Operation::Reply,
+            sender_mac,
+            sender_ip,
+            target_mac: PORT_MAC,
+            target_ip,
+        }
+    }
+
+    fn receive_caps() -> ReceiveCapabilities {
+        ReceiveCapabilities {
+            max_ip_packet: 1500,
+            ipv4: Ipv4Receive::Enabled {
+                interpretation: false,
+                source_routes: false,
+            },
+            ipv6: Ipv6Receive::Disabled,
+            gro: false,
+        }
+    }
+
+    fn build_host(
+        context: u64,
+        local_ip: Ipv4Addr,
+        member: Member,
+    ) -> (Host, Endpoint, EndpointConfig, LinkId, LinkId) {
+        let mut cfg = EndpointConfig {
+            max_connections: 2,
+            ..Default::default()
+        };
+        cfg.connection.timebase.units_per_second = SECOND;
+        let (paths, limits) = managed_limits(&cfg, 2, 2, 2, 2, 0).unwrap();
+        let mut host = Host::new(
+            ContextId::new(context),
+            paths,
+            limits,
+            cfg.connection.timebase,
+            [context as u8; 16],
+        )
+        .unwrap();
+        host.set_entropy(crate::entropy());
+        host.set_ipv4_neighbor_table(Box::new(member)).unwrap();
+        let ctx = host
+            .register_neighbor_port(InterfaceKey(1), 1500, receive_caps(), NdPort::new(PORT_MAC))
+            .unwrap();
+        let link = ctx.link();
+        // A second link on the same host (not bound to this member) for wrong-link tests.
+        let foreign = host
+            .register_link(
+                InterfaceKey(2),
+                1500,
+                receive_caps(),
+                ntcp_host::Forwarding::IpNextHop,
+            )
+            .unwrap()
+            .link();
+        assert_eq!(
+            host.add_neighbor_address(link, local_ip),
+            Ok(AddressState::Assigned)
+        );
+        host.add_route(Route {
+            destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24).unwrap(),
+            source: None,
+            dscp: None,
+            link,
+            next_hop: NextHop::OnLink,
+            metric: 10,
+        })
+        .unwrap();
+        let mut endpoint = Endpoint::new(cfg.clone(), [context as u8; 32], 0, |_| true).unwrap();
+        host.attach(&mut endpoint).unwrap();
+        endpoint
+            .enable_output_reservations_with_capacity(2)
+            .unwrap();
+        (host, endpoint, cfg, link, foreign)
+    }
+
+    fn open_options(cfg: &EndpointConfig) -> ManagedOpenOptions {
+        ManagedOpenOptions {
+            transport: ActiveOpenOptions::from(&cfg.connection),
+            dscp: 0,
+            ipv4_options: OutgoingIpv4Options::default(),
+            registration: None,
+            receive_authority: None,
+        }
+    }
+
+    fn poll_attempt(endpoint: &mut Endpoint, now: Instant) -> TransmitAttempt {
+        let mut tcp = [0u8; 2048];
+        let (_poll, token) = endpoint.poll_reserved_transmit(now, &mut tcp, 32).unwrap();
+        token.expect("pending transmit attempt")
+    }
+
+    fn member_mut(host: &mut Host) -> &mut Member {
+        let table: &mut dyn Any = host.ipv4_neighbor_table_mut().unwrap();
+        table.downcast_mut::<Member>().unwrap()
+    }
+
+    #[test]
+    fn cached_resolution_matches_resolve_and_respects_expiry_link_and_shared_updates() {
+        let shared = SharedNeighbors::new(
+            PORT_MAC,
+            SECOND,
+            SharedNeighborLimits {
+                members: 2,
+                entries: 8,
+                held: 16,
+                replies: 4,
+            },
+        )
+        .unwrap();
+
+        let (mut host_a, mut ep_a, cfg_a, link_a, foreign) =
+            build_host(77, LOCAL_A, shared.join(4, 4).unwrap());
+        let (mut host_b, _ep_b, _cfg_b, link_b, _) =
+            build_host(78, LOCAL_B, shared.join(4, 4).unwrap());
+
+        let conn_peer = ep_a
+            .connect_with_path_provider(
+                0,
+                SocketAddr::new(IpAddr::V4(LOCAL_A), 5000),
+                SocketAddr::new(IpAddr::V4(PEER), 80),
+                open_options(&cfg_a),
+                &mut host_a,
+            )
+            .unwrap();
+        let conn_static = ep_a
+            .connect_with_path_provider(
+                0,
+                SocketAddr::new(IpAddr::V4(LOCAL_A), 5001),
+                SocketAddr::new(IpAddr::V4(STATIC_PEER), 80),
+                open_options(&cfg_a),
+                &mut host_a,
+            )
+            .unwrap();
+
+        // Unknown entry and wrong link both return None.
+        assert_eq!(member_mut(&mut host_a).cached_resolution(link_a, UNKNOWN, 0), None);
+        assert_eq!(member_mut(&mut host_a).cached_resolution(foreign, PEER, 0), None);
+
+        // Select SYN to PEER and trigger ARP resolution through Host::resolve_neighbor.
+        let attempt = poll_attempt(&mut ep_a, 10);
+        let egress = host_a.egress_context(&mut ep_a, attempt).unwrap();
+        assert_eq!(
+            host_a.resolve_neighbor(egress, Owner::Tcp(conn_peer), 10),
+            Ok(NeighborHop::Held)
+        );
+        assert_eq!(member_mut(&mut host_a).cached_resolution(link_a, PEER, 10), None);
+
+        // Deliver ARP reply to member_a so PEER becomes REACHABLE with PEER_MAC_1.
+        let reply1 = arp_reply(PEER_MAC_1, PEER, LOCAL_A);
+        let mut entropy = crate::entropy();
+        member_mut(&mut host_a)
+            .receive(link_a, &reply1, 20, Some(&mut entropy))
+            .unwrap();
+
+        // Resolve via Host so member_a populates its front cache, then check cached_resolution
+        // matches resolve without mutating ARP counters or entry state.
+        assert_eq!(
+            host_a.resolve_neighbor(egress, Owner::Tcp(conn_peer), 25),
+            Ok(NeighborHop::Resolved(PEER_MAC_1))
+        );
+        let counters_before = member_mut(&mut host_a).counters();
+        let entry_before = member_mut(&mut host_a).entry(link_a, PEER);
+        assert_eq!(
+            member_mut(&mut host_a).cached_resolution(link_a, PEER, 25),
+            Some(PEER_MAC_1)
+        );
+        assert_eq!(member_mut(&mut host_a).counters(), counters_before);
+        assert_eq!(member_mut(&mut host_a).entry(link_a, PEER), entry_before);
+        assert_eq!(
+            host_a.resolve_neighbor(egress, Owner::Tcp(conn_peer), 25),
+            Ok(NeighborHop::Resolved(PEER_MAC_1))
+        );
+
+        // Wrong link or unknown address returns None even when the front cache is warm.
+        assert_eq!(member_mut(&mut host_a).cached_resolution(foreign, PEER, 25), None);
+        assert_eq!(member_mut(&mut host_a).cached_resolution(link_b, PEER, 25), None);
+        assert_eq!(member_mut(&mut host_a).cached_resolution(link_a, UNKNOWN, 25), None);
+
+        // Shared-table update from member_b changes the MAC and advances the shared epoch.
+        let reply2 = arp_reply(PEER_MAC_2, PEER, LOCAL_B);
+        member_mut(&mut host_b)
+            .receive(link_b, &reply2, 30, Some(&mut entropy))
+            .unwrap();
+        // Once member_a begins its next drive, its epoch updates and stale PEER_MAC_1 is invalid.
+        member_mut(&mut host_a).begin();
+        member_mut(&mut host_a).settled();
+        assert_eq!(member_mut(&mut host_a).cached_resolution(link_a, PEER, 30), None);
+        // Resolving refreshes member_a's front cache with PEER_MAC_2.
+        assert_eq!(
+            host_a.resolve_neighbor(egress, Owner::Tcp(conn_peer), 35),
+            Ok(NeighborHop::Resolved(PEER_MAC_2))
+        );
+        assert_eq!(
+            member_mut(&mut host_a).cached_resolution(link_a, PEER, 35),
+            Some(PEER_MAC_2)
+        );
+
+        // Expiry: once ReachableTime passes, cached_resolution returns None.
+        let expiry = member_mut(&mut host_a)
+            .front
+            .iter()
+            .find(|f| f.address == PEER)
+            .expect("front entry present for PEER")
+            .until;
+        assert!(expiry > 35);
+        assert_eq!(
+            member_mut(&mut host_a).cached_resolution(link_a, PEER, expiry - 1),
+            Some(PEER_MAC_2)
+        );
+        assert_eq!(member_mut(&mut host_a).cached_resolution(link_a, PEER, expiry), None);
+        assert_eq!(
+            member_mut(&mut host_a).cached_resolution(link_a, PEER, expiry + SECOND),
+            None
+        );
+
+        // Reject first attempt so we can select the SYN for STATIC_PEER, then verify permanent
+        // entries stay usable across arbitrarily large timestamps.
+        assert!(ep_a.reject_unsubmitted(attempt).unwrap());
+        host_a
+            .add_static_neighbor(link_a, IpAddr::V4(STATIC_PEER), STATIC_MAC, expiry + SECOND)
+            .unwrap();
+        let attempt_static = poll_attempt(&mut ep_a, expiry + SECOND);
+        let egress_static = {
+            let e = host_a.egress_context(&mut ep_a, attempt_static).unwrap();
+            if e.next_hop
+                == ntcp_host::path::ResolvedNextHop::Address(
+                    ScopedAddress::new(IpAddr::V4(STATIC_PEER), None).unwrap(),
+                )
+            {
+                e
+            } else {
+                assert!(ep_a.reject_unsubmitted(attempt_static).unwrap());
+                let _ = ep_a.abort(conn_peer);
+                let a = poll_attempt(&mut ep_a, expiry + SECOND);
+                host_a.egress_context(&mut ep_a, a).unwrap()
+            }
+        };
+        assert_eq!(
+            host_a.resolve_neighbor(egress_static, Owner::Tcp(conn_static), expiry + SECOND),
+            Ok(NeighborHop::Resolved(STATIC_MAC))
+        );
+        assert_eq!(
+            member_mut(&mut host_a).cached_resolution(
+                link_a,
+                STATIC_PEER,
+                expiry + 10_000 * SECOND
+            ),
+            Some(STATIC_MAC)
+        );
     }
 }

@@ -476,6 +476,12 @@ impl EgressContext {
     pub const fn stamp(&self) -> path::ChangeStamp {
         self.stamp
     }
+    fn neighbor_address(&self) -> Option<IpAddr> {
+        match self.next_hop {
+            ResolvedNextHop::Address(via) => Some(via.address()),
+            ResolvedNextHop::Forwarder(_) => None,
+        }
+    }
 }
 
 // Whether `bytes` lie inside `frame`'s: a datagram received in place,
@@ -1242,12 +1248,17 @@ impl Host {
         if receive.max_ip_packet < 20 || receive.max_ip_packet > 65575 {
             return Err(Error::Unsupported);
         }
-        let slot = self
-            .ports
-            .iter()
-            .position(Option::is_none)
-            .ok_or(Error::Capacity)?;
+        // The host port table is parallel to PathService's link slots.
+        // Preserve the capacity check before the path service creates a link.
+        if self.ports.iter().all(Option::is_some) {
+            return Err(Error::Capacity);
+        }
         let link = self.paths.register_link(interface, mtu)?;
+        let slot = link.index();
+        if self.ports.get(slot).is_none_or(Option::is_some) {
+            let _ = self.paths.remove_link(link);
+            return Err(Error::InvalidContext);
+        }
         self.ports[slot] = Some(Port {
             link,
             receive,
@@ -1259,11 +1270,19 @@ impl Host {
         self.port_slot(link).map(|slot| self.ports[slot].unwrap())
     }
     fn port_slot(&self, link: LinkId) -> Result<usize, Error> {
+        let index = link.index();
+        if self
+            .ports
+            .get(index)
+            .is_some_and(|port| port.is_some_and(|p| p.link == link))
+        {
+            debug_assert!(self.paths.link(link).is_ok());
+            return Ok(index);
+        }
+        // Distinguish a foreign or stale path handle from a live link
+        // without a host port, as the path service does.
         self.paths.link(link)?;
-        self.ports
-            .iter()
-            .position(|port| port.is_some_and(|port| port.link == link))
-            .ok_or(Error::InvalidContext)
+        Err(Error::InvalidContext)
     }
     pub fn receive_capabilities(
         &self,
@@ -1276,15 +1295,10 @@ impl Host {
         Ok(IngressContext { link })
     }
     pub fn remove_link(&mut self, context: IngressContext) -> Result<(), Error> {
-        self.port(context.link)?;
+        let slot = self.port_slot(context.link)?;
         self.paths.remove_link(context.link)?;
         self.neighbors.remove_port(context.link);
         self.ipv4_neighbors.table_mut().remove_link(context.link);
-        let slot = self
-            .ports
-            .iter()
-            .position(|p| p.is_some_and(|p| p.link == context.link))
-            .unwrap();
         self.ports[slot] = None;
         Ok(())
     }
@@ -2080,19 +2094,18 @@ impl Host {
     // before its current mapping (`confirm`).
     fn confirm_progress(&mut self, index: usize, sent: Instant) {
         let binding = self.bindings[index].as_ref().unwrap();
-        let snapshot = binding.prepared.snapshot;
+        let snapshot = &binding.prepared.snapshot;
         if binding.moved.is_some_and(|moved| sent <= moved)
             || snapshot.status() != PathStatus::Valid
         {
             return;
         }
-        let ResolvedNextHop::Address(next_hop) = snapshot.key().next_hop() else {
+        let Some((link, next_hop)) = snapshot.neighbor() else {
             return;
         };
-        let link = snapshot.key().link();
         // A confirmation without entropy for its ReachableTime is lost, like
         // an unsent hint; NUD then probes.
-        let _ = match next_hop.address() {
+        let _ = match next_hop {
             IpAddr::V6(next_hop) => {
                 self.neighbors
                     .confirm(link, next_hop, sent, self.now, self.entropy.as_mut())

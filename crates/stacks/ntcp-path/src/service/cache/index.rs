@@ -86,7 +86,7 @@ impl PathIndex {
     // flows need only hash equally), and an address its family.
     pub(super) fn bucket(&self, key: &PathKey) -> usize {
         let mut hash = siphasher::sip::SipHasher13::new_with_key(&self.key);
-        for address in [key.destination, key.forwarding_destination] {
+        for address in [key.destination(), key.forwarding_destination()] {
             match address.address {
                 IpAddr::V4(ip) => {
                     hash.write_u8(4);

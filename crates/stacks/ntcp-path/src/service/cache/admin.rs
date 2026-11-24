@@ -242,7 +242,7 @@ impl PathService {
     pub(in crate::service) fn route_admin(&self, route: RouteId) -> Option<RouteAdmin> {
         let record = *self.route_admin.get(route.0.slot)?;
         (route.0.context == self.context
-            && record.route_generation == route.0.generation
+            && record.route_generation == route.0.generation.get()
             && self.route(route).is_ok())
         .then_some(record)
     }
@@ -421,7 +421,7 @@ impl PathService {
                 (
                     admin.policy,
                     admin.generation,
-                    admin.snapshot.key.destination.address.is_ipv4(),
+                    admin.snapshot.key.destination.is_ipv4(),
                     admin.snapshot.first_hop_mtu,
                 )
             }
@@ -494,7 +494,7 @@ impl PathService {
                 let imposed = plan.restriction.and(policy.estimate);
                 let retained = policy.estimate.and(lower(old.restriction, imposed));
                 self.route_admin[route.0.slot] = RouteAdmin {
-                    route_generation: route.0.generation,
+                    route_generation: route.0.generation.get(),
                     policy,
                     generation: plan.generation,
                     hold: old.hold.max(plan.restriction.unwrap_or(0)),
@@ -514,7 +514,6 @@ impl PathService {
         // One revision (and, for a restriction, one negative revision) for
         // the whole change. The plan's service revision is current and was
         // checked whenever a snapshot changes, so this cannot overflow.
-        let revision = self.revision.wrapping_add(1);
         let mut changed = false;
         for index in 0..self.paths.slots.len() {
             let Some(snapshot) = self.admin_candidate(plan, index) else {
@@ -528,7 +527,7 @@ impl PathService {
             }
         }
         if changed {
-            self.revision = revision;
+            self.revision = self.next_revision()?;
         }
         Ok(())
     }
@@ -543,11 +542,12 @@ impl PathService {
             plan.generation,
             plan.restriction.unwrap_or(0),
         )?;
-        let revision = plan.revision.wrapping_add(1);
-        if restricted {
-            snapshot.negative_revision = revision;
-        }
-        if snapshot != self.paths.slots[index].value?.snapshot {
+        let current = self.paths.slots[index].value?.snapshot;
+        if restricted || snapshot != current {
+            let revision = plan.revision.checked_add(1)?;
+            if restricted {
+                snapshot.negative_revision = revision;
+            }
             snapshot.stamp.version = revision;
         }
         Some(snapshot)
@@ -649,7 +649,7 @@ impl PathService {
             let staged = record.staged.take();
             *record = match (staged, self.routes.slots[slot].value) {
                 (Some((policy, generation, hold, restriction)), Some(_)) => RouteAdmin {
-                    route_generation: self.routes.slots[slot].generation,
+                    route_generation: self.routes.slots[slot].generation.get(),
                     policy,
                     generation,
                     hold,

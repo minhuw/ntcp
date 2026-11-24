@@ -3,6 +3,7 @@ use core::{
     cmp::Reverse,
     mem::size_of,
     net::{IpAddr, Ipv6Addr},
+    num::NonZeroU64,
 };
 
 use crate::{Error, Ipv4Plateaus};
@@ -27,7 +28,10 @@ impl ContextId {
 struct Handle {
     context: ContextId,
     slot: usize,
-    generation: u64,
+    // Service generations are allocated by checked increment from zero.
+    // Keep that invariant in the handle so optional links, routes and
+    // clients need no extra discriminant.
+    generation: NonZeroU64,
 }
 
 macro_rules! handle {
@@ -45,6 +49,12 @@ handle!(LinkId);
 handle!(SourceId);
 
 impl LinkId {
+    /// Index of this link in its path service's bounded link table.
+    /// Successive link generations can reuse the same index.
+    pub const fn index(self) -> usize {
+        self.0.slot
+    }
+
     /// The complete identity (context, slot, generation) as fixed-width
     /// big-endian octets: keyed digests of scoped identities include it, so
     /// a recycled slot never names the same zone.
@@ -52,7 +62,7 @@ impl LinkId {
         let mut bytes = [0; 24];
         bytes[..8].copy_from_slice(&self.0.context.0.to_be_bytes());
         bytes[8..16].copy_from_slice(&(self.0.slot as u64).to_be_bytes());
-        bytes[16..].copy_from_slice(&self.0.generation.to_be_bytes());
+        bytes[16..].copy_from_slice(&self.0.generation.get().to_be_bytes());
         bytes
     }
 }
@@ -155,7 +165,7 @@ fn segment_list(route: Route, segments: &[Ipv6Addr]) -> Result<Box<[Ipv6Addr]>, 
     Ok(list.into_boxed_slice())
 }
 
-fn is_link_local(address: IpAddr) -> bool {
+const fn is_link_local(address: IpAddr) -> bool {
     matches!(address, IpAddr::V6(v) if v.is_unicast_link_local())
 }
 
@@ -317,19 +327,26 @@ pub struct PathRequest {
     pub dscp: Dscp,
 }
 
+// The route-selection checks require every link-local address in a key
+// (including a gateway or Redirect target) to be on its output link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum PathNextHop {
+    Address(IpAddr),
+    Forwarder(ForwarderId),
+}
+
 /// Canonical immutable identity, minted only by authoritative route resolution.
 /// A key is provenance, not a perpetual output authorization: validate_selection
 /// must be checked at use. Link MTU and mutable ECN do not change identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct PathKey {
-    context: ContextId,
     source: SourceId,
-    source_address: ScopedAddress,
-    destination: ScopedAddress,
-    forwarding_destination: ScopedAddress,
+    source_address: IpAddr,
+    destination: IpAddr,
+    forwarding_destination: IpAddr,
     dscp: Dscp,
     link: LinkId,
-    next_hop: ResolvedNextHop,
+    next_hop: PathNextHop,
     route: RouteId,
     // The forwarding generation of the Redirect override that chose
     // `next_hop`; 0 for the route's own next hop.
@@ -337,22 +354,32 @@ pub struct PathKey {
 }
 
 impl PathKey {
+    const fn scoped(&self, address: IpAddr) -> ScopedAddress {
+        ScopedAddress {
+            address,
+            zone: if is_link_local(address) {
+                Some(self.link)
+            } else {
+                None
+            },
+        }
+    }
     pub const fn context(&self) -> ContextId {
-        self.context
+        self.link.context()
     }
     pub const fn source(&self) -> SourceId {
         self.source
     }
     pub const fn source_address(&self) -> ScopedAddress {
-        self.source_address
+        self.scoped(self.source_address)
     }
     pub const fn destination(&self) -> ScopedAddress {
-        self.destination
+        self.scoped(self.destination)
     }
     /// Actual destination used for forwarding (the first source-route hop
     /// when explicitly supplied), distinct from the transport destination.
     pub const fn forwarding_destination(&self) -> ScopedAddress {
-        self.forwarding_destination
+        self.scoped(self.forwarding_destination)
     }
     pub const fn dscp(&self) -> Dscp {
         self.dscp
@@ -361,7 +388,10 @@ impl PathKey {
         self.link
     }
     pub const fn next_hop(&self) -> ResolvedNextHop {
-        self.next_hop
+        match self.next_hop {
+            PathNextHop::Address(address) => ResolvedNextHop::Address(self.scoped(address)),
+            PathNextHop::Forwarder(id) => ResolvedNextHop::Forwarder(id),
+        }
     }
     pub const fn route(&self) -> RouteId {
         self.route
@@ -369,7 +399,7 @@ impl PathKey {
     pub const fn request(&self) -> PathRequest {
         PathRequest {
             source: self.source,
-            destination: self.destination,
+            destination: self.destination(),
             dscp: self.dscp,
         }
     }
@@ -402,7 +432,7 @@ impl ResolvedPath {
 
 #[derive(Clone, Copy)]
 struct Slot<T> {
-    generation: u64,
+    generation: NonZeroU64,
     value: Option<T>,
 }
 
@@ -419,7 +449,7 @@ impl<T: Copy> Table<T> {
         slots.resize(
             limit,
             Slot {
-                generation: 0,
+                generation: NonZeroU64::MIN,
                 value: None,
             },
         );
@@ -446,6 +476,7 @@ impl<T: Copy> Table<T> {
             .ok_or(Error::StaleHandle)
     }
     fn insert(&mut self, context: ContextId, slot: usize, generation: u64, value: T) -> Handle {
+        let generation = NonZeroU64::new(generation).expect("a live path-service generation");
         self.slots[slot] = Slot {
             generation,
             value: Some(value),
@@ -1146,14 +1177,14 @@ impl PathService {
         let (next_hop, forwarding) =
             match self.redirect_for(id, forwarding_destination, request.dscp) {
                 Some(redirect) => (
-                    ResolvedNextHop::Address(redirect.target()),
+                    PathNextHop::Address(redirect.target().address),
                     redirect.generation(),
                 ),
                 None => (
                     match route.next_hop {
-                        NextHop::OnLink => ResolvedNextHop::Address(forwarding_destination),
-                        NextHop::Gateway(g) => ResolvedNextHop::Address(g),
-                        NextHop::Forwarder(id) => ResolvedNextHop::Forwarder(id),
+                        NextHop::OnLink => PathNextHop::Address(forwarding_destination.address),
+                        NextHop::Gateway(g) => PathNextHop::Address(g.address),
+                        NextHop::Forwarder(id) => PathNextHop::Forwarder(id),
                     },
                     0,
                 ),
@@ -1161,11 +1192,10 @@ impl PathService {
         Ok(ResolvedPath {
             revision: self.revision,
             key: PathKey {
-                context: self.context,
                 source: request.source,
-                source_address: source,
-                destination: request.destination,
-                forwarding_destination,
+                source_address: source.address,
+                destination: request.destination.address,
+                forwarding_destination: forwarding_destination.address,
                 dscp: request.dscp,
                 link: route.link,
                 next_hop,
@@ -1181,7 +1211,7 @@ impl PathService {
     /// Returns current physical facts only if the exact original selection is
     /// still authoritative. A superseded key never silently migrates.
     pub fn validate_selection(&self, key: PathKey) -> Result<ResolvedPath, Error> {
-        if key.context != self.context {
+        if key.context() != self.context {
             return Err(Error::ForeignContext);
         }
         self.link(key.link)?;
@@ -1189,7 +1219,7 @@ impl PathService {
         // final destination and compare the derived S1 with the rest of the
         // key, never matching S1 against the route's destination prefix.
         let current = if self.route_segments(key.route)?.is_empty() {
-            self.resolve_via(key.request(), key.forwarding_destination)?
+            self.resolve_via(key.request(), key.forwarding_destination())?
         } else {
             self.resolve(key.request())?
         };

@@ -109,6 +109,17 @@ pub trait Ipv4NeighborTable: Any + Send {
     fn entry(&self, _link: LinkId, _address: Ipv4Addr) -> Option<(ArpState, Option<[u8; 6]>)> {
         None
     }
+    /// A cached resolution that can satisfy an output immediately without
+    /// entering the normal resolution or hold path.
+    ///
+    /// Contract: while a valid mapping for `(link, address)` at `now` is
+    /// locally available, implementations must return the exact MAC that
+    /// `resolve` would return without mutating neighbor state, and `None`
+    /// otherwise (on a miss, expired or invalid entry, or unknown/foreign
+    /// link). Returning `None` falls back to `resolve`.
+    fn cached_resolution(&self, _link: LinkId, _address: Ipv4Addr, _now: Instant) -> Option<[u8; 6]> {
+        None
+    }
     /// The neighbour-state generation (`ArpCache::neighbor_generation`):
     /// it changes whenever a REACHABLE or PERMANENT entry leaves that
     /// state, changes its MAC or is removed. While it is unchanged, a MAC
@@ -201,11 +212,17 @@ impl Ipv4Backend {
         }
     }
     pub(crate) fn table_mut(&mut self) -> &mut dyn Ipv4NeighborTable {
-        self.next.set(None);
         match &mut self.installed {
             Some(table) => &mut **table,
-            None => &mut self.own,
+            None => {
+                self.next.set(None);
+                &mut self.own
+            }
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn has_cached_deadline(&self) -> bool {
+        self.next.get().is_some()
     }
 }
 

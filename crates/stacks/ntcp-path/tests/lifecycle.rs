@@ -1057,3 +1057,306 @@ fn failed_authority_transactions_preserve_notifications_versions_and_pins() {
         before
     );
 }
+
+#[test]
+fn path_key_zone_derivation_and_snapshot_neighbor() {
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let mut service = PathService::new(ContextId::new(201), limits(8, 8), [2; 16]).unwrap();
+    let link_a = service.register_link(InterfaceKey(1), 1500).unwrap();
+    let link_b = service.register_link(InterfaceKey(2), 1500).unwrap();
+
+    // IPv6 link-local source, destination, and gateway derive their zone from the output link.
+    let ll_src_addr: IpAddr = IpAddr::V6("fe80::1".parse().unwrap());
+    let ll_dst_addr: IpAddr = IpAddr::V6("fe80::2".parse().unwrap());
+    let ll_gw_addr: IpAddr = IpAddr::V6("fe80::fe".parse().unwrap());
+    let ll_redir_addr: IpAddr = IpAddr::V6("fe80::fd".parse().unwrap());
+    let ll_src = service
+        .register_source(ScopedAddress::new(ll_src_addr, Some(link_a)).unwrap(), link_a)
+        .unwrap();
+    let ll_onlink_route = service
+        .add_route(Route {
+            destination: IpPrefix::new("fe80::".parse().unwrap(), 64).unwrap(),
+            source: None,
+            dscp: None,
+            link: link_a,
+            next_hop: NextHop::OnLink,
+            metric: 10,
+        })
+        .unwrap();
+    let ll_req = PathRequest {
+        source: ll_src,
+        destination: ScopedAddress::new(ll_dst_addr, Some(link_a)).unwrap(),
+        dscp: Dscp::new(0).unwrap(),
+    };
+    let (ll_client, ll_snap) = service.acquire(ll_req).unwrap();
+    let ll_key = ll_snap.key();
+    assert_eq!(ll_key.context(), ContextId::new(201));
+    assert_eq!(ll_key.link(), link_a);
+    assert_eq!(ll_key.route(), ll_onlink_route);
+    assert_eq!(ll_key.source_address().zone(), Some(link_a));
+    assert_eq!(ll_key.destination().zone(), Some(link_a));
+    assert_eq!(ll_key.forwarding_destination().zone(), Some(link_a));
+    assert_eq!(
+        ll_key.next_hop(),
+        ResolvedNextHop::Address(ScopedAddress::new(ll_dst_addr, Some(link_a)).unwrap())
+    );
+    assert_eq!(ll_snap.neighbor(), Some((link_a, ll_dst_addr)));
+    assert_eq!(service.validate_selection(ll_key).unwrap().key(), ll_key);
+
+    // Global IPv6 destination via link-local gateway: destination has no zone, next hop derives zone.
+    let g_src_addr: IpAddr = IpAddr::V6("2001:db8::1".parse().unwrap());
+    let g_dst_addr: IpAddr = IpAddr::V6("2001:db8:2::9".parse().unwrap());
+    let g_src = service
+        .register_source(ScopedAddress::new(g_src_addr, None).unwrap(), link_a)
+        .unwrap();
+    service
+        .add_route(Route {
+            destination: IpPrefix::new("2001:db8:2::".parse().unwrap(), 48).unwrap(),
+            source: None,
+            dscp: None,
+            link: link_a,
+            next_hop: NextHop::Gateway(ScopedAddress::new(ll_gw_addr, Some(link_a)).unwrap()),
+            metric: 10,
+        })
+        .unwrap();
+    let g_req = PathRequest {
+        source: g_src,
+        destination: ScopedAddress::new(g_dst_addr, None).unwrap(),
+        dscp: Dscp::new(0).unwrap(),
+    };
+    let (g_client, g_snap) = service.acquire(g_req).unwrap();
+    let g_key = g_snap.key();
+    assert_eq!(g_key.source_address().zone(), None);
+    assert_eq!(g_key.destination().zone(), None);
+    assert_eq!(g_key.forwarding_destination().zone(), None);
+    assert_eq!(
+        g_key.next_hop(),
+        ResolvedNextHop::Address(ScopedAddress::new(ll_gw_addr, Some(link_a)).unwrap())
+    );
+    assert_eq!(g_snap.neighbor(), Some((link_a, ll_gw_addr)));
+
+    // Redirect to another link-local router target derives its zone from the output link.
+    service
+        .redirect(
+            g_key,
+            ScopedAddress::new(ll_gw_addr, Some(link_a)).unwrap(),
+            ScopedAddress::new(ll_redir_addr, Some(link_a)).unwrap(),
+            false,
+        )
+        .unwrap();
+    let (g_redir_client, g_redir_snap) = service.acquire(g_req).unwrap();
+    assert_eq!(
+        g_redir_snap.key().next_hop(),
+        ResolvedNextHop::Address(ScopedAddress::new(ll_redir_addr, Some(link_a)).unwrap())
+    );
+    assert_eq!(g_redir_snap.neighbor(), Some((link_a, ll_redir_addr)));
+    assert_eq!(
+        service.validate_selection(g_redir_snap.key()).unwrap().key(),
+        g_redir_snap.key()
+    );
+
+    // Segment-routed global destination: forwarding_destination is S1, unscoped.
+    let s1: Ipv6Addr = "2001:db8:9::1".parse().unwrap();
+    let sr_dst: IpAddr = IpAddr::V6("2001:db8:3::44".parse().unwrap());
+    service
+        .add_segment_route(
+            Route {
+                destination: IpPrefix::new("2001:db8:3::".parse().unwrap(), 48).unwrap(),
+                source: None,
+                dscp: None,
+                link: link_a,
+                next_hop: NextHop::OnLink,
+                metric: 10,
+            },
+            &[s1],
+        )
+        .unwrap();
+    let sr_req = PathRequest {
+        source: g_src,
+        destination: ScopedAddress::new(sr_dst, None).unwrap(),
+        dscp: Dscp::new(0).unwrap(),
+    };
+    let (sr_client, sr_snap) = service.acquire(sr_req).unwrap();
+    assert_eq!(sr_snap.key().destination().address(), sr_dst);
+    assert_eq!(sr_snap.key().destination().zone(), None);
+    assert_eq!(sr_snap.key().forwarding_destination().address(), IpAddr::V6(s1));
+    assert_eq!(sr_snap.key().forwarding_destination().zone(), None);
+    assert_eq!(sr_snap.neighbor(), Some((link_a, IpAddr::V6(s1))));
+
+    // Forwarder route yields None for PathSnapshot::neighbor() and preserves ForwarderId.
+    let v4_src = service
+        .register_source(
+            ScopedAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap(),
+            link_b,
+        )
+        .unwrap();
+    service
+        .add_route(Route {
+            destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+            source: None,
+            dscp: None,
+            link: link_b,
+            next_hop: NextHop::Forwarder(ForwarderId(7)),
+            metric: 10,
+        })
+        .unwrap();
+    let fwd_req = PathRequest {
+        source: v4_src,
+        destination: ScopedAddress::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), None).unwrap(),
+        dscp: Dscp::new(0).unwrap(),
+    };
+    let (fwd_client, fwd_snap) = service.acquire(fwd_req).unwrap();
+    assert_eq!(fwd_snap.key().next_hop(), ResolvedNextHop::Forwarder(ForwarderId(7)));
+    assert_eq!(fwd_snap.neighbor(), None);
+
+    for client in [ll_client, g_client, g_redir_client, sr_client, fwd_client] {
+        service.release(client).unwrap();
+    }
+}
+
+#[test]
+fn link_id_index_and_generations_across_link_route_redirect_mtu_and_admin_changes() {
+    use core::net::{IpAddr, Ipv4Addr};
+
+    let mut service = PathService::new(
+        ContextId::new(202),
+        Limits {
+            links: 2,
+            sources: 4,
+            source_owners: 4,
+            routes: 4,
+            paths: 4,
+            clients: 4,
+        },
+        [3; 16],
+    )
+    .unwrap();
+
+    // LinkId::index() stays within 0..links and reuses freed slots with fresh nonzero generations.
+    let link0 = service.register_link(InterfaceKey(10), 1500).unwrap();
+    let link1 = service.register_link(InterfaceKey(11), 1500).unwrap();
+    assert_eq!(link0.index(), 0);
+    assert_eq!(link1.index(), 1);
+    assert_eq!(
+        service.register_link(InterfaceKey(12), 1500),
+        Err(Error::Capacity)
+    );
+
+    service.remove_link(link0).unwrap();
+    let link0_reused = service.register_link(InterfaceKey(12), 1500).unwrap();
+    assert_eq!(link0_reused.index(), link0.index());
+    assert_ne!(link0_reused, link0);
+    assert_ne!(link0_reused.to_bytes(), link0.to_bytes());
+    // Generation bytes in to_bytes()[16..] are nonzero and strictly increasing.
+    assert_ne!(&link0.to_bytes()[16..], &[0u8; 8]);
+    assert_ne!(&link0_reused.to_bytes()[16..], &[0u8; 8]);
+    assert!(
+        u64::from_be_bytes(link0_reused.to_bytes()[16..].try_into().unwrap())
+            > u64::from_be_bytes(link0.to_bytes()[16..].try_into().unwrap())
+    );
+    assert_eq!(service.link(link0), Err(Error::StaleHandle));
+
+    // Attach source + gateway route on the reused link slot, then exercise MTU, redirect,
+    // route replacement, and administrative updates.
+    let src = service
+        .register_source(
+            ScopedAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), None).unwrap(),
+            link0_reused,
+        )
+        .unwrap();
+    let gw = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let redir = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+    let route0 = service
+        .add_route(Route {
+            destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+            source: None,
+            dscp: None,
+            link: link0_reused,
+            next_hop: NextHop::Gateway(ScopedAddress::new(gw, None).unwrap()),
+            metric: 10,
+        })
+        .unwrap();
+    let req = PathRequest {
+        source: src,
+        destination: ScopedAddress::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)), None).unwrap(),
+        dscp: Dscp::new(0).unwrap(),
+    };
+    let (client, snap0) = service.acquire(req).unwrap();
+    assert_eq!(snap0.neighbor(), Some((link0_reused, gw)));
+
+    // MTU change preserves LinkId and index while bumping version and first_hop_mtu.
+    service.set_link_mtu(link0_reused, 1400).unwrap();
+    let snap_mtu = service.snapshot(client).unwrap();
+    assert_eq!(snap_mtu.key().link(), link0_reused);
+    assert_eq!(snap_mtu.key().link().index(), link0.index());
+    assert_eq!(snap_mtu.first_hop_mtu(), 1400);
+    assert!(snap_mtu.version() > snap0.version());
+    assert_eq!(snap_mtu.neighbor(), Some((link0_reused, gw)));
+
+    // Admin update (checked_add revision path) updates snapshot and bumps revision.
+    let rev_before_admin = service.revision();
+    let plan = service
+        .prepare_admin(
+            AdminChange {
+                target: AdminTarget::Route(route0),
+                expected: 0,
+                policy: AdminPolicy {
+                    discovery_disabled: false,
+                    estimate: Some(1200),
+                },
+            },
+            100,
+            600,
+        )
+        .unwrap();
+    assert_eq!(service.preview_admin(plan).unwrap().count(), 1);
+    service.commit_admin(plan).unwrap();
+    assert_eq!(service.revision(), rev_before_admin + 1);
+    let snap_admin = service.snapshot(client).unwrap();
+    assert_eq!(snap_admin.ip_packet_budget(), Ok(1200));
+
+    // Redirect invalidates old incarnation and new acquisition carries redirected neighbor.
+    service
+        .redirect(
+            snap_admin.key(),
+            ScopedAddress::new(gw, None).unwrap(),
+            ScopedAddress::new(redir, None).unwrap(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        service.snapshot(client).unwrap().status(),
+        PathStatus::Invalidated(InvalidationReason::SelectionChanged)
+    );
+    let (client2, snap_redir) = service.acquire(req).unwrap();
+    assert_ne!(snap_redir.path(), snap_admin.path());
+    assert_eq!(snap_redir.neighbor(), Some((link0_reused, redir)));
+
+    // Route replacement retires old RouteId generation while reusing the route slot.
+    let route1 = service
+        .replace_route(
+            route0,
+            Route {
+                destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+                source: None,
+                dscp: None,
+                link: link0_reused,
+                next_hop: NextHop::OnLink,
+                metric: 5,
+            },
+        )
+        .unwrap();
+    assert_ne!(route1, route0);
+    assert_eq!(service.route(route0), Err(Error::StaleHandle));
+    let (client3, snap_onlink) = service.acquire(req).unwrap();
+    assert_eq!(snap_onlink.key().route(), route1);
+    assert_eq!(
+        snap_onlink.neighbor(),
+        Some((link0_reused, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))))
+    );
+
+    for c in [client, client2, client3] {
+        service.release(c).unwrap();
+    }
+}

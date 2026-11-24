@@ -611,3 +611,43 @@ fn a_connection_keeps_a_connected_next_hop_until_its_entry_changes() {
     assert_eq!(side.0.neighbor_cached(context, owner), None);
     assert!(hop(&mut side, context, owner, expiry).is_err());
 }
+
+#[test]
+fn cached_resolution_defaults_to_none_and_installed_table_mut_keeps_own_deadline_cache() {
+    let mut side = side();
+    let link = side.2.link();
+    side.0
+        .add_static_neighbor(link, IpAddr::V4(GATEWAY), GATEWAY_MAC, 0)
+        .unwrap();
+    // The Host's built-in ARP cache uses `connected()`/`generation()` rather than
+    // `cached_resolution()`, so the trait default returns None.
+    assert_eq!(
+        side.0
+            .ipv4_neighbors
+            .table()
+            .cached_resolution(link, GATEWAY, 0),
+        None
+    );
+
+    // Prime own deadline cache, then install a custom table and verify `table_mut()` does not
+    // clear `next` for the installed branch (only the own branch clears it).
+    let _ = side.0.ipv4_neighbors.next_deadline();
+    assert!(side.0.ipv4_neighbors.has_cached_deadline());
+    let _ = side.0.ipv4_neighbors.table_mut();
+    assert!(!side.0.ipv4_neighbors.has_cached_deadline());
+
+    let _ = side.0.ipv4_neighbors.next_deadline();
+    assert!(side.0.ipv4_neighbors.has_cached_deadline());
+    side.0
+        .ipv4_neighbors
+        .install(Box::new(Installed::default()));
+    assert_eq!(
+        side.0
+            .ipv4_neighbors
+            .table()
+            .cached_resolution(link, GATEWAY, 0),
+        None
+    );
+    let _ = side.0.ipv4_neighbors.table_mut();
+    assert!(side.0.ipv4_neighbors.has_cached_deadline());
+}

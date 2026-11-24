@@ -287,3 +287,96 @@ fn after_each_change_the_next_packet_built_uses_the_new_state() {
         }
     }
 }
+
+#[test]
+fn register_link_reused_slot_rejects_stale_handle_and_guards_occupancy_and_capacity() {
+    let cfg = config(1);
+    let (paths, limits) = managed_limits(&cfg, 2, 2, 2, 2, 0).unwrap();
+    let mut host = Host::new(
+        ContextId::new(88),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [8; 16],
+    )
+    .unwrap();
+    let recv = ReceiveCapabilities {
+        max_ip_packet: 1500,
+        ipv4: Ipv4Receive::Enabled {
+            interpretation: false,
+            source_routes: false,
+        },
+        ipv6: Ipv6Receive::Disabled,
+        gro: false,
+    };
+
+    let ctx0 = host
+        .register_link(InterfaceKey(1), 1500, recv, Forwarding::IpNextHop)
+        .unwrap();
+    let ctx1 = host
+        .register_link(InterfaceKey(2), 1500, recv, Forwarding::IpNextHop)
+        .unwrap();
+    assert_eq!(ctx0.link().index(), 0);
+    assert_eq!(ctx1.link().index(), 1);
+    assert_eq!(host.port_slot(ctx0.link()), Ok(0));
+    assert_eq!(host.port_slot(ctx1.link()), Ok(1));
+
+    // Capacity bound rejects a third link without mutating PathService.
+    assert_eq!(
+        host.register_link(InterfaceKey(3), 1500, recv, Forwarding::IpNextHop),
+        Err(Error::Capacity)
+    );
+    assert_eq!(host.paths().usage().links, 2);
+
+    // Removing link 0 and re-adding reuses slot 0 with a new generation; the old handle is stale.
+    host.remove_link(ctx0).unwrap();
+    let ctx2 = host
+        .register_link(InterfaceKey(3), 1500, recv, Forwarding::IpNextHop)
+        .unwrap();
+    assert_eq!(ctx2.link().index(), ctx0.link().index());
+    assert_ne!(ctx2.link(), ctx0.link());
+    assert_eq!(
+        host.receive_capabilities(ctx0),
+        Err(Error::Path(path::Error::StaleHandle))
+    );
+    assert_eq!(
+        host.ingress_context(ctx0.link()),
+        Err(Error::Path(path::Error::StaleHandle))
+    );
+    assert_eq!(
+        host.port_slot(ctx0.link()),
+        Err(Error::Path(path::Error::StaleHandle))
+    );
+    assert_eq!(
+        host.remove_link(ctx0),
+        Err(Error::Path(path::Error::StaleHandle))
+    );
+    assert_eq!(host.port_slot(ctx2.link()), Ok(ctx2.link().index()));
+    assert_eq!(host.receive_capabilities(ctx2), Ok(recv));
+
+    // R4 release occupancy check: if a port slot is already occupied when PathService allocates
+    // that index, register_link refuses it, rolls back the path link, and preserves the live port.
+    let slot = ctx2.link().index();
+    let sentinel = Port {
+        link: ctx1.link(),
+        receive: recv,
+        forwarding: Forwarding::IpNextHop,
+    };
+    host.remove_link(ctx2).unwrap();
+    assert_eq!(host.paths().usage().links, 1);
+    let saved_port1 = host.ports[1].take();
+    host.ports[slot] = Some(sentinel);
+    assert_eq!(
+        host.register_link(InterfaceKey(4), 1500, recv, Forwarding::IpNextHop),
+        Err(Error::InvalidContext)
+    );
+    assert_eq!(host.ports[slot].unwrap().link, sentinel.link);
+    assert_eq!(host.paths().usage().links, 1);
+    // Restore host state cleanly and verify normal registration succeeds again.
+    host.ports[slot] = None;
+    host.ports[1] = saved_port1;
+    let ctx3 = host
+        .register_link(InterfaceKey(4), 1500, recv, Forwarding::IpNextHop)
+        .unwrap();
+    assert_eq!(ctx3.link().index(), slot);
+}

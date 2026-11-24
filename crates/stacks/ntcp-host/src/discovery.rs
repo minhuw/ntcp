@@ -359,7 +359,7 @@ impl Host {
         };
         // A connection whose next hop's entry is still connected sends to
         // the address it found.
-        if let Some(mac) = self.cached_neighbor(context, binding) {
+        if let Some(mac) = self.cached_neighbor(&context, binding) {
             return Ok(NeighborHop::Resolved(mac));
         }
         let stamp = context.stamp();
@@ -394,22 +394,35 @@ impl Host {
 
     // The link-layer address binding record `binding` keeps for the next
     // hop of `context` (`NeighborDst`), while it holds.
-    fn cached_neighbor(&self, context: EgressContext, binding: Option<usize>) -> Option<[u8; 6]> {
-        let n = self.bindings[binding?].as_ref().unwrap().neighbor?;
-        let ResolvedNextHop::Address(next_hop) = context.next_hop else {
-            return None;
-        };
-        if n.stamp != context.stamp()
-            || !self.ports[n.port].is_some_and(|p| p.link == context.link)
-            || self.neighbor_generation(next_hop.address()) != Some(n.generation)
+    fn cached_neighbor(
+        &self,
+        context: &EgressContext,
+        binding: Option<usize>,
+    ) -> Option<[u8; 6]> {
+        self.connected_mapping(
+            self.bindings[binding?].as_ref().unwrap().neighbor,
+            context.link,
+            context.neighbor_address()?,
+            context.stamp(),
+        )
+    }
+
+    pub(super) fn connected_mapping(
+        &self,
+        neighbor: Option<crate::NeighborDst>,
+        link: LinkId,
+        next_hop: IpAddr,
+        stamp: ntcp_path::ChangeStamp,
+    ) -> Option<[u8; 6]> {
+        let n = neighbor?;
+        if n.stamp != stamp
+            || !self.ports[n.port].is_some_and(|p| p.link == link)
+            || self.neighbor_generation(next_hop) != Some(n.generation)
         {
             return None;
         }
-        debug_assert_eq!(self.port_slot(context.link), Ok(n.port));
-        debug_assert_eq!(
-            self.connected_neighbor(context.link, next_hop.address()),
-            Some(n.mac)
-        );
+        debug_assert_eq!(self.port_slot(link), Ok(n.port));
+        debug_assert_eq!(self.connected_neighbor(link, next_hop), Some(n.mac));
         Some(n.mac)
     }
     // Whether `resolve_neighbor` of `owner`'s `context` takes the kept
@@ -419,7 +432,7 @@ impl Host {
         let Owner::Tcp(id) = owner else {
             return None;
         };
-        self.cached_neighbor(context, self.binding_index(id))
+        self.cached_neighbor(&context, self.binding_index(id))
     }
 
     // The neighbour-state generation of `next_hop`'s family, None for an

@@ -125,8 +125,8 @@ impl PathService {
         type_of_service: bool,
     ) -> Result<(), Error> {
         self.validate_selection(key)?;
-        let destination = key.forwarding_destination;
-        if key.next_hop != ResolvedNextHop::Address(sender)
+        let destination = key.forwarding_destination();
+        if key.next_hop() != ResolvedNextHop::Address(sender)
             || sender == destination
             || target.address.is_ipv4() != destination.address.is_ipv4()
             || target.zone.is_some_and(|zone| zone != key.link)
@@ -269,7 +269,7 @@ impl PathService {
     // changes only the first hop an override chose.
     pub(super) fn forwarding_transition(&self, key: PathKey) -> bool {
         let current = if self.route_segments(key.route).is_ok_and(<[_]>::is_empty) {
-            self.resolve_via(key.request(), key.forwarding_destination)
+            self.resolve_via(key.request(), key.forwarding_destination())
         } else {
             self.resolve(key.request())
         };

@@ -1568,3 +1568,129 @@ fn ipv6_disabled_path_caps_every_physical_gso_segment_at_1280() {
     assert_eq!(b.1.read(child, &mut bytes).unwrap(), payload.len());
     assert_eq!(&bytes[..payload.len()], &payload[..]);
 }
+
+#[test]
+fn admin_apply_rebind_clears_cached_dst_and_neighbor() {
+    use alloc::boxed::Box;
+    use core::net::Ipv4Addr;
+
+    let cfg = config(1);
+    let own_mac = [2, 0, 0, 0, 0, 1];
+    let gw_mac = [2, 0, 0, 0, 0, 0xfe];
+    let local_ip = Ipv4Addr::new(192, 0, 2, 1);
+    let gw_ip = Ipv4Addr::new(192, 0, 2, 254);
+    let remote_ip = Ipv4Addr::new(198, 51, 100, 9);
+    let local = SocketAddr::new(IpAddr::V4(local_ip), 4000);
+    let remote = SocketAddr::new(IpAddr::V4(remote_ip), 80);
+
+    let (paths, mut limits) = managed_limits(&cfg, 1, 1, 1, 2, 0).unwrap();
+    limits.ipv4_neighbors = NeighborLimits {
+        entries: 2,
+        pending_packets: 2,
+        addresses: 1,
+        answers: 1,
+    };
+    let mut host = Host::new(
+        ContextId::new(9250),
+        paths,
+        limits,
+        cfg.connection.timebase,
+        [9; 16],
+    )
+    .unwrap();
+    host.set_entropy(Box::new(|out: &mut [u8]| {
+        out.fill(0);
+        out[0] = 0x80;
+        Ok(())
+    }));
+    let recv = ReceiveCapabilities {
+        max_ip_packet: 1500,
+        ipv4: Ipv4Receive::Enabled {
+            interpretation: false,
+            source_routes: false,
+        },
+        ipv6: Ipv6Receive::Disabled,
+        gro: false,
+    };
+    let ctx = host
+        .register_neighbor_port(InterfaceKey(1), 1500, recv, NdPort::new(own_mac))
+        .unwrap();
+    let link = ctx.link();
+    assert_eq!(
+        host.add_neighbor_address(link, local_ip),
+        Ok(AddressState::Assigned)
+    );
+    let route = host
+        .add_route(path::Route {
+            destination: path::IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+            source: None,
+            dscp: None,
+            link,
+            next_hop: path::NextHop::Gateway(
+                ScopedAddress::new(IpAddr::V4(gw_ip), None).unwrap(),
+            ),
+            metric: 10,
+        })
+        .unwrap();
+    host.add_static_neighbor(link, IpAddr::V4(gw_ip), gw_mac, 0)
+        .unwrap();
+
+    let mut endpoint = Endpoint::new(cfg.clone(), [92; 32], 0, |_| true).unwrap();
+    host.attach(&mut endpoint).unwrap();
+    endpoint
+        .enable_output_reservations_with_capacity(1)
+        .unwrap();
+    let tcp = endpoint
+        .connect_with_path_provider(0, local, remote, options(&cfg, 0), &mut host)
+        .unwrap();
+
+    // Populate both `dst` (via egress_context) and `neighbor` (via resolve_neighbor).
+    let (attempt, _, _) = selected(&mut endpoint, 10).unwrap();
+    let egress = host.egress_context(&mut endpoint, attempt).unwrap();
+    assert_eq!(
+        host.resolve_neighbor(egress, Owner::Tcp(tcp), 10),
+        Ok(NeighborHop::Resolved(gw_mac))
+    );
+    let idx = host.binding_index(tcp).unwrap();
+    assert!(host.bindings[idx].as_ref().unwrap().dst.is_some());
+    assert!(host.bindings[idx].as_ref().unwrap().neighbor.is_some());
+    assert!(host.dst_held(&endpoint, tcp));
+    assert_eq!(host.neighbor_cached(egress, Owner::Tcp(tcp)), Some(gw_mac));
+
+    // Applying an administrative policy change rebinds the connection and clears both caches.
+    let capability = host.administration();
+    let candidate = host
+        .admin_validate(
+            &capability,
+            20,
+            AdminChange {
+                target: AdminTarget::Route(route),
+                expected: 0,
+                policy: AdminPolicy {
+                    discovery_disabled: false,
+                    estimate: Some(1200),
+                },
+            },
+        )
+        .unwrap();
+    host.admin_apply(&capability, &mut endpoint, candidate)
+        .unwrap();
+    assert!(host.bindings[idx].as_ref().unwrap().dst.is_none());
+    assert!(host.bindings[idx].as_ref().unwrap().neighbor.is_none());
+    assert!(!host.dst_held(&endpoint, tcp));
+    assert_eq!(host.neighbor_cached(egress, Owner::Tcp(tcp)), None);
+
+    // Reject the stale pre-admin attempt, select a fresh attempt, and verify both caches repopulate.
+    assert!(endpoint.reject_unsubmitted(attempt).unwrap());
+    let (next_attempt, _, _) = selected(&mut endpoint, 30).unwrap();
+    let next_egress = host.egress_context(&mut endpoint, next_attempt).unwrap();
+    assert_eq!(
+        host.resolve_neighbor(next_egress, Owner::Tcp(tcp), 30),
+        Ok(NeighborHop::Resolved(gw_mac))
+    );
+    assert!(host.dst_held(&endpoint, tcp));
+    assert_eq!(
+        host.neighbor_cached(next_egress, Owner::Tcp(tcp)),
+        Some(gw_mac)
+    );
+}
