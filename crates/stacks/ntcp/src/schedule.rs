@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 
 // A slot index always fits below END, since Rust's Vec length is bounded by
 // `isize::MAX` (so `usize::MAX` is never a valid index). The head and every
@@ -139,7 +140,6 @@ impl Deadlines {
         self.heap.first().copied()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn time(&self, index: usize) -> Option<u64> {
         self.positions[index].map(|position| self.heap[position].0)
     }
@@ -274,6 +274,79 @@ impl ConnectionTimers {
             (Some(at), None) => Some((at, self.current)),
             (None, other) => other,
         }
+    }
+}
+
+// The index can keep an earlier wakeup when a connection moves its timer
+// later or disarms it. Busy polls need only establish that nothing is due.
+// Reconcile stale roots when one may be due or an exact minimum is requested.
+pub(crate) struct SocketTimers {
+    index: RefCell<ConnectionTimers>,
+    deadlines: Vec<Option<u64>>,
+    // No indexed socket can be due before this time. Earlier insertions
+    // lower it immediately. Removing or postponing a timer can leave an
+    // early hint until the next time the index is consulted.
+    earliest: Cell<u64>,
+}
+
+impl SocketTimers {
+    pub(crate) fn new(capacity: usize) -> Result<Self, ()> {
+        let mut deadlines = Vec::new();
+        deadlines.try_reserve_exact(capacity).map_err(|_| ())?;
+        deadlines.resize(capacity, None);
+        Ok(Self {
+            index: RefCell::new(ConnectionTimers::new(capacity)?),
+            earliest: Cell::new(u64::MAX),
+            deadlines,
+        })
+    }
+
+    pub(crate) fn set(&mut self, slot: usize, deadline: Option<u64>) {
+        self.deadlines[slot] = deadline;
+        if let Some(at) = deadline {
+            self.earliest.set(self.earliest.get().min(at));
+        }
+        let index = self.index.get_mut();
+        if index.current == slot {
+            index.deadline = deadline;
+        } else if let Some(at) = deadline
+            && index.stored.time(slot).is_none_or(|lower| at < lower)
+        {
+            index.set(slot, deadline);
+        }
+    }
+
+    fn due_by(&self, through: u64) -> Option<(u64, usize)> {
+        let mut index = self.index.borrow_mut();
+        loop {
+            let Some((at, slot)) = index.first() else {
+                self.earliest.set(u64::MAX);
+                return None;
+            };
+            if at > through {
+                self.earliest.set(at);
+                return None;
+            }
+            let deadline = self.deadlines[slot];
+            if deadline == Some(at) {
+                self.earliest.set(at);
+                return Some((at, slot));
+            }
+            debug_assert!(deadline.is_none_or(|later| later > at));
+            index.set(slot, deadline);
+        }
+    }
+
+    pub(crate) fn first(&self) -> Option<(u64, usize)> {
+        self.due_by(u64::MAX)
+    }
+
+    pub(crate) fn due(&self, now: u64) -> bool {
+        now >= self.earliest.get() && self.due_by(now).is_some()
+    }
+
+    pub(crate) fn earliest_possible(&self) -> u64 {
+        self.earliest.get()
     }
 }
 
@@ -651,5 +724,138 @@ mod tests {
         assert_eq!(timers.first_with(Some(100)), Some((100, 0)));
         assert_eq!(timers.first_with(Some(200)), Some((100, 0)));
         assert_eq!(timers.first_with(None), Some((100, 0)));
+    }
+
+    fn oracle_first(oracle: &[Option<u64>]) -> Option<(u64, usize)> {
+        oracle
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, &deadline)| deadline.map(|at| (at, slot)))
+            .min()
+    }
+
+    #[test]
+    fn socket_timers_differential_model_against_oracle() {
+        // Edge cases: empty, full, equal timestamps, u64::MAX / 0 boundaries,
+        // postponing, moving earlier, clearing, and reusing slots.
+        let mut st = SocketTimers::new(4).unwrap();
+        assert_eq!(st.earliest_possible(), u64::MAX);
+        assert!(!st.due(0));
+        assert!(!st.due(u64::MAX));
+        assert_eq!(st.first(), None);
+
+        // Equal timestamps tie-break by lowest slot index, even when inserted out of order.
+        st.set(3, Some(50));
+        st.set(1, Some(50));
+        st.set(2, Some(50));
+        st.set(0, Some(50));
+        assert!(st.earliest_possible() <= 50);
+        assert!(!st.due(49));
+        assert!(st.due(50));
+        assert_eq!(st.first(), Some((50, 0)));
+        // Postpone slot 0 and clear slot 1; slot 2 must win next.
+        st.set(0, Some(100));
+        st.set(1, None);
+        assert_eq!(st.first(), Some((50, 2)));
+        // Boundary timestamps 0 and u64::MAX.
+        st.set(1, Some(u64::MAX));
+        st.set(2, None);
+        st.set(3, None);
+        st.set(0, None);
+        assert!(!st.due(u64::MAX - 1));
+        assert!(st.due(u64::MAX));
+        assert_eq!(st.first(), Some((u64::MAX, 1)));
+        st.set(2, Some(0));
+        assert!(st.due(0));
+        assert_eq!(st.first(), Some((0, 2)));
+        st.set(1, None);
+        st.set(2, None);
+        assert_eq!(st.first(), None);
+        assert_eq!(st.earliest_possible(), u64::MAX);
+
+        // Randomized model test across capacities 1, 2, 3, 7, 19.
+        for cap in [1usize, 2, 3, 7, 19] {
+            let mut timers = SocketTimers::new(cap).unwrap();
+            let mut oracle: Vec<Option<u64>> = alloc::vec![None; cap];
+            let mut seed = 0x50c4_e771_dead_beefu64 ^ (cap as u64);
+            let mut next = || {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                seed
+            };
+
+            for _ in 0..8000 {
+                let op = (next() >> 16) % 10;
+                match op {
+                    0..=4 => {
+                        // Set or update a slot's deadline (earlier, later, equal, or boundary).
+                        let slot = (next() >> 32) as usize % cap;
+                        let val = match (next() >> 24) % 8 {
+                            0 => 0,
+                            1 => u64::MAX,
+                            2 => 42, // Frequent equal timestamps to stress tie-breaking
+                            3 => 43,
+                            _ => (next() >> 20) % 200,
+                        };
+                        timers.set(slot, Some(val));
+                        oracle[slot] = Some(val);
+                    }
+                    5 | 6 => {
+                        // Clear a slot.
+                        let slot = (next() >> 32) as usize % cap;
+                        timers.set(slot, None);
+                        oracle[slot] = None;
+                    }
+                    7 => {
+                        // Query due(now) without forcing a full first() reconciliation.
+                        let now = match (next() >> 24) % 6 {
+                            0 => 0,
+                            1 => u64::MAX,
+                            2 => oracle_first(&oracle).map_or(0, |(t, _)| t.saturating_sub(1)),
+                            3 => oracle_first(&oracle).map_or(0, |(t, _)| t),
+                            _ => (next() >> 20) % 200,
+                        };
+                        let expected_due = oracle_first(&oracle).is_some_and(|(t, _)| t <= now);
+                        assert_eq!(timers.due(now), expected_due);
+                    }
+                    8 => {
+                        // Query exact first().
+                        assert_eq!(timers.first(), oracle_first(&oracle));
+                    }
+                    _ => {
+                        // Fill or drain the table to exercise full/empty transitions.
+                        if (next() & 1) == 0 {
+                            let base = (next() >> 20) % 100;
+                            for (slot, entry) in oracle.iter_mut().enumerate() {
+                                let at = base.saturating_add((slot % 3) as u64);
+                                timers.set(slot, Some(at));
+                                *entry = Some(at);
+                            }
+                        } else {
+                            for (slot, entry) in oracle.iter_mut().enumerate() {
+                                timers.set(slot, None);
+                                *entry = None;
+                            }
+                        }
+                    }
+                }
+                // Lower-bound invariant must hold after EVERY operation without reconciling.
+                let min_deadline = oracle_first(&oracle).map_or(u64::MAX, |(t, _)| t);
+                assert!(
+                    timers.earliest_possible() <= min_deadline,
+                    "earliest_possible={} exceeded true min={}",
+                    timers.earliest_possible(),
+                    min_deadline
+                );
+            }
+            // Final full reconciliation and drain.
+            assert_eq!(timers.first(), oracle_first(&oracle));
+            for slot in 0..cap {
+                timers.set(slot, None);
+                oracle[slot] = None;
+                assert_eq!(timers.first(), oracle_first(&oracle));
+            }
+            assert_eq!(timers.first(), None);
+            assert_eq!(timers.earliest_possible(), u64::MAX);
+        }
     }
 }

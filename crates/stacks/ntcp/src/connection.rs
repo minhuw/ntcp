@@ -2459,6 +2459,19 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc8985#section-8
     //# When arming a RACK reordering timer or TLP
     //# PTO timer, the sender SHOULD cancel any other pending timers.
+    #[cfg(debug_assertions)]
+    fn selected_loss_timer(&self) -> Option<(LossTimer, Instant)> {
+        if let Some(deadline) = self.rack.deadline {
+            Some((LossTimer::Rack, deadline))
+        } else if let Some(deadline) = self.tlp_deadline {
+            Some((LossTimer::Pto, deadline))
+        } else if let Some(deadline) = self.persist_deadline {
+            Some((LossTimer::Zwp, deadline))
+        } else {
+            self.rto_deadline.map(|deadline| (LossTimer::Rto, deadline))
+        }
+    }
+
     fn select_loss_timer(&mut self) {
         self.loss_timer = if let Some(deadline) = self.rack.deadline {
             self.tlp_deadline = None;
@@ -5421,6 +5434,21 @@ impl Connection {
 
     fn arm_work_with_probe(&mut self, restart_probe: bool) {
         self.resolve_probe_response();
+        let flight = self.flight();
+        let queued = self.send.len();
+        let idle = queued == 0 && flight == 0 && self.state == State::Established;
+        if idle && !self.shutdown {
+            self.tlp_deadline = None;
+            self.tlp_pending = false;
+            self.clear_persist();
+            self.update_cork_flush();
+            self.cork_deadline = None;
+            self.sws_deadline = None;
+            self.sws_override = false;
+            self.arm_idle_keepalive();
+            self.select_loss_timer();
+            return;
+        }
         let early_response = self.early_response_eligible();
         if !self.synchronized() && !early_response {
             self.select_loss_timer();
@@ -5437,8 +5465,8 @@ impl Connection {
             self.tlp_deadline = None;
             self.tlp_pending = false;
         }
-        let pending = self.send.len() != 0
-            || self.flight() != 0
+        let pending = queued != 0
+            || flight != 0
             || self.shutdown && self.fin_sequence.is_none();
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
         //# If the window shrinks to zero, the TCP implementation MUST probe it in the
@@ -5459,7 +5487,7 @@ impl Connection {
             if self.persist_interval == 0 {
                 self.persist_interval = self.rto();
             }
-            if self.flight() == 0 {
+            if flight == 0 {
                 if self.persist_deadline.is_none() && !self.probe_pending {
                     self.persist_deadline = Some(self.now.saturating_add(self.persist_interval));
                 }
@@ -5474,23 +5502,36 @@ impl Connection {
                 }
             }
         } else if !early_response {
-            self.probe_pending = false;
-            self.persist_interval = 0;
-            self.persist_unanswered_since = None;
-            self.persist_deadline = None;
-            if self.flight() != 0 && self.rto_deadline.is_none() && !self.retx_pending {
+            self.clear_persist();
+            if flight != 0 && self.rto_deadline.is_none() && !self.retx_pending {
                 self.rto_deadline = Some(self.now.saturating_add(self.rto()));
             }
         }
-        let unsent = self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize;
-        if self.cork_flush.is_some_and(|end| !end.after(self.snd_nxt)) {
-            self.cork_flush = None;
+        self.arm_send_queue(queued > self.snd_nxt.distance_from(self.send_base) as usize);
+        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
+        //# Keep-alive packets MUST only be sent when no sent data is outstanding, and
+        //# no data or acknowledgment packets have been received for the connection
+        //# within an interval (MUST-26).
+        if idle {
+            self.arm_idle_keepalive();
+        } else {
+            self.keepalive_deadline = None;
+            self.keepalive_pending = false;
         }
-        let queued_end = self.send_base.wrapping_add(self.send.len() as u32);
+        if restart_probe {
+            self.arm_tlp(probe_packets);
+        }
+        self.select_loss_timer();
+    }
+
+    fn arm_send_queue(&mut self, unsent: bool) {
+        self.update_cork_flush();
         if unsent
             && (self.cork || self.more)
             && !self.shutdown
-            && self.cork_flush.is_none_or(|end| queued_end.after(end))
+            && self
+                .cork_flush
+                .is_none_or(|end| self.send_base.wrapping_add(self.send.len() as u32).after(end))
         {
             // Linux tcp(7): corking has a 200ms ceiling. Like all timers this
             // is caller-clock time, and does not override transport admission.
@@ -5517,28 +5558,86 @@ impl Connection {
             self.sws_deadline = None;
             self.sws_override = false;
         }
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4
-        //# Keep-alive packets MUST only be sent when no sent data is outstanding, and
-        //# no data or acknowledgment packets have been received for the connection
-        //# within an interval (MUST-26).
-        if self.send.len() == 0 && self.flight() == 0 && self.state == State::Established {
-            if let Some(keepalive) = self.config.keepalive
-                && self.keepalive_deadline.is_none()
-                && !self.keepalive_pending
-            {
-                self.keepalive_deadline = Some(
-                    self.last_received
-                        .saturating_add(self.config.timebase.ticks_from_us(keepalive.idle_us)),
-                );
-            }
-        } else {
-            self.keepalive_deadline = None;
-            self.keepalive_pending = false;
+    }
+
+    // Appending bytes changes the unsent queue and ends keepalive idleness.
+    // In an established socket with an open window, it does not change
+    // flight, RACK delivery, PTO eligibility or an armed retransmission.
+    fn arm_after_write(&mut self) {
+        if self.state != State::Established
+            || self.snd_wnd == 0
+            || self.pmtud.is_some()
+            || self.persist_interval != 0
+            || self.flight() != 0 && self.rto_deadline.is_none()
+        {
+            self.arm_work();
+            return;
         }
-        if restart_probe {
-            self.arm_tlp(probe_packets);
+        // Appending a nonempty prefix to this open stream leaves its
+        // last byte beyond SND.NXT.
+        debug_assert!(self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize);
+        self.arm_send_queue(true);
+        self.keepalive_deadline = None;
+        self.keepalive_pending = false;
+        #[cfg(debug_assertions)]
+        self.assert_arm_after_write_invariants();
+    }
+
+    // Pure `&self` verification that `arm_work()` would make no further state
+    // change on the `arm_after_write` fast path.
+    #[cfg(debug_assertions)]
+    fn assert_arm_after_write_invariants(&self) {
+        debug_assert!(!self.early_response_eligible() && self.synchronized());
+        debug_assert!(
+            !(self.tlp_deadline.is_some() || self.tlp_pending)
+                || self.tlp_arm_packets().is_some(),
+            "write invalidated active TLP state"
+        );
+        debug_assert!(
+            !self.probe_pending
+                && self.persist_interval == 0
+                && self.persist_unanswered_since.is_none()
+                && self.persist_deadline.is_none(),
+            "write left stale persist state"
+        );
+        debug_assert!(
+            self.flight() == 0 || self.rto_deadline.is_some(),
+            "write left unarmed RTO for in-flight data"
+        );
+        debug_assert!(
+            !(self.rack.deadline.is_some() && self.tlp_deadline.is_some()),
+            "write left both RACK and TLP armed"
+        );
+        debug_assert_eq!(
+            self.loss_timer,
+            self.selected_loss_timer(),
+            "write changed the active loss timer"
+        );
+    }
+
+    fn clear_persist(&mut self) {
+        self.probe_pending = false;
+        self.persist_interval = 0;
+        self.persist_unanswered_since = None;
+        self.persist_deadline = None;
+    }
+
+    fn update_cork_flush(&mut self) {
+        if self.cork_flush.is_some_and(|end| !end.after(self.snd_nxt)) {
+            self.cork_flush = None;
         }
-        self.select_loss_timer();
+    }
+
+    fn arm_idle_keepalive(&mut self) {
+        if let Some(keepalive) = self.config.keepalive
+            && self.keepalive_deadline.is_none()
+            && !self.keepalive_pending
+        {
+            self.keepalive_deadline = Some(
+                self.last_received
+                    .saturating_add(self.config.timebase.ticks_from_us(keepalive.idle_us)),
+            );
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
@@ -5752,6 +5851,14 @@ impl Connection {
             || (self.large_send_ring | self.large_ledgers)
                 && (self.send_ring_reclaimable() || self.ledgers_reclaimable())
             || self.receive_spare_reclaimable()
+    }
+
+    // A write accepted bytes, so neither send allocation can be reclaimed.
+    pub(crate) fn refresh_after_write(&self) -> bool {
+        debug_assert!(self.send.len() != 0);
+        let work = self.refresh_work || self.receive_spare_reclaimable();
+        debug_assert_eq!(work, self.refresh_work());
+        work
     }
 
     // The drained in-order receive deque stays allocated (charged as held)
@@ -6474,17 +6581,22 @@ impl Connection {
         room: usize,
     ) -> Result<usize, Error> {
         let input_len = shared.as_ref().map_or(data.len(), crate::Payload::len);
-        let application_idle = !self.application_timer_needed();
-        let idle = !self.user_timer_needed();
-        let count = if let Some(payload) = shared {
-            self.send
-                .write_shared(payload.slice(0..input_len.min(room)).unwrap())
-        } else {
-            self.send.write(&data[..input_len.min(room)])
-        };
+        let count = input_len.min(room);
         self.send_backpressured |= count < input_len;
         if count == 0 {
             return Err(Error::WouldBlock);
+        }
+        let application_idle = !self.application_timer_needed();
+        // The user timer additionally covers FIN-WAIT-2, which cannot
+        // accept a stream write.
+        debug_assert_ne!(self.state, State::FinWait2);
+        debug_assert_eq!(application_idle, !self.user_timer_needed());
+        if let Some(payload) = shared {
+            let accepted = self.send.write_shared(payload.slice(0..count).unwrap());
+            debug_assert_eq!(count, accepted);
+        } else {
+            let accepted = self.send.write(&data[..count]);
+            debug_assert_eq!(count, accepted);
         }
         self.send_issued = true;
         self.more = more;
@@ -6494,13 +6606,11 @@ impl Connection {
         if push {
             self.send.mark_push();
         }
-        if idle {
-            self.progress_at = self.now;
-        }
         if application_idle {
+            self.progress_at = self.now;
             self.application_progress_at = self.now;
         }
-        self.arm_work();
+        self.arm_after_write();
         Ok(count)
     }
 
@@ -6651,11 +6761,17 @@ impl Connection {
         Ok(count)
     }
 
+    #[cfg(test)]
     pub(crate) fn read(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         self.read_stream(out).map(|(count, _)| count)
     }
 
-    // The second result records a new immediate window update.
+    pub(crate) fn at_time(&self, now: Instant) -> bool {
+        self.now == now
+    }
+
+    // The second result records a new immediate window update. Draining
+    // receive data at the current clock otherwise leaves the timers alone.
     pub(crate) fn read_stream(&mut self, out: &mut [u8]) -> Result<(usize, bool), Error> {
         if self.read_closed {
             return Err(Error::InvalidState);
@@ -13066,6 +13182,73 @@ impl Connection {
         self.congestion.initial_window()
     }
 
+    // Most timers store an absolute expiry. Pacing and timestamp credit
+    // can instead report a different expiry as the service clock advances.
+    pub(crate) fn deadline_uses_clock(&self) -> bool {
+        self.config.pacing.is_some()
+            || self.timestamp_ambiguous
+            || self.timestamp_bytes >= self.config.timestamp_bytes_per_tick
+    }
+
+    // A fresh unpaced stream packet just acknowledged all contiguous
+    // receive data. A payload has a loss timer. An ACK with an empty
+    // send queue and no flight can still leave a keepalive or ECN pause.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn submitted_stream_deadline(&self) -> Option<Instant> {
+        debug_assert!(!self.deadline_uses_clock() && !self.pacing_enabled());
+        debug_assert_eq!(self.state, State::Established);
+        debug_assert!(self.pmtud.is_none() && self.ack_deadline.is_none());
+        debug_assert!(self.pacing_deadline.is_none() && self.time_wait_deadline.is_none());
+        if self.flight() == 0 {
+            debug_assert!(self.send.len() == 0 && !self.shutdown);
+            debug_assert!(self.cork_deadline.is_none() && self.sws_deadline.is_none());
+            let first = self
+                .keepalive_deadline
+                .into_iter()
+                .chain(self.ecn_pause)
+                .chain(self.loss_timer.map(|(_, at)| at))
+                .chain(self.local_resource.and_then(|r| r.retry_at))
+                .min();
+            debug_assert_eq!(first, self.next_deadline());
+            return first;
+        }
+        debug_assert!(
+            self.keepalive_deadline.is_none()
+                && self.local_resource.is_none_or(|r| r.retry_at.is_none())
+        );
+        let Some((_, mut first)) = self.loss_timer else {
+            return self.next_deadline();
+        };
+        if let Some(at) = self.ecn_pause {
+            first = first.min(at);
+        }
+        if let Some(at) = self.sws_deadline {
+            first = first.min(at);
+        }
+        if let Some(at) = self.cork_deadline {
+            first = first.min(at);
+        }
+        if let Some(at) = self.application_deadline() {
+            first = first.min(at);
+        }
+        debug_assert!(self.flight() != 0 && self.snd_wnd != 0);
+        if let Some(since) = if self.flight() <= self.snd_wnd {
+            Some(self.progress_at)
+        } else {
+            self.shrink_unanswered_since
+        } {
+            first = first.min(
+                since.saturating_add(
+                    self.config
+                        .timebase
+                        .ticks_from_us(self.config.user_timeout_us),
+                ),
+            );
+        }
+        debug_assert_eq!(Some(first), self.next_deadline());
+        Some(first)
+    }
+
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         // A successfully filled tick can leave stream/control output queued.
         // Derive its wakeup from committed credit: failed encodes do not arm a
@@ -14299,6 +14482,252 @@ mod fast_path_differential_tests {
             // Call twice to exercise both cache miss and cache hit!
             assert_eq!(c.receive_limit(), expected);
             assert_eq!(c.receive_limit(), expected);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TimerFieldsSnapshot {
+        tlp_deadline: Option<Instant>,
+        tlp_pending: bool,
+        probe_pending: bool,
+        persist_interval: u64,
+        persist_unanswered_since: Option<Instant>,
+        persist_deadline: Option<Instant>,
+        rto_deadline: Option<Instant>,
+        loss_timer: Option<(LossTimer, Instant)>,
+        keepalive_deadline: Option<Instant>,
+        keepalive_pending: bool,
+        cork_flush: Option<Seq>,
+        cork_deadline: Option<Instant>,
+        sws_deadline: Option<Instant>,
+        sws_override: bool,
+        next_deadline: Option<Instant>,
+    }
+
+    fn snapshot_timer_fields(c: &Connection) -> TimerFieldsSnapshot {
+        TimerFieldsSnapshot {
+            tlp_deadline: c.tlp_deadline,
+            tlp_pending: c.tlp_pending,
+            probe_pending: c.probe_pending,
+            persist_interval: c.persist_interval,
+            persist_unanswered_since: c.persist_unanswered_since,
+            persist_deadline: c.persist_deadline,
+            rto_deadline: c.rto_deadline,
+            loss_timer: c.loss_timer,
+            keepalive_deadline: c.keepalive_deadline,
+            keepalive_pending: c.keepalive_pending,
+            cork_flush: c.cork_flush,
+            cork_deadline: c.cork_deadline,
+            sws_deadline: c.sws_deadline,
+            sws_override: c.sws_override,
+            next_deadline: c.next_deadline(),
+        }
+    }
+
+    #[test]
+    fn submitted_stream_deadline_matches_next_deadline_and_never_panics_without_loss_timer() {
+        let config = ConnectionConfig {
+            keepalive: Some(crate::KeepaliveConfig {
+                idle_us: 30_000_000,
+                interval_us: 5_000_000,
+                probes: 3,
+                ..crate::KeepaliveConfig::default()
+            }),
+            ..ConnectionConfig::default()
+        };
+        let (mut c, _) = established_pair(config, 1_000, 2_000);
+        assert!(!c.deadline_uses_clock());
+        assert!(!c.pacing_enabled());
+
+        // 1) Idle (flight == 0): keepalive, ECN pause, local resource retry, and none.
+        assert_eq!(c.flight(), 0);
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+        c.ecn_pause = Some(c.now + 5_000);
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+        c.local_resource = Some(LocalResource {
+            retry_at: Some(c.now + 2_000),
+            epoch: Some(c.now),
+        });
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+        c.local_resource = None;
+        c.ecn_pause = None;
+        c.keepalive_deadline = None;
+        assert_eq!(c.submitted_stream_deadline(), None);
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+
+        // 2) Active flight > 0: send data and verify across ECN pause, SWS, cork,
+        // application timeout, and shrunk window.
+        c.write(b"hello stream world").unwrap();
+        let mut pkt = [0u8; 2048];
+        let _len = c.transmit(c.now + 10, &mut pkt).unwrap().unwrap();
+        assert!(c.flight() > 0);
+        assert!(c.loss_timer.is_some());
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+
+        // Add queued unsent data to arm SWS + cork deadlines.
+        c.set_cork(true);
+        c.write(b"more").unwrap();
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+
+        // Application timeout earlier than loss timer.
+        c.set_application_timeout(Some(10_000)).unwrap();
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+
+        // ECN pause earlier still.
+        c.ecn_pause = Some(c.now + 1_000);
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+        c.ecn_pause = None;
+
+        // Shrunk window (flight > snd_wnd) with and without shrink_unanswered_since.
+        let saved_wnd = c.snd_wnd;
+        c.snd_wnd = 1;
+        c.shrink_unanswered_since = None;
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+        c.shrink_unanswered_since = Some(c.now);
+        assert_eq!(c.submitted_stream_deadline(), c.next_deadline());
+        c.snd_wnd = saved_wnd;
+        c.shrink_unanswered_since = None;
+
+        // 3) R13 fix verification: loss_timer == None with flight > 0 MUST NOT panic,
+        // and falls back cleanly to next_deadline().
+        c.loss_timer = None;
+        c.rto_deadline = None;
+        c.tlp_deadline = None;
+        let fallback = c.submitted_stream_deadline();
+        assert_eq!(fallback, c.next_deadline());
+
+        // Even when every timer is None while flight > 0, returns None cleanly without panicking.
+        c.sws_deadline = None;
+        c.cork_deadline = None;
+        c.application_timeout_us = None;
+        c.snd_wnd = 1;
+        c.shrink_unanswered_since = None;
+        assert_eq!(c.submitted_stream_deadline(), None);
+        assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
+    fn deadline_uses_clock_and_arm_after_write_match_slow_paths() {
+        // 1) deadline_uses_clock covers pacing, timestamp_ambiguous, and timestamp_bytes cap.
+        let (mut c, _) = established_pair(ConnectionConfig::default(), 1_000, 2_000);
+        assert!(!c.deadline_uses_clock());
+        let d0 = c.next_deadline();
+        c.update_time(c.now + 50_000).unwrap();
+        assert_eq!(c.next_deadline(), d0);
+
+        c.timestamp_ambiguous = true;
+        assert!(c.deadline_uses_clock());
+        c.timestamp_ambiguous = false;
+        assert!(!c.deadline_uses_clock());
+
+        c.timestamp_bytes = c.config.timestamp_bytes_per_tick;
+        assert!(c.deadline_uses_clock());
+        c.timestamp_bytes = 0;
+        assert!(!c.deadline_uses_clock());
+
+        c.config.pacing = Some(crate::PacingConfig::default());
+        assert!(c.deadline_uses_clock());
+
+        // 2) arm_after_write vs slow arm_work across idle, keepalive, delayed ACK,
+        // cork/more, in-flight, and zero-window/persist states.
+        let configs = [
+            ConnectionConfig::default(),
+            ConnectionConfig {
+                keepalive: Some(crate::KeepaliveConfig {
+                    idle_us: 10_000_000,
+                    interval_us: 1_000_000,
+                    probes: 2,
+                    ..crate::KeepaliveConfig::default()
+                }),
+                ..ConnectionConfig::default()
+            },
+            ConnectionConfig {
+                delayed_ack_us: 40_000,
+                ..ConnectionConfig::default()
+            },
+        ];
+
+        for cfg in configs {
+            // Scenario A: idle established -> receive data (arms delayed ACK) -> write ->
+            // compare arm_after_write vs slow arm_work.
+            let (mut fast, mut slow) = established_pair(cfg.clone(), 5_000, 6_000);
+            let tuple = test_tuple();
+            let incoming = Segment {
+                header: Header {
+                    source_port: tuple.remote.port(),
+                    destination_port: tuple.local.port(),
+                    sequence: 6_001,
+                    acknowledgment: fast.snd_nxt.0,
+                    flags: ACK | PSH,
+                    window: 32_768,
+                    urgent_pointer: 0,
+                },
+                options: wire::Options {
+                    timestamps: fast
+                        .timestamps
+                        .then_some((50_010, fast.timestamp_value(fast.now))),
+                    ..wire::Options::default()
+                },
+                raw_options: &[],
+                payload: b"ping",
+            };
+            fast.input(fast.now + 10, &incoming).unwrap();
+            slow.input(slow.now + 10, &incoming).unwrap();
+
+            for (cork, more) in [(false, false), (true, false), (false, true)] {
+                fast.set_cork(cork);
+                slow.set_cork(cork);
+                let _ = fast.write_with_options(b"abc", true, more).unwrap();
+                let _ = slow.write_with_options(b"abc", true, more).unwrap();
+                slow.arm_work();
+                assert_eq!(snapshot_timer_fields(&fast), snapshot_timer_fields(&slow));
+
+                // Transmit to put bytes in flight (arming RTO/TLP), then write again.
+                let mut out_f = [0u8; 2048];
+                let mut out_s = [0u8; 2048];
+                let _ = fast.transmit(fast.now + 20, &mut out_f).unwrap();
+                let _ = slow.transmit(slow.now + 20, &mut out_s).unwrap();
+                let _ = fast.write_with_options(b"defg", true, more).unwrap();
+                let _ = slow.write_with_options(b"defg", true, more).unwrap();
+                slow.arm_work();
+                assert_eq!(snapshot_timer_fields(&fast), snapshot_timer_fields(&slow));
+            }
+
+            // Scenario B: zero window / persist fallback in arm_after_write.
+            let (mut zw_f, mut zw_s) = established_pair(cfg.clone(), 9_000, 10_000);
+            zw_f.snd_wnd = 0;
+            zw_s.snd_wnd = 0;
+            zw_f.write(b"z").unwrap();
+            zw_s.write(b"z").unwrap();
+            zw_s.arm_work();
+            assert_eq!(snapshot_timer_fields(&zw_f), snapshot_timer_fields(&zw_s));
+            assert!(zw_f.persist_deadline.is_some());
+
+            // Scenario C: idle arm_work_with_probe fast path vs expected state on keepalive + cork cleanup.
+            let (mut idle_a, _) = established_pair(cfg, 11_000, 12_000);
+            idle_a.cork_flush = Some(idle_a.snd_nxt);
+            idle_a.cork_deadline = Some(idle_a.now + 100);
+            idle_a.sws_deadline = Some(idle_a.now + 200);
+            idle_a.sws_override = true;
+            idle_a.tlp_deadline = Some(idle_a.now + 300);
+            idle_a.tlp_pending = true;
+            idle_a.persist_interval = 500;
+            idle_a.persist_deadline = Some(idle_a.now + 500);
+            idle_a.probe_pending = true;
+            idle_a.arm_work_with_probe(false);
+            assert!(idle_a.tlp_deadline.is_none());
+            assert!(!idle_a.tlp_pending);
+            assert_eq!(idle_a.persist_interval, 0);
+            assert!(idle_a.persist_deadline.is_none());
+            assert!(!idle_a.probe_pending);
+            assert!(idle_a.cork_flush.is_none());
+            assert!(idle_a.cork_deadline.is_none());
+            assert!(idle_a.sws_deadline.is_none());
+            assert!(!idle_a.sws_override);
+            assert_eq!(
+                idle_a.keepalive_deadline.is_some(),
+                idle_a.config.keepalive.is_some()
+            );
         }
     }
 }

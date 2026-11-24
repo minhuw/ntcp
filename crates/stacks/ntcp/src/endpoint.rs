@@ -22,7 +22,7 @@ use crate::{
         Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple, State, Tuple,
     },
     rx_timestamp::RxTimestamps,
-    schedule::{ConnectionTimers, ReadyQueue},
+    schedule::{ReadyQueue, SocketTimers},
     seq::Seq,
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
 };
@@ -694,6 +694,10 @@ struct Slot {
     receive_authority: Option<ListenerId>,
     released: bool,
     closed_output_drained: bool,
+    // The last refresh either found no output or queued the owner. A
+    // selection that produced nothing removes the hint until a change
+    // (including a read) asks the scheduler to try again.
+    output_checked: bool,
     mapped: bool,
     // While the connection waits for memory (`memory_waiters`), when it
     // looks again whether its growth fits (`memory_throttled`).
@@ -879,6 +883,7 @@ pub struct Endpoint {
     // secret.
     lookup_key: [u8; 16],
     now: Instant,
+    timestamp_jump: u64,
     isn_clock: u32,
     last_isn_time: Instant,
     slots: Vec<Option<Slot>>,
@@ -912,7 +917,14 @@ pub struct Endpoint {
     // MemoryCounters::ledger_split_refusals, taken from connections at
     // their refresh and reclaim.
     ledger_split_refusals: u64,
-    deadlines: ConnectionTimers,
+    deadlines: SocketTimers,
+    // At most one steady connection defers sampling its next deadline until
+    // a timer query or another owner's deadline update. `usize::MAX` means none.
+    deferred_deadline: usize,
+    sampled_deadline: Cell<Option<Option<Instant>>>,
+    socket_poll_at: Instant,
+    #[cfg(debug_assertions)]
+    expected_deadline: Cell<Option<Instant>>,
     // The owner's timer wheel geometry: how far ahead a timer may be set.
     timer_wheel: crate::TimerWheelGeometry,
     // The owner's timer wheel: TIME-WAIT records' timers.
@@ -1208,7 +1220,12 @@ impl Endpoint {
                 una.resize(count, 0);
                 una
             },
-            deadlines: ConnectionTimers::new(count).map_err(|_| Error::NoMemory)?,
+            deadlines: SocketTimers::new(count).map_err(|_| Error::NoMemory)?,
+            deferred_deadline: usize::MAX,
+            sampled_deadline: Cell::new(None),
+            socket_poll_at: 0,
+            #[cfg(debug_assertions)]
+            expected_deadline: Cell::new(None),
             timer_wheel: config.timer_wheel_geometry()?,
             wheel: {
                 let mut wheel = crate::wheel::Wheel::new(config.timer_wheel_geometry()?)
@@ -1225,6 +1242,12 @@ impl Endpoint {
             time_wait: crate::time_wait::TimeWaitTable::new(config.max_time_wait),
             time_wait_overflows: 0,
             loss_counters: crate::LossCounters::default(),
+            timestamp_jump: ((1u64 << 31) - 1).saturating_mul(
+                config
+                    .connection
+                    .timebase
+                    .ticks_from_us(config.connection.timestamp_granularity.tick_us()),
+            ),
             isn_clock: (now / config.connection.timebase.ticks_from_us(4)) as u32,
             config,
             routes: Vec::new(),
@@ -1398,20 +1421,12 @@ impl Endpoint {
     //# For the purpose of PAWS, the timestamps sent on a connection are
     //# required to be monotonically increasing.
     fn check_clock(&self, now: Instant) -> Result<(), EndpointError> {
-        // One caller sample can service timers, input and output. Once it
-        // equals the endpoint clock, it cannot jump backwards or across the
-        // timestamp half-range, so there is no conversion to repeat.
-        if now == self.now {
-            return Ok(());
-        }
-        if now < self.now {
+        let Some(elapsed) = now.checked_sub(self.now) else {
             return Err(Error::TimeWentBackwards.into());
-        }
+        };
         let granularity = self.config.connection.timestamp_granularity;
         let timebase = self.config.connection.timebase;
-        // Fewer than 2^31 - 1 periods cannot advance the tick by 2^31.
-        let period = timebase.ticks_from_us(granularity.tick_us());
-        if now - self.now >= ((1 << 31) - 1u64).saturating_mul(period)
+        if elapsed >= self.timestamp_jump
             && self.timestamp_clock_required()
             && granularity.tick_in(now, timebase) - granularity.tick_in(self.now, timebase)
                 >= 1 << 31
@@ -2347,6 +2362,7 @@ impl Endpoint {
             accepted_ready: false,
             released: false,
             closed_output_drained: false,
+            output_checked: false,
             mapped: true,
             memory_retry: None,
             time_wait: false,
@@ -3466,7 +3482,7 @@ impl Endpoint {
         self.advice.remove(index);
         self.progress.remove(index);
         self.stop_memory_wait(index);
-        self.deadlines.set(index, None);
+        self.set_deadline(index, None);
         if slot.time_wait {
             self.time_wait_slots -= 1;
         }
@@ -3649,16 +3665,26 @@ impl Endpoint {
         {
             self.progress.push(index);
         }
-        if self.is_output_reserved(self.id(index)) {
-            self.deadlines.set(index, None);
+        // This is the live socket slot. A held reservation owns this slot
+        // until it is released, including for a closed connection's reset.
+        let reserved = self.has_output_reservations() && self.reservation_owners[index].is_some();
+        debug_assert_eq!(reserved, self.is_output_reserved(self.id(index)));
+        if reserved {
+            self.set_deadline(index, None);
             return;
         }
+        self.defer_deadline(index);
         let slot = self.slots[index].as_ref().unwrap();
-        self.deadlines.set(index, slot.deadline());
         if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
             self.events.push(index);
         }
-        if slot.mapped && !slot.connection.output_idle() {
+        self.queue_connection_output(index);
+    }
+
+    fn queue_connection_output(&mut self, index: usize) {
+        let slot = self.slots[index].as_mut().unwrap();
+        slot.output_checked = true;
+        if slot.mapped && !self.output.contains(index) && !slot.connection.output_idle() {
             self.output.push(index);
         }
     }
@@ -3812,7 +3838,7 @@ impl Endpoint {
             self.progress.push(index);
         }
         if self.is_output_reserved(self.id(index)) {
-            self.deadlines.set(index, None);
+            self.set_deadline(index, None);
             return;
         }
         if let Some(slot) = &self.slots[index]
@@ -3901,8 +3927,9 @@ impl Endpoint {
                 self.events.push(self.config.max_connections + parent.slot);
             }
         }
+        let deadline = self.slots[index].as_ref().unwrap().deadline();
+        self.set_deadline(index, deadline);
         let slot = self.slots[index].as_ref().unwrap();
-        self.deadlines.set(index, slot.deadline());
         if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
             self.events.push(index);
         }
@@ -5256,7 +5283,8 @@ impl Endpoint {
             let slot = self.slots[index].as_mut().unwrap();
             slot.memory_retry = Some(retry);
             // A write refused whole refreshes nothing.
-            self.deadlines.set(index, slot.deadline());
+            let deadline = slot.deadline();
+            self.set_deadline(index, deadline);
         }
     }
 
@@ -5631,12 +5659,38 @@ impl Endpoint {
         request: Option<TxTimestampRequest>,
     ) -> Result<usize, EndpointError> {
         let room = self.prepare_write_metadata(id, bytes.len(), lowat, request)?;
-        let count = self.slots[id.slot]
-            .as_mut()
-            .unwrap()
-            .connection
-            .write_prepared(bytes, push, more, end_of_record, room, request)?;
-        self.refresh(id.slot);
+        let index = id.slot;
+        let reserved = self.has_output_reservations() && self.reservation_owners[index].is_some();
+        debug_assert_eq!(reserved, self.is_output_reserved(id));
+        let slot = self.slots[index].as_mut().unwrap();
+        let count =
+            slot.connection
+                .write_prepared(bytes, push, more, end_of_record, room, request)?;
+        // Appending to a synchronized stream leaves new unsent bytes. It
+        // changes the write timers and can free a memory-waiting writer,
+        // but cannot advance SND.UNA or the managed path's delivery.
+        if count != 0
+            && !reserved
+            && slot.mapped
+            && slot.connection.state() == State::Established
+            && slot.steady()
+            && !slot.connection.refresh_after_write()
+            && !slot.connection.managed_results.unpublished()
+        {
+            debug_assert!(!slot.connection.output_idle());
+            debug_assert!(
+                self.managed_context.is_none()
+                    || slot.connection.unacknowledged() == self.progress_una[index]
+                    || self.progress.contains(index)
+            );
+            if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
+                self.events.push(index);
+            }
+            self.output.push(index);
+            self.defer_deadline(index);
+        } else {
+            self.refresh(index);
+        }
         Ok(count)
     }
 
@@ -5807,9 +5861,18 @@ impl Endpoint {
     }
 
     pub fn read(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
-        self.reserved_call(id)?;
-        let connection = &mut self.slot_mut(id)?.connection;
-        let count = connection.read(out)?;
+        self.slot(id)?;
+        let reserved = self.has_output_reservations() && self.reservation_owners[id.slot].is_some();
+        debug_assert_eq!(reserved, self.is_output_reserved(id));
+        let slot = self.slots[id.slot].as_mut().unwrap();
+        let connection = &mut slot.connection;
+        let same_clock = connection.at_time(self.now);
+        if reserved {
+            connection.forget_reserved_undo();
+        } else if !same_clock {
+            connection.update_time(self.now)?;
+        }
+        let (count, update) = connection.read_stream(out)?;
         if connection.receive_tuned()
             && let Some(target) = connection.receive_space_adjust()
         {
@@ -5817,10 +5880,36 @@ impl Endpoint {
         }
         // Frames read to their end go back to the budget, waking writers
         // waiting for memory (sock_rfree).
-        if let Some((old, new)) = connection.settle_receive_charge() {
+        let charge = connection.settle_receive_charge();
+        // A stream read can newly arm a window update or free a drained
+        // deque. At the same clock it otherwise changes no timer, event
+        // or managed progress. Keep the scheduler's live output hint.
+        let settled = same_clock
+            && !update
+            && !reserved
+            && slot.steady()
+            && !slot.connection.refresh_work()
+            && self.memory_waiters.is_empty();
+        let output_checked = slot.output_checked;
+        if let Some((old, new)) = charge {
             self.recharge(old, new);
         }
-        self.refresh(id.slot);
+        if settled {
+            if !output_checked {
+                self.queue_connection_output(id.slot);
+            } else {
+                debug_assert!(
+                    self.output.contains(id.slot)
+                        || self.slots[id.slot]
+                            .as_ref()
+                            .unwrap()
+                            .connection
+                            .output_idle()
+                );
+            }
+        } else {
+            self.refresh(id.slot);
+        }
         Ok(count)
     }
 
@@ -6707,10 +6796,84 @@ impl Endpoint {
         self.timer_wheel.lateness_bound(duration)
     }
 
+    // Input, reads, writes and output selection can all refresh one owner
+    // between timer queries. Resolve its deadline just once when the caller
+    // looks at the timer queue or before another owner takes its place.
+    fn defer_deadline(&mut self, index: usize) {
+        // Returning socket memory can refresh a waiting writer from inside
+        // another connection's operation, before its own refresh completes.
+        let slot = self.slots[index].as_ref().unwrap();
+        if !self.memory_waiters.is_empty() || slot.connection.deadline_uses_clock() {
+            let deadline = slot.deadline();
+            self.set_deadline(index, deadline);
+            return;
+        }
+        if self.deferred_deadline != index {
+            self.flush_deadline();
+            self.deadlines.set(index, None);
+            self.deferred_deadline = index;
+        }
+        self.socket_poll_at = 0;
+        self.sampled_deadline.set(None);
+        #[cfg(debug_assertions)]
+        self.expected_deadline
+            .set(self.slots[index].as_ref().unwrap().deadline());
+    }
+
+    fn sample_deadline(&self, index: usize) -> Option<Instant> {
+        if let Some(deadline) = self.sampled_deadline.get() {
+            return deadline;
+        }
+        let deadline = self.slots[index].as_ref().unwrap().deadline();
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            deadline,
+            self.expected_deadline.get(),
+            "unscheduled change of deadline"
+        );
+        self.sampled_deadline.set(Some(deadline));
+        deadline
+    }
+
+    fn flush_deadline(&mut self) {
+        let index = core::mem::replace(&mut self.deferred_deadline, usize::MAX);
+        if index != usize::MAX {
+            let deadline = self.sample_deadline(index);
+            self.deadlines.set(index, deadline);
+        }
+    }
+
+    fn set_deadline(&mut self, index: usize, deadline: Option<Instant>) {
+        if let Some(at) = deadline {
+            self.socket_poll_at = self.socket_poll_at.min(at);
+        }
+        if self.deferred_deadline == index {
+            self.deferred_deadline = usize::MAX;
+        } else {
+            self.flush_deadline();
+        }
+        self.deadlines.set(index, deadline);
+    }
+
+    fn deferred_timer(&self) -> Option<(Instant, usize)> {
+        let index = self.deferred_deadline;
+        if index == usize::MAX {
+            return None;
+        }
+        self.sample_deadline(index).map(|at| (at, index))
+    }
+
+    fn first_connection_deadline(&self) -> Option<(Instant, usize)> {
+        let first = self.deadlines.first();
+        if let Some(pending) = self.deferred_timer() {
+            return Some(first.map_or(pending, |other| other.min(pending)));
+        }
+        first
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         // Only a held slot without a current attempt can wait for pacing.
-        self.deadlines
-            .first()
+        self.first_connection_deadline()
             .map(|(time, _)| time)
             .into_iter()
             .chain(self.wheel.next_expiry())
@@ -6870,20 +7033,36 @@ impl Endpoint {
         self.clock(now)
     }
 
+    fn socket_timer_due(&mut self, now: Instant) -> bool {
+        if now < self.socket_poll_at {
+            return false;
+        }
+        if self.deadlines.due(now) {
+            return true;
+        }
+        let deferred = self.deferred_timer().map(|(at, _)| at);
+        self.socket_poll_at = self
+            .deadlines
+            .earliest_possible()
+            .min(deferred.unwrap_or(Instant::MAX));
+        deferred.is_some_and(|at| at <= now)
+    }
+
     #[inline]
     pub fn on_timeout(&mut self, now: Instant, budget: usize) -> Result<bool, EndpointError> {
         // At the endpoint's clock with nothing due by `now`, a run only
         // moves the wheel's time to `now`, and finds nothing due.
-        if now == self.now
-            && budget != 0
-            && self
-                .deadlines
-                .first()
-                .is_none_or(|(deadline, _)| deadline > now)
-            && self.wheel.idle(now)
-        {
-            self.wheel.finish(now);
-            return Ok(false);
+        if now == self.now && budget != 0 && !self.socket_timer_due(now) {
+            // The TIME-WAIT table owns every wheel timer. The first record
+            // advances an empty wheel to the endpoint clock before filing.
+            if self.time_wait.len() == 0 {
+                debug_assert!(self.wheel.next_expiry().is_none());
+                return Ok(false);
+            }
+            if self.wheel.idle(now) {
+                self.wheel.finish(now);
+                return Ok(false);
+            }
         }
         self.on_timeout_pass(now, budget)
     }
@@ -6894,13 +7073,13 @@ impl Endpoint {
         let mut drained = false;
         for _ in 0..budget {
             let connection = self
-                .deadlines
-                .first()
+                .first_connection_deadline()
                 .filter(|&(deadline, _)| deadline <= now);
             // A TIME-WAIT record's timer runs at its wheel bucket's expiry,
             // never before its deadline: a record whose deadline a restart
             // moved later is filed again instead.
-            if let Some((index, expiry)) = self.wheel.due(now)
+            if self.time_wait.len() != 0
+                && let Some((index, expiry)) = self.wheel.due(now)
                 && connection.is_none_or(|(first, _)| expiry < first)
             {
                 if self.time_wait.record(index).deadline > now {
@@ -6917,7 +7096,7 @@ impl Endpoint {
                 drained = true;
                 break;
             };
-            self.deadlines.set(index, None);
+            self.set_deadline(index, None);
             let slot = self.slots[index].as_mut().unwrap();
             let retry = slot.memory_retry.is_some_and(|deadline| deadline <= now);
             if !retry
@@ -6941,12 +7120,11 @@ impl Endpoint {
         }
         // Every bucket up to `now` ran: timers filed from now on are placed
         // against it.
-        if drained {
+        if drained && self.time_wait.len() != 0 {
             self.wheel.finish(now);
         }
         Ok(self
-            .deadlines
-            .first()
+            .first_connection_deadline()
             .map(|(deadline, _)| deadline)
             .into_iter()
             .chain(self.wheel.next_expiry())
@@ -7840,12 +8018,14 @@ impl Endpoint {
             self.clock(now)?;
             if self.output.contains(id.slot) {
                 self.output.remove(id.slot);
-                let slot = self.slots[id.slot].as_ref().unwrap();
+                let slot = self.slots[id.slot].as_mut().unwrap();
                 if let Err(error) = slot.connection.check_time(now) {
                     self.output.push(id.slot);
                     return Err(error.into());
                 }
-                self.deadlines.set(id.slot, slot.deadline());
+                slot.output_checked = false;
+                let deadline = slot.deadline();
+                self.set_deadline(id.slot, deadline);
             }
             return Ok(Polled {
                 more_work: self.has_pending_output(),
@@ -8736,12 +8916,16 @@ impl Endpoint {
                     ));
                 }
                 Ok(None) => {
-                    self.deadlines.set(index, slot.deadline());
-                    if slot.connection.state() == State::Closed {
+                    slot.output_checked = false;
+                    let deadline = slot.deadline();
+                    let closed = slot.connection.state() == State::Closed;
+                    if closed {
                         slot.closed_output_drained = true;
-                        if slot.released && !slot.connection.reset_pending() {
-                            self.reclaim(index);
-                        }
+                    }
+                    let reclaim = closed && slot.released && !slot.connection.reset_pending();
+                    self.set_deadline(index, deadline);
+                    if reclaim {
+                        self.reclaim(index);
                     }
                 }
                 Err(error) => {
@@ -12656,5 +12840,483 @@ mod commit7_ingress_policy_tests {
         .unwrap();
         assert_eq!(df, ds);
         assert_same_server(&mut srv_f, &mut srv_s, now + 80, "time_wait_dup");
+    }
+}
+
+#[cfg(test)]
+mod deferred_timer_model_tests {
+    use super::*;
+    use core::net::{Ipv4Addr, SocketAddrV4};
+
+    fn addr(ip: u8, port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 88, 0, ip), port))
+    }
+
+    fn make_endpoint(seed: u8, now: Instant, delayed_ack_us: u64) -> Endpoint {
+        let cfg = EndpointConfig {
+            max_connections: 16,
+            max_listeners: 4,
+            max_time_wait: 16,
+            connection: ConnectionConfig {
+                delayed_ack_us,
+                sack: true,
+                rack: true,
+                tlp: true,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        Endpoint::new(cfg, [seed; 32], now, |_| true).unwrap()
+    }
+
+    fn brute_force_connection_deadline(ep: &Endpoint) -> Option<(Instant, usize)> {
+        ep.occupied
+            .iter()
+            .filter(|&index| !ep.is_output_reserved(ep.id(index)))
+            .filter_map(|index| ep.slots[index].as_ref()?.deadline().map(|at| (at, index)))
+            .min()
+    }
+
+    fn assert_timer_oracle(ep: &Endpoint, label: &str) {
+        let brute = brute_force_connection_deadline(ep);
+
+        // Check live deferred slot invariant before touching any lazy state.
+        if ep.deferred_deadline != usize::MAX {
+            assert!(
+                ep.slots[ep.deferred_deadline].is_some(),
+                "{label}: deferred_deadline points to empty slot {}",
+                ep.deferred_deadline
+            );
+        }
+
+        // socket_poll_at must NEVER exceed the true earliest connection deadline.
+        let min_conn = brute.map_or(Instant::MAX, |(at, _)| at);
+        assert!(
+            ep.socket_poll_at <= min_conn,
+            "{label}: socket_poll_at={} > brute min={min_conn}",
+            ep.socket_poll_at
+        );
+
+        // Lazy SocketTimers earliest_possible must NEVER exceed any non-deferred slot.
+        let min_indexed = ep
+            .occupied
+            .iter()
+            .filter(|&index| {
+                index != ep.deferred_deadline && !ep.is_output_reserved(ep.id(index))
+            })
+            .filter_map(|index| ep.slots[index].as_ref()?.deadline())
+            .min()
+            .unwrap_or(Instant::MAX);
+        assert!(
+            ep.deadlines.earliest_possible() <= min_indexed,
+            "{label}: earliest_possible={} > min_indexed={min_indexed}",
+            ep.deadlines.earliest_possible()
+        );
+
+        // Exact connection deadline must match brute-force scan (including tie-break).
+        assert_eq!(
+            ep.first_connection_deadline(),
+            brute,
+            "{label}: first_connection_deadline mismatch"
+        );
+
+        // Public next_deadline() must stay within reference_next_deadline() bounds.
+        let (earliest, latest) = ep.reference_next_deadline();
+        let reported = ep.next_deadline();
+        if ep.time_wait.len() == 0 {
+            assert_eq!(reported, earliest, "{label}: exact next_deadline mismatch");
+        } else {
+            assert_eq!(
+                reported.is_some(),
+                earliest.is_some(),
+                "{label}: next_deadline presence mismatch"
+            );
+            if let (Some(rep), Some(lo), Some(hi)) = (reported, earliest, latest) {
+                assert!(
+                    rep >= lo && rep <= hi,
+                    "{label}: next_deadline={rep} outside [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    fn drain_tx(ep: &mut Endpoint, now: Instant) -> Vec<(Transmit, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 2048];
+        for _ in 0..64 {
+            let polled = ep.poll_transmit(now, &mut buf, 16).unwrap();
+            let Some(pkt) = polled.packet else {
+                break;
+            };
+            out.push((pkt, buf[..pkt.len].to_vec()));
+            if !polled.more_work {
+                break;
+            }
+        }
+        out
+    }
+
+    fn deliver(dst: &mut Endpoint, now: Instant, pkts: &[(Transmit, Vec<u8>)]) {
+        for (pkt, bytes) in pkts {
+            let _ = dst.input(now, pkt.ip, bytes).unwrap();
+        }
+    }
+
+    fn open_pair(
+        client: &mut Endpoint,
+        server: &mut Endpoint,
+        listener: ListenerId,
+        port: u16,
+        now: &mut Instant,
+    ) -> (ConnectionId, ConnectionId) {
+        let cid = client.connect(*now, addr(1, port), addr(2, 80)).unwrap();
+        let syn = drain_tx(client, *now);
+        *now += 10;
+        deliver(server, *now, &syn);
+        let synack = drain_tx(server, *now);
+        *now += 10;
+        deliver(client, *now, &synack);
+        let ack = drain_tx(client, *now);
+        *now += 10;
+        deliver(server, *now, &ack);
+        let sid = server.accept(listener).unwrap();
+        assert_eq!(client.state(cid).unwrap(), State::Established);
+        assert_eq!(server.state(sid).unwrap(), State::Established);
+        (cid, sid)
+    }
+
+    #[test]
+    fn deferred_deadline_edge_cases_reclaim_abort_close_timeout_and_next_deadline() {
+        let mut now = 1_000u64;
+        let mut client = make_endpoint(1, now, 40_000);
+        let mut server = make_endpoint(2, now, 40_000);
+        let listener = server.listen(addr(2, 80), 8).unwrap();
+
+        let (c1, s1) = open_pair(&mut client, &mut server, listener, 40001, &mut now);
+        let (c2, s2) = open_pair(&mut client, &mut server, listener, 40002, &mut now);
+        let ka = Some(crate::KeepaliveConfig {
+            idle_us: 5_000_000,
+            interval_us: 1_000_000,
+            probes: 2,
+            ..crate::KeepaliveConfig::default()
+        });
+        client.set_keepalive(c1, ka).unwrap();
+        client.set_keepalive(c2, ka).unwrap();
+
+        // 1) Defer-then-next_deadline: c2 is deferred after set_keepalive.
+        assert_eq!(client.deferred_deadline, c2.slot);
+        assert!(client.sampled_deadline.get().is_none());
+        let d = client.next_deadline();
+        assert!(d.is_some());
+        assert!(client.sampled_deadline.get().is_some());
+        assert_timer_oracle(&client, "defer_then_next_deadline");
+
+        // 2) Defer-then-on_timeout at same clock (not due) populates socket_poll_at,
+        // and repeated same-clock call hits the socket_poll_at fast gate.
+        client.advance_clock(now).unwrap();
+        client.write(c1, b"hello").unwrap();
+        assert_eq!(client.deferred_deadline, c1.slot);
+        assert_eq!(client.socket_poll_at, 0);
+        assert!(!client.on_timeout(now, 8).unwrap());
+        assert!(client.socket_poll_at > now);
+        assert!(!client.on_timeout(now, 8).unwrap());
+        assert_timer_oracle(&client, "defer_then_same_clock_on_timeout");
+
+        // 3) Defer-then-on_timeout when deferred timer IS due (via delayed ACK on server).
+        let data = drain_tx(&mut client, now);
+        now += 10;
+        deliver(&mut server, now, &data);
+        assert_eq!(server.deferred_deadline, s1.slot);
+        let due = server.next_deadline().unwrap();
+        server.advance_clock(due).unwrap();
+        // Re-defer s1 via settled read at same clock? First verify due fires on_timeout.
+        assert_eq!(server.deferred_deadline, s1.slot);
+        assert!(!server.on_timeout(due, 8).unwrap());
+        assert_timer_oracle(&server, "defer_then_due_on_timeout");
+        let acks = drain_tx(&mut server, due);
+        now = due + 10;
+        deliver(&mut client, now, &acks);
+        assert_timer_oracle(&client, "after_delayed_ack");
+
+        // 4) Defer-then-abort & reclaim: leave c1 deferred, abort + drain RST + release -> reclaim.
+        client.write(c1, b"x").unwrap();
+        assert_eq!(client.deferred_deadline, c1.slot);
+        client.abort(c1).unwrap();
+        assert_timer_oracle(&client, "defer_then_abort");
+        let rsts = drain_tx(&mut client, now);
+        client.release(c1).unwrap();
+        assert_timer_oracle(&client, "defer_then_reclaim_same_slot");
+        deliver(&mut server, now + 5, &rsts);
+        server.release(s1).unwrap();
+        assert_timer_oracle(&server, "server_after_rst_release");
+
+        // 5) Defer-then-close on c2 while another connection (c3) is deferred!
+        now += 10;
+        let (c3, s3) = open_pair(&mut client, &mut server, listener, 40003, &mut now);
+        client.write(c3, b"keep-c3-deferred").unwrap();
+        assert_eq!(client.deferred_deadline, c3.slot);
+        // Close c2 while c3 is deferred -> must flush c3 cleanly.
+        client.close(c2).unwrap();
+        assert_timer_oracle(&client, "close_other_while_c3_deferred");
+        // Now leave c2 deferred via write? c2 is closing; defer c3, then abort+release c2.
+        client.write(c3, b"again").unwrap();
+        assert_eq!(client.deferred_deadline, c3.slot);
+        client.abort(c2).unwrap();
+        let pkts = drain_tx(&mut client, now);
+        client.release(c2).unwrap();
+        assert_timer_oracle(&client, "reclaim_other_while_c3_deferred");
+
+        // 6) Settled read fast path at same clock (both output_checked true and false).
+        now += 5;
+        deliver(&mut server, now, &pkts);
+        let mut rbuf = [0u8; 4];
+        let n1 = server.read(s3, &mut rbuf).unwrap();
+        assert_eq!(n1, 4);
+        assert_timer_oracle(&server, "settled_read_1");
+        let n2 = server.read(s3, &mut rbuf).unwrap();
+        assert_eq!(n2, 4);
+        assert_timer_oracle(&server, "settled_read_2");
+        // Empty poll of a queued connection (e.g. corked partial write) clears output_checked;
+        // a subsequent settled read re-checks and sets it back to true.
+        server.set_cork(s3, true).unwrap();
+        server.write(s3, b"x").unwrap();
+        assert!(server.output.contains(s3.slot));
+        let empty = drain_tx(&mut server, now);
+        assert!(empty.is_empty());
+        assert!(!server.slots[s3.slot].as_ref().unwrap().output_checked);
+        let n3 = server.read(s3, &mut rbuf).unwrap();
+        assert_eq!(n3, 4);
+        assert!(server.slots[s3.slot].as_ref().unwrap().output_checked);
+        assert_timer_oracle(&server, "settled_read_3_rechecked");
+        let _ = s2;
+    }
+
+    #[test]
+    fn endpoint_timers_differential_randomized_model() {
+        let mut now = 10_000u64;
+        let mut client = make_endpoint(11, now, 40_000);
+        let mut server = make_endpoint(22, now, 40_000);
+        let listener = server.listen(addr(2, 80), 16).unwrap();
+
+        let mut next_port = 50_000u16;
+        let mut pairs: Vec<(ConnectionId, ConnectionId)> = Vec::new();
+        // Open 4 initial simultaneous connections with different timer profiles.
+        for i in 0..4 {
+            let (c, s) = open_pair(&mut client, &mut server, listener, next_port, &mut now);
+            next_port += 1;
+            if i % 2 == 0 {
+                let ka = Some(crate::KeepaliveConfig {
+                    idle_us: 2_000_000 + (i as u64) * 500_000,
+                    interval_us: 500_000,
+                    probes: 2,
+                    ..crate::KeepaliveConfig::default()
+                });
+                client.set_keepalive(c, ka).unwrap();
+                server.set_keepalive(s, ka).unwrap();
+            }
+            pairs.push((c, s));
+        }
+        assert_timer_oracle(&client, "init_client");
+        assert_timer_oracle(&server, "init_server");
+
+        let mut in_flight_c2s: VecDeque<(Instant, Transmit, Vec<u8>)> = VecDeque::new();
+        let mut in_flight_s2c: VecDeque<(Instant, Transmit, Vec<u8>)> = VecDeque::new();
+        let mut seed = 0xdead_beef_c0de_1234u64;
+        let mut rng = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed
+        };
+        let payload = [0x5au8; 512];
+        let mut rbuf = [0u8; 512];
+
+        for step in 0..600 {
+            let op = (rng() >> 16) % 16;
+            match op {
+                0..=3 => {
+                    // Write on a random live connection (client or server).
+                    if !pairs.is_empty() {
+                        let idx = (rng() >> 24) as usize % pairs.len();
+                        let len = 1 + ((rng() >> 32) as usize % 256);
+                        let (ep, id) = if (rng() & 1) == 0 {
+                            (&mut client, pairs[idx].0)
+                        } else {
+                            (&mut server, pairs[idx].1)
+                        };
+                        let _ = ep.write(id, &payload[..len]);
+                    }
+                }
+                4..=6 => {
+                    // Poll transmit and queue packets with occasional loss/reorder.
+                    let c_pkts = drain_tx(&mut client, now);
+                    for (pkt, bytes) in c_pkts {
+                        let r = (rng() >> 24) % 10;
+                        if r == 0 {
+                            // Drop packet to exercise RTO / TLP / SACK / RACK!
+                            continue;
+                        }
+                        let delay = if r == 1 { 8_000 } else { 1_000 };
+                        in_flight_c2s.push_back((now + delay, pkt, bytes));
+                    }
+                    let s_pkts = drain_tx(&mut server, now);
+                    for (pkt, bytes) in s_pkts {
+                        let r = (rng() >> 24) % 10;
+                        if r == 0 {
+                            continue;
+                        }
+                        let delay = if r == 1 { 8_000 } else { 1_000 };
+                        in_flight_s2c.push_back((now + delay, pkt, bytes));
+                    }
+                }
+                7..=8 => {
+                    // Deliver due in-flight packets.
+                    let mut n = in_flight_c2s.len();
+                    while n > 0 {
+                        n -= 1;
+                        let item = in_flight_c2s.pop_front().unwrap();
+                        if item.0 <= now {
+                            let _ = server.input(now, item.1.ip, &item.2);
+                        } else {
+                            in_flight_c2s.push_back(item);
+                        }
+                    }
+                    let mut m = in_flight_s2c.len();
+                    while m > 0 {
+                        m -= 1;
+                        let item = in_flight_s2c.pop_front().unwrap();
+                        if item.0 <= now {
+                            let _ = client.input(now, item.1.ip, &item.2);
+                        } else {
+                            in_flight_s2c.push_back(item);
+                        }
+                    }
+                }
+                9..=10 => {
+                    // Read on a random connection (partial or full to test settled read path).
+                    if !pairs.is_empty() {
+                        let idx = (rng() >> 24) as usize % pairs.len();
+                        let len = 1 + ((rng() >> 32) as usize % rbuf.len());
+                        let (ep, id) = if (rng() & 1) == 0 {
+                            (&mut client, pairs[idx].0)
+                        } else {
+                            (&mut server, pairs[idx].1)
+                        };
+                        let _ = ep.read(id, &mut rbuf[..len]);
+                    }
+                }
+                11..=12 => {
+                    // Advance time and run on_timeout with varied budgets (including same-clock fast path).
+                    let next_c = client.next_deadline();
+                    let next_s = server.next_deadline();
+                    let earliest = next_c.into_iter().chain(next_s).min();
+                    let delta = match (rng() >> 24) % 5 {
+                        0 => 0, // Same-clock poll (hits socket_poll_at fast gate)
+                        1 => 1_000,
+                        2 => earliest
+                            .map(|t| t.saturating_sub(now).saturating_sub(1))
+                            .unwrap_or(5_000)
+                            .min(500_000),
+                        3 => earliest
+                            .map(|t| t.saturating_sub(now))
+                            .unwrap_or(5_000)
+                            .min(500_000),
+                        _ => 25_000,
+                    };
+                    now = now.saturating_add(delta);
+                    let budget = [0, 1, 2, 8][((rng() >> 32) as usize) % 4];
+                    let _ = client.on_timeout(now, budget).unwrap();
+                    let _ = server.on_timeout(now, budget).unwrap();
+                    // Second same-clock poll to verify socket_poll_at gate after on_timeout.
+                    let _ = client.on_timeout(now, 4).unwrap();
+                    let _ = server.on_timeout(now, 4).unwrap();
+                }
+                13 => {
+                    // Mutate timer-affecting options (cork, keepalive, application timeout).
+                    if !pairs.is_empty() {
+                        let idx = (rng() >> 24) as usize % pairs.len();
+                        let (ep, id) = if (rng() & 1) == 0 {
+                            (&mut client, pairs[idx].0)
+                        } else {
+                            (&mut server, pairs[idx].1)
+                        };
+                        match (rng() >> 32) % 3 {
+                            0 => {
+                                let _ = ep.set_cork(id, (rng() & 2) != 0);
+                            }
+                            1 => {
+                                let ka = ((rng() & 2) != 0).then_some(crate::KeepaliveConfig {
+                                    idle_us: 1_500_000,
+                                    interval_us: 500_000,
+                                    probes: 2,
+                                    ..crate::KeepaliveConfig::default()
+                                });
+                                let _ = ep.set_keepalive(id, ka);
+                            }
+                            _ => {
+                                let t = ((rng() & 2) != 0).then_some(3_000_000);
+                                let _ = ep.set_application_timeout(id, t);
+                            }
+                        }
+                    }
+                }
+                14 => {
+                    // Close / abort / release a random connection to test defer-then-reclaim/abort/close.
+                    if pairs.len() > 2 {
+                        let idx = (rng() >> 24) as usize % pairs.len();
+                        let (cid, sid) = pairs.swap_remove(idx);
+                        if (rng() & 1) == 0 {
+                            let _ = client.abort(cid);
+                            let pkts = drain_tx(&mut client, now);
+                            deliver(&mut server, now, &pkts);
+                            let _ = client.release(cid);
+                            let _ = server.abort(sid);
+                            let _ = drain_tx(&mut server, now);
+                            let _ = server.release(sid);
+                        } else {
+                            // Graceful FIN exchange into TIME-WAIT + release.
+                            let _ = client.shutdown(cid);
+                            let _ = server.shutdown(sid);
+                            for _ in 0..4 {
+                                let p1 = drain_tx(&mut client, now);
+                                deliver(&mut server, now, &p1);
+                                let p2 = drain_tx(&mut server, now);
+                                deliver(&mut client, now, &p2);
+                            }
+                            let _ = client.release(cid);
+                            let _ = server.release(sid);
+                        }
+                    }
+                }
+                _ => {
+                    // Open a fresh connection when below 6 live pairs (tests slot reuse!).
+                    if pairs.len() < 6 {
+                        let pair =
+                            open_pair(&mut client, &mut server, listener, next_port, &mut now);
+                        next_port = next_port.wrapping_add(1).max(10_000);
+                        pairs.push(pair);
+                    }
+                }
+            }
+
+            // Reap any connections that closed due to timeout/R2/keepalive.
+            pairs.retain(|&(cid, sid)| {
+                let c_closed = client
+                    .state(cid)
+                    .is_ok_and(|s| matches!(s, State::Closed | State::TimeWait));
+                let s_closed = server
+                    .state(sid)
+                    .is_ok_and(|s| matches!(s, State::Closed | State::TimeWait));
+                if c_closed && s_closed {
+                    let _ = client.release(cid);
+                    let _ = server.release(sid);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Verify brute-force timer oracle on BOTH endpoints after every single step!
+            assert_timer_oracle(&client, &alloc::format!("step_{step}_client"));
+            assert_timer_oracle(&server, &alloc::format!("step_{step}_server"));
+        }
     }
 }
