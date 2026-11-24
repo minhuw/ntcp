@@ -582,14 +582,22 @@ impl Rack {
         // use a full sample deque only if exact expiration becomes necessary.
         // Like Linux tcp_update_rtt_min, aging happens on accepted samples,
         // not on timers: idle time alone does not erase the ambiguity guard.
+        if self.latest.is_none() {
+            self.rtt = rtt;
+        }
         let epoch = self.timebase.us_from_ticks(now) / MIN_RTT_BUCKET;
         let bucket = &mut self.min_rtt_buckets[(epoch % 4) as usize];
-        *bucket = Some((
-            epoch,
-            bucket
-                .filter(|old| old.0 == epoch)
-                .map_or(rtt, |old| old.1.min(rtt)),
-        ));
+        match bucket {
+            Some((time, best)) if *time == epoch => {
+                // A slower RTT in this same window changes neither
+                // the bucket minimum nor the filter's minimum.
+                if rtt >= *best && epoch == self.min_rtt_epoch {
+                    return;
+                }
+                *best = (*best).min(rtt);
+            }
+            _ => *bucket = Some((epoch, rtt)),
+        }
         // No other bucket enters or leaves the window within this epoch.
         self.min_rtt = if epoch == self.min_rtt_epoch {
             Some(self.min_rtt.map_or(rtt, |old| old.min(rtt)))
@@ -613,9 +621,6 @@ impl Rack {
                 .min();
             debug_assert_eq!(self.min_rtt, recomputed);
         }
-        if self.latest.is_none() {
-            self.rtt = rtt;
-        }
     }
 
     pub(crate) fn discard_samples_before(&mut self, now: u64) {
@@ -626,7 +631,7 @@ impl Rack {
     // delivery/RTT evidence. Trim in place: a full ledger needs no split slot.
     pub(crate) fn trim_cumulative(&mut self, ack: Seq) {
         // Usually the ACK's acknowledge_within emptied the ledger already.
-        if !self.intervals.is_empty() {
+        if self.intervals.first().is_some_and(|r| ack.after(r.start)) {
             let count = self.locate(ack);
             self.acknowledge_units(ack, None, &[(0, count)]);
             for r in self.intervals.range(0, count) {
@@ -920,6 +925,27 @@ impl Rack {
             self.tally = Tally::default();
             return;
         }
+        if self.intervals.originals >= count && !self.same_packet(count - 1, count) {
+            // These complete units have independent wire identities. The
+            // suffix cannot inherit any of their packet or loss credit.
+            let data = self.intervals[count - 1]
+                .end
+                .distance_from(self.intervals[0].start);
+            let short = if count == 1 {
+                u32::from(data < self.short_mss)
+            } else {
+                self.intervals
+                    .range(0, count)
+                    .filter(|r| self.short(r))
+                    .count() as u32
+            };
+            self.tally.pipe -= data;
+            self.tally.short -= short;
+            self.tally.packets.unacked -= count as u32;
+            self.tally.units.unacked -= count as u32;
+            self.intervals.remove_prefix(count);
+            return;
+        }
         let packets = if count < len {
             self.packet_end(count + 1)
         } else {
@@ -950,10 +976,19 @@ impl Rack {
 
     // Remembers a range whose intervals the next ACK must look at again
     // although the scoreboard did not change there.
+    #[inline]
     fn mark_dirty(&mut self, start: Seq, end: Seq) {
-        if !end.after(start) {
-            return;
+        if end.after(start) {
+            if self.dirty_len == 0 {
+                self.dirty[0] = (start, end);
+                self.dirty_len = 1;
+            } else {
+                self.merge_dirty(start, end);
+            }
         }
+    }
+
+    fn merge_dirty(&mut self, start: Seq, end: Seq) {
         for span in &mut self.dirty[..self.dirty_len] {
             if !start.after(span.1) && !span.0.after(end) {
                 if span.0.after(start) {
@@ -1032,11 +1067,25 @@ impl Rack {
             units: (0, len),
         };
         debug_assert_eq!(self.tally, self.contribution(all));
-        let mut previous: Option<Seq> = None;
-        for r in self.intervals.iter() {
+        let mut previous: Option<(Seq, u64)> = None;
+        debug_assert!(self.intervals.originals <= len);
+        for (i, r) in self.intervals.iter().enumerate() {
             debug_assert!(r.end.after(r.start));
-            debug_assert!(previous.is_none_or(|end| !end.after(r.start)));
-            previous = Some(r.end);
+            debug_assert!(previous.is_none_or(|(end, _)| !end.after(r.start)));
+            if i < self.intervals.originals {
+                debug_assert_eq!(
+                    (r.start, r.end),
+                    (r.original_wire_start, r.original_wire_end)
+                );
+                debug_assert_eq!((r.start, r.end), (r.transmission_start, r.transmission_end));
+                debug_assert!(
+                    r.departure_committed && !r.retransmitted && !r.original_retransmitted
+                );
+                debug_assert!(!r.delivered && !r.sacked && !r.original_lost && !r.needs_retransmit);
+                debug_assert_eq!(r.stats_flags, DELIVERY_END);
+                debug_assert!(previous.is_none_or(|(end, sent)| end == r.start && sent <= r.sent));
+            }
+            previous = Some((r.end, r.sent));
         }
     }
 
@@ -1163,6 +1212,11 @@ impl Rack {
                 && r.transmission_end == selection.end
                 && r.retransmitted == selection.retransmit
         };
+        if let Some(tail) = self.intervals.last()
+            && (tail.start, tail.end) == (start, end)
+        {
+            return matches(tail);
+        }
         let mut covered = start;
         let (first, last) = self.overlapping(start, end);
         if last == first + 1 {
@@ -1226,6 +1280,43 @@ impl Rack {
         true
     }
 
+    // The whole original just appended by record_transmission, leaving at
+    // selection time. With the owner exclusively held, all its sequence
+    // bounds, flags and timestamps are already those of the wire packet.
+    pub(crate) fn commit_new_packet(&mut self, selection: DepartureSelection) -> bool {
+        let DepartureSelection {
+            start,
+            end,
+            selected: now,
+            ..
+        } = selection;
+        debug_assert!(self.validate_departure(selection, start, end, now));
+        debug_assert!(!selection.retransmit);
+        debug_assert!(!self.intervals.is_empty());
+        let Some(index) = self.intervals.len().checked_sub(1) else {
+            return false;
+        };
+        let prior = index.checked_sub(1).map(|i| &self.intervals[i]);
+        if self.intervals.originals == index
+            && prior.is_none_or(|r| r.end == start && r.sent <= now)
+        {
+            let from = prior.map_or(start, |r| r.start);
+            let tail = &mut self.intervals[index];
+            debug_assert!(tail.start == start && tail.end == end && tail.original_sent == now);
+            debug_assert!(tail.original_wire_start == start && tail.original_wire_end == end);
+            debug_assert_eq!(tail.stats_flags, 0);
+            tail.departure_committed = true;
+            tail.set_stats_flag(DELIVERY_END, true);
+            self.intervals.originals = index + 1;
+            self.tally.units.unacked += 1;
+            self.mark_dirty(from, end);
+            self.verify();
+            true
+        } else {
+            self.commit_validated_departure(selection, start, end, now)
+        }
+    }
+
     // `commit_departure` of a departure `validate_departure` accepted, with
     // the intervals unchanged since. Each departure of a selection accepted
     // in parts (an MTU repair's frames) becomes its own entry, split off at
@@ -1235,14 +1326,55 @@ impl Rack {
     // timestamp for the segments of a GSO skb it could not fragment. That is
     // RACK's conservative side: a later transmission time detects loss
     // later, and the whole entry must be acknowledged.
+    // Returns true only on the whole-new-packet fast path, where the
+    // entire recorded packet is submitted unchanged, keeping its packet
+    // counts and the length used by PTO scheduling. Returns false
+    // conservatively whenever the slow path runs.
     pub(crate) fn commit_validated_departure(
         &mut self,
         selection: DepartureSelection,
         start: Seq,
         end: Seq,
         now: u64,
-    ) {
+    ) -> bool {
         debug_assert!(self.validate_departure(selection, start, end, now));
+        // Committing a whole new packet preserves the wire packet, its
+        // length and its loss counts. It closes one delivery unit when the
+        // previous unit is already closed. Cuts, retries and coalesced
+        // units need the accounting walk below.
+        if !selection.retransmit
+            && let Some(tail) = self.intervals.last()
+            && (tail.start, tail.end) == (start, end)
+            && (tail.original_wire_start, tail.original_wire_end) == (start, end)
+            && (tail.transmission_start, tail.transmission_end) == (start, end)
+            && !tail.sacked
+            && !tail.original_lost
+            && tail.stats_flags & (DIAGNOSTIC_RETRY | DELIVERY_END) == 0
+        {
+            let index = self.intervals.len() - 1;
+            let previous = index.checked_sub(1).map(|i| &self.intervals[i]);
+            if previous.is_none_or(|r| r.stats_flag(DELIVERY_END)) {
+                let extend = self.intervals.originals == index
+                    && (selection.start, selection.end) == (start, end)
+                    && previous.is_none_or(|r| r.end == start && r.sent <= now)
+                    && !tail.delivered
+                    && !tail.retransmitted
+                    && !tail.original_retransmitted
+                    && !tail.needs_retransmit
+                    && tail.stats_flags == 0;
+                let from = previous
+                    .filter(|r| r.end == start)
+                    .map_or(start, |r| r.start);
+                Self::depart(&mut self.intervals[index], selection, start, end, now);
+                if extend {
+                    self.intervals.originals = index + 1;
+                }
+                self.tally.units.unacked += 1;
+                self.mark_dirty(from, end);
+                self.verify();
+                return true;
+            }
+        }
         // The usual departure is one whole interval, which neither edge
         // splits.
         let i = self.locate(start);
@@ -1269,7 +1401,9 @@ impl Rack {
             // Repacketize delivery units only after actual acceptance. Keep the
             // untouched prefix/suffix as separate queued units; do not tie their
             // completion to an overwritten latest-transmission sequence range.
-            if let Some(previous) = previous {
+            if let Some(previous) = previous
+                && !s.intervals[previous].stats_flag(DELIVERY_END)
+            {
                 s.intervals[previous].set_stats_flag(DELIVERY_END, true);
             }
             // An entry starting before `start` holds earlier parts of the
@@ -1325,6 +1459,7 @@ impl Rack {
             .map_or(end, |r| r.end);
         self.mark_dirty(dirty_start, dirty_end);
         self.verify();
+        false
     }
 
     // Records r, inside the departure [start, end), as departed at now.
@@ -1366,6 +1501,10 @@ impl Rack {
     ) {
         debug_assert!(self.validate_departure_group(selection, start, size, bytes, now));
         let end = start.wrapping_add(bytes as u32);
+        if bytes <= size as usize {
+            self.commit_validated_departure(selection, start, end, now);
+            return;
+        }
         let edge = |k: usize| start.wrapping_add((k * size as usize).min(bytes) as u32);
         // Everything the commits change lies in [from, last) and its
         // pieces; the hull's packet and unit edges are unchanged intervals,
@@ -1386,7 +1525,9 @@ impl Rack {
         let mut previous = first
             .checked_sub(1)
             .filter(|&i| self.intervals[i].end == start);
-        if let Some(previous) = previous {
+        if let Some(previous) = previous
+            && !self.intervals[previous].stats_flag(DELIVERY_END)
+        {
             self.intervals[previous].set_stats_flag(DELIVERY_END, true);
         }
         let mut i = first;
@@ -1438,6 +1579,43 @@ impl Rack {
     //# record the time in Segment.xmit_ts and set Segment.lost to FALSE.
     //# Upon retransmitting a segment, set Segment.retransmitted to TRUE.
     pub(crate) fn transmit(&mut self, start: Seq, end: Seq, now: u64, retransmit: bool) {
+        self.record_transmission(start, end, now, retransmit, false);
+    }
+
+    pub(crate) fn record_transmission(
+        &mut self,
+        start: Seq,
+        end: Seq,
+        now: u64,
+        retransmit: bool,
+        originally_in_window: bool,
+    ) {
+        self.record::<false>(start, end, now, retransmit, originally_in_window);
+    }
+
+    // An original submitted at the instant of selection. It can be
+    // appended with its final wire bounds, timestamp and delivery-unit
+    // boundary in one write.
+    // Callers in `connection.rs` land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn record_submitted_original(
+        &mut self,
+        start: Seq,
+        end: Seq,
+        now: u64,
+        originally_in_window: bool,
+    ) -> bool {
+        self.record::<true>(start, end, now, false, originally_in_window)
+    }
+
+    fn record<const SUBMITTED: bool>(
+        &mut self,
+        start: Seq,
+        end: Seq,
+        now: u64,
+        retransmit: bool,
+        originally_in_window: bool,
+    ) -> bool {
         self.departure_selection = self.selection_generation.checked_add(1).map(|generation| {
             self.selection_generation = generation;
             DepartureSelection {
@@ -1453,13 +1631,13 @@ impl Rack {
             if end.after(boundary) {
                 self.fallback = Some(end);
             }
-            return;
+            return true;
         }
         if retransmit {
             if !self.split(start) || !self.split(end) {
                 let boundary = self.intervals.last().map_or(end, |r| r.end);
                 self.abandon(boundary);
-                return;
+                return true;
             }
             let (first, last) = self.overlapping(start, end);
             if first < last {
@@ -1491,8 +1669,18 @@ impl Rack {
                     self.mark_dirty(start, end);
                 }
             }
-        } else if self.intervals.len() < self.capacity {
-            self.push(Interval {
+        } else if self.intervals.len() < self.intervals.capacity() {
+            debug_assert_eq!(self.capacity, self.intervals.capacity());
+            let previous = if SUBMITTED {
+                self.intervals.last()
+            } else {
+                None
+            };
+            let committed = SUBMITTED
+                && self.departure_selection.is_some()
+                && self.intervals.originals == self.intervals.len()
+                && previous.is_none_or(|r| r.end == start && r.sent <= now);
+            let interval = Interval {
                 start,
                 end,
                 original_start: start,
@@ -1500,27 +1688,44 @@ impl Rack {
                 original_wire_start: start,
                 original_wire_end: end,
                 original_sent: now,
-                originally_in_window: false,
+                originally_in_window,
                 successful_retries: 0,
                 transmission_start: start,
                 transmission_end: end,
                 sent: now,
                 timestamp_eligible: true,
                 retransmitted: false,
-                departure_committed: false,
+                departure_committed: committed,
                 original_retransmitted: false,
                 delivered: false,
-                stats_flags: 0,
+                stats_flags: if committed { DELIVERY_END } else { 0 },
                 sacked: false,
                 original_lost: false,
                 needs_retransmit: false,
                 loss_response_pending: false,
                 ptb: Ptb::None,
-            });
+            };
+            if committed {
+                let from = previous.map_or(start, |r| r.start);
+                let bytes = end.distance_from(start);
+                self.tally.pipe += bytes;
+                self.tally.short += u32::from(bytes < self.short_mss);
+                self.tally.packets.unacked += 1;
+                self.tally.units.unacked += 1;
+                self.intervals.push(interval);
+                self.intervals.originals = self.intervals.len();
+                self.mark_dirty(from, end);
+            } else {
+                self.push(interval);
+                if SUBMITTED && let Some(selection) = self.departure_selection() {
+                    return self.commit_new_packet(selection);
+                }
+            }
         } else {
             self.abandon(end);
         }
         self.verify();
+        true
     }
 
     // Returns whether an already-delivered data-only unit cannot also supply
@@ -1706,6 +1911,21 @@ impl Rack {
         dsack: bool,
         bound: SplitBound,
     ) -> u32 {
+        // With no SACK ranges, only the cumulative prefix can supply
+        // delivery evidence. Whole intervals can be retired directly,
+        // including when more packets follow them in the flight.
+        if scoreboard.is_empty() && self.valid() {
+            let count = if self.covered_by(ack) {
+                self.intervals.len()
+            } else {
+                self.locate(ack)
+            };
+            if count == self.intervals.len() || !ack.after(self.intervals[count].start) {
+                return self.acknowledge_in_order(
+                    count, ack, high, scoreboard, now, echo, timestamps, mss, dsack,
+                );
+            }
+        }
         self.ack_sample = None;
         self.reo_grew = false;
         // Earlier ACKs marked every interval the scoreboard then covered.
@@ -1713,36 +1933,6 @@ impl Rack {
         // here since can hold work; without a record, visit everything.
         let fresh = scoreboard.take_fresh();
         let scoreboard = &*scoreboard;
-        // A cumulative ACK of every interval with no SACK advice held, as
-        // for a request answered, takes them all: nothing to look up,
-        // split or count (tcp_clean_rtx_queue taking the whole queue).
-        if scoreboard.ranges().is_empty()
-            && self
-                .intervals
-                .last()
-                .map_or_else(|| self.valid(), |r| !r.end.after(ack))
-        {
-            self.dirty_len = 0;
-            self.rescan = false;
-            let input = AckInput {
-                ack,
-                scoreboard,
-                now,
-                echo,
-                timestamps,
-                mss,
-            };
-            let mut walk = AckWalk {
-                delivered: 0,
-                newest: None,
-                prior_fack: self.fack,
-                sack_reordered: false,
-                cumulative_reordered: false,
-            };
-            self.deliver_all(&input, &mut walk);
-            let acked = self.intervals.len();
-            return self.finish_ack(walk, acked, ack, high, now, dsack);
-        }
         let mut spans = [(Seq(0), Seq(0)); SPANS];
         let mut count = 0;
         let mut fresh_from = 0;
@@ -1834,7 +2024,7 @@ impl Rack {
                 }
                 self.edit(i, j, |s| {
                     for k in i..j {
-                        s.deliver(k, &input, &mut walk);
+                        s.deliver::<false>(k, &input, &mut walk);
                     }
                 });
                 i = j;
@@ -1848,10 +2038,189 @@ impl Rack {
         self.finish_ack(walk, acked, ack, high, now, dsack)
     }
 
-    // The end of acknowledge_within once the ACK's intervals are marked:
-    // RACK's update from the newest delivered transmission (RFC 8985
-    // section 6.2), the cumulative prefix of `acked` intervals dropped and
-    // the DSACK round.
+    fn covered_by(&self, ack: Seq) -> bool {
+        self.intervals
+            .last()
+            .map_or_else(|| self.valid(), |r| !r.end.after(ack))
+    }
+
+    // A drained flight has no remaining loss candidates. For a partial
+    // ACK the unretired packets must all be intact originals transmitted
+    // at or after everything that can advance RACK's delivery frontier.
+    // Callers in `connection.rs` land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    pub(crate) fn in_order_ack(
+        &self,
+        low: Seq,
+        ack: Seq,
+        high: Seq,
+        advancing: bool,
+        carries_data: bool,
+    ) -> Option<usize> {
+        if ack == high {
+            return if advancing {
+                self.covered_by(ack).then_some(self.intervals.len())
+            } else {
+                (ack == low && self.empty_valid()).then_some(0)
+            };
+        }
+        if advancing || ack == low && carries_data {
+            self.in_order_prefix(low, ack, high)
+        } else {
+            None
+        }
+    }
+
+    // Callers in `connection.rs` land in a later commit (via `in_order_ack`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline(never)]
+    fn in_order_prefix(&self, low: Seq, ack: Seq, high: Seq) -> Option<usize> {
+        let len = self.intervals.len();
+        if len == 0 || self.intervals.originals != len || self.intervals[0].start != low {
+            return None;
+        }
+        let tail = &self.intervals[len - 1];
+        if tail.end != high {
+            return None;
+        }
+        let count = if ack == low { 0 } else { self.locate(ack) };
+        if count >= len {
+            return None;
+        }
+        let next = &self.intervals[count];
+        (next.start == ack
+            && self.latest.is_none_or(|(sent, edge)| {
+                sent < next.sent
+                    || sent == next.sent && next.end.at_or_after(edge) && tail.end.at_or_after(edge)
+            }))
+        .then_some(count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(crate) fn acknowledge_in_order(
+        &mut self,
+        count: usize,
+        ack: Seq,
+        high: Seq,
+        scoreboard: &mut Scoreboard,
+        now: u64,
+        echo: Option<u32>,
+        timestamps: Option<TimestampGranularity>,
+        mss: u32,
+        dsack: bool,
+    ) -> u32 {
+        debug_assert!(count <= self.intervals.len());
+        self.begin_in_order_ack(scoreboard);
+        if count == 0 {
+            self.finish_dsack_round(ack, high, dsack);
+            self.verify();
+            return 0;
+        }
+        self.acknowledge_prefix(
+            count, ack, high, scoreboard, now, echo, timestamps, mss, dsack,
+        )
+    }
+
+    fn begin_in_order_ack(&mut self, scoreboard: &mut Scoreboard) {
+        debug_assert!(scoreboard.is_empty());
+        scoreboard.discard_fresh();
+        self.ack_sample = None;
+        self.reo_grew = false;
+        self.dirty_len = 0;
+        self.rescan = false;
+    }
+
+    // A nonadvancing ordinary ACK delivers no interval or DSACK. It
+    // still clears the previous ACK sample and can finish a DSACK round.
+    // Callers in `connection.rs` land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn acknowledge_unchanged(&mut self, ack: Seq, scoreboard: &mut Scoreboard) {
+        self.begin_in_order_ack(scoreboard);
+        self.finish_dsack_round(ack, ack, false);
+        self.verify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acknowledge_prefix(
+        &mut self,
+        count: usize,
+        ack: Seq,
+        high: Seq,
+        scoreboard: &mut Scoreboard,
+        now: u64,
+        echo: Option<u32>,
+        timestamps: Option<TimestampGranularity>,
+        mss: u32,
+        dsack: bool,
+    ) -> u32 {
+        if count <= self.intervals.originals {
+            let first = self.intervals[0].start;
+            let tail = &self.intervals[count - 1];
+            if self
+                .fack
+                .is_none_or(|fack| first == fack || first.after(fack) && tail.end.after(fack))
+            {
+                // Each extent is one newly delivered packet. Contiguous
+                // sequence space supplies their total bytes, and monotone
+                // departures make the last packet the newest RTT candidate.
+                let delivered = tail.end.distance_from(first);
+                self.fack = Some(tail.end);
+                if self.delivered_segments_valid {
+                    self.delivered_segments = self.delivered_segments.saturating_add(count as u64);
+                }
+                if tail.sent >= self.sample_floor {
+                    self.record_delivery(
+                        tail.sent,
+                        tail.end,
+                        now.saturating_sub(tail.sent),
+                        now,
+                        false,
+                    );
+                }
+                self.retire_delivered(count, ack, high, dsack);
+                return delivered;
+            }
+        }
+        let input = AckInput {
+            ack,
+            scoreboard,
+            now,
+            echo,
+            timestamps,
+            mss,
+        };
+        let mut walk = AckWalk {
+            delivered: 0,
+            newest: None,
+            prior_fack: self.fack,
+            sack_reordered: false,
+            cumulative_reordered: false,
+        };
+        // Every complete unit in the prefix is cumulatively covered. A
+        // unit continuing into the rest of the flight cannot be credited
+        // yet. All individual interval flags in the prefix go away with
+        // it, so they need no mutation or retally.
+        let (mut committed, mut newly) = (true, false);
+        for i in 0..count {
+            let r = &self.intervals[i];
+            let sacked = r.sacked;
+            committed &= r.departure_committed;
+            newly |= !r.stats_flag(PACKET_DELIVERED) && !r.stats_flag(SYN_PAYLOAD);
+            if r.stats_flag(DELIVERY_END) {
+                if committed && newly && self.delivered_segments_valid {
+                    self.delivered_segments = self.delivered_segments.saturating_add(1);
+                }
+                (committed, newly) = (true, false);
+            }
+            if !sacked {
+                self.deliver::<true>(i, &input, &mut walk);
+            }
+        }
+        self.finish_ack(walk, count, ack, high, now, dsack)
+    }
+
     fn finish_ack(
         &mut self,
         walk: AckWalk,
@@ -1861,22 +2230,36 @@ impl Rack {
         now: u64,
         dsack: bool,
     ) -> u32 {
-        let delivered = walk.delivered;
         self.reordering_events = self
             .reordering_events
             .saturating_add(u64::from(walk.sack_reordered) + u64::from(walk.cumulative_reordered));
         if let Some((sent, end, rtt, retransmitted)) = walk.newest {
-            if !retransmitted {
-                self.ack_sample = Some(rtt);
-                self.sample(rtt, now);
-            }
-            self.rtt = rtt;
-            if self.latest.is_none_or(|old| sent_after((sent, end), old)) {
-                self.latest = Some((sent, end));
-            }
-            // Karn: retransmissions can advance RACK, not the ordinary RTT estimator.
+            self.record_delivery(sent, end, rtt, now, retransmitted);
         }
-        self.remove_prefix(acked);
+        self.retire_delivered(acked, ack, high, dsack);
+        walk.delivered
+    }
+
+    fn record_delivery(&mut self, sent: u64, end: Seq, rtt: u64, now: u64, retransmitted: bool) {
+        // Karn: retransmissions can advance RACK's latest delivery.
+        // Only an original also updates the ordinary RTT estimator.
+        if !retransmitted {
+            self.ack_sample = Some(rtt);
+            self.sample(rtt, now);
+        }
+        self.rtt = rtt;
+        if self.latest.is_none_or(|old| sent_after((sent, end), old)) {
+            self.latest = Some((sent, end));
+        }
+    }
+
+    fn retire_delivered(&mut self, count: usize, ack: Seq, high: Seq, dsack: bool) {
+        self.remove_prefix(count);
+        self.finish_dsack_round(ack, high, dsack);
+        self.verify();
+    }
+
+    fn finish_dsack_round(&mut self, ack: Seq, high: Seq, dsack: bool) {
         if self.dsack_round.is_some_and(|end| !end.after(ack)) {
             self.dsack_round = None;
         }
@@ -1887,8 +2270,6 @@ impl Rack {
             self.reo_grew = true;
             self.reordering_seen = true;
         }
-        self.verify();
-        delivered
     }
 
     // `acknowledge_within` with no bound on SACK splits but the entries.
@@ -1916,30 +2297,6 @@ impl Rack {
             dsack,
             SplitBound::NONE,
         )
-    }
-
-    // acknowledge_units and the marking of an ACK of every interval with
-    // no SACK advice, in one pass: a unit is complete once its intervals
-    // are committed, all being below the ACK. Their flags and the tally
-    // need no update: finish_ack drops every interval, and the tally with
-    // them.
-    fn deliver_all(&mut self, input: &AckInput, walk: &mut AckWalk) {
-        let (mut committed, mut newly) = (true, false);
-        for i in 0..self.intervals.len() {
-            let r = &self.intervals[i];
-            let sacked = r.sacked;
-            committed &= r.departure_committed;
-            newly |= !r.stats_flag(PACKET_DELIVERED) && !r.stats_flag(SYN_PAYLOAD);
-            if r.stats_flag(DELIVERY_END) {
-                if committed && newly && self.delivered_segments_valid {
-                    self.delivered_segments = self.delivered_segments.saturating_add(1);
-                }
-                (committed, newly) = (true, false);
-            }
-            if !sacked {
-                self.deliver(i, input, walk);
-            }
-        }
     }
 
     // Splits the entry a SACK block's edge falls inside, unless the split
@@ -1971,10 +2328,10 @@ impl Rack {
     }
 
     // Marks one newly covered interval delivered, in sequence order.
-    fn deliver(&mut self, i: usize, input: &AckInput, walk: &mut AckWalk) {
+    fn deliver<const RETIRED: bool>(&mut self, i: usize, input: &AckInput, walk: &mut AckWalk) {
         let (ack, scoreboard) = (input.ack, input.scoreboard);
         let r = &mut self.intervals[i];
-        let cumulative = !r.end.after(ack);
+        let cumulative = RETIRED || !r.end.after(ack);
         let packet_complete = !r.transmission_end.after(ack)
             || scoreboard.unsacked_bytes(
                 if r.transmission_start.after(ack) {
@@ -1986,7 +2343,9 @@ impl Rack {
             ) == 0;
         if !r.delivered {
             walk.delivered += r.end.distance_from(r.start);
-            r.delivered = true;
+            if !RETIRED {
+                r.delivered = true;
+            }
         }
         if !r.original_retransmitted
             && let Some(fack) = self.fack
@@ -2025,9 +2384,11 @@ impl Rack {
         {
             walk.newest = Some((r.sent, r.transmission_end, rtt, r.retransmitted));
         }
-        r.sacked = true;
-        r.original_lost = false;
-        r.needs_retransmit = false;
+        if !RETIRED {
+            r.sacked = true;
+            r.original_lost = false;
+            r.needs_retransmit = false;
+        }
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-6.2

@@ -853,14 +853,35 @@ impl Congestion {
         flight_after_ack: u32,
         ece: bool,
     ) -> bool {
+        self.on_delivery_ack::<false>(ack, acked, flight_after_ack, ece)
+    }
+
+    /// A cumulative data ACK that covers the whole flight, already
+    /// validated for ordinary non-ECN congestion processing.
+    // Callers in `connection.rs` land in a later commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn on_drained_ack(&mut self, ack: Seq, acked: u32) -> bool {
+        debug_assert!(acked != 0 && !self.in_recovery() && self.ecn_prr.is_none());
+        self.on_delivery_ack::<true>(ack, acked, 0, false)
+    }
+
+    fn on_delivery_ack<const DRAINED: bool>(
+        &mut self,
+        ack: Seq,
+        acked: u32,
+        flight_after_ack: u32,
+        ece: bool,
+    ) -> bool {
         if self
             .retransmitted_end
             .is_some_and(|end| ack.at_or_after(end))
         {
             self.retransmitted_end = None;
         }
-        self.observe_ack(ack);
-        if acked == 0 {
+        if !DRAINED {
+            self.observe_ack(ack);
+        }
+        if !DRAINED && acked == 0 {
             return false;
         }
         self.reset_duplicate_acks();
@@ -873,7 +894,7 @@ impl Congestion {
             // Reno/NewReno retain the epoch at equality; SACK entry checks coverage.
             self.recover = None;
         }
-        if self.sack_recovery {
+        if !DRAINED && self.sack_recovery {
             if matches!(relation, Some(Ordering::Equal | Ordering::Greater)) {
                 self.prr_window(
                     self.cwnd().min(self.recovery_target()).min(
@@ -891,7 +912,7 @@ impl Congestion {
             }
             return false;
         }
-        if self.fast_recovery {
+        if !DRAINED && self.fast_recovery {
             let exit_cap = if ece { self.cwnd() } else { MAX_WINDOW };
             if self.algorithm == RecoveryAlgorithm::Reno && relation.is_some() {
                 // Retain recover and the independent ECN epoch: exiting fast recovery
@@ -956,7 +977,7 @@ impl Congestion {
         if self.ecn_end.is_some_and(|end| ack.after(end)) {
             self.ecn_end = None;
         }
-        if ece || self.ecn_prr.is_some() {
+        if !DRAINED && (ece || self.ecn_prr.is_some()) {
             if let Some(cubic) = &mut self.cubic {
                 cubic.ack_flight(flight_after_ack, self.cwnd);
             }
@@ -3488,6 +3509,236 @@ mod tests {
                 assert_eq!(c.cwnd(), 1_000);
             }
         }
+    }
+
+    #[test]
+    fn on_drained_ack_matches_general_ack_across_states() {
+        use alloc::format;
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                if n == 0 { 0 } else { self.next() % n }
+            }
+            fn chance(&mut self, p: u64) -> bool {
+                self.below(100) < p
+            }
+        }
+
+        let mut compared = 0usize;
+        let mut saw_initial_recover_retained = 0usize;
+        let mut saw_initial_recover_cleared = 0usize;
+        let mut saw_probe_response = 0usize;
+        let mut saw_cubic_ca = 0usize;
+        let mut saw_hystart_exit = 0usize;
+
+        for seed in 1..=120u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let recovery_alg =
+                [RecoveryAlgorithm::Reno, RecoveryAlgorithm::NewReno][rng.below(2) as usize];
+            let cc_alg = if rng.chance(65) {
+                CongestionAlgorithm::Cubic
+            } else {
+                CongestionAlgorithm::Reno
+            };
+            let hystart_on = rng.chance(70);
+            let mss = [536, 1000, 1460][rng.below(3) as usize];
+            let iss = match rng.below(3) {
+                0 => Seq(u32::MAX - 2500),
+                1 => Seq(rng.next() as u32),
+                _ => Seq(1000),
+            };
+            let timebase = CallerTimebase::default();
+            let mut a = Congestion::new(mss, recovery_alg, InitialWindow::Iw10, iss)
+                .with_congestion(cc_alg, timebase)
+                .with_cubic_hystart(hystart_on);
+            let mut una = iss.wrapping_add(1);
+            let mut now = 10_000u64;
+            let mut rtt = 10_000u64;
+
+            for step in 0..80 {
+                // Occasionally set optional epochs or probe_response before testing a drained ACK.
+                if step == 0 && rng.chance(50) {
+                    // Keep initial_recover active (ack == iss + 1 vs advancing past it).
+                    assert_eq!(a.initial_recover, Some(iss.wrapping_add(1)));
+                }
+                if rng.chance(15) {
+                    a.duplicate_acks = (1 + rng.below(2)) as u8;
+                }
+                if rng.chance(10) {
+                    a.timeout_retransmitted = true;
+                }
+                if rng.chance(12) {
+                    let edge = una.wrapping_add(rng.below(4 * u64::from(mss)) as u32);
+                    a.retransmitted_end = Some(edge);
+                }
+                if rng.chance(12) {
+                    let edge = una.wrapping_add(rng.below(4 * u64::from(mss)) as u32);
+                    a.tlp_reduction_end = Some(edge);
+                }
+                if rng.chance(12) {
+                    let edge = una.wrapping_add(rng.below(4 * u64::from(mss)) as u32);
+                    a.recover = Some(edge);
+                }
+                if rng.chance(12) {
+                    let edge = una.wrapping_add(rng.below(4 * u64::from(mss)) as u32);
+                    a.ecn_end = Some(edge);
+                }
+                if rng.chance(12) && a.probe_response.is_none() {
+                    a.begin_probe_response(una, (2 * mss).max(1));
+                } else if a.probe_response.is_some() && rng.chance(50) {
+                    a.commit_probe_response();
+                }
+
+                // Occasionally drive a loss + recovery exit so CUBIC enters CA or updates ssthresh.
+                if rng.chance(8) && a.probe_response.is_none() {
+                    let flight = a.cwnd().max(mss);
+                    let end = una.wrapping_add(flight);
+                    a.on_timeout(flight, end);
+                }
+
+                // Simulate a flight drained by one cumulative ACK.
+                let acked = 1 + rng.below(u64::from(mss) * 6) as u32;
+                let ack = una.wrapping_add(acked);
+                now = now.saturating_add(1_000 + rng.below(30_000));
+                if rng.chance(15) {
+                    rtt = [10_000, 45_000, 8_000, 70_000][rng.below(4) as usize];
+                }
+                let paced = rng.chance(50);
+                a.on_startup_sent(ack, paced);
+                a.on_data_sent(now, acked, ack, rng.chance(70));
+                let sample = (!rng.chance(10)).then_some(rtt);
+                a.prepare_ack(now, sample, ack, acked, a.cwnd().saturating_add(mss));
+                a.prepare_startup_ack(StartupAck {
+                    rtt: sample,
+                    snd_nxt: ack,
+                    paced,
+                });
+
+                // Only compare under on_drained_ack's preconditions.
+                if a.in_recovery() || a.ecn_prr.is_some() {
+                    a.observe_ack_advance(una, ack);
+                    a.on_ack_with_ecn(ack, acked, 0, false);
+                    una = ack;
+                    continue;
+                }
+
+                let mut b = a.clone();
+
+                // Both paths run observe_ack_advance first, matching Connection::accept_ack_inner.
+                let had_initial_recover = a.initial_recover.is_some();
+                let retain_initial = step == 0 && rng.chance(30);
+                let (test_ack, test_acked) = if retain_initial {
+                    // Check when initial_recover is still active at equality (ack == iss + 1).
+                    a.initial_recover = Some(ack);
+                    b.initial_recover = Some(ack);
+                    (ack, acked)
+                } else {
+                    (ack, acked)
+                };
+
+                a.observe_ack_advance(una, test_ack);
+                b.observe_ack_advance(una, test_ack);
+                if had_initial_recover && a.initial_recover.is_none() {
+                    saw_initial_recover_cleared += 1;
+                }
+                if a.initial_recover.is_some() {
+                    saw_initial_recover_retained += 1;
+                }
+                if a.probe_response.is_some() {
+                    saw_probe_response += 1;
+                }
+                let had_hystart = a.hystart.is_some();
+
+                let ret_drained = a.on_drained_ack(test_ack, test_acked);
+                let ret_general = b.on_ack_with_ecn(test_ack, test_acked, 0, false);
+
+                assert_eq!(
+                    ret_drained, ret_general,
+                    "seed {seed} step {step}: return mismatch"
+                );
+                assert_eq!(
+                    format!("{a:?}"),
+                    format!("{b:?}"),
+                    "seed {seed} step {step}: state mismatch"
+                );
+                compared += 1;
+
+                if a.cubic.is_some() && a.congestion_avoidance {
+                    saw_cubic_ca += 1;
+                }
+                if had_hystart && a.hystart.is_none() {
+                    saw_hystart_exit += 1;
+                }
+                una = test_ack;
+            }
+        }
+
+        // Also explicitly drive HyStart through 5 CSS rounds to exit via on_drained_ack.
+        {
+            let iss = Seq(500);
+            let mut a = Congestion::new(1000, RecoveryAlgorithm::NewReno, InitialWindow::Iw10, iss)
+                .with_congestion(CongestionAlgorithm::Cubic, CallerTimebase::default());
+            let mut una = iss.wrapping_add(1);
+            let mut now = 100_000u64;
+            // Round 0: establish last_min = 10ms with 8 partial ACKs, then drain.
+            for r in 0..8 {
+                let flight_end = una.wrapping_add(8_000);
+                let rtt = if r == 0 { 10_000 } else { 40_000 };
+                for k in 0..8 {
+                    let ack = una.wrapping_add(1000);
+                    let remaining = 7_000 - k * 1000;
+                    now += 1_000;
+                    a.on_data_sent(now, 8_000 - k * 1000, flight_end, true);
+                    a.prepare_ack(now, Some(rtt), ack, 1000, a.cwnd());
+                    a.prepare_startup_ack(StartupAck {
+                        rtt: Some(rtt),
+                        snd_nxt: flight_end,
+                        paced: false,
+                    });
+                    if remaining == 0 {
+                        let mut b = a.clone();
+                        a.observe_ack_advance(una, ack);
+                        b.observe_ack_advance(una, ack);
+                        assert_eq!(
+                            a.on_drained_ack(ack, 1000),
+                            b.on_ack_with_ecn(ack, 1000, 0, false)
+                        );
+                        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+                        if a.hystart.is_none() {
+                            saw_hystart_exit += 1;
+                        }
+                    } else {
+                        a.observe_ack_advance(una, ack);
+                        a.on_ack_with_ecn(ack, 1000, remaining, false);
+                    }
+                    una = ack;
+                }
+                if a.hystart.is_none() {
+                    break;
+                }
+            }
+        }
+
+        assert!(compared > 5000, "too few comparisons: {compared}");
+        assert!(
+            saw_initial_recover_cleared > 20,
+            "{saw_initial_recover_cleared}"
+        );
+        assert!(
+            saw_initial_recover_retained > 10,
+            "{saw_initial_recover_retained}"
+        );
+        assert!(saw_probe_response > 50, "{saw_probe_response}");
+        assert!(saw_cubic_ca > 100, "{saw_cubic_ca}");
+        assert!(saw_hystart_exit > 0, "HyStart CSS exit never exercised");
     }
 }
 

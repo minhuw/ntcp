@@ -753,3 +753,726 @@ fn randomized_exchanges_match_the_walking_ledger() {
     assert!(compared > 400 * 500 * 85 / 100, "{compared}");
     assert!(unconstrained > 300, "{unconstrained}");
 }
+
+#[test]
+fn submitting_an_original_directly_matches_record_then_commit() {
+    for generation in [0, u64::MAX - 2] {
+        let mut recorded = Rack::with_timebase(16, CallerTimebase::default()).unwrap();
+        let mut submitted = Rack::with_timebase(16, CallerTimebase::default()).unwrap();
+        recorded.selection_generation = generation;
+        submitted.selection_generation = generation;
+        let mut start = Seq(u32::MAX - 1100);
+        for i in 0..20 {
+            if i == 3 {
+                start = start.wrapping_add(1);
+            }
+            let end = start.wrapping_add(if i % 3 == 0 { 1200 } else { i + 1 });
+            let now = u64::from(i.saturating_sub(u32::from(i == 6)));
+            let in_window = i % 7 != 0;
+            recorded.record_transmission(start, end, now, false, in_window);
+            let whole = recorded.departure_selection().is_none_or(|selection| {
+                recorded.commit_validated_departure(selection, start, end, now)
+            });
+            assert_eq!(
+                submitted.record_submitted_original(start, end, now, in_window),
+                whole
+            );
+            assert_eq!(format!("{submitted:?}"), format!("{recorded:?}"));
+            start = end;
+        }
+    }
+}
+
+#[test]
+fn fast_commit_record_and_remove_prefix_match_slow_path() {
+    let mut fast_record_hits = 0usize;
+    let mut fast_commit_hits = 0usize;
+    let mut fast_remove_prefix_single = 0usize;
+    let mut fast_remove_prefix_multi = 0usize;
+    let mut fallback_hits = 0usize;
+    let mut retransmit_hits = 0usize;
+    let mut same_packet_boundary_hits = 0usize;
+
+    for seed in 1..=100u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let cap = [6, 12, 32][rng.below(3) as usize];
+        let mut fast = Rack::with_capacity(cap + SPARE).unwrap();
+        let mut slow = Rack::with_capacity(cap + SPARE).unwrap();
+        let mut reference = Reference::with_capacity(cap).unwrap();
+        let mut sb_fast = Scoreboard::with_capacity(cap).unwrap();
+        let mut sb_slow = Scoreboard::with_capacity(cap).unwrap();
+        let mut sb_ref = Scoreboard::with_capacity(cap).unwrap();
+        let base = if rng.chance(40) {
+            Seq(u32::MAX - 2000)
+        } else {
+            Seq(1000)
+        };
+        sb_fast.update(base, base, &[None; 4]);
+        sb_slow.update(base, base, &[None; 4]);
+        sb_ref.update(base, base, &[None; 4]);
+        let mss = [100, 536, 1200][rng.below(3) as usize];
+        let mut una = base;
+        let mut nxt = base;
+        let mut now = 10u64;
+        let mut ref_valid = true;
+
+        for _ in 0..90 {
+            if rng.chance(60) {
+                now += rng.below(20);
+            }
+            match rng.below(100) {
+                // Fresh original via record_submitted_original or record_transmission + commit_new_packet.
+                0..=49 => {
+                    let len = match rng.below(3) {
+                        0 => 1 + rng.below(u64::from(mss)) as u32,
+                        1 => mss,
+                        _ => mss + 1 + rng.below(u64::from(mss)) as u32,
+                    };
+                    let (start, end) = (nxt, nxt.wrapping_add(len));
+                    let in_window = rng.chance(50);
+                    let use_direct = rng.chance(50);
+                    if fast.fallback.is_some() {
+                        fallback_hits += 1;
+                    }
+                    if use_direct {
+                        if fast.fallback.is_none()
+                            && fast.intervals.len() < fast.intervals.capacity()
+                            && fast.intervals.originals == fast.intervals.len()
+                        {
+                            fast_record_hits += 1;
+                        }
+                        let got = fast.record_submitted_original(start, end, now, in_window);
+                        slow.record_transmission(start, end, now, false, in_window);
+                        let expected = slow.departure_selection().is_none_or(|sel| {
+                            slow.commit_validated_departure(sel, start, end, now)
+                        });
+                        assert_eq!(got, expected, "seed {seed}: record_submitted_original bool");
+                    } else {
+                        fast.record_transmission(start, end, now, false, in_window);
+                        slow.record_transmission(start, end, now, false, in_window);
+                        if let Some(sel) = fast.departure_selection() {
+                            if fast.intervals.originals + 1 == fast.intervals.len() {
+                                fast_commit_hits += 1;
+                            }
+                            let got = fast.commit_new_packet(sel);
+                            let expected = slow.commit_validated_departure(sel, start, end, now);
+                            assert_eq!(got, expected, "seed {seed}: commit_new_packet bool");
+                        }
+                    }
+                    if ref_valid {
+                        reference.transmit(start, end, now, false);
+                        reference.commit_original_window(start, end, in_window);
+                        if !reference.valid() {
+                            ref_valid = false;
+                        } else if let Some(sel) = reference.departure_selection()
+                            && !reference.commit_departure(sel, start, end, now)
+                        {
+                            ref_valid = false;
+                        }
+                    }
+                    nxt = end;
+                }
+                // Partial departure of a fresh packet to create split intervals sharing the same packet.
+                50..=59 => {
+                    let len = 40 + rng.below(200) as u32;
+                    let (start, end) = (nxt, nxt.wrapping_add(len));
+                    let mid = start.wrapping_add(len / 2);
+                    fast.record_transmission(start, end, now, false, true);
+                    slow.record_transmission(start, end, now, false, true);
+                    if let Some(sel) = fast.departure_selection() {
+                        fast.commit_validated_departure(sel, start, mid, now);
+                        slow.commit_validated_departure(sel, start, mid, now);
+                        fast.commit_validated_departure(sel, mid, end, now + 1);
+                        slow.commit_validated_departure(sel, mid, end, now + 1);
+                    }
+                    if ref_valid {
+                        reference.transmit(start, end, now, false);
+                        reference.commit_original_window(start, end, true);
+                        if !reference.valid() {
+                            ref_valid = false;
+                        } else if let Some(sel) = reference.departure_selection()
+                            && (!reference.commit_departure(sel, start, mid, now)
+                                || !reference.commit_departure(sel, mid, end, now + 1))
+                        {
+                            ref_valid = false;
+                        }
+                    }
+                    nxt = end;
+                    now += 1;
+                }
+                // Retransmit an in-flight interval.
+                60..=71 if nxt.after(una) => {
+                    let span = nxt.distance_from(una);
+                    let off = rng.below(u64::from(span)) as u32;
+                    let len = 1 + rng.below(u64::from((span - off).min(mss))) as u32;
+                    let start = una.wrapping_add(off);
+                    let end = start.wrapping_add(len);
+                    retransmit_hits += 1;
+                    fast.transmit(start, end, now, true);
+                    slow.transmit(start, end, now, true);
+                    if let Some(sel) = fast.departure_selection() {
+                        fast.commit_departure(sel, start, end, now);
+                        slow.commit_departure(sel, start, end, now);
+                    }
+                    if ref_valid {
+                        reference.transmit(start, end, now, true);
+                        if !reference.valid() {
+                            ref_valid = false;
+                        } else if let Some(sel) = reference.departure_selection()
+                            && !reference.commit_departure(sel, start, end, now)
+                        {
+                            ref_valid = false;
+                        }
+                    }
+                }
+                // Cumulative ACK (optionally with SACK blocks) driving remove_prefix.
+                _ if nxt.after(una) => {
+                    let edges: Vec<Seq> = fast.intervals.iter().map(|r| r.end).collect();
+                    let ack = if !edges.is_empty() && rng.chance(70) {
+                        edges[rng.below(edges.len() as u64) as usize]
+                    } else if rng.chance(50) {
+                        nxt
+                    } else {
+                        let span = nxt.distance_from(una);
+                        una.wrapping_add(1 + rng.below(u64::from(span)) as u32)
+                    };
+                    let mut blocks = [None; 4];
+                    if rng.chance(30) && nxt.after(ack) {
+                        let rem = nxt.distance_from(ack);
+                        let a = ack.wrapping_add(1 + rng.below(u64::from(rem)) as u32);
+                        if nxt.after(a) {
+                            let b = a.wrapping_add(
+                                1 + rng.below(u64::from(nxt.distance_from(a))) as u32,
+                            );
+                            blocks[0] = Some((a.0, b.0));
+                        }
+                    }
+                    // Track remove_prefix fast-path and same_packet(count - 1, count) boundary hits.
+                    if fast.valid() && !fast.intervals.is_empty() {
+                        let count = fast.locate(ack);
+                        let len = fast.intervals.len();
+                        if count > 0 && count < len {
+                            if fast.same_packet(count - 1, count) {
+                                same_packet_boundary_hits += 1;
+                            } else if fast.intervals.originals >= count {
+                                if count == 1 {
+                                    fast_remove_prefix_single += 1;
+                                } else {
+                                    fast_remove_prefix_multi += 1;
+                                }
+                            }
+                        }
+                    }
+                    let u_fast = sb_fast.update(ack, nxt, &blocks);
+                    let u_slow = sb_slow.update(ack, nxt, &blocks);
+                    let d_fast = fast.acknowledge(
+                        ack,
+                        nxt,
+                        &mut sb_fast,
+                        now,
+                        None,
+                        None,
+                        mss,
+                        u_fast.dsack,
+                    );
+                    let d_slow = slow.acknowledge(
+                        ack,
+                        nxt,
+                        &mut sb_slow,
+                        now,
+                        None,
+                        None,
+                        mss,
+                        u_slow.dsack,
+                    );
+                    assert_eq!(d_fast, d_slow, "seed {seed}: delivered mismatch");
+                    fast.trim_cumulative(ack);
+                    slow.trim_cumulative(ack);
+                    if ref_valid {
+                        let u_ref = sb_ref.update(ack, nxt, &blocks);
+                        let d_ref = reference.acknowledge(
+                            ack,
+                            nxt,
+                            &sb_ref,
+                            now,
+                            None,
+                            None,
+                            mss,
+                            u_ref.dsack,
+                        );
+                        if !reference.valid() {
+                            ref_valid = false;
+                        } else {
+                            assert_eq!(d_fast, d_ref, "seed {seed}: ref delivered mismatch");
+                            reference.trim_cumulative(ack);
+                        }
+                    }
+                    una = ack;
+                }
+                _ => {}
+            }
+
+            assert_eq!(
+                format!("{fast:?}"),
+                format!("{slow:?}"),
+                "seed {seed}: fast vs slow Rack Debug mismatch"
+            );
+            assert_eq!(fast.pipe(), slow.pipe());
+            assert_eq!(
+                format!("{:?}", fast.packet_counts()),
+                format!("{:?}", slow.packet_counts())
+            );
+            assert_eq!(
+                format!("{:?}", fast.diagnostic_packet_counts()),
+                format!("{:?}", slow.diagnostic_packet_counts())
+            );
+            if ref_valid && fast.split_refusals == 0 {
+                let a: Vec<Interval> = fast.intervals.iter().copied().collect();
+                let b: Vec<Interval> = reference.intervals.iter().copied().collect();
+                assert_eq!(a, b, "seed {seed}: fast vs reference intervals mismatch");
+                assert_eq!(
+                    snapshot_rack(&fast),
+                    snapshot_reference(&reference),
+                    "seed {seed}: fast vs reference snapshot mismatch"
+                );
+                assert_eq!(fast.pipe(), reference.pipe());
+                assert_eq!(
+                    format!("{:?}", fast.packet_counts()),
+                    format!("{:?}", reference.packet_counts())
+                );
+                assert_eq!(
+                    format!("{:?}", fast.diagnostic_packet_counts()),
+                    format!("{:?}", reference.diagnostic_packet_counts())
+                );
+            }
+        }
+    }
+
+    // Explicit capacity-exhaustion test for record_submitted_original -> fallback.
+    {
+        let mut fast = Rack::with_capacity(4).unwrap();
+        let mut slow = Rack::with_capacity(4).unwrap();
+        for i in 0..6u32 {
+            let start = Seq(100 + i * 100);
+            let end = Seq(200 + i * 100);
+            let got = fast.record_submitted_original(start, end, u64::from(i + 1), true);
+            slow.record_transmission(start, end, u64::from(i + 1), false, true);
+            let expected = slow.departure_selection().is_none_or(|sel| {
+                slow.commit_validated_departure(sel, start, end, u64::from(i + 1))
+            });
+            assert_eq!(got, expected);
+            assert_eq!(format!("{fast:?}"), format!("{slow:?}"));
+        }
+        assert!(!fast.valid());
+        assert_eq!(fast.fallback, Some(Seq(700)));
+    }
+
+    assert!(fast_record_hits > 100, "{fast_record_hits}");
+    assert!(fast_commit_hits > 100, "{fast_commit_hits}");
+    assert!(
+        fast_remove_prefix_single > 20,
+        "{fast_remove_prefix_single}"
+    );
+    assert!(fast_remove_prefix_multi > 20, "{fast_remove_prefix_multi}");
+    assert!(fallback_hits > 10, "{fallback_hits}");
+    assert!(retransmit_hits > 100, "{retransmit_hits}");
+    assert!(
+        same_packet_boundary_hits > 10,
+        "{same_packet_boundary_hits}"
+    );
+}
+
+#[test]
+fn in_order_ack_matches_general_acknowledge_across_loss_free_and_sack_mixed_runs() {
+    let mut drained_fast_hits = 0usize;
+    let mut partial_fast_hits = 0usize;
+    let mut unchanged_hits = 0usize;
+    let mut prefix_originals_fast_hits = 0usize;
+    let mut drained_non_originals_hits = 0usize;
+    let mut sack_then_in_order_hits = 0usize;
+
+    for seed in 1..=160u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let sack_mixed = seed % 2 == 0;
+        let cap = 64;
+        let mut fast = Rack::with_capacity(cap + SPARE).unwrap();
+        let mut general = Rack::with_capacity(cap + SPARE).unwrap();
+        let mut reference = Reference::with_capacity(cap).unwrap();
+        let mut sb_fast = Scoreboard::with_capacity(cap).unwrap();
+        let mut sb_general = Scoreboard::with_capacity(cap).unwrap();
+        let mut sb_ref = Scoreboard::with_capacity(cap).unwrap();
+
+        let base = if rng.chance(40) {
+            Seq(u32::MAX - 3000)
+        } else {
+            Seq(5000)
+        };
+        sb_fast.update(base, base, &[None; 4]);
+        sb_general.update(base, base, &[None; 4]);
+        sb_ref.update(base, base, &[None; 4]);
+
+        let mss = [100, 536, 1200][rng.below(3) as usize];
+        let mut una = base;
+        let mut nxt = base;
+        let mut now = 100u64;
+        let mut saw_sack_this_seed = false;
+
+        for _ in 0..120 {
+            if rng.chance(70) {
+                now += rng.below(50);
+            }
+            let op = rng.below(100);
+            if op < 48 || (una == nxt && op < 80) {
+                // Send a fresh original packet.
+                if fast.intervals.len() + 8 < cap {
+                    let len = 1 + rng.below(u64::from(mss)) as u32;
+                    let (start, end) = (nxt, nxt.wrapping_add(len));
+                    let in_window = rng.chance(50);
+                    fast.record_submitted_original(start, end, now, in_window);
+                    general.record_transmission(start, end, now, false, in_window);
+                    if let Some(sel) = general.departure_selection() {
+                        general.commit_validated_departure(sel, start, end, now);
+                    }
+                    reference.transmit(start, end, now, false);
+                    reference.commit_original_window(start, end, in_window);
+                    if let Some(sel) = reference.departure_selection() {
+                        reference.commit_validated_departure(sel, start, end, now);
+                    }
+                    nxt = end;
+                }
+            } else if sack_mixed && op < 62 && nxt.after(una) && fast.intervals.len() + 8 < cap {
+                // Retransmit an existing interval to mix non-originals with originals.
+                let idx = rng.below(fast.intervals.len() as u64) as usize;
+                let (start, end) = (fast.intervals[idx].start, fast.intervals[idx].end);
+                fast.transmit(start, end, now, true);
+                general.transmit(start, end, now, true);
+                reference.transmit(start, end, now, true);
+                if let Some(sel) = fast.departure_selection() {
+                    fast.commit_departure(sel, start, end, now);
+                    general.commit_departure(sel, start, end, now);
+                    reference.commit_departure(sel, start, end, now);
+                }
+            } else {
+                // Incoming ACK (either pure in-order or with SACK blocks in sack_mixed runs).
+                let edges: Vec<Seq> = fast.intervals.iter().map(|r| r.end).collect();
+                let ack = if edges.is_empty() || rng.chance(20) {
+                    una
+                } else if rng.chance(40) {
+                    nxt
+                } else {
+                    edges[rng.below(edges.len() as u64) as usize]
+                };
+                let advancing = ack.after(una);
+                let carries_data = rng.chance(50);
+                let mut blocks = [None; 4];
+                if sack_mixed && rng.chance(30) && nxt.after(ack) && fast.intervals.len() + 8 < cap
+                {
+                    let rem = nxt.distance_from(ack);
+                    let a = ack.wrapping_add(1 + rng.below(u64::from(rem)) as u32);
+                    if nxt.after(a) {
+                        let b =
+                            a.wrapping_add(1 + rng.below(u64::from(nxt.distance_from(a))) as u32);
+                        blocks[0] = Some((a.0, b.0));
+                        saw_sack_this_seed = true;
+                    }
+                }
+                let has_sack_blocks = blocks.iter().any(Option::is_some);
+
+                let u_gen = sb_general.update(ack, nxt, &blocks);
+                let d_gen = general.acknowledge(
+                    ack,
+                    nxt,
+                    &mut sb_general,
+                    now,
+                    None,
+                    None,
+                    mss,
+                    u_gen.dsack,
+                );
+                general.trim_cumulative(ack);
+
+                let u_ref = sb_ref.update(ack, nxt, &blocks);
+                let d_ref =
+                    reference.acknowledge(ack, nxt, &sb_ref, now, None, None, mss, u_ref.dsack);
+                reference.trim_cumulative(ack);
+
+                if sb_fast.is_empty() && !has_sack_blocks {
+                    if let Some(count) = fast.in_order_ack(una, ack, nxt, advancing, carries_data) {
+                        if saw_sack_this_seed {
+                            sack_then_in_order_hits += 1;
+                        }
+                        sb_fast.acknowledge_empty(ack);
+                        let d_fast = if advancing {
+                            if ack == nxt {
+                                drained_fast_hits += 1;
+                                if count > fast.intervals.originals {
+                                    drained_non_originals_hits += 1;
+                                }
+                            } else {
+                                partial_fast_hits += 1;
+                            }
+                            if count > 0 && count <= fast.intervals.originals {
+                                prefix_originals_fast_hits += 1;
+                            }
+                            fast.acknowledge_in_order(
+                                count,
+                                ack,
+                                nxt,
+                                &mut sb_fast,
+                                now,
+                                None,
+                                None,
+                                mss,
+                                false,
+                            )
+                        } else {
+                            assert_eq!(count, 0);
+                            unchanged_hits += 1;
+                            fast.acknowledge_unchanged(ack, &mut sb_fast);
+                            0
+                        };
+                        assert_eq!(d_fast, d_gen, "seed {seed}: in_order vs general delivered");
+                        assert_eq!(d_fast, d_ref, "seed {seed}: in_order vs ref delivered");
+
+                        // Invariant I5: in_order_ack implies no RACK loss candidate and no deadline.
+                        for recovery in [false, true] {
+                            let mut probe = fast.grown(fast.capacity).unwrap();
+                            let before = format!("{probe:?}");
+                            let retx_lost = probe.detect(now + 1_000_000, recovery, Some(100));
+                            assert!(
+                                !retx_lost,
+                                "seed {seed}: unexpected retx loss after in_order_ack"
+                            );
+                            assert_eq!(probe.deadline, None, "seed {seed}: unexpected deadline");
+                            assert_eq!(
+                                format!("{probe:?}"),
+                                before,
+                                "seed {seed}: detect mutated intervals"
+                            );
+                        }
+                    } else {
+                        let u_fast = sb_fast.update(ack, nxt, &blocks);
+                        let d_fast = fast.acknowledge(
+                            ack,
+                            nxt,
+                            &mut sb_fast,
+                            now,
+                            None,
+                            None,
+                            mss,
+                            u_fast.dsack,
+                        );
+                        fast.trim_cumulative(ack);
+                        assert_eq!(d_fast, d_gen);
+                        assert_eq!(d_fast, d_ref);
+                    }
+                } else {
+                    let u_fast = sb_fast.update(ack, nxt, &blocks);
+                    let d_fast = fast.acknowledge(
+                        ack,
+                        nxt,
+                        &mut sb_fast,
+                        now,
+                        None,
+                        None,
+                        mss,
+                        u_fast.dsack,
+                    );
+                    fast.trim_cumulative(ack);
+                    assert_eq!(d_fast, d_gen);
+                    assert_eq!(d_fast, d_ref);
+                }
+
+                una = ack;
+            }
+
+            assert_eq!(
+                format!("{fast:?}"),
+                format!("{general:?}"),
+                "seed {seed}: fast vs general Rack mismatch"
+            );
+            assert_eq!(sb_fast.ranges(), sb_general.ranges());
+            let a: Vec<Interval> = fast.intervals.iter().copied().collect();
+            let b: Vec<Interval> = reference.intervals.iter().copied().collect();
+            assert_eq!(a, b, "seed {seed}: fast vs reference intervals");
+            assert_eq!(
+                snapshot_rack(&fast),
+                snapshot_reference(&reference),
+                "seed {seed}: fast vs reference snapshot"
+            );
+        }
+    }
+
+    assert!(drained_fast_hits > 200, "{drained_fast_hits}");
+    assert!(partial_fast_hits > 200, "{partial_fast_hits}");
+    assert!(unchanged_hits > 100, "{unchanged_hits}");
+    assert!(
+        prefix_originals_fast_hits > 200,
+        "{prefix_originals_fast_hits}"
+    );
+    assert!(
+        drained_non_originals_hits > 20,
+        "{drained_non_originals_hits}"
+    );
+    assert!(sack_then_in_order_hits > 100, "{sack_then_in_order_hits}");
+}
+
+#[test]
+fn in_order_prefix_latest_boundary_conditions() {
+    for base in [Seq(1000), Seq(u32::MAX - 250)] {
+        let p0 = (base, base.wrapping_add(100));
+        let p1 = (p0.1, p0.1.wrapping_add(100));
+        let p2 = (p1.1, p1.1.wrapping_add(100));
+        let mut r = Rack::with_capacity(16).unwrap();
+        assert!(r.record_submitted_original(p0.0, p0.1, 10, true));
+        assert!(r.record_submitted_original(p1.0, p1.1, 20, true));
+        assert!(r.record_submitted_original(p2.0, p2.1, 20, true));
+
+        // Partial ACK retiring p0, leaving next = p1 (sent=20, end=p1.1), tail = p2 (sent=20, end=p2.1).
+        r.latest = None;
+        assert_eq!(r.in_order_ack(p0.0, p1.0, p2.1, true, false), Some(1));
+
+        // latest.sent < next.sent: always safe regardless of latest.end.
+        r.latest = Some((19, p2.1.wrapping_add(500)));
+        assert_eq!(r.in_order_ack(p0.0, p1.0, p2.1, true, false), Some(1));
+
+        // latest.sent > next.sent: p1 would be a RACK loss candidate -> must reject.
+        r.latest = Some((21, p0.1));
+        assert_eq!(r.in_order_ack(p0.0, p1.0, p2.1, true, false), None);
+
+        // Equal sent (20), edge < next.end: safe.
+        r.latest = Some((20, p0.1));
+        assert_eq!(r.in_order_ack(p0.0, p1.0, p2.1, true, false), Some(1));
+
+        // Equal sent (20), equal ends (edge == next.end): safe (sent_after is strict).
+        r.latest = Some((20, p1.1));
+        assert_eq!(r.in_order_ack(p0.0, p1.0, p2.1, true, false), Some(1));
+        let mut probe = r.grown(r.capacity).unwrap();
+        let mut sb = Scoreboard::new();
+        sb.acknowledge_empty(p1.0);
+        probe.acknowledge_in_order(1, p1.0, p2.1, &mut sb, 30, None, None, 100, false);
+        assert!(!probe.detect(1_000_000, false, Some(10)));
+        assert_eq!(probe.deadline, None);
+
+        // Equal sent (20), edge > next.end (e.g. edge == p2.1): sent_after((20, p2.1), (20, p1.1)) is true -> must reject!
+        r.latest = Some((20, p2.1));
+        assert_eq!(r.in_order_ack(p0.0, p1.0, p2.1, true, false), None);
+
+        // Non-advancing ACK at low: accepted only when carrying data (and respecting latest).
+        r.latest = Some((10, p0.1));
+        assert_eq!(r.in_order_ack(p0.0, p0.0, p2.1, false, false), None);
+        assert_eq!(r.in_order_ack(p0.0, p0.0, p2.1, false, true), Some(0));
+        r.latest = Some((10, p1.1));
+        assert_eq!(r.in_order_ack(p0.0, p0.0, p2.1, false, true), None);
+
+        // Unaligned ACK inside p1 rejects in_order_prefix.
+        r.latest = None;
+        assert_eq!(
+            r.in_order_ack(p0.0, p1.0.wrapping_add(1), p2.1, true, false),
+            None
+        );
+    }
+}
+
+#[test]
+fn sample_rtt_bucket_early_return_matches_window_min_with_epoch_rollover() {
+    let mut early_returns = 0usize;
+    let mut epoch_rollovers = 0usize;
+
+    for latest_present in [false, true] {
+        let mut fast = Rack::with_capacity(16).unwrap();
+        let mut reference = Reference::with_capacity(16).unwrap();
+        if latest_present {
+            fast.latest = Some((10, Seq(100)));
+            reference.latest = Some((10, Seq(100)));
+            fast.rtt = 777;
+            reference.rtt = 777;
+        }
+        let mut rng = Rng(if latest_present {
+            0xCAFE_BABE
+        } else {
+            0xDEAD_BEEF
+        });
+        let mut now = 0u64;
+        let mut last_epoch = 0u64;
+
+        for step in 0..500 {
+            // Mix same-epoch samples, 1..6 epoch jumps (rollover past 4 buckets),
+            // and occasional backward/stale-epoch timestamps.
+            match step % 15 {
+                0 => {
+                    let jump = 1 + rng.below(6);
+                    now = now.saturating_add(jump * MIN_RTT_BUCKET);
+                }
+                7 if now >= 2 * MIN_RTT_BUCKET => {
+                    // Temporarily sample an older epoch without advancing `now` permanently.
+                    let stale_now = now - MIN_RTT_BUCKET;
+                    let rtt = 100 + rng.below(50_000);
+                    fast.sample(rtt, stale_now);
+                    reference.sample(rtt, stale_now);
+                    assert_eq!(fast.min_rtt, reference.min_rtt, "step {step} stale");
+                    assert_eq!(
+                        fast.min_rtt_buckets, reference.min_rtt_buckets,
+                        "step {step} stale"
+                    );
+                    assert_eq!(fast.rtt, reference.rtt, "step {step} stale rtt");
+                    continue;
+                }
+                _ => {
+                    now = now.saturating_add(rng.below(MIN_RTT_BUCKET / 4));
+                }
+            }
+            let epoch = fast.timebase.us_from_ticks(now) / MIN_RTT_BUCKET;
+            if epoch > last_epoch {
+                epoch_rollovers += 1;
+                last_epoch = epoch;
+            }
+            // Bias toward slower RTTs in the same epoch to hit the early return often.
+            let rtt = match rng.below(4) {
+                0 => 50 + rng.below(500),
+                1 => 500 + rng.below(5_000),
+                _ => 5_000 + rng.below(50_000),
+            };
+            let bucket = fast.min_rtt_buckets[(epoch % 4) as usize];
+            if let Some((time, best)) = bucket
+                && time == epoch
+                && rtt >= best
+                && epoch == fast.min_rtt_epoch
+            {
+                early_returns += 1;
+            }
+
+            fast.sample(rtt, now);
+            reference.sample(rtt, now);
+
+            assert_eq!(fast.min_rtt, reference.min_rtt, "step {step}");
+            assert_eq!(
+                fast.min_rtt_buckets, reference.min_rtt_buckets,
+                "step {step}"
+            );
+            assert_eq!(
+                fast.rtt, reference.rtt,
+                "step {step} latest={latest_present}"
+            );
+        }
+    }
+
+    // Also verify trim_cumulative is a clean no-op when ack <= first.start.
+    {
+        let mut r = Rack::with_capacity(16).unwrap();
+        r.record_submitted_original(Seq(200), Seq(300), 10, true);
+        let before = format!("{r:?}");
+        r.trim_cumulative(Seq(150));
+        r.trim_cumulative(Seq(200));
+        assert_eq!(format!("{r:?}"), before);
+    }
+
+    assert!(
+        early_returns > 200,
+        "early return rarely hit: {early_returns}"
+    );
+    assert!(
+        epoch_rollovers > 40,
+        "epoch rollovers rarely hit: {epoch_rollovers}"
+    );
+}

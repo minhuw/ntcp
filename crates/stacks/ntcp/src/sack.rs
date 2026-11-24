@@ -89,12 +89,23 @@ impl Scoreboard {
             .checked_mul(core::mem::size_of::<(Seq, Seq)>())
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub(crate) fn ranges(&self) -> &[(Seq, Seq)] {
         &self.ranges[..self.len]
     }
 
     pub(crate) fn clear(&mut self) {
         self.len = 0;
+    }
+
+    // Advance the cumulative edge when neither the record nor the ACK
+    // carries selective acknowledgments.
+    pub(crate) fn acknowledge_empty(&mut self, ack: Seq) {
+        debug_assert_eq!(self.len, 0);
+        self.ack = ack;
     }
 
     // Frees the ranges while none is held and nothing is in flight: no
@@ -110,6 +121,16 @@ impl Scoreboard {
     // if they did not fit: the caller must then consider all of ranges().
     pub(crate) fn take_fresh(&mut self) -> Option<([(Seq, Seq); FRESH], usize)> {
         self.fresh.replace(([EMPTY; FRESH], 0))
+    }
+
+    // All intervals are being retired. Only the length of the next set of
+    // fresh ranges matters until the next note_fresh writes its entries.
+    pub(crate) fn discard_fresh(&mut self) {
+        if let Some((_, len)) = &mut self.fresh {
+            *len = 0;
+        } else {
+            self.fresh = Some(([EMPTY; FRESH], 0));
+        }
     }
 
     fn note_fresh(&mut self, left: Seq, right: Seq) {
@@ -172,7 +193,7 @@ impl Scoreboard {
         // nothing but its cumulative edge, as Linux tcp_ack enters
         // tcp_sacktag_write_queue only for an ACK carrying SACK blocks.
         if self.len == 0 && blocks.iter().all(Option::is_none) {
-            self.ack = ack;
+            self.acknowledge_empty(ack);
             return UpdateOutcome::default();
         }
         self.walk_update(ack, packet_ack, high_data, blocks)
@@ -1222,5 +1243,48 @@ mod tests {
             }
         }
         assert!(fast > 5000 && walked > 5000, "{fast} {walked}");
+    }
+
+    #[test]
+    fn discard_fresh_and_acknowledge_empty_match_take_fresh_and_update() {
+        let mut a = Scoreboard::new();
+        let mut b = Scoreboard::new();
+        assert!(a.is_empty());
+        assert_eq!(a.ranges().len(), 0);
+
+        // First advance on empty scoreboards.
+        a.acknowledge_empty(Seq(100));
+        b.update(Seq(100), Seq(500), &[None; 4]);
+        assert!(a.is_empty());
+        assert_eq!((a.ranges(), a.ack, a.fresh), (b.ranges(), b.ack, b.fresh));
+
+        // Add SACK blocks so fresh contains entries, then clear via discard_fresh vs take_fresh.
+        let blocks = [Some((200, 300)), Some((350, 450)), None, None];
+        a.update(Seq(100), Seq(500), &blocks);
+        b.update(Seq(100), Seq(500), &blocks);
+        assert!(!a.is_empty());
+        a.discard_fresh();
+        let _ = b.take_fresh();
+        assert_eq!(
+            a.take_fresh().map(|(_, n)| n),
+            b.take_fresh().map(|(_, n)| n)
+        );
+
+        // Overflow fresh to None, then reset with discard_fresh vs take_fresh.
+        a.fresh = None;
+        b.fresh = None;
+        a.discard_fresh();
+        let _ = b.take_fresh();
+        assert_eq!(a.fresh.map(|(_, n)| n), Some(0));
+        assert_eq!(a.fresh.map(|(_, n)| n), b.fresh.map(|(_, n)| n));
+
+        // Subsequent SACK writes populate identical fresh slices.
+        let more = [Some((460, 490)), None, None, None];
+        a.update(Seq(100), Seq(500), &more);
+        b.update(Seq(100), Seq(500), &more);
+        let (af, alen) = a.take_fresh().unwrap();
+        let (bf, blen) = b.take_fresh().unwrap();
+        assert_eq!(&af[..alen], &bf[..blen]);
+        assert_eq!(alen, 1);
     }
 }
