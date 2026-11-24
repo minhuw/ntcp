@@ -11041,6 +11041,56 @@ impl Connection {
         !self.ack_pending && self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize
     }
 
+    /// Whether this connection's next output poll could form a multi-segment
+    /// GSO aggregate (or alter `burst_push` under `output_group_flush`).
+    /// Conservatively lower-bounds `wire_mss` for timestamps, SACK options, and
+    /// downward PMTU probes so no TSO-eligible connection takes the scalar
+    /// `offer_fresh_transmit` path.
+    pub(crate) fn may_segment_gso(&self) -> bool {
+        if self.pending_rst.is_some()
+            || self.challenge_ack_pending
+            || self.syn_pending
+            || self.retx_pending
+            || self.tlp_pending
+            || self.probe_pending
+            || self.limited_pending
+            || self.pacing_enabled()
+            || !self.rack.valid()
+        {
+            return false;
+        }
+        let offset = self.snd_nxt.distance_from(self.send_base) as usize;
+        let unsent = self.send.len().saturating_sub(offset);
+        if unsent == 0 {
+            return false;
+        }
+        let ts_len: usize = if self.timestamps { 12 } else { 0 };
+        let sack_max = if self.sack_send && !self.sack_omit && self.receive.has_sack_blocks() {
+            let blocks = (40usize - ts_len).saturating_sub(4) / 8;
+            4 + blocks * 8
+        } else {
+            0
+        };
+        let option_len = ts_len + sack_max;
+        let ordinary_mss = if let Some(p) = self.pmtud.as_ref().filter(|p| {
+            p.probe
+                .is_some_and(|probe| probe.size <= p.info.current_mtu)
+        }) {
+            self.mss.min(
+                p.info
+                    .search_low
+                    .saturating_sub(u32::from(self.ip_header_len) + 20 + ts_len as u32)
+                    .max(1) as usize,
+            )
+        } else {
+            self.mss
+        };
+        let min_wire_mss = ordinary_mss
+            .saturating_sub(sack_max)
+            .min(self.path_payload_limit().saturating_sub(20 + option_len));
+        unsent > min_wire_mss
+    }
+
     // Control packets, probes and repairs all precede ordinary stream output.
     fn stream_output_only(&self) -> bool {
         !(self.syn_pending
@@ -12429,6 +12479,7 @@ impl Connection {
                     total = segments * wire_mss;
                 }
                 if segments >= 2 {
+                    debug_assert!(self.may_segment_gso());
                     count = total;
                     segmentation = Some(crate::TransmitSegmentation {
                         payload_len: total,

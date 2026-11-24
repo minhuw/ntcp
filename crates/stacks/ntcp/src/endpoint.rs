@@ -8247,10 +8247,12 @@ impl Endpoint {
         finish_owner: bool,
         submit: impl FnOnce(&mut FreshTransmit<'_>) -> Option<crate::PhysicalReceipt>,
     ) -> Result<FreshPoll, EndpointError> {
-        self.retained_slot(id)?;
+        let slot = self.retained_slot(id)?;
         if self.free_reservations == 0
             || !self.cleanup.is_empty()
             || self.reservations[0].gso.is_some()
+                && self.output.contains(id.slot)
+                && slot.connection.may_segment_gso()
         {
             return Ok(FreshPoll::Unavailable);
         }
@@ -13168,6 +13170,287 @@ mod reserved_poll_tests {
             assert_eq!(a.next_deadline(), b.next_deadline());
             assert_eq!(a.transport_info(ca).unwrap(), b.transport_info(cb).unwrap());
         }
+    }
+
+    #[test]
+    fn offer_fresh_under_gso_takes_fast_path_for_single_segment_and_defers_multi_segment() {
+        let gso = crate::GsoLimits {
+            max_bytes: 16_384,
+            max_segments: 16,
+        };
+        let group_limits = crate::TransmitGroupLimits {
+            max_bytes: 16_384,
+            max_segments: 16,
+            allow_psh: true,
+            allow_cwr: false,
+            allow_options: true,
+        };
+        let make_pair = |port: u16, timestamps: bool, output_group_flush: bool| {
+            let mut cfg = EndpointConfig::default();
+            cfg.connection.timestamps = timestamps;
+            cfg.connection.sack = true;
+            cfg.connection.rack = true;
+            cfg.connection.initial_window = crate::InitialWindow::Iw10;
+            cfg.connection.output_group_flush = output_group_flush;
+            let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+            let mut b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
+            let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+            let local: SocketAddr = SocketAddr::new("192.0.2.1".parse().unwrap(), port);
+            let listener = b.listen(remote, 8).unwrap();
+            let client = a.connect(0, local, remote).unwrap();
+            let mut out = [0u8; 2048];
+            loop {
+                let mut moved = false;
+                while let Some(p) = a.poll_transmit(1, &mut out, 16).unwrap().packet {
+                    b.input(1, p.ip, &out[..p.len]).unwrap();
+                    moved = true;
+                }
+                while let Some(p) = b.poll_transmit(1, &mut out, 16).unwrap().packet {
+                    a.input(1, p.ip, &out[..p.len]).unwrap();
+                    moved = true;
+                }
+                if !moved {
+                    break;
+                }
+            }
+            let server = b.accept(listener).unwrap();
+            (a, b, client, server)
+        };
+
+        for (i, (timestamps, output_group_flush)) in [
+            (true, false),
+            (false, false),
+            (true, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let wire_mss = if timestamps { 1448 } else { 1460 };
+
+            // 1) Small write (64B) and exact 1 wire MSS write both take offer_fresh
+            //    directly without touching the GSO payload scratch or capturing a reservation,
+            //    and match the reserved path bit-for-bit.
+            for (j, size) in [64usize, wire_mss].into_iter().enumerate() {
+                let port = 42000 + (i * 10 + j) as u16;
+                let (mut reserved, _, ra, _) = make_pair(port, timestamps, output_group_flush);
+                let (mut offered, _, oa, _) = make_pair(port, timestamps, output_group_flush);
+                reserved.enable_output_reservations_with_gso(2, gso).unwrap();
+                offered.enable_output_reservations_with_gso(2, gso).unwrap();
+
+                let payload = alloc::vec![0x5a; size];
+                reserved.write(ra, &payload).unwrap();
+                offered.write(oa, &payload).unwrap();
+
+                let mut tcp = [0u8; 2048];
+                let (poll, attempt) = reserved.poll_reserved_transmit_for(10, ra, &mut tcp, 1).unwrap();
+                let pkt = poll.packet.unwrap();
+                let attempt = attempt.unwrap();
+                assert!(reserved.transmit_segmentation(attempt).is_none());
+                let receipt = crate::PhysicalReceipt {
+                    ip_packet_len: pkt.len as u32 + 20,
+                    dont_fragment: true,
+                };
+
+                let mut bytes = [0u8; 2048];
+                let mut called = false;
+                let res = offered
+                    .offer_fresh_transmit(10, oa, &mut bytes, 34, false, |frame| {
+                        called = true;
+                        assert_eq!(&frame.frame()[34..], &tcp[..pkt.len]);
+                        assert!(frame.carries_payload());
+                        Some(receipt)
+                    })
+                    .unwrap();
+                assert!(called);
+                assert!(matches!(res, FreshPoll::Submitted { .. }));
+                assert!(!offered.has_output_reservations());
+                // GSO payload scratch was never initialized and reservation bytes were never captured.
+                assert!(offered.reservations[0].payload.is_empty());
+                assert!(offered.reservations[0].bytes.iter().all(|&b| b == 0));
+
+                assert!(reserved.accept_transmit_submitted(10, attempt, receipt).unwrap());
+                assert_eq!(reserved.next_deadline(), offered.next_deadline());
+                assert_eq!(
+                    reserved.transport_info(ra).unwrap(),
+                    offered.transport_info(oa).unwrap()
+                );
+            }
+
+            // 2) Pure ACK and FIN also stay on offer_fresh under GSO.
+            {
+                let port = 42100 + i as u16;
+                let (mut peer, mut ep, sender, receiver) =
+                    make_pair(port, timestamps, output_group_flush);
+                peer.write(sender, b"ack-me").unwrap();
+                let mut out = [0u8; 2048];
+                let pkt = peer.poll_transmit(2, &mut out, 16).unwrap().packet.unwrap();
+                ep.input(2, pkt.ip, &out[..pkt.len]).unwrap();
+                ep.enable_output_reservations_with_gso(2, gso).unwrap();
+                let ack_due = 2 + ep.config.connection.timebase.ticks_from_us(200_000);
+                ep.on_timeout(ack_due, 16).unwrap();
+
+                let mut bytes = [0u8; 2048];
+                let res = ep
+                    .offer_fresh_transmit(ack_due, receiver, &mut bytes, 0, true, |frame| {
+                        assert!(!frame.carries_payload());
+                        Some(crate::PhysicalReceipt {
+                            ip_packet_len: frame.packet().len as u32 + 20,
+                            dont_fragment: true,
+                        })
+                    })
+                    .unwrap();
+                assert!(matches!(res, FreshPoll::Submitted { .. }));
+                assert!(ep.reservations[0].payload.is_empty());
+
+                // Standalone FIN after shutdown.
+                ep.shutdown(receiver).unwrap();
+                let res = ep
+                    .offer_fresh_transmit(ack_due + 1, receiver, &mut bytes, 0, true, |frame| {
+                        Some(crate::PhysicalReceipt {
+                            ip_packet_len: frame.packet().len as u32 + 20,
+                            dont_fragment: true,
+                        })
+                    })
+                    .unwrap();
+                assert!(matches!(res, FreshPoll::Submitted { .. }));
+                assert_eq!(ep.state(receiver).unwrap(), State::FinWait1);
+                assert!(ep.reservations[0].payload.is_empty());
+            }
+
+            // 3) Multi-MSS writes (wire_mss + 1 and 6 KiB) return FreshPoll::Unavailable
+            //    and form a TransmitGroup on the fallback reserved path.
+            for (j, size) in [wire_mss + 1, 6144].into_iter().enumerate() {
+                let port = 42200 + (i * 10 + j) as u16;
+                let (mut ep, _, id, _) = make_pair(port, timestamps, output_group_flush);
+                ep.enable_output_reservations_with_gso(2, gso).unwrap();
+                let payload = alloc::vec![0x3c; size];
+                ep.write(id, &payload).unwrap();
+
+                let mut bytes = [0u8; 2048];
+                let res = ep
+                    .offer_fresh_transmit(10, id, &mut bytes, 34, false, |_frame| {
+                        panic!("multi-MSS write under GSO must not invoke fresh submit callback");
+                    })
+                    .unwrap();
+                assert!(matches!(res, FreshPoll::Unavailable));
+                assert!(!ep.has_output_reservations());
+
+                let mut tcp = [0u8; 2048];
+                let (poll, attempt) = ep.poll_reserved_transmit_for(10, id, &mut tcp, 1).unwrap();
+                assert!(poll.packet.is_some());
+                let attempt = attempt.unwrap();
+                let seg = ep
+                    .transmit_segmentation(attempt)
+                    .expect("multi-MSS fallback must select a GSO aggregate");
+                assert_eq!(seg.segment_payload_len, wire_mss);
+                assert!(seg.payload_len > wire_mss && seg.payload_len <= size);
+                let group = ep
+                    .prepare_transmit_group(attempt, group_limits)
+                    .unwrap()
+                    .expect("prepare_transmit_group must succeed");
+                let view = ep.transmit_group(group).unwrap();
+                assert!(view.segment_count >= 2);
+                assert_eq!(view.payload.len(), seg.payload_len);
+            }
+        }
+    }
+
+    #[test]
+    fn offer_fresh_under_gso_respects_sack_option_overhead_in_wire_mss() {
+        let mut cfg = EndpointConfig::default();
+        cfg.connection.timestamps = true;
+        cfg.connection.sack = true;
+        cfg.connection.rack = true;
+        cfg.connection.nagle = false;
+        let mut a = Endpoint::new(cfg.clone(), [1; 32], 0, |_| true).unwrap();
+        let mut b = Endpoint::new(cfg, [2; 32], 0, |_| true).unwrap();
+        let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+        let local: SocketAddr = "192.0.2.1:42300".parse().unwrap();
+        let listener = b.listen(remote, 8).unwrap();
+        let ca = a.connect(0, local, remote).unwrap();
+        let mut out = [0u8; 2048];
+        loop {
+            let mut moved = false;
+            while let Some(p) = a.poll_transmit(1, &mut out, 16).unwrap().packet {
+                b.input(1, p.ip, &out[..p.len]).unwrap();
+                moved = true;
+            }
+            while let Some(p) = b.poll_transmit(1, &mut out, 16).unwrap().packet {
+                a.input(1, p.ip, &out[..p.len]).unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+        let sb = b.accept(listener).unwrap();
+
+        // Send two segments from b -> a, drop the first, deliver the second so `a` has
+        // an outgoing SACK block (12 bytes) in addition to timestamps (12 bytes).
+        b.write(sb, &[0x11; 1448]).unwrap();
+        let _dropped = b.poll_transmit(2, &mut out, 16).unwrap().packet.unwrap();
+        b.write(sb, &[0x22; 100]).unwrap();
+        let ooo = b.poll_transmit(3, &mut out, 16).unwrap().packet.unwrap();
+        a.input(3, ooo.ip, &out[..ooo.len]).unwrap();
+
+        a.enable_output_reservations_with_gso(
+            2,
+            crate::GsoLimits {
+                max_bytes: 16_384,
+                max_segments: 16,
+            },
+        )
+        .unwrap();
+
+        // With timestamps (12B) + 1 SACK block (12B), actual wire_mss is 1436 (< self.mss = 1448).
+        // A 1440-byte write fits in self.mss (1448) but exceeds actual wire_mss (1436), so it
+        // must return FreshPoll::Unavailable and still form a 2-segment GSO group on fallback.
+        a.write(ca, &[0x77; 1440]).unwrap();
+        let mut bytes = [0u8; 2048];
+        let res = a
+            .offer_fresh_transmit(4, ca, &mut bytes, 0, false, |_| {
+                panic!("write exceeding SACK-reduced wire_mss must defer to GSO");
+            })
+            .unwrap();
+        assert!(matches!(res, FreshPoll::Unavailable));
+
+        let (_, attempt) = a.poll_reserved_transmit_for(4, ca, &mut out, 1).unwrap();
+        let attempt = attempt.unwrap();
+        let seg = a
+            .transmit_segmentation(attempt)
+            .expect("1440B with 12B SACK option must form a 2-segment GSO group");
+        assert_eq!(seg.segment_payload_len, 1436);
+        assert_eq!(seg.payload_len, 1440);
+        let group = a
+            .prepare_transmit_group(
+                attempt,
+                crate::TransmitGroupLimits {
+                    max_bytes: 16_384,
+                    max_segments: 16,
+                    allow_psh: true,
+                    allow_cwr: false,
+                    allow_options: true,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let view = a.transmit_group(group).unwrap();
+        assert_eq!(view.segment_count, 2);
+        a.accept_transmit_group(4, group).unwrap();
+
+        // A small write (<= min_wire_mss = 1420) while SACK blocks are still pending
+        // still takes offer_fresh directly.
+        a.write(ca, &[0x88; 100]).unwrap();
+        let res = a
+            .offer_fresh_transmit(5, ca, &mut bytes, 0, true, |frame| {
+                assert!(frame.carries_payload());
+                Some(crate::PhysicalReceipt {
+                    ip_packet_len: frame.packet().len as u32 + 20,
+                    dont_fragment: true,
+                })
+            })
+            .unwrap();
+        assert!(matches!(res, FreshPoll::Submitted { .. }));
     }
 
     #[test]

@@ -10,7 +10,10 @@
 //   vs padded/IPv4-options/IPv6 slow path, offer_fresh/fill_selected/quiet gate,
 //   blocked TX retry via reserved path, and scratch restore on mid-drive error)
 use super::*;
-use ntcp_io::{PacketLayer, TxOutcome};
+use ntcp_io::{
+    PacketLayer, TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
+    TxOutcome,
+};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -30,6 +33,9 @@ struct MockIo {
     add_ipv4_nop_options: Rc<Cell<bool>>,
     // When Some(0), receive returns a hard backend I/O error; Some(n) counts down.
     fail_after_receives: Rc<Cell<Option<usize>>>,
+    tso: Option<TcpSegmentationCapabilities>,
+    scalar_transmits: Rc<Cell<usize>>,
+    aggregates: Rc<Cell<usize>>,
 }
 
 impl MockIo {
@@ -41,6 +47,9 @@ impl MockIo {
             blocked: Rc::new(Cell::new(false)),
             add_ipv4_nop_options: Rc::new(Cell::new(false)),
             fail_after_receives: Rc::new(Cell::new(None)),
+            tso: None,
+            scalar_transmits: Rc::new(Cell::new(0)),
+            aggregates: Rc::new(Cell::new(0)),
         }
     }
 }
@@ -50,7 +59,7 @@ impl PacketIo for MockIo {
         self.layer
     }
     fn max_packet_len(&self) -> Option<usize> {
-        Some(1514)
+        Some(if self.tso.is_some() { 65535 } else { 1514 })
     }
     fn receive(&mut self, out: &mut [u8]) -> io::Result<Option<usize>> {
         if let Some(remaining) = self.fail_after_receives.get() {
@@ -70,6 +79,7 @@ impl PacketIo for MockIo {
         if self.blocked.get() {
             return Ok(TxOutcome::WouldBlock);
         }
+        self.scalar_transmits.set(self.scalar_transmits.get() + 1);
         let mut frame = packet.to_vec();
         if self.add_ipv4_nop_options.get() {
             let ip_off = if self.layer == PacketLayer::Ethernet {
@@ -83,6 +93,60 @@ impl PacketIo for MockIo {
             }
         }
         self.outgoing.borrow_mut().push_back(frame);
+        Ok(TxOutcome::Submitted)
+    }
+    fn tcp_segmentation_capabilities(&self) -> Option<TcpSegmentationCapabilities> {
+        self.tso
+    }
+    fn transmit_segmented(
+        &mut self,
+        packet: &[u8],
+        request: TcpSegmentationRequest,
+    ) -> std::result::Result<TxOutcome, TcpSegmentationError> {
+        if self.blocked.get() {
+            return Ok(TxOutcome::WouldBlock);
+        }
+        self.aggregates.set(self.aggregates.get() + 1);
+        let ip_off = if self.layer == PacketLayer::Ethernet {
+            14
+        } else {
+            0
+        };
+        let ip_hdr = usize::from(packet[ip_off] & 0x0f) * 4;
+        let tcp = ip_off + ip_hdr;
+        let tcp_hdr = usize::from(packet[tcp + 12] >> 4) * 4;
+        let payload = tcp + tcp_hdr;
+        let data = &packet[payload..];
+        let mss = request.segment_payload_len;
+        let count = data.len().div_ceil(mss);
+        let sequence = u32::from_be_bytes(packet[tcp + 4..tcp + 8].try_into().unwrap());
+        let ip = ntcp::IpMetadata {
+            source: IpAddr::from(<[u8; 4]>::try_from(&packet[ip_off + 12..ip_off + 16]).unwrap()),
+            destination: IpAddr::from(
+                <[u8; 4]>::try_from(&packet[ip_off + 16..ip_off + 20]).unwrap(),
+            ),
+        };
+        for n in 0..count {
+            let mut seg = packet[..payload].to_vec();
+            seg.extend_from_slice(&data[n * mss..((n + 1) * mss).min(data.len())]);
+            let ip_len = (seg.len() - ip_off) as u16;
+            seg[ip_off + 2..ip_off + 4].copy_from_slice(&ip_len.to_be_bytes());
+            seg[ip_off + 10..ip_off + 12].fill(0);
+            let sum = ipv4_header_checksum(&seg[ip_off..tcp]);
+            seg[ip_off + 10..ip_off + 12].copy_from_slice(&sum.to_be_bytes());
+            seg[tcp + 4..tcp + 8]
+                .copy_from_slice(&sequence.wrapping_add((n * mss) as u32).to_be_bytes());
+            if n + 1 != count {
+                seg[tcp + 13] &= !0x09;
+            }
+            seg[tcp + 16..tcp + 18].fill(0);
+            let sum = ntcp::wire::checksum(ip, &seg[tcp..]).unwrap();
+            seg[tcp + 16..tcp + 18].copy_from_slice(&sum.to_be_bytes());
+            if ip_off != 0 && seg.len() < 60 {
+                seg.resize(60, 0);
+            }
+            self.outgoing.borrow_mut().push_back(seg);
+        }
         Ok(TxOutcome::Submitted)
     }
 }
@@ -1030,4 +1094,206 @@ fn drive_receive_error_restores_lazy_scratch() {
     assert!(matches!(err, Error::Backend(_)));
     assert_eq!(pair.server.rx.len(), orig_rx_len);
     assert_eq!(pair.server.completed.len(), orig_completed_len);
+}
+
+#[test]
+fn tso_enabled_network_uses_offer_fresh_for_single_segment_and_tso_for_multi_segment() {
+    let caps = TcpSegmentationCapabilities {
+        max_aggregate_len: 65535,
+        max_segments: 64,
+        max_wire_bytes: 65535 + 63 * 114,
+        local_ip_mtu: 1500,
+        allow_psh: true,
+        allow_cwr: false,
+    };
+
+    let build_tso_pair = || {
+        let to_client = Queue::default();
+        let to_server = Queue::default();
+
+        let make_cfg = |local: IpAddr, local_mac: [u8; 6], peer_mac: [u8; 6]| {
+            let mut cfg = NetworkConfig::new(local, 1500);
+            cfg.tcp.max_connections = 4;
+            cfg.tcp.max_listeners = 2;
+            cfg.link = Link::Ethernet {
+                local_mac,
+                next_hop: EthernetNextHop::Fixed(peer_mac),
+            };
+            cfg
+        };
+
+        let mut client_io = MockIo::new(PacketLayer::Ethernet, &to_client, &to_server);
+        client_io.tso = Some(caps);
+        let client_blocked = client_io.blocked.clone();
+        let client_scalars = client_io.scalar_transmits.clone();
+        let client_aggregates = client_io.aggregates.clone();
+
+        let server_io = MockIo::new(PacketLayer::Ethernet, &to_server, &to_client);
+
+        let client = Network::new(
+            make_cfg(v4_addr(1), CLIENT_MAC, SERVER_MAC),
+            client_io,
+            [1; 32],
+            0,
+        )
+        .unwrap();
+        let mut server = Network::new(
+            make_cfg(v4_addr(2), SERVER_MAC, CLIENT_MAC),
+            server_io,
+            [2; 32],
+            0,
+        )
+        .unwrap();
+        let listener = server.listen(PORT, 4).unwrap();
+        assert!(client.segmentation.is_some());
+        (
+            Pair {
+                client,
+                server,
+                listener,
+                client_blocked,
+                to_server,
+                peer_addr: SocketAddr::new(v4_addr(2), PORT),
+                now: 0,
+            },
+            client_scalars,
+            client_aggregates,
+        )
+    };
+
+    let read_all = |pair: &mut Pair, s: ConnId, expected: usize| {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        for _ in 0..32 {
+            pair.step();
+            while let Ok(ReadOutcome::Data { len, .. }) = pair.server.try_read(s, &mut buf) {
+                out.extend_from_slice(&buf[..len]);
+            }
+            if out.len() >= expected {
+                break;
+            }
+        }
+        out
+    };
+
+    // (a) Small <= 1 wire MSS writes take offer_fresh directly under TSO (no
+    //     segmentation, no prepare_group), while multi-MSS writes fall back to
+    //     fill() + prepare_group() + transmit_segmented().
+    {
+        let (mut pair, scalars, aggregates) = build_tso_pair();
+        let (c, s) = pair.connected();
+        pair.client.set_nodelay(c, true).unwrap();
+
+        let before_scalars = scalars.get();
+        let before_aggregates = aggregates.get();
+
+        // Small RPC (64 bytes): submitted directly via offer_fresh scalar path.
+        let rpc = [0x41u8; 64];
+        pair.client
+            .try_write(c, &rpc, WriteOptions::default())
+            .unwrap();
+        let rep = pair.client.push(c, pair.now).unwrap();
+        assert_eq!(rep.transmitted, 1);
+        assert_eq!(scalars.get(), before_scalars + 1);
+        assert_eq!(aggregates.get(), before_aggregates);
+        assert_eq!(pair.client.counters().segmented, 0);
+        assert_eq!(read_all(&mut pair, s, rpc.len()), rpc);
+
+        // Exact 1 wire MSS (1448 bytes with timestamps): also stays scalar via offer_fresh.
+        let one_mss = [0x42u8; 1448];
+        let before_scalars = scalars.get();
+        pair.client
+            .try_write(c, &one_mss, WriteOptions::default())
+            .unwrap();
+        let rep = pair.client.push(c, pair.now).unwrap();
+        assert_eq!(rep.transmitted, 1);
+        assert_eq!(scalars.get(), before_scalars + 1);
+        assert_eq!(aggregates.get(), before_aggregates);
+        assert_eq!(pair.client.counters().segmented, 0);
+        assert_eq!(read_all(&mut pair, s, one_mss.len()), one_mss);
+
+        // Multi-MSS bulk write (6 KiB): offer_fresh returns Unavailable and
+        // transmit_slot falls back to fill() -> transmit_segmented().
+        let bulk: Vec<u8> = (0..6144).map(|i| (i % 251) as u8).collect();
+        pair.client
+            .try_write(c, &bulk, WriteOptions::default())
+            .unwrap();
+        let rep = pair.client.push(c, pair.now).unwrap();
+        assert!(rep.transmitted >= 2);
+        assert!(aggregates.get() > before_aggregates);
+        assert!(pair.client.counters().segmented >= 1);
+        assert_eq!(read_all(&mut pair, s, bulk.len()), bulk);
+
+        // Follow-up small RPC after a TSO burst returns to scalar offer_fresh.
+        let seg_after_bulk = pair.client.counters().segmented;
+        let agg_after_bulk = aggregates.get();
+        let rpc2 = [0x43u8; 128];
+        pair.client
+            .try_write(c, &rpc2, WriteOptions::default())
+            .unwrap();
+        let rep = pair.client.push(c, pair.now).unwrap();
+        assert_eq!(rep.transmitted, 1);
+        assert_eq!(aggregates.get(), agg_after_bulk);
+        assert_eq!(pair.client.counters().segmented, seg_after_bulk);
+        assert_eq!(read_all(&mut pair, s, rpc2.len()), rpc2);
+    }
+
+    // (b) Blocked-TX proof that transmit_slot actually entered offer_fresh (not
+    //     fill()) for <= 1 wire MSS under TSO, and entered fill() + prepare_group()
+    //     for > 1 wire MSS under TSO.
+    {
+        let (mut pair, _, aggregates) = build_tso_pair();
+        let (c, s) = pair.connected();
+        pair.client.set_nodelay(c, true).unwrap();
+
+        // Small write with backend blocked -> offer_fresh captures PendingFrame
+        // with scalar == true, context.is_some(), group.is_none().
+        let small = b"blocked-small-under-tso";
+        pair.client
+            .try_write(c, small, WriteOptions::default())
+            .unwrap();
+        pair.client_blocked.set(true);
+        let rep = pair.client.push(c, pair.now).unwrap();
+        assert_eq!(rep.transmitted, 0);
+        assert!(rep.tx_blocked);
+        let pending = pair
+            .client
+            .tx
+            .iter()
+            .find_map(|slot| slot.pending.as_ref())
+            .expect("small write must retain pending frame on WouldBlock");
+        assert!(
+            pending.is_scalar() && pending.has_context() && !pending.has_group(),
+            "small write under TSO must take offer_fresh, not fill()"
+        );
+        pair.client_blocked.set(false);
+        assert_eq!(read_all(&mut pair, s, small.len()), small);
+        assert_eq!(aggregates.get(), 0);
+
+        // Multi-MSS write with backend blocked -> offer_fresh returns Unavailable,
+        // fill() + prepare_group() captures PendingFrame with scalar == false and
+        // group.is_some().
+        let large: Vec<u8> = (0..4096).map(|i| (i % 199) as u8).collect();
+        pair.client
+            .try_write(c, &large, WriteOptions::default())
+            .unwrap();
+        pair.client_blocked.set(true);
+        let rep = pair.client.push(c, pair.now).unwrap();
+        assert_eq!(rep.transmitted, 0);
+        assert!(rep.tx_blocked);
+        let pending = pair
+            .client
+            .tx
+            .iter()
+            .find_map(|slot| slot.pending.as_ref())
+            .expect("multi-MSS write must retain pending aggregate on WouldBlock");
+        assert!(
+            !pending.is_scalar() && pending.has_group(),
+            "multi-MSS write under TSO must bypass offer_fresh and prepare a TransmitGroup"
+        );
+        pair.client_blocked.set(false);
+        assert_eq!(read_all(&mut pair, s, large.len()), large);
+        assert!(aggregates.get() >= 1);
+        assert!(pair.client.counters().segmented >= 1);
+    }
 }

@@ -30,6 +30,18 @@ pub(super) struct PendingFrame {
     // autocorking (`Network::push`).
     data: bool,
 }
+#[cfg(test)]
+impl PendingFrame {
+    pub(super) fn is_scalar(&self) -> bool {
+        self.scalar
+    }
+    pub(super) fn has_context(&self) -> bool {
+        self.context.is_some()
+    }
+    pub(super) fn has_group(&self) -> bool {
+        self.group.is_some()
+    }
+}
 pub(super) struct TxSlot {
     pub bytes: Vec<u8>,
     pub pending: Option<PendingFrame>,
@@ -594,7 +606,7 @@ impl<P: PacketIo> Network<P> {
                         .then(ntcp_host::SubmissionTicket::connection),
                     held: false,
                     group: None,
-                    scalar: false,
+                    scalar: true,
                     data: data_in_device,
                 });
                 if let Some(error) = failure {
@@ -2133,7 +2145,6 @@ impl<P: PacketIo> Network<P> {
     ) -> Result<bool> {
         if slot.pending.is_none() {
             let fresh = if self.tx_held == 0
-                && self.segmentation.is_none()
                 && let Some(core) = owner.or_else(|| self.endpoint.next_fresh_connection())
             {
                 let follow =
@@ -2147,7 +2158,7 @@ impl<P: PacketIo> Network<P> {
                     return Ok(idle && (owner.is_some() || !self.endpoint.has_pending_output()));
                 }
                 Some(FreshResult::Reserved(more, attempt)) => {
-                    self.fill_selected(slot, owner, false, report, more, Some(attempt))?;
+                    self.fill_selected(slot, owner, true, report, more, Some(attempt))?;
                 }
                 None => {
                     if let Some(idle) = self.fill(slot, owner, false, report)? {
