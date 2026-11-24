@@ -42,9 +42,8 @@ use core::{cell::Cell, net::IpAddr};
 use ntcp::{
     ConnectionId, CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError,
     ExpectedRegistrations, Instant, IpMetadata, Ipv4Options, Ipv4RegistrationPlan, ManagedError,
-    ManagedRoute, NetworkError, OutgoingIpv4Options, PathFactoryRequest, PathProvider,
-    PmtuFeedback, PreparedFactory, PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt,
-    TransmitGroup,
+    ManagedRoute, NetworkError, PathFactoryRequest, PathProvider, PmtuFeedback, PreparedFactory,
+    PreparedPath, RxPacketMetadata, Transmit, TransmitAttempt, TransmitGroup,
 };
 use ntcp_icmp::{FeedbackKind, QuotedTransport};
 pub use ntcp_path as path;
@@ -467,6 +466,18 @@ pub struct EgressContext {
     snapshot: PathSnapshot,
 }
 impl EgressContext {
+    fn for_path(attempt: TransmitAttempt, binding: &PreparedPath) -> Self {
+        Self {
+            link: binding.snapshot.key().link(),
+            next_hop: binding.snapshot.key().next_hop(),
+            attempt,
+            client: binding.client,
+            stamp: binding.snapshot.stamp(),
+            #[cfg(debug_assertions)]
+            snapshot: binding.snapshot,
+        }
+    }
+
     /// The path client the attempt's packet leaves through.
     pub const fn client(&self) -> path::ClientId {
         self.client
@@ -482,13 +493,6 @@ impl EgressContext {
             ResolvedNextHop::Forwarder(_) => None,
         }
     }
-}
-
-// Whether `bytes` lie inside `frame`'s: a datagram received in place,
-// not one reassembled or rewritten into another buffer.
-fn holds(frame: &ntcp::RxFrame, bytes: &[u8]) -> bool {
-    let (start, at) = (frame.as_ptr() as usize, bytes.as_ptr() as usize);
-    start <= at && at + bytes.len() <= start + frame.len()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -708,9 +712,9 @@ struct Port {
 // same, as Linux's early demux trusts a socket's cached input route while
 // its dst stays valid.
 #[derive(Clone, Copy, PartialEq)]
-struct LocalDestination {
+struct LocalDestination<A = IpAddr> {
     link: LinkId,
-    address: IpAddr,
+    address: A,
     revision: u64,
 }
 #[derive(Clone, Copy)]
@@ -774,30 +778,9 @@ struct NeighborDst {
 // checks on every use (`current_checks`).
 #[derive(Clone, Copy)]
 struct Dst {
-    stamp: path::ChangeStamp,
-    client: path::ClientId,
-    dscp: u8,
-    zone: Option<LinkId>,
-    forwarding_destination: IpAddr,
-    ip_header_len: u16,
+    revision: u64,
+    route: ManagedRoute,
     port: usize,
-}
-impl Dst {
-    fn holds(
-        &self,
-        prepared: &PreparedPath,
-        stamp: path::ChangeStamp,
-        current: &ManagedRoute,
-    ) -> bool {
-        self.stamp == stamp
-            && prepared.snapshot.stamp() == stamp
-            && current.stamp == stamp
-            && self.client == prepared.client
-            && self.dscp == current.dscp
-            && self.zone == current.zone
-            && self.forwarding_destination == current.forwarding_destination
-            && self.ip_header_len == current.ip_header_len
-    }
 }
 // A planned open's checked plan, whose options hold the connection's
 // complete immutable source route, and the route authority the owner's
@@ -838,6 +821,10 @@ pub struct Host {
     // The destination last found to be a source owned on a link, and the
     // path revision it was found at (`owned_on_link`).
     local: Cell<Option<LocalDestination>>,
+    // A registered port's receive profile is immutable over its link
+    // generation. A matching destination and path revision also retain
+    // the source-ownership checks made for an option-free TCP datagram.
+    plain_ingress: Option<(LocalDestination<core::net::Ipv4Addr>, ReceiveCapabilities)>,
     bindings: Vec<Option<Binding>>,
     // Occupied `bindings` records: what service and collection passes and
     // owner lookups visit.
@@ -974,6 +961,7 @@ impl Host {
             paths,
             ports: table(path_limits.links, None)?,
             local: Cell::new(None),
+            plain_ingress: None,
             bindings: table(limits.bindings, None)?,
             live_bindings: Live::new(limits.bindings)?,
             free_bindings: free_slots(limits.bindings)?,
@@ -1512,35 +1500,37 @@ impl Host {
     ) -> Result<PreparedPath, Error> {
         self.check_endpoint(endpoint)?;
         let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
-        let current = endpoint.managed_route(owner)?;
-        self.refresh_route(endpoint, owner, index, current)?;
+        self.refresh_route(endpoint, owner, index)?;
         Ok(self.bindings[index].as_ref().unwrap().prepared)
     }
-    // `refresh` of `owner`'s binding record `index`, the connection's route
-    // as the Endpoint reports it now being `current`. The record then holds
+    // `refresh` of `owner`'s binding record `index`. The record then holds
     // the refreshed path.
     fn refresh_route(
         &mut self,
         endpoint: &mut Endpoint,
         owner: ConnectionId,
         index: usize,
-        current: ManagedRoute,
-    ) -> Result<(), Error> {
+    ) -> Result<(Option<LinkId>, IpAddr), Error> {
         let binding = self.bindings[index].as_ref().unwrap();
-        let client = binding.prepared.client;
-        if current.client != client {
-            return Err(Error::InvalidContext);
-        }
-        // The decision checked for these inputs, while its cookie holds.
-        if let Some(dst) = self.held_dst(binding, &current) {
+        if let Some(dst) = self.held_dst(endpoint, owner, binding) {
             debug_assert_eq!(
-                self.current_checks(endpoint, owner, &binding.prepared, &current),
+                self.current_checks(
+                    endpoint,
+                    owner,
+                    &binding.prepared,
+                    &endpoint.managed_route(owner)?,
+                ),
                 Ok(Some(dst.port))
             );
-            debug_assert_eq!(self.paths.is_dirty(client), Ok(false));
-            return Ok(());
+            debug_assert_eq!(self.paths.is_dirty(binding.prepared.client), Ok(false));
+            return Ok((dst.route.zone, dst.route.forwarding_destination));
         }
-        self.refresh_changed_route(endpoint, owner, index, current)
+        let current = endpoint.managed_route(owner)?;
+        if current.client != binding.prepared.client {
+            return Err(Error::InvalidContext);
+        }
+        self.refresh_changed_route(endpoint, owner, index, current)?;
+        Ok((current.zone, current.forwarding_destination))
     }
 
     fn refresh_changed_route(
@@ -1556,12 +1546,8 @@ impl Host {
             let stamp = binding.prepared.snapshot.stamp();
             self.paths.acknowledge(client, stamp)?;
             self.bindings[index].as_mut().unwrap().dst = Some(Dst {
-                stamp,
-                client,
-                dscp: current.dscp,
-                zone: current.zone,
-                forwarding_destination: current.forwarding_destination,
-                ip_header_len: current.ip_header_len,
+                revision: self.paths.revision(),
+                route: current,
                 port,
             });
             return Ok(());
@@ -1606,14 +1592,42 @@ impl Host {
     }
 
     // `binding`'s egress decision, if it still holds for the connection's
-    // route `current`.
-    fn held_dst<'a>(&self, binding: &'a Binding, current: &ManagedRoute) -> Option<&'a Dst> {
+    // current route.
+    fn held_dst<'a>(
+        &self,
+        endpoint: &Endpoint,
+        owner: ConnectionId,
+        binding: &'a Binding,
+    ) -> Option<&'a Dst> {
+        self.held_matching_dst(binding, |route| endpoint.managed_route_matches(owner, route))
+    }
+
+    fn held_matching_dst<'a>(
+        &self,
+        binding: &'a Binding,
+        matches: impl FnOnce(&ManagedRoute) -> bool,
+    ) -> Option<&'a Dst> {
         let dst = binding.dst.as_ref()?;
-        let stamp = self.paths.stamp(binding.prepared.client).ok()?;
-        (dst.holds(&binding.prepared, stamp, current)
-            && self.ports[dst.port]
-                .is_some_and(|port| port.link == binding.prepared.snapshot.key().link()))
-        .then_some(dst)
+        let prepared = &binding.prepared;
+        // Every change to the path table's snapshots — including link removal,
+        // re-registration, route updates, MTU/DF changes, and admin rebinds —
+        // advances `self.paths.revision()` and invalidates or updates the
+        // affected client's `ChangeStamp`. This binding owns the client until
+        // it is rebound or released (both of which clear `binding.dst`), so an
+        // unchanged revision or matching client stamp guarantees the snapshot
+        // and `self.ports[dst.port]` still match this link.
+        if self.paths.revision() != dst.revision
+            && self.paths.stamp(prepared.client).ok()? != dst.route.stamp
+        {
+            return None;
+        }
+        debug_assert_eq!(self.paths.stamp(prepared.client), Ok(dst.route.stamp));
+        debug_assert_eq!(prepared.snapshot.stamp(), dst.route.stamp);
+        debug_assert_eq!(prepared.client, dst.route.client);
+        debug_assert!(
+            self.ports[dst.port].is_some_and(|port| port.link == prepared.snapshot.key().link())
+        );
+        matches(&dst.route).then_some(dst)
     }
     // Whether `refresh` of `owner` would take its held egress decision now.
     #[cfg(test)]
@@ -1621,8 +1635,7 @@ impl Host {
         let binding = self.bindings[self.binding_index(owner).unwrap()]
             .as_ref()
             .unwrap();
-        self.held_dst(binding, &endpoint.managed_route(owner).unwrap())
-            .is_some()
+        self.held_dst(endpoint, owner, binding).is_some()
     }
 
     // The checks `refresh` makes of a binding `prepared` whose observation
@@ -2073,17 +2086,22 @@ impl Host {
     // acknowledged data confirms its neighbor at once, as Linux confirms a
     // route's neighbor in tcp_ack, and results wait for the next service
     // pass.
+    #[inline]
     fn take_progress(&mut self, endpoint: &mut Endpoint) {
-        while let Some((owner, delivered)) = endpoint.next_progress() {
-            let Some(index) = self.binding_index(owner) else {
+        if endpoint.progress_pending() {
+            self.apply_progress(endpoint);
+        }
+    }
+
+    fn apply_progress(&mut self, endpoint: &mut Endpoint) {
+        while let Some(progress) = endpoint.next_managed_progress() {
+            let Some(index) = self.binding_index(progress.owner) else {
                 continue;
             };
-            if let Some(sent) = delivered {
+            if let Some(sent) = progress.delivered {
                 self.confirm_progress(index, sent);
             }
-            if !self.unpublished.contains(index)
-                && endpoint.has_unpublished_results(owner) == Ok(true)
-            {
+            if progress.unpublished && !self.unpublished.contains(index) {
                 self.unpublished.insert(index);
             }
         }
@@ -2366,79 +2384,94 @@ impl Host {
         if packet.protocol == ntcp_ip::PROTOCOL_UDP && metadata.tcp_segment_size.is_none() {
             return Ok(self.input_udp(endpoint, now, processed, packet));
         }
-        if packet.protocol == 6 {
-            // Bindings cover every Endpoint slot plus one provisional factory,
-            // so a full table can only hold generations this embedding has not
-            // yet collected. Reclaim them before a factory needs one, rather
-            // than reporting admissible input as a capacity failure.
-            if self.live_bindings.len() == self.bindings.len() {
-                self.collect(endpoint)?;
-            }
-            let disposition = match frame.take_if(|frame| holds(frame, packet.payload)) {
-                Some(mut segment) => {
-                    let offset = packet.payload.as_ptr() as usize - segment.as_ptr() as usize;
-                    segment.advance(offset);
-                    segment.truncate(packet.payload.len());
-                    endpoint.input_frame_with_path_provider(
-                        now,
-                        context.link,
-                        packet.ip,
-                        packet.traffic_class,
-                        packet.options,
-                        segment,
-                        frame,
-                        metadata,
-                        outgoing_dscp,
-                        self,
-                    )?
-                }
-                None => endpoint.input_with_path_provider(
-                    now,
-                    context.link,
-                    packet.ip,
-                    packet.traffic_class,
-                    packet.options,
-                    packet.payload,
-                    metadata,
-                    outgoing_dscp,
-                    self,
-                )?,
-            };
-            self.take_progress(endpoint);
-            Ok(disposition)
-        } else {
-            let (ip, protocol) = (packet.ip, packet.protocol);
-            self.drops.record_error(
-                ntcp::DropReason::IpNoproto,
+        if packet.protocol == ntcp_ip::PROTOCOL_TCP {
+            return self.input_tcp(
+                endpoint,
                 now,
-                packet.payload.len(),
-                || ntcp::DropSubject::Ip {
-                    source: ip.source,
-                    destination: ip.destination,
-                    protocol,
-                },
+                context,
+                packet.ip,
+                packet.traffic_class,
+                Some(&packet.options),
+                packet.payload,
+                metadata,
+                outgoing_dscp,
+                frame,
             );
-            // Linux's ip_protocol_deliver_rcu (net/ipv4/ip_input.c:212-217)
-            // answers with Protocol Unreachable, and ip6_protocol_deliver_rcu
-            // (net/ipv6/ip6_input.c:453-459) with Parameter Problem code 1
-            // at the Next Header that names the protocol: here the base
-            // header's, as no other reaches this point (receive processing
-            // refuses an unrecognized one after extension headers).
-            let invoking = processed.bytes();
-            let kind = match ip.destination {
-                IpAddr::V4(_) => Some(ntcp_icmp::ErrorMessage::ProtocolUnreachable),
-                IpAddr::V6(_) => (invoking.get(6) == Some(&protocol)).then_some(
-                    ntcp_icmp::ErrorMessage::Ipv6ParameterProblem {
-                        code: 1,
-                        pointer: 6,
-                    },
-                ),
-            };
-            if let Some(kind) = kind {
-                self.queue_unreachable(now, processed, kind);
-            }
-            Err(Error::Unsupported)
         }
+        let (ip, protocol) = (packet.ip, packet.protocol);
+        self.drops.record_error(
+            ntcp::DropReason::IpNoproto,
+            now,
+            packet.payload.len(),
+            || ntcp::DropSubject::Ip {
+                source: ip.source,
+                destination: ip.destination,
+                protocol,
+            },
+        );
+        // Linux's ip_protocol_deliver_rcu (net/ipv4/ip_input.c:212-217)
+        // answers with Protocol Unreachable, and ip6_protocol_deliver_rcu
+        // (net/ipv6/ip6_input.c:453-459) with Parameter Problem code 1
+        // at the Next Header that names the protocol: here the base
+        // header's, as no other reaches this point (receive processing
+        // refuses an unrecognized one after extension headers).
+        let invoking = processed.bytes();
+        let kind = match ip.destination {
+            IpAddr::V4(_) => Some(ntcp_icmp::ErrorMessage::ProtocolUnreachable),
+            IpAddr::V6(_) => (invoking.get(6) == Some(&protocol)).then_some(
+                ntcp_icmp::ErrorMessage::Ipv6ParameterProblem {
+                    code: 1,
+                    pointer: 6,
+                },
+            ),
+        };
+        if let Some(kind) = kind {
+            self.queue_unreachable(now, processed, kind);
+        }
+        Err(Error::Unsupported)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn input_tcp(
+        &mut self,
+        endpoint: &mut Endpoint,
+        now: Instant,
+        context: IngressContext,
+        ip: ntcp::IpMetadata,
+        traffic_class: u8,
+        options: Option<&ntcp::Ipv4Options>,
+        payload: &[u8],
+        metadata: RxPacketMetadata,
+        outgoing_dscp: u8,
+        frame: &mut Option<ntcp::RxFrame>,
+    ) -> Result<ntcp::InputDisposition, Error> {
+        self.make_binding_room(endpoint)?;
+        let disposition = endpoint.input_backed_with_path_provider(
+            now,
+            context.link,
+            ip,
+            traffic_class,
+            options,
+            payload,
+            frame,
+            metadata,
+            outgoing_dscp,
+            self,
+        )?;
+        self.take_progress(endpoint);
+        Ok(disposition)
+    }
+
+    fn make_binding_room(&mut self, endpoint: &mut Endpoint) -> Result<(), Error> {
+        // Bindings cover every Endpoint slot plus one provisional factory,
+        // so a full table can only hold generations this embedding has not
+        // yet collected. Reclaim them before a factory needs one, rather
+        // than reporting admissible input as a capacity failure.
+        if self.live_bindings.len() == self.bindings.len() {
+            self.collect(endpoint)?;
+        }
+        Ok(())
     }
 
     /// The single ICMP classification/dispatch path. The error is admitted on
@@ -2994,55 +3027,107 @@ impl Host {
         endpoint: &mut Endpoint,
         attempt: TransmitAttempt,
     ) -> Result<EgressContext, Error> {
+        self.grant_egress(endpoint, attempt)
+            .map(|(context, _)| context)
+    }
+
+    // Non-test callers land with the host submission fast-path commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn egress_address(
+        &self,
+        link: LinkId,
+        next_hop: IpAddr,
+        stamp: path::ChangeStamp,
+        neighbor: Option<NeighborDst>,
+        now: Instant,
+    ) -> Option<[u8; 6]> {
+        self.connected_mapping(neighbor, link, next_hop, stamp)
+            .or_else(|| {
+                let IpAddr::V4(via) = next_hop else {
+                    return None;
+                };
+                self.ipv4_neighbors
+                    .table()
+                    .cached_resolution(link, via, now)
+            })
+    }
+
+    fn grant_egress(
+        &mut self,
+        endpoint: &mut Endpoint,
+        attempt: TransmitAttempt,
+    ) -> Result<(EgressContext, Option<usize>), Error> {
         self.check_endpoint(endpoint)?;
         let packet = endpoint
-            .transmit_attempt_packet(attempt)
+            .transmit_attempt_packet_ref(attempt)
             .ok_or(Error::Obsolete)?;
-        let destination = wire_destination(&packet);
-        // A connection's packets carry its scoped identity; a stateless reply
-        // to a link-local peer carries the arrival link of the input that
-        // caused it. Either leaves only on that link.
-        let route = match packet.connection {
-            Some(owner) => Some(endpoint.managed_route(owner)?),
-            None => None,
-        };
-        let zone = match route {
-            Some(route) => route.zone,
-            None => endpoint
+        let destination = wire_destination(packet);
+        let (ip, dscp, owner) = (packet.ip, packet.dscp, packet.connection);
+        let (binding, index, zone, checked) = if let Some(owner) = owner {
+            let with_options = !packet.ipv4_options.is_empty();
+            let Some(index) = self.binding_index(owner) else {
+                endpoint.managed_route(owner)?;
+                return Err(Error::InvalidContext);
+            };
+            let (zone, via) = self.authorized_index(endpoint, owner, index, with_options)?;
+            let binding = &self.bindings[index].as_ref().unwrap().prepared;
+            (binding, Some(index), zone, via == destination)
+        } else {
+            // A reply to a link-local peer leaves on its arrival link. A
+            // removed or replaced link makes it permanently undeliverable.
+            let zone = endpoint
                 .transmit_attempt_zone(attempt)
-                .ok_or(Error::Obsolete)?,
+                .ok_or(Error::Obsolete)?;
+            if let Some(link) = zone
+                && self.port(link).is_err()
+            {
+                endpoint.count_undeliverable_reply(attempt);
+                return Err(Error::Obsolete);
+            }
+            let index = self.egress_lease(attempt, ip, dscp, destination, zone)?;
+            let binding = &self.leases[index].as_ref().unwrap().prepared;
+            self.forwarding(&binding.snapshot)?;
+            (binding, None, zone, false)
         };
-        // A reply whose link was removed or replaced can leave on no link:
-        // it is counted once and the embedding discards it as certainly
-        // unsubmitted, rather than holding it for a link that never returns.
-        if packet.connection.is_none()
-            && let Some(link) = zone
-            && self.port(link).is_err()
+        debug_assert!(
+            !checked
+                || scoped(destination, zone)
+                    .is_ok_and(|via| self.forwards_via(binding.snapshot.key(), via))
+        );
+        if !packet_on_path(&binding.snapshot, ip, dscp)
+            || (!checked
+                && !self.forwards_via(binding.snapshot.key(), scoped(destination, zone)?))
         {
-            endpoint.count_undeliverable_reply(attempt);
             return Err(Error::Obsolete);
         }
-        // The record that holds the attempt's path: its connection's
-        // binding, or a stateless reply's lease.
-        enum Record {
-            Binding(usize),
-            Lease(usize),
+        // A stateless reply's evidence storage is reserved with the
+        // authority, before any bytes can reach a backend; validate_egress
+        // fills it for each retry. A connection keeps none: ICMP errors
+        // about it are checked against its own sequence space.
+        let context = EgressContext::for_path(attempt, binding);
+        if owner.is_none() {
+            self.reserve_attempt(endpoint, Owner::Stateless, attempt)?;
         }
-        let record = if let (Some(owner), Some(route)) = (packet.connection, route) {
-            Record::Binding(self.authorized_route(endpoint, owner, route, &packet)?)
-        } else if let Some(index) = self
+        Ok((context, index))
+    }
+
+    // Keep a stateless reply's path pinned while its attempt is held.
+    fn egress_lease(
+        &mut self,
+        attempt: TransmitAttempt,
+        ip: IpMetadata,
+        dscp: u8,
+        destination: IpAddr,
+        zone: Option<LinkId>,
+    ) -> Result<usize, Error> {
+        if let Some(index) = self
             .leases
             .iter()
             .position(|l| l.as_ref().is_some_and(|l| l.attempt == attempt))
         {
             let lease = self.leases[index].unwrap();
             let mut snapshot = self.paths.snapshot(lease.prepared.client)?;
-            let request = self.request(
-                packet.ip.source,
-                packet.ip.destination,
-                zone,
-                Dscp::new(packet.dscp)?,
-            )?;
+            let request = self.request(ip.source, ip.destination, zone, Dscp::new(dscp)?)?;
             let via = scoped(destination, zone)?;
             let prepared = if snapshot.status() != PathStatus::Valid
                 || snapshot.key().request() != request
@@ -3067,19 +3152,14 @@ impl Host {
             };
             self.leases[index].as_mut().unwrap().prepared = prepared;
             self.paths.acknowledge(prepared.client, snapshot.stamp())?;
-            Record::Lease(index)
+            Ok(index)
         } else {
             let index = self
                 .leases
                 .iter()
                 .position(Option::is_none)
                 .ok_or(Error::Capacity)?;
-            let request = self.request(
-                packet.ip.source,
-                packet.ip.destination,
-                zone,
-                Dscp::new(packet.dscp)?,
-            )?;
+            let request = self.request(ip.source, ip.destination, zone, Dscp::new(dscp)?)?;
             let via = scoped(destination, zone)?;
             let resolved = self.paths.resolve_via(request, via)?;
             self.forwarding_resolved(resolved.key())?;
@@ -3087,52 +3167,8 @@ impl Host {
             let prepared = PreparedPath { client, snapshot };
             self.leases[index] = Some(Lease { attempt, prepared });
             self.live_leases += 1;
-            Record::Lease(index)
-        };
-        let binding = match record {
-            Record::Binding(index) => &self.bindings[index].as_ref().unwrap().prepared,
-            Record::Lease(index) => &self.leases[index].as_ref().unwrap().prepared,
-        };
-        // A connection's binding comes from `refresh`, which checked its
-        // forwarding; nothing since changed a path or port.
-        if packet.connection.is_none() {
-            self.forwarding(&binding.snapshot)?;
+            Ok(index)
         }
-        // Refresh checked that a connection's binding forwards via the
-        // destination its route names now, the packet's own: the Endpoint
-        // takes no input for a connection while its output is reserved, so
-        // no later return route changes it under a selected packet.
-        let checked = route.is_some_and(|r| r.forwarding_destination == destination);
-        debug_assert!(
-            !checked
-                || scoped(destination, zone)
-                    .is_ok_and(|via| self.forwards_via(binding.snapshot.key(), via))
-        );
-        if packet.dscp != binding.snapshot.key().dscp().value()
-            || packet.ip.source != binding.snapshot.key().source_address().address()
-            || packet.ip.destination != binding.snapshot.key().destination().address()
-            || (!checked
-                && !self.forwards_via(binding.snapshot.key(), scoped(destination, zone)?))
-        {
-            return Err(Error::Obsolete);
-        }
-        // A stateless reply's evidence storage is reserved with the
-        // authority, before any bytes can reach a backend; validate_egress
-        // fills it for each retry. A connection keeps none: ICMP errors
-        // about it are checked against its own sequence space.
-        let context = EgressContext {
-            link: binding.snapshot.key().link(),
-            next_hop: binding.snapshot.key().next_hop(),
-            attempt,
-            client: binding.client,
-            stamp: binding.snapshot.stamp(),
-            #[cfg(debug_assertions)]
-            snapshot: binding.snapshot,
-        };
-        if packet.connection.is_none() {
-            self.reserve_attempt(endpoint, Owner::Stateless, attempt)?;
-        }
-        Ok(context)
     }
 
     /// The snapshot of the path `context` was granted on, read in place:
@@ -3164,57 +3200,35 @@ impl Host {
         &mut self,
         endpoint: &mut Endpoint,
         owner: ConnectionId,
-        packet: &Transmit,
+        with_options: bool,
     ) -> Result<(), Error> {
         self.check_endpoint(endpoint)?;
         let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
-        let current = endpoint.managed_route(owner)?;
-        self.authorized_index(endpoint, owner, index, current, packet)
+        self.authorized_index(endpoint, owner, index, with_options)
+            .map(|_| ())
     }
-    // `authorized_refresh` of a connection whose route `egress_context`
-    // read for its packet; its binding record, which holds the path.
-    fn authorized_route(
-        &mut self,
-        endpoint: &mut Endpoint,
-        owner: ConnectionId,
-        current: ManagedRoute,
-        packet: &Transmit,
-    ) -> Result<usize, Error> {
-        let index = self.binding_index(owner).ok_or(Error::InvalidContext)?;
-        self.authorized_index(endpoint, owner, index, current, packet)?;
-        Ok(index)
-    }
+
     fn authorized_index(
         &mut self,
         endpoint: &mut Endpoint,
         owner: ConnectionId,
         index: usize,
-        current: ManagedRoute,
-        packet: &Transmit,
-    ) -> Result<(), Error> {
-        let registration = self.bindings[index]
-            .as_ref()
-            .unwrap()
-            .registration
-            .filter(|_| packet.ipv4_options != OutgoingIpv4Options::default());
-        match (
-            self.refresh_route(endpoint, owner, index, current),
-            registration,
-        ) {
-            (Ok(()), Some(r))
-                if self.bindings[index]
-                    .as_ref()
-                    .unwrap()
-                    .prepared
-                    .snapshot
-                    .key()
-                    != r.authorized =>
-            {
-                Err(Error::StaleRoute)
+        with_options: bool,
+    ) -> Result<(Option<LinkId>, IpAddr), Error> {
+        let result = self.refresh_route(endpoint, owner, index);
+        if with_options
+            && let Some(binding) = &self.bindings[index]
+            && let Some(registration) = &binding.registration
+        {
+            match result {
+                Ok(_) if binding.prepared.snapshot.key() != registration.authorized => {
+                    return Err(Error::StaleRoute);
+                }
+                Err(Error::Path(path::Error::NoRoute)) => return Err(Error::StaleRoute),
+                _ => {}
             }
-            (Err(Error::Path(path::Error::NoRoute)), Some(_)) => Err(Error::StaleRoute),
-            (result, _) => result,
         }
+        result
     }
     #[cfg(test)]
     fn registration(&self, owner: ConnectionId) -> Option<Registration> {
@@ -3419,8 +3433,8 @@ impl Host {
         // output again for the current path; a stateless reply is dropped.
         let Some(snapshot) = self.granted(&context) else {
             if let Some(owner) = packet.connection {
-                let obsolete = *packet;
-                self.authorized_refresh(endpoint, owner, &obsolete)?;
+                let with_options = !packet.ipv4_options.is_empty();
+                self.authorized_refresh(endpoint, owner, with_options)?;
             }
             return Err(Error::Obsolete);
         };
@@ -3433,11 +3447,7 @@ impl Host {
         // as for IP_PMTUDISC_PROBE: discovery probes exceed the estimate),
         // and RFC 1191 section 6.6: no DF on a discovery-disabled route,
         // which the embedding clears (`clears_dont_fragment`).
-        if actual > snapshot.first_hop_mtu() as usize
-            || (ipv4
-                && snapshot.clears_dont_fragment()
-                && frame.get(6).is_none_or(|f| f & 0x40 != 0))
-        {
+        if !frame_fits(snapshot, ipv4, frame, actual) {
             return Err(Error::Obsolete);
         }
         debug_assert_eq!(
@@ -3656,7 +3666,7 @@ impl Host {
         let packet = view.packet;
         let owner = packet.connection.ok_or(Error::Obsolete)?;
         let Some(snapshot) = self.granted(&context) else {
-            self.authorized_refresh(endpoint, owner, &packet)?;
+            self.authorized_refresh(endpoint, owner, !packet.ipv4_options.is_empty())?;
             return Err(Error::Obsolete);
         };
         // The aggregate is the IP and TCP headers of one segment and the
@@ -3757,6 +3767,20 @@ impl Host {
             .then_some(())
             .ok_or(Error::Obsolete)
     }
+}
+
+fn packet_on_path(snapshot: &PathSnapshot, ip: IpMetadata, dscp: u8) -> bool {
+    let key = snapshot.key();
+    dscp == key.dscp().value()
+        && ip.source == key.source_address().address()
+        && ip.destination == key.destination().address()
+}
+
+fn frame_fits(snapshot: &PathSnapshot, ipv4: bool, frame: &[u8], actual: usize) -> bool {
+    actual <= snapshot.first_hop_mtu() as usize
+        && (!ipv4
+            || !snapshot.clears_dont_fragment()
+            || frame.get(6).is_some_and(|f| f & 0x40 == 0))
 }
 
 // Whether the network may not fragment this physical packet: IPv4 with DF
@@ -4066,3 +4090,518 @@ impl PathProvider for Host {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod commit7_cache_tests {
+    use super::*;
+    use alloc::{boxed::Box, vec, vec::Vec};
+    use core::net::{Ipv4Addr, SocketAddr};
+    use ntcp::{
+        ActiveOpenOptions, ConnectionConfig, InitialWindow, ManagedOpenOptions,
+        OutgoingIpv4Options, PmtudConfig, RxFrame,
+    };
+    use ntcp_arp::{Arp, ControlOutcome, ControlToken};
+    use path::{AdminChange, AdminPolicy, AdminTarget};
+
+    const A_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+    const B_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
+    const GW_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 254);
+
+    fn plain_recv_caps() -> ReceiveCapabilities {
+        ReceiveCapabilities {
+            max_ip_packet: 1500,
+            ipv4: Ipv4Receive::Enabled {
+                interpretation: true,
+                source_routes: false,
+            },
+            ipv6: Ipv6Receive::Disabled,
+            gro: false,
+        }
+    }
+
+    fn make_host(local: Ipv4Addr, id: u64) -> (Host, Endpoint, IngressContext) {
+        let cfg = EndpointConfig {
+            max_connections: 4,
+            max_listeners: 2,
+            connection: ConnectionConfig {
+                mss: 1460,
+                send_capacity: 65536,
+                receive_capacity: 65536,
+                initial_window: InitialWindow::Iw10,
+                nagle: false,
+                delayed_ack_us: 0,
+                timestamps: true,
+                pmtud: Some(PmtudConfig::new(1500)),
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let (mut path_limits, limits) = managed_limits(&cfg, 2, 3, 2, 8, 2).unwrap();
+        path_limits.routes = 8;
+        path_limits.paths = 16;
+        let ctx = ContextId::new(id);
+        let mut host = Host::new(
+            ctx,
+            path_limits,
+            limits,
+            cfg.connection.timebase,
+            [id as u8; 16],
+        )
+        .unwrap();
+        let link = host
+            .register_link(
+                path::InterfaceKey(id),
+                1500,
+                plain_recv_caps(),
+                Forwarding::Forwarder(ForwarderId(9)),
+            )
+            .unwrap();
+        host.register_source(ScopedAddress::new(IpAddr::V4(local), None).unwrap(), link.link())
+            .unwrap();
+        host.add_route(path::Route {
+            destination: path::IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+            source: None,
+            dscp: None,
+            link: link.link(),
+            next_hop: path::NextHop::Forwarder(ForwarderId(9)),
+            metric: 0,
+        })
+        .unwrap();
+        let mut ep = Endpoint::new(cfg, [id as u8; 32], 0, move |req| match req {
+            ntcp::AddressValidation::Bind { local: a }
+            | ntcp::AddressValidation::Open { local: a, .. }
+            | ntcp::AddressValidation::Incoming { destination: a, .. }
+            | ntcp::AddressValidation::Route { source: a, .. } => a == IpAddr::V4(local),
+        })
+        .unwrap();
+        host.attach(&mut ep).unwrap();
+        ep.enable_output_reservations().unwrap();
+        (host, ep, link)
+    }
+
+    fn emit_ipv4(host: &mut Host, ep: &mut Endpoint, now: Instant) -> Option<Vec<u8>> {
+        let mut tcp = [0u8; 2048];
+        let (poll, attempt) = ep.poll_reserved_transmit(now, &mut tcp, 32).unwrap();
+        let pkt = poll.packet?;
+        let attempt = attempt.unwrap();
+        let ctx = host.egress_context(ep, attempt).unwrap();
+        let mut ip_buf = vec![0u8; 20 + pkt.len];
+        ip_buf[20..20 + pkt.len].copy_from_slice(&tcp[..pkt.len]);
+        let n = ntcp_ip::encode(&mut ip_buf, pkt, 123).unwrap();
+        ip_buf.truncate(n);
+        if host.clears_dont_fragment(ctx) {
+            host.lease_df_clear(now, &mut ip_buf).unwrap();
+        }
+        let ticket = host.submission_ticket(ep, ctx).unwrap();
+        let sub = host
+            .submit(ep, now, ticket, ctx, &ip_buf, 0, |_| BackendOutcome::Submitted)
+            .unwrap();
+        assert_eq!(sub, Submission::Submitted);
+        Some(ip_buf)
+    }
+
+    type Side = (Host, Endpoint, IngressContext);
+
+    fn connect_pair() -> (Side, Side, ConnectionId, ConnectionId) {
+        let mut a = make_host(A_IP, 1);
+        let mut b = make_host(B_IP, 2);
+        let listener = b.1.listen(SocketAddr::new(IpAddr::V4(B_IP), 80), 4).unwrap();
+        let c = a
+            .1
+            .connect_with_path_provider(
+                0,
+                SocketAddr::new(IpAddr::V4(A_IP), 40001),
+                SocketAddr::new(IpAddr::V4(B_IP), 80),
+                ManagedOpenOptions {
+                    transport: ActiveOpenOptions::from(&EndpointConfig::default().connection),
+                    dscp: 0,
+                    ipv4_options: OutgoingIpv4Options::default(),
+                    registration: None,
+                    receive_authority: None,
+                },
+                &mut a.0,
+            )
+            .unwrap();
+        let mut now = 10u64;
+        for _ in 0..16 {
+            let mut moved = false;
+            while let Some(pkt) = emit_ipv4(&mut a.0, &mut a.1, now) {
+                let mut frame = Some(RxFrame::copy_from_slice(&pkt));
+                let slice = unsafe {
+                    core::slice::from_raw_parts(
+                        frame.as_ref().unwrap().as_ptr(),
+                        frame.as_ref().unwrap().len(),
+                    )
+                };
+                b.0.receive_tcp_frame(&mut b.1, b.2, now + 1, slice, &mut frame, Default::default(), 0)
+                    .unwrap()
+                    .unwrap();
+                moved = true;
+            }
+            while let Some(pkt) = emit_ipv4(&mut b.0, &mut b.1, now + 2) {
+                let mut frame = Some(RxFrame::copy_from_slice(&pkt));
+                let slice = unsafe {
+                    core::slice::from_raw_parts(
+                        frame.as_ref().unwrap().as_ptr(),
+                        frame.as_ref().unwrap().len(),
+                    )
+                };
+                a.0.receive_tcp_frame(&mut a.1, a.2, now + 3, slice, &mut frame, Default::default(), 0)
+                    .unwrap()
+                    .unwrap();
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+            now += 10;
+        }
+        let s = b.1.accept(listener).unwrap();
+        (a, b, c, s)
+    }
+
+    #[test]
+    fn plain_ingress_cache_hits_defers_on_reservation_and_invalidates_on_local_address_change() {
+        let (mut a, mut b, c, s) = connect_pair();
+
+        // Handshake already populated `b.0.plain_ingress` for (b.2.link(), B_IP, rev).
+        let (cached_key, _) = b.0.plain_ingress.expect("plain_ingress should be populated");
+        assert_eq!(cached_key.link, b.2.link());
+        assert_eq!(cached_key.address, B_IP);
+        assert_eq!(cached_key.revision, b.0.paths.revision());
+
+        // Send in-order payload: hits plain_ingress cache and retains RxFrame in RxQueue.
+        a.1.write(c, b"cached-ingress").unwrap();
+        let pkt = emit_ipv4(&mut a.0, &mut a.1, 100).unwrap();
+        let mut frame = Some(RxFrame::copy_from_slice(&pkt));
+        let slice = unsafe {
+            core::slice::from_raw_parts(
+                frame.as_ref().unwrap().as_ptr(),
+                frame.as_ref().unwrap().len(),
+            )
+        };
+        assert_eq!(
+            b.0.receive_tcp_frame(&mut b.1, b.2, 105, slice, &mut frame, Default::default(), 0)
+                .unwrap(),
+            Some(ntcp::InputDisposition::Processed)
+        );
+        assert!(frame.is_none(), "in-order backed plain TCP frame should be retained");
+        let mut buf = [0u8; 32];
+        let n = b.1.read(s, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"cached-ingress");
+
+        // Non-plain IPv4 (IHL > 5) returns Ok(None) from receive_tcp_frame.
+        let mut opt_pkt = vec![0u8; pkt.len() + 4];
+        opt_pkt[..20].copy_from_slice(&pkt[..20]);
+        opt_pkt[0] = 0x46; // IHL = 6
+        let new_len = opt_pkt.len() as u16;
+        opt_pkt[2..4].copy_from_slice(&new_len.to_be_bytes());
+        opt_pkt[10..12].fill(0);
+        opt_pkt[20..24].copy_from_slice(&[1, 1, 1, 0]);
+        let csum = ntcp_ip_common::checksum(&opt_pkt[..24]);
+        opt_pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        opt_pkt[24..].copy_from_slice(&pkt[20..]);
+        let mut opt_frame = None;
+        assert_eq!(
+            b.0.receive_tcp_frame(&mut b.1, b.2, 110, &opt_pkt, &mut opt_frame, Default::default(), 0)
+                .unwrap(),
+            None
+        );
+
+        // Active output reservation causes receive_tcp_frame to return Ok(None).
+        b.1.write(s, b"reserve-b").unwrap();
+        let mut out = [0u8; 2048];
+        let (_, att) = b.1.poll_reserved_transmit(115, &mut out, 32).unwrap();
+        let att = att.unwrap();
+        let mut res_frame = None;
+        assert_eq!(
+            b.0.receive_tcp_frame(&mut b.1, b.2, 120, &pkt, &mut res_frame, Default::default(), 0)
+                .unwrap(),
+            None
+        );
+        b.1.accept_transmit(120, att).unwrap();
+
+        // Removing the local address bumps paths.revision() and invalidates plain_ingress!
+        let rev_before = b.0.paths.revision();
+        let src_id = b.0.source(IpAddr::V4(B_IP), None).unwrap();
+        b.0.remove_source_owner(src_id, b.2.link()).unwrap();
+        assert_ne!(b.0.paths.revision(), rev_before);
+        let mut stale_frame = None;
+        assert!(
+            b.0.receive_tcp_frame(&mut b.1, b.2, 130, &pkt, &mut stale_frame, Default::default(), 0)
+                .is_err(),
+            "stale plain_ingress cache must not admit packet after local source removal"
+        );
+    }
+
+    #[test]
+    fn held_matching_dst_invalidates_on_route_mtu_df_and_admin_rebind() {
+        let (mut a, _b, c, _s) = connect_pair();
+
+        // Populate dst via refresh; verify dst_held is true.
+        a.0.refresh(&mut a.1, c).unwrap();
+        assert!(a.0.dst_held(&a.1, c));
+
+        // 1. Unrelated route bumps revision, but stamp stays equal -> dst stays held!
+        let rev0 = a.0.paths.revision();
+        let unrelated = path::Route {
+            destination: path::IpPrefix::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24)
+                .unwrap(),
+            source: None,
+            dscp: None,
+            link: a.2.link(),
+            next_hop: path::NextHop::Forwarder(ForwarderId(9)),
+            metric: 0,
+        };
+        a.0.add_route(unrelated).unwrap();
+        assert_ne!(a.0.paths.revision(), rev0);
+        assert!(a.0.dst_held(&a.1, c));
+
+        // 2. More-specific route change invalidates dst.
+        let specific = path::Route {
+            destination: path::IpPrefix::new(IpAddr::V4(B_IP), 32).unwrap(),
+            source: None,
+            dscp: None,
+            link: a.2.link(),
+            next_hop: path::NextHop::Forwarder(ForwarderId(9)),
+            metric: 0,
+        };
+        let specific_route = a.0.add_route(specific).unwrap();
+        assert!(!a.0.dst_held(&a.1, c));
+        a.0.refresh(&mut a.1, c).unwrap();
+        a.0.refresh(&mut a.1, c).unwrap();
+        assert!(a.0.dst_held(&a.1, c));
+
+        // 3. MTU decrease invalidates dst.
+        a.0.set_link_mtu(a.2.link(), 1300).unwrap();
+        assert!(!a.0.dst_held(&a.1, c));
+        a.0.refresh(&mut a.1, c).unwrap();
+        a.0.refresh(&mut a.1, c).unwrap();
+        assert!(a.0.dst_held(&a.1, c));
+
+        // 4. DF-clear / discovery-disabled admin policy rebind invalidates dst.
+        let capability = a.0.administration();
+        let candidate = a
+            .0
+            .admin_validate(
+                &capability,
+                100,
+                AdminChange {
+                    target: AdminTarget::Route(specific_route),
+                    expected: 0,
+                    policy: AdminPolicy {
+                        discovery_disabled: true,
+                        estimate: None,
+                    },
+                },
+            )
+            .unwrap();
+        a.0.admin_apply(&capability, &mut a.1, candidate).unwrap();
+        assert!(!a.0.dst_held(&a.1, c));
+        a.0.refresh(&mut a.1, c).unwrap();
+        assert!(a.0.dst_held(&a.1, c));
+        assert!(a.0.binding(c).unwrap().snapshot.clears_dont_fragment());
+
+        // 5. Link removal & re-registration invalidates dst.
+        a.0.remove_link(a.2).unwrap();
+        assert!(!a.0.dst_held(&a.1, c));
+        let new_link = a
+            .0
+            .register_link(
+                path::InterfaceKey(1),
+                1500,
+                plain_recv_caps(),
+                Forwarding::Forwarder(ForwarderId(9)),
+            )
+            .unwrap();
+        a.0.register_source(
+            ScopedAddress::new(IpAddr::V4(A_IP), None).unwrap(),
+            new_link.link(),
+        )
+        .unwrap();
+        a.0.add_route(path::Route {
+            destination: path::IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+            source: None,
+            dscp: None,
+            link: new_link.link(),
+            next_hop: path::NextHop::Forwarder(ForwarderId(9)),
+            metric: 0,
+        })
+        .unwrap();
+        assert!(!a.0.dst_held(&a.1, c));
+        a.0.refresh(&mut a.1, c).unwrap();
+        a.0.refresh(&mut a.1, c).unwrap();
+        assert!(a.0.dst_held(&a.1, c));
+    }
+
+    struct ExpiringArp {
+        link: LinkId,
+        target: Ipv4Addr,
+        mac: [u8; 6],
+        expires_at: Instant,
+        generation: u64,
+    }
+
+    impl Ipv4NeighborTable for ExpiringArp {
+        fn add_link(
+            &mut self,
+            _link: LinkId,
+            _mac: [u8; 6],
+            _entropy: Option<&mut Entropy>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn remove_link(&mut self, _link: LinkId) {}
+        fn add_local(&mut self, _link: LinkId, _address: Ipv4Addr) -> Result<(), Error> {
+            Ok(())
+        }
+        fn remove_local(&mut self, _link: LinkId, _address: Ipv4Addr) {}
+        fn add_permanent(
+            &mut self,
+            _link: LinkId,
+            _address: Ipv4Addr,
+            _mac: [u8; 6],
+            _now: Instant,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn has_link(&self, link: LinkId) -> bool {
+            link == self.link
+        }
+        fn resolve(
+            &mut self,
+            link: LinkId,
+            address: Ipv4Addr,
+            now: Instant,
+            _hold: NeighborHold,
+        ) -> Result<Option<[u8; 6]>, Error> {
+            Ok(self.cached_resolution(link, address, now))
+        }
+        fn next_wake(
+            &mut self,
+            _filter: &dyn Fn(&NeighborHold) -> bool,
+        ) -> Option<(NeighborHold, bool)> {
+            None
+        }
+        fn cached_resolution(
+            &self,
+            link: LinkId,
+            address: Ipv4Addr,
+            now: Instant,
+        ) -> Option<[u8; 6]> {
+            (link == self.link && address == self.target && now < self.expires_at)
+                .then_some(self.mac)
+        }
+        fn receive(
+            &mut self,
+            _link: LinkId,
+            _arp: &Arp,
+            _now: Instant,
+            _entropy: Option<&mut Entropy>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn output(
+            &mut self,
+            _link: LinkId,
+            _now: Instant,
+            _out: &mut [u8],
+        ) -> Result<Option<([u8; 6], usize, ControlToken)>, Error> {
+            Ok(None)
+        }
+        fn complete(&mut self, _token: ControlToken, _outcome: ControlOutcome, _now: Instant) {}
+        fn service(&mut self, _now: Instant, _unreachable: &mut dyn FnMut(LinkId, Ipv4Addr)) {}
+        fn next_deadline(&self) -> Option<Instant> {
+            Some(self.expires_at)
+        }
+        fn confirm(
+            &mut self,
+            _link: LinkId,
+            _address: Ipv4Addr,
+            _carried_at: Instant,
+            _now: Instant,
+            _entropy: Option<&mut Entropy>,
+        ) -> Result<bool, Error> {
+            Ok(false)
+        }
+        fn counters(&self) -> ArpCounters {
+            ArpCounters::default()
+        }
+        fn connected(&self, link: LinkId, address: Ipv4Addr) -> Option<[u8; 6]> {
+            (link == self.link && address == self.target).then_some(self.mac)
+        }
+        fn generation(&self) -> Option<u64> {
+            Some(self.generation)
+        }
+    }
+
+    #[test]
+    fn egress_address_uses_connected_mapping_and_cached_resolution_with_expiry() {
+        let (mut host, _ep, ctx) = make_host(A_IP, 99);
+        let link = ctx.link();
+        let port = host.port_slot(link).unwrap();
+        let cached_mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01];
+        let conn_mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x02];
+        host.ipv4_neighbors.install(Box::new(ExpiringArp {
+            link,
+            target: GW_IP,
+            mac: cached_mac,
+            expires_at: 5_000,
+            generation: 7,
+        }));
+
+        // Obtain a real ChangeStamp via paths.acquire.
+        let src = host
+            .paths
+            .acquire(path::PathRequest {
+                source: host.source(IpAddr::V4(A_IP), None).unwrap(),
+                destination: ScopedAddress::new(IpAddr::V4(GW_IP), None).unwrap(),
+                dscp: Dscp::new(0).unwrap(),
+            })
+            .unwrap();
+        let stamp = src.1.stamp();
+
+        // 1. With matching NeighborDst, connected_mapping wins (and its MAC matches connected()).
+        let matching = Some(NeighborDst {
+            stamp,
+            port,
+            generation: 7,
+            mac: cached_mac,
+        });
+        assert_eq!(
+            host.egress_address(link, IpAddr::V4(GW_IP), stamp, matching, 1_000),
+            Some(cached_mac)
+        );
+        // Even past ARP expiry, connected_mapping (for matching generation) returns the connected MAC.
+        assert_eq!(
+            host.egress_address(link, IpAddr::V4(GW_IP), stamp, matching, 6_000),
+            Some(cached_mac)
+        );
+
+        // 2. With stale NeighborDst generation (or None), falls back to cached_resolution before expiry.
+        let stale = Some(NeighborDst {
+            stamp,
+            port,
+            generation: 6,
+            mac: conn_mac,
+        });
+        assert_eq!(
+            host.egress_address(link, IpAddr::V4(GW_IP), stamp, stale, 1_000),
+            Some(cached_mac)
+        );
+        assert_eq!(
+            host.egress_address(link, IpAddr::V4(GW_IP), stamp, None, 4_999),
+            Some(cached_mac)
+        );
+
+        // 3. After ARP expiry (now >= 5_000), cached_resolution returns None -> egress_address returns None.
+        assert_eq!(
+            host.egress_address(link, IpAddr::V4(GW_IP), stamp, None, 5_000),
+            None
+        );
+        assert_eq!(
+            host.egress_address(link, IpAddr::V4(GW_IP), stamp, stale, 5_000),
+            None
+        );
+    }
+}

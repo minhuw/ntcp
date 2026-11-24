@@ -909,15 +909,31 @@ struct DeferredSyn {
     urgent: Option<u64>,
 }
 
+// Sentinel for an unpopulated `rcv_memory_limit` cache. Valid receive
+// capacities are bounded by `65535 << 14`, so `usize::MAX` never matches.
+const RCV_MEMORY_LIMIT_UNSET: (usize, usize) = (usize::MAX, 0);
+
+// Window information from before the ACK changed flight or sender state.
+struct AckWindow {
+    prior: u32,
+    offered: u32,
+    update: bool,
+    was_blocked: bool,
+}
+
 pub(crate) struct Connection {
     pub(crate) managed_path: Option<crate::PreparedPath>,
     // The immutable snapshot's packet budget, updated on a path rebind.
     managed_packet_budget: u32,
     // The usable space rounds the send limit down to a whole send quantum.
     // Both can change independently (autotuning, negotiation and path MTU).
-    send_space_cache: core::cell::Cell<(usize, usize, usize)>,
+    send_space: usize,
     pub(crate) managed_results: crate::endpoint::ManagedResults,
     tuple: Tuple,
+    // Source and destination are fixed for the life of the connection.
+    pub(crate) ip: IpMetadata,
+    pseudo_header: wire::PseudoHeader,
+    wire_ports: u32,
     // The link scoping `tuple`; set by the Endpoint before insertion.
     zone: Option<ntcp_path::LinkId>,
     config: ConnectionConfig,
@@ -1009,7 +1025,6 @@ pub(crate) struct Connection {
     scoreboard: Scoreboard,
     rack: Rack,
     tlp_deadline: Option<Instant>,
-    tlp_pending: bool,
     // Retain a retransmitted probe at equality until DSACK/duplicate ACK or
     // an ACK beyond its end resolves the RFC 8985 section 7.4.2 ambiguity.
     tlp_end: Option<(Seq, Seq, bool)>,
@@ -1083,9 +1098,19 @@ pub(crate) struct Connection {
     fin_sent_at: Option<Instant>,
     // Distinguish standalone FIN from data+FIN even at the same caller instant.
     fin_standalone: bool,
+    // Flags that select a control packet instead of ordinary stream output.
     syn_pending: bool,
+    challenge_ack_pending: bool,
+    retx_pending: bool,
+    probe_pending: bool,
+    keepalive_pending: bool,
+    tlp_pending: bool,
     ack_pending: bool,
     ack_ato: u64,
+    // Validated, immutable delayed-ACK bounds in the socket's caller clock.
+    // Both are below half a second, even in nanosecond units.
+    ack_floor: u32,
+    ack_max: u32,
     // The boolean distinguishes the establishment seed from the first data sample.
     ack_receive: Option<(Instant, bool)>,
     // A waiting Fast Open writer can initialize ATO without stream receive history.
@@ -1093,11 +1118,9 @@ pub(crate) struct Connection {
     fast_open_write_pending: bool,
     ack_quick: u8,
     ack_interactive: bool,
-    challenge_ack_pending: bool,
     challenge_ack_start: Option<Instant>,
     challenge_ack_sent: u32,
     pending_rst: Option<(Seq, bool)>,
-    retx_pending: bool,
     duplicate_acks: u8,
     limited_pending: bool,
     limited_sent: u32,
@@ -1105,8 +1128,6 @@ pub(crate) struct Connection {
     // Earlier no-SACK delivery estimates, consumed only by real data ACKs.
     // Independent of Limited Transmit grants and recovery's PRR counters.
     growth_dupack_bytes: u32,
-    probe_pending: bool,
-    keepalive_pending: bool,
     rtt: RttEstimator,
     congestion: Congestion,
     ecn_sent_setup: bool,
@@ -1205,6 +1226,10 @@ pub(crate) struct Connection {
     // that takes them settles it, so the refresh of a connection with
     // nothing pending skips the walk over them.
     refresh_work: bool,
+    // Storage grows only on admission. An ordinary refresh needs to
+    // inspect a drained queue for reclamation only above its reserve.
+    large_send_ring: bool,
+    large_ledgers: bool,
     // The receive direction's limits, as the send direction's: whether it
     // is tuned and the window_clamp DRS may raise it to (tcp_rmem[2]).
     receive_tuned: bool,
@@ -1242,6 +1267,8 @@ pub(crate) struct Connection {
     // measurement sets it to `rcv_scaling` (n0bw decision Q2), so the
     // frames of a window offered before then have room for their overhead.
     rcv_limit_scaling: (u32, u32),
+    // Window clamp and corresponding byte limit at the measured scaling.
+    rcv_memory_limit: core::cell::Cell<(usize, usize)>,
     // Successful data output only; ACKs and keepalives do not restart data-idle time.
     last_sent: Instant,
     retransmit_burst: Option<(Seq, u32)>,
@@ -1389,14 +1416,23 @@ impl Connection {
         let storage = Self::storage()?;
         let timestamp_tick = config.timestamp_granularity.tick_in(now, config.timebase);
         let ack_ato = config.ack_timeout_floor();
+        let ack_max = config.timebase.ticks_from_us(config.delayed_ack_us) as u32;
+        let large_ledgers = rack.allocation_bytes() + scoreboard.storage_bytes() > LEDGER_RESERVE;
+        let ip = IpMetadata {
+            source: tuple.local.ip(),
+            destination: tuple.remote.ip(),
+        };
         let connection = Self {
             managed_packet_budget: managed_path.as_ref().map_or(u32::MAX, |path| {
                 path.snapshot.ip_packet_budget().unwrap_or(0)
             }),
             managed_path,
-            send_space_cache: core::cell::Cell::new((0, 0, 0)),
+            send_space: config.send_capacity,
             managed_results: crate::endpoint::ManagedResults::new(pmtud.is_some())?,
             tuple,
+            wire_ports: (u32::from(tuple.local.port()) << 16) | u32::from(tuple.remote.port()),
+            ip,
+            pseudo_header: wire::PseudoHeader::new(ip).map_err(Error::Wire)?,
             zone: None,
             peer_mss: config.mss,
             receive_mss_offer: config.receive_mss_offer(receive_capability),
@@ -1525,6 +1561,8 @@ impl Connection {
             fin_standalone: false,
             syn_pending: true,
             ack_ato,
+            ack_floor: ack_ato as u32,
+            ack_max,
             ack_receive: None,
             ack_engine_initialized: false,
             fast_open_write_pending: false,
@@ -1600,6 +1638,8 @@ impl Connection {
             send_max: send_sizes.max,
             send_expand_pending: false,
             refresh_work: false,
+            large_send_ring: false,
+            large_ledgers,
             receive_tuned,
             receive_max: receive_sizes.max,
             receive_min: receive_sizes.min,
@@ -1617,12 +1657,15 @@ impl Connection {
             },
             rcv_scaling: (1, 1),
             rcv_limit_scaling: (1, 2),
+            rcv_memory_limit: core::cell::Cell::new(RCV_MEMORY_LIMIT_UNSET),
             last_sent: now,
             retransmit_burst: None,
             keepalive_deadline: None,
             keepalive_probes: 0,
         };
-        Ok(Box::write(storage, connection))
+        let mut connection = Box::write(storage, connection);
+        connection.refresh_send_space();
+        Ok(connection)
     }
 
     // A connection's heap home. The ~10 KB value is copied into it once, and
@@ -1790,16 +1833,23 @@ impl Connection {
         (old != storage).then_some((old, storage))
     }
 
-    // Lends the receive queue `frame`, the segment the next input borrows,
-    // so that the payload it holds is the frame itself, not a copy
-    // (`Endpoint::input_frame`).
-    pub(crate) fn lend_frame(&mut self, frame: ntcp_buffer::RxFrame) {
-        self.receive.lend(frame);
-    }
-
-    // Ends `lend_frame`'s lend: the frame unless the queue holds it.
-    pub(crate) fn end_lend(&mut self) -> Option<ntcp_buffer::RxFrame> {
-        self.receive.end_lend()
+    // General input can consume or clear a frame in several phases. Keep
+    // its lender's allocation alive until the last use of the segment.
+    pub(crate) fn with_input_lend<R>(
+        &mut self,
+        backing: Option<&mut Option<crate::RxFrame>>,
+        input: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if let Some(slot) = backing
+            && let Some(frame) = slot.take()
+        {
+            self.receive.lend(frame);
+            let result = input(self);
+            *slot = self.receive.end_lend();
+            result
+        } else {
+            input(self)
+        }
     }
 
     // Whether the receive queue holds a frame whose bytes lie in `bytes`.
@@ -1842,8 +1892,7 @@ impl Connection {
     // expansion nor pressure changes it. It allocates nothing; the next
     // write grows the send ring.
     pub(crate) fn set_send_buffer(&mut self, send: usize) {
-        self.send.set_limit(send);
-        self.config.send_capacity = send;
+        self.set_send_limit(send);
         self.send_tuned = false;
         self.send_expand_pending = false;
         if self.stream_writable(None) {
@@ -1902,6 +1951,10 @@ impl Connection {
                 && matches!(self.state, State::Established | State::CloseWait)
                 && self.stream_writable(None),
         );
+    }
+
+    pub(crate) fn pseudo_header(&self) -> wire::PseudoHeader {
+        self.pseudo_header
     }
 
     pub(crate) fn tuple(&self) -> Tuple {
@@ -1990,6 +2043,7 @@ impl Connection {
         // end offers, as Linux's tcp_send_syn_data clamps it (mss_clamp =
         // advmss unless tcp_fastopen_cache_get has an MSS). The actual peer
         // MSS defaults above stay for a SYN-ACK without the option.
+        self.refresh_send_space();
         let admission_mss = peer_mss.unwrap_or(self.receive_mss_offer);
         // Reserve the entire option budget (MAX_TCP_OPTION_SPACE), including
         // cookies up to 16 bytes. A changed path may clip the SYN further;
@@ -2285,50 +2339,67 @@ impl Connection {
 
     fn transport_ticks_at(&self, now: Instant) -> [u64; 3] {
         let mut ticks = self.transport_ticks;
-        let fin_pending =
-            self.shutdown && self.fin_sequence.is_none_or(|fin| !self.snd_una.after(fin));
-        if !matches!(self.state, State::Closed | State::TimeWait)
-            && (self.send.len() != 0 || fin_pending)
-        {
+        if self.transport_busy() {
             let elapsed = now.saturating_sub(self.now);
             ticks[0] = ticks[0].saturating_add(elapsed);
-            let unsent = self.notsent_bytes();
-            let flight = self.flight();
-            // Linux chronographs prioritize sndbuf over rwnd. Here NOSPACE means
-            // an actual short/blocked core write, and ends at core writable credit.
-            let sndbuf = self.send_backpressured
-                && self.send_space_remaining() == 0
-                && unsent == 0
-                && matches!(self.state, State::Established | State::CloseWait)
-                && flight < self.congestion.cwnd();
-            let next_payload = unsent.min(self.mss) as u32;
-            // Standalone FIN needs one peer-window sequence unit, but no
-            // payload cwnd credit. Match transmit's PRR/recovery admission.
-            let standalone_fin = unsent == 0
-                && self.shutdown
-                && self.fin_sequence.is_none()
-                && matches!(self.state, State::Established | State::CloseWait)
-                && self.prr.is_none_or(|prr| {
-                    self.sack_recovery.map_or_else(
-                        || prr.credit() != 0,
-                        |recovery| {
-                            !recovery.entry_pending
-                                && self.recovery_credit(recovery) >= self.mss as u32
-                        },
-                    )
-                });
-            let rwnd = self.synchronized()
-                && (next_payload != 0
-                    && self.congestion.cwnd().saturating_sub(flight) >= next_payload
-                    && self.snd_wnd.saturating_sub(flight) < next_payload
-                    || standalone_fin && self.snd_wnd.saturating_sub(flight) == 0);
-            if sndbuf {
-                ticks[2] = ticks[2].saturating_add(elapsed);
-            } else if rwnd {
-                ticks[1] = ticks[1].saturating_add(elapsed);
+            if let Some(index) = self.limited_chronograph() {
+                ticks[index] = ticks[index].saturating_add(elapsed);
             }
         }
         ticks
+    }
+
+    fn transport_busy(&self) -> bool {
+        !matches!(self.state, State::Closed | State::TimeWait)
+            && (self.send.len() != 0
+                || self.shutdown && self.fin_sequence.is_none_or(|fin| !self.snd_una.after(fin)))
+    }
+
+    #[inline]
+    fn limited_chronograph(&self) -> Option<usize> {
+        let flight = self.flight();
+        let room = self.snd_wnd.saturating_sub(flight);
+        // A full segment of peer credit also covers a standalone FIN.
+        if !self.send_backpressured && room >= self.mss as u32 && room != 0 {
+            return None;
+        }
+        self.window_or_buffer_limited(flight, room)
+    }
+
+    fn window_or_buffer_limited(&self, flight: u32, room: u32) -> Option<usize> {
+        let unsent = self.notsent_bytes();
+        // Linux chronographs prioritize sndbuf over rwnd. Here NOSPACE means
+        // an actual short/blocked core write, and ends at core writable credit.
+        if self.send_backpressured
+            && self.send_space_remaining() == 0
+            && unsent == 0
+            && matches!(self.state, State::Established | State::CloseWait)
+            && flight < self.congestion.cwnd()
+        {
+            return Some(2);
+        }
+        let next_payload = unsent.min(self.mss) as u32;
+        // Standalone FIN needs one peer-window sequence unit, but no
+        // payload cwnd credit. Match transmit's PRR/recovery admission.
+        let standalone_fin = unsent == 0
+            && self.shutdown
+            && self.fin_sequence.is_none()
+            && matches!(self.state, State::Established | State::CloseWait)
+            && self.prr.is_none_or(|prr| {
+                self.sack_recovery.map_or_else(
+                    || prr.credit() != 0,
+                    |recovery| {
+                        !recovery.entry_pending
+                            && self.recovery_credit(recovery) >= self.mss as u32
+                    },
+                )
+            });
+        let rwnd = self.synchronized()
+            && (next_payload != 0
+                && self.congestion.cwnd().saturating_sub(flight) >= next_payload
+                && room < next_payload
+                || standalone_fin && room == 0);
+        rwnd.then_some(1)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8985#section-1
@@ -2344,11 +2415,9 @@ impl Connection {
     //# on a per-connection basis ("SACK scoreboard" has the same meaning
     //# here as in [RFC6675], Section 3).
     fn rack_enabled(&self) -> bool {
-        self.config.rack
-            && self.sack_receive
-            && self.sack_send
-            && self.rack.valid()
+        self.config.rack & self.sack_receive & self.sack_send
             && self.sack_fallback.is_none()
+            && self.rack.valid()
     }
 
     fn tlp_arm_packets(&self) -> Option<u32> {
@@ -2809,7 +2878,7 @@ impl Connection {
 
     // Holds the new part of `payload`, the stream from `sequence`, within
     // `limit`, the right edge of the window offered.
-    fn receive_payload(
+    fn receive_payload<const IN_ORDER: bool>(
         &mut self,
         sequence: Seq,
         payload: RxPayload<'_>,
@@ -2820,13 +2889,13 @@ impl Connection {
         if !self.rx_timestamps.enabled() || self.input_timestamps == RxPacketTimestamps::default() {
             return self
                 .receive
-                .insert(sequence, payload, fin, push, limit, |_, _| {});
+                .insert_segment::<IN_ORDER>(sequence, payload, fin, push, limit, |_, _| {});
         }
         let base = self.received_read;
         let timestamps = self.input_timestamps;
         let metadata = &mut self.rx_timestamps;
         self.receive
-            .insert(sequence, payload, fin, push, limit, |start, end| {
+            .insert_segment::<IN_ORDER>(sequence, payload, fin, push, limit, |start, end| {
                 if let (Some(start), Some(end)) =
                     (base.checked_add(start as u64), base.checked_add(end as u64))
                 {
@@ -2894,6 +2963,7 @@ impl Connection {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn input_with_metadata(
         &mut self,
         now: Instant,
@@ -2901,31 +2971,45 @@ impl Connection {
         segment: &Segment<'_>,
         metadata: crate::RxPacketMetadata,
     ) -> Result<(), Error> {
-        self.input_with_receive_authorization(now, traffic_class, segment, metadata, None)
+        metadata.timestamps.validate(self.config.timebase)?;
+        metadata.validate_segment(segment)?;
+        self.input_validated(now, traffic_class, segment, &metadata, None)
             .map(|_| ())
     }
 
-    pub(crate) fn input_with_receive_authorization(
+    pub(crate) fn input_validated(
         &mut self,
         now: Instant,
         traffic_class: u8,
         segment: &Segment<'_>,
-        metadata: crate::RxPacketMetadata,
+        metadata: &crate::RxPacketMetadata,
         authorization: Option<crate::endpoint::CrossingSynAuthorization>,
     ) -> Result<bool, Error> {
-        metadata.timestamps.validate(self.config.timebase)?;
-        metadata.validate_segment(segment)?;
+        debug_assert!(metadata.timestamps.validate(self.config.timebase).is_ok());
+        debug_assert!(metadata.validate_segment(segment).is_ok());
+        if authorization.is_none()
+            && metadata.tcp_segment_size.is_none()
+            && metadata.timestamps.software.is_none()
+            && metadata.timestamps.hardware.is_none()
+        {
+            debug_assert_eq!(self.input_timestamps, RxPacketTimestamps::default());
+            debug_assert!(self.input_segment_size.is_none());
+            return self
+                .input_with_traffic_class(now, traffic_class, segment)
+                .map(|()| false);
+        }
         self.input_timestamps = metadata.timestamps;
         self.input_segment_size = metadata.tcp_segment_size;
         let was_early = self.fast_open_early;
-        let result = if authorization.is_some() {
-            self.input_authorized(now, traffic_class, segment, authorization)
+        let authorized = authorization.is_some();
+        let result = if authorized {
+            self.input_authorized(now, traffic_class, segment, authorization, None)
         } else {
             self.input_with_traffic_class(now, traffic_class, segment)
         };
         self.input_timestamps = RxPacketTimestamps::default();
         self.input_segment_size = None;
-        result.map(|()| !was_early && self.fast_open_early)
+        result.map(|()| authorized && !was_early && self.fast_open_early)
     }
 
     pub(crate) fn acknowledged(&self) -> u64 {
@@ -3863,6 +3947,7 @@ impl Connection {
         // A replacement route may add, change or drop a Segment Routing
         // Header: every later packet is sized for the new path's header.
         self.ip_header_len = self.path_ip_header_len(&path);
+        self.refresh_send_space();
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
         let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
         let local = self.pmtud.as_ref().map_or(usize::MAX, |p| {
@@ -3971,6 +4056,7 @@ impl Connection {
     pub(crate) fn set_ip_header_len(&mut self, len: u16) {
         if self.ip_header_len != len {
             self.ip_header_len = len;
+            self.refresh_send_space();
             self.refresh_path_mss();
         }
     }
@@ -4442,6 +4528,7 @@ impl Connection {
         let decreased = effective < self.mss;
         let blocked = !self.stream_writable(None);
         self.mss = effective;
+        self.refresh_send_space();
         // A new segment size moves C; reopened room is writable as after an ACK.
         if blocked && self.stream_writable(None) {
             self.send_backpressured = false;
@@ -4490,7 +4577,15 @@ impl Connection {
     }
 
     fn advance_checked_time(&mut self, now: Instant) {
-        self.transport_ticks = self.transport_ticks_at(now);
+        // Only a running chronograph has a counter to update. Both move
+        // across the state transition using the same pre-transition time.
+        if self.transport_busy() {
+            let elapsed = now - self.now;
+            self.transport_ticks[0] = self.transport_ticks[0].saturating_add(elapsed);
+            if let Some(index) = self.limited_chronograph() {
+                self.transport_ticks[index] = self.transport_ticks[index].saturating_add(elapsed);
+            }
+        }
         if self.timestamps_stale(now) {
             self.sample = None;
             self.last_timestamp_sent_at = None;
@@ -4817,6 +4912,7 @@ impl Connection {
             .max(1)
             .min(self.config.send_ip_payload_limit - 20 - if self.timestamps { 12 } else { 0 })
             as usize;
+        self.refresh_send_space();
         self.refresh_path_mss();
         self.congestion
             .set_initial_mss(self.mss as u32, self.syn_loss_detected);
@@ -4865,7 +4961,7 @@ impl Connection {
             self.receive_used = count;
             return false;
         }
-        let outcome = self.receive_payload(
+        let outcome = self.receive_payload::<false>(
             start,
             RxPayload::Borrowed(&syn.payload[..count]),
             fin,
@@ -5058,7 +5154,7 @@ impl Connection {
         if self.config.adaptive_ack {
             self.ack_receive = Some((self.now, false));
             if self.ack_engine_initialized {
-                self.ack_ato = self.config.ack_timeout_floor();
+                self.ack_ato = u64::from(self.ack_floor);
                 self.ack_quick = self.adaptive_quick_budget();
             }
         }
@@ -5178,7 +5274,7 @@ impl Connection {
         self.fast_open_write_pending = false;
         self.ack_interactive = false;
         self.ack_quick = 0;
-        self.ack_ato = self.config.ack_timeout_floor();
+        self.ack_ato = u64::from(self.ack_floor);
         self.challenge_ack_pending = false;
         self.retx_pending = false;
         self.probe_pending = false;
@@ -5585,10 +5681,11 @@ impl Connection {
     // connection whose writes never needed more (a request/response one)
     // reallocates nothing per exchange.
     pub(crate) fn ledgers_reclaimable(&self) -> bool {
-        self.send.len() == 0
-            && self.rack.len() == 0
-            && self.scoreboard.ranges().is_empty()
-            && self.rack.allocation_bytes() + self.scoreboard.storage_bytes() > LEDGER_RESERVE
+        debug_assert_eq!(
+            self.large_ledgers,
+            self.rack.allocation_bytes() + self.scoreboard.storage_bytes() > LEDGER_RESERVE
+        );
+        self.large_ledgers && self.send.len() == 0 && self.rack.len() == 0 && self.scoreboard.is_empty()
     }
 
     // Whether the send ring holds more than SEND_RING_RESERVE with nothing
@@ -5599,7 +5696,11 @@ impl Connection {
     // first growth step, send_ring_target) stays, so request/response
     // traffic reallocates nothing per exchange.
     pub(crate) fn send_ring_reclaimable(&self) -> bool {
-        self.send.len() == 0 && self.send.storage_bytes() > SEND_RING_RESERVE
+        debug_assert_eq!(
+            self.large_send_ring,
+            self.send.storage_bytes() > SEND_RING_RESERVE
+        );
+        self.large_send_ring && self.send.len() == 0
     }
 
     // Frees the drained send ring (`send_ring_reclaimable`); nothing
@@ -5607,6 +5708,7 @@ impl Connection {
     // again.
     pub(crate) fn reclaim_send_ring(&mut self) {
         self.send.release();
+        self.large_send_ring = false;
     }
 
     #[cfg(test)]
@@ -5624,6 +5726,7 @@ impl Connection {
     pub(crate) fn reclaim_ledgers(&mut self) {
         self.rack.release();
         self.scoreboard.release();
+        self.large_ledgers = false;
     }
 
     // What an ACK's SACK splits are held to: the queued payload and
@@ -5646,7 +5749,8 @@ impl Connection {
     pub(crate) fn refresh_work(&self) -> bool {
         debug_assert!(self.refresh_work || !self.refresh_work_held());
         self.refresh_work
-            || self.send.len() == 0 && (self.send_ring_reclaimable() || self.ledgers_reclaimable())
+            || (self.large_send_ring | self.large_ledgers)
+                && (self.send_ring_reclaimable() || self.ledgers_reclaimable())
             || self.receive_spare_reclaimable()
     }
 
@@ -5790,8 +5894,7 @@ impl Connection {
         }
         let limit = (self.send.len() + self.allocated_send_room()).max(self.send_min);
         if limit < self.config.send_capacity {
-            self.config.send_capacity = limit;
-            self.send.set_limit(limit);
+            self.set_send_limit(limit);
         }
     }
 
@@ -5809,8 +5912,7 @@ impl Connection {
             .max(self.rack.reordering as usize + 1);
         let limit = segments.saturating_mul(2 * mss).min(self.send_max);
         if limit > self.config.send_capacity {
-            self.config.send_capacity = limit;
-            self.send.set_limit(limit);
+            self.set_send_limit(limit);
         }
     }
 
@@ -5862,6 +5964,12 @@ impl Connection {
     // `mss` already carries the fixed IP and TCP headers, negotiated
     // timestamps and the user, local and path ceilings. Fast Open installs
     // a cached or default peer MSS before the SYN-ACK updates `mss`.
+    fn set_send_limit(&mut self, limit: usize) {
+        self.config.send_capacity = limit;
+        self.send.set_limit(limit);
+        self.refresh_send_space();
+    }
+
     fn send_quantum(&self) -> usize {
         let base = if self.tuple.local.is_ipv4() { 20 } else { 40 };
         let options = usize::from(self.ip_header_len - base) + if self.timestamps { 12 } else { 0 };
@@ -5887,18 +5995,23 @@ impl Connection {
     // a raw Endpoint keeps B. Derived on demand, so every PMTU, MSS, header
     // and capacity change applies before the next admission.
     pub(crate) fn send_space(&self) -> usize {
-        if self.managed_path.is_none() {
-            return self.config.send_capacity;
+        debug_assert_eq!(self.send_space, self.calculate_send_space());
+        self.send_space
+    }
+
+    // Only a buffer resize, MSS negotiation or a change of IP path can
+    // alter the usable space. Reads of it in write admission, poll and
+    // output selection all use this same configured limit.
+    fn refresh_send_space(&mut self) {
+        self.send_space = self.calculate_send_space();
+    }
+
+    fn calculate_send_space(&self) -> usize {
+        if self.managed_path.is_some() {
+            rounded_send_space(self.config.send_capacity, self.send_quantum())
+        } else {
+            self.config.send_capacity
         }
-        let capacity = self.config.send_capacity;
-        let quantum = self.send_quantum();
-        let (previous_capacity, previous_quantum, space) = self.send_space_cache.get();
-        if capacity == previous_capacity && quantum == previous_quantum {
-            return space;
-        }
-        let space = rounded_send_space(capacity, quantum);
-        self.send_space_cache.set((capacity, quantum, space));
-        space
     }
 
     // Send usage, what writes are admitted against and what
@@ -5967,6 +6080,12 @@ impl Connection {
     // `stream_writable` with send usage `usage` and send space `space`.
     #[inline]
     fn writable_with(&self, lowat: Option<u32>, usage: usize, space: usize) -> bool {
+        // Send usage includes every queued byte. An empty queue clears
+        // any positive NOTSENT_LOWAT and the stream's space threshold.
+        if usage == 0 {
+            debug_assert_eq!(self.send.len(), 0);
+            return space != 0 && lowat != Some(0);
+        }
         usage < space
             && space - usage >= usage / 2
             && lowat
@@ -6228,7 +6347,10 @@ impl Connection {
         // The ring grows in place, last: a failure leaves the ledgers staged
         // aside to drop, and the queued bytes as they were.
         if grow_ring {
-            self.send.grow(limit).map_err(|_| staged)?;
+            let result = self.send.grow(limit);
+            // One ring may have grown even if the other allocation failed.
+            self.large_send_ring = self.send.storage_bytes() > SEND_RING_RESERVE;
+            result.map_err(|_| staged)?;
         }
         if let Some(rack) = rack {
             self.rack.commit_growth(rack, target);
@@ -6236,6 +6358,8 @@ impl Connection {
         if let Some(scoreboard) = scoreboard {
             self.scoreboard = scoreboard;
         }
+        self.large_ledgers =
+            self.rack.allocation_bytes() + self.scoreboard.storage_bytes() > LEDGER_RESERVE;
         Ok(())
     }
 
@@ -6254,7 +6378,9 @@ impl Connection {
         }
         self.send
             .prepare_shared(payload, peak_room)
-            .map_err(|_| Error::NoMemory)
+            .map_err(|_| Error::NoMemory)?;
+        self.large_send_ring = self.send.storage_bytes() > SEND_RING_RESERVE;
+        Ok(())
     }
 
     pub(crate) fn write_shared(
@@ -6526,6 +6652,11 @@ impl Connection {
     }
 
     pub(crate) fn read(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        self.read_stream(out).map(|(count, _)| count)
+    }
+
+    // The second result records a new immediate window update.
+    pub(crate) fn read_stream(&mut self, out: &mut [u8]) -> Result<(usize, bool), Error> {
         if self.read_closed {
             return Err(Error::InvalidState);
         }
@@ -6543,32 +6674,40 @@ impl Connection {
         if self.handshake_pending() && !self.fast_open_early {
             return Err(Error::WouldBlock);
         }
-        let count = self.receive.read(out);
-        self.receive_used -= count;
-        if count == 0 && !self.receive.eof() {
+        if self.receive.readable() == 0 && !self.receive.eof() {
             return Err(Error::WouldBlock);
         }
+        let count = self.receive.read(out);
+        self.receive_used -= count;
         self.received_read = self.received_read.saturating_add(count as u64);
         self.rx_timestamps.consumed(self.received_read);
-        if count != 0 {
-            self.read_window_update();
-        }
-        Ok(count)
+        let update = count != 0 && self.read_window_update();
+        Ok((count, update))
     }
 
     // A read made room: ACK now if the window it opens is worth an update.
-    fn read_window_update(&mut self) {
+    fn read_window_update(&mut self) -> bool {
         if self.receive.eof() || self.ack_pending && self.ack_deadline.is_none() {
-            return;
+            return false;
         }
         // Only credit that an ordinary ACK can actually offer is useful: the
         // free space may exceed the wire cap, or be below a scale unit.
-        let shift = if self.scaling { self.local_scale } else { 0 };
-        let credit = (u32::from(self.advertised_window(false)) << shift)
-            .saturating_sub(self.receive_window());
-        if credit >= self.read_window_threshold() {
-            self.immediate_ack();
+        let old = self.receive_window();
+        let threshold = self.read_window_threshold();
+        // Even a fully drained queue cannot open more than the clamp and
+        // receive slow-start threshold allow. Most reads replace only a
+        // small part of the last advertised window.
+        let ceiling = self.config.receive_capacity.min(self.rcv_ssthresh as usize) as u32;
+        if ceiling.saturating_sub(old) < threshold {
+            return false;
         }
+        let shift = if self.scaling { self.local_scale } else { 0 };
+        let credit = (u32::from(self.advertised_window(false)) << shift).saturating_sub(old);
+        if credit >= threshold {
+            self.immediate_ack();
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -6753,8 +6892,12 @@ impl Connection {
     fn measure_receive_scaling(&mut self, size: usize, len: usize, truesize: usize) {
         let rcv_mss = usize::from(self.received_mss.value(self.receive_mss()));
         if size > rcv_mss && len != 0 && truesize != 0 {
-            self.rcv_scaling = (len as u32, (truesize + RX_ENTRY_TRUESIZE) as u32);
-            self.rcv_limit_scaling = self.rcv_scaling;
+            let ratio = (len as u32, (truesize + RX_ENTRY_TRUESIZE) as u32);
+            if self.rcv_limit_scaling != ratio {
+                self.rcv_memory_limit.set(RCV_MEMORY_LIMIT_UNSET);
+            }
+            self.rcv_scaling = ratio;
+            self.rcv_limit_scaling = ratio;
         }
     }
 
@@ -6818,9 +6961,16 @@ impl Connection {
     // one 2 KiB skb (TCP_SKB_MIN_TRUESIZE, 2048 + 256 on x86_64), to which
     // Linux clamps every SO_RCVBUF.
     pub(crate) fn receive_limit(&self) -> usize {
+        let capacity = self.config.receive_capacity;
+        let (clamp, limit) = self.rcv_memory_limit.get();
+        if clamp == capacity {
+            return limit;
+        }
         let (len, truesize) = self.rcv_limit_scaling;
-        ((self.config.receive_capacity as u64 * u64::from(truesize) / u64::from(len)) as usize)
-            .max(SOCK_MIN_RCVBUF)
+        let limit = ((capacity as u64 * u64::from(truesize) / u64::from(len)) as usize)
+            .max(SOCK_MIN_RCVBUF);
+        self.rcv_memory_limit.set((capacity, limit));
+        limit
     }
 
     // Whether receive memory below tcp_rmem[0] (always granted under
@@ -6835,15 +6985,21 @@ impl Connection {
     // it, prune (`prune_queue`), then drop out-of-order data until the
     // budget has room. False if the segment cannot be taken.
     fn try_rmem_schedule(&mut self, seq: Seq, incoming: usize) -> bool {
+        let queued = self.receive.rmem();
+        if incoming <= self.receive_room && (queued == 0 || queued <= self.receive_limit()) {
+            return true;
+        }
+        self.prune_for_receive(seq, incoming)
+    }
+
+    #[cold]
+    fn prune_for_receive(&mut self, seq: Seq, incoming: usize) -> bool {
         let storage = self.receive.storage();
         // The Endpoint's room for this input, plus what pruning freed.
         let room = |c: &Self| {
             c.receive_room
                 .saturating_add(storage.saturating_sub(c.receive.storage()))
         };
-        if self.receive.rmem() <= self.receive_limit() && incoming <= room(self) {
-            return true;
-        }
         if !self.prune_queue(seq) {
             return false;
         }
@@ -7253,7 +7409,17 @@ impl Connection {
         traffic_class: u8,
         segment: &Segment<'_>,
     ) -> Result<(), Error> {
-        self.input_authorized(now, traffic_class, segment, None)
+        self.input_authorized(now, traffic_class, segment, None, None)
+    }
+
+    pub(crate) fn input_backed_no_metadata(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        backing: Option<&mut Option<crate::RxFrame>>,
+    ) -> Result<(), Error> {
+        self.input_authorized(now, traffic_class, segment, None, backing)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
@@ -7265,15 +7431,64 @@ impl Connection {
         traffic_class: u8,
         segment: &Segment<'_>,
         authorization: Option<crate::endpoint::CrossingSynAuthorization>,
+        backing: Option<&mut Option<crate::RxFrame>>,
     ) -> Result<(), Error> {
         self.accepted_metadata = false;
-        self.check_time(now)?;
+        self.update_time(now)?;
         // Supersede the previous packet's D-SACK even when this checked arrival
         // is later dropped. Endpoint rejects checksum-invalid packets before
         // this boundary; output failure alone must not consume the report.
         self.receive.clear_dsack();
-        self.update_time(now)?;
         self.retransmit_burst = None;
+
+        // An ordinary in-order ACK or data segment passes the sequence,
+        // state and PAWS checks below. Limit prediction to text that fits
+        // the advertised window and arrives on a receive queue without gaps.
+        let h = segment.header;
+        let seq = Seq(h.sequence);
+        let ack = Seq(h.acknowledgment);
+        let established = self.state == State::Established && h.flags & !PSH == ACK;
+        if let Some(window) =
+            (established && seq == self.receive.next()).then(|| self.receive_window())
+            && segment.payload.len() <= window as usize
+            && self.receive.can_append()
+            && self.snd_nxt.at_or_after(ack)
+            && ack.at_or_after(self.snd_una.wrapping_add(0u32.wrapping_sub(self.max_snd_wnd)))
+            && (!self.timestamps
+                || segment.options.timestamps.is_some_and(|(ts, _)| {
+                    Seq(ts).at_or_after(Seq(self.ts_recent))
+                        && Seq(ts).at_or_after(Seq(self.ts_latest))
+                }))
+        {
+            if self.timestamps {
+                let (ts, _) = segment.options.timestamps.unwrap();
+                self.ts_latest = ts;
+                if self.last_ack_sent.at_or_after(seq) {
+                    self.ts_recent = ts;
+                    self.ts_recent_at = now;
+                }
+            }
+            if self.read_closed && backing.is_some() {
+                self.with_input_lend(backing, |c| {
+                    c.input_connected::<true>(now, traffic_class, segment, false, window, None);
+                });
+            } else {
+                self.input_connected::<true>(now, traffic_class, segment, false, window, backing);
+            }
+            return Ok(());
+        }
+        self.with_input_lend(backing, |c| {
+            c.input_slow(now, traffic_class, segment, authorization)
+        })
+    }
+
+    fn input_slow(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        authorization: Option<crate::endpoint::CrossingSynAuthorization>,
+    ) -> Result<(), Error> {
         if self.state == State::Closed {
             self.dropped = Some(DropReason::TcpClose);
             return Ok(());
@@ -7603,7 +7818,7 @@ impl Connection {
             self.establish();
             self.last_received = now;
             self.immediate_ack();
-            self.receive_text(seq.wrapping_add(1), segment);
+            self.receive_text::<false>(seq.wrapping_add(1), segment, self.receive_window(), None);
             if self.sack_send && segment.payload.is_empty() {
                 // Linux-compatible D-SACK of the repeated SYN sequence only,
                 // not rejected Fast Open text. Preserve any payload D-SACK.
@@ -7971,6 +8186,22 @@ impl Connection {
         if self.state == State::TimeWait {
             return Ok(());
         }
+        self.input_connected::<false>(now, traffic_class, segment, response_handshake, window, None);
+        Ok(())
+    }
+
+    fn input_connected<const IN_ORDER: bool>(
+        &mut self,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        response_handshake: bool,
+        window: u32,
+        backing: Option<&mut Option<crate::RxFrame>>,
+    ) {
+        let h = segment.header;
+        let seq = Seq(h.sequence);
+        let ack = Seq(h.acknowledgment);
         self.accepted_metadata = true;
         self.last_received = now;
         self.keepalive_probes = 0;
@@ -8019,9 +8250,13 @@ impl Connection {
         // ECN never bypasses sequence, RST/SYN, or ACK-range validation.
         // Old ACKs cannot signal sender congestion, but their accepted duplex
         // data still carries receive-side CE/CWR (RFC 3168 section 6.1.3).
-        let ece = self.ecn_feedback() && ack.at_or_after(self.snd_una) && h.flags & ECE != 0;
-        if self.ecn_feedback() {
-            if h.flags & CWR != 0 && self.ecn_ce_end.is_none_or(|end| seq.at_or_after(end)) {
+        debug_assert!(!IN_ORDER || (!response_handshake && h.flags & !PSH == ACK));
+        let ece = !IN_ORDER && h.flags & ECE != 0 && self.ecn_feedback() && ack.at_or_after(self.snd_una);
+        if (!IN_ORDER || traffic_class & 3 == 3) && self.ecn_feedback() {
+            if !IN_ORDER
+                && h.flags & CWR != 0
+                && self.ecn_ce_end.is_none_or(|end| seq.at_or_after(end))
+            {
                 self.ecn_echo = false;
                 self.ecn_ce_end = None;
             }
@@ -8045,6 +8280,33 @@ impl Connection {
                 self.immediate_ack();
             }
         }
+        let advancing = ack.after(self.snd_una);
+        if !self.process_ack::<IN_ORDER>(segment, ece, response_handshake, advancing) {
+            return;
+        }
+        self.receive_text::<IN_ORDER>(seq, segment, window, backing);
+        // MSG_MORE is a per-call hint, unlike persistent TCP_CORK. Linux's
+        // ACK-driven output uses socket Nagle policy, releasing a MORE tail
+        // without inventing PUSH: once Nagle (Minshall) no longer holds it.
+        if advancing && self.more && !self.cork && (!self.config.nagle || !self.minshall_check()) {
+            self.release_corked();
+        }
+        self.arm_work_with_probe(advancing);
+    }
+
+    // Returns whether the connection can still receive the segment's text.
+    #[inline]
+    fn process_ack<const IN_ORDER: bool>(
+        &mut self,
+        segment: &Segment<'_>,
+        ece: bool,
+        response_handshake: bool,
+        advancing: bool,
+    ) -> bool {
+        let h = segment.header;
+        let now = self.now;
+        let seq = Seq(h.sequence);
+        let ack = Seq(h.acknowledgment);
         self.congestion.observe_ack(ack);
         let old_window = self.snd_wnd;
         // Compute the existing WL1/WL2 admission once. CUBIC needs the
@@ -8053,11 +8315,105 @@ impl Connection {
         let window_update = ack.at_or_after(self.snd_una)
             && (seq.after(self.wl1) || seq == self.wl1 && ack.at_or_after(self.wl2));
         let was_blocked = old_window == 0 || self.flight() > old_window;
-        let prr_window_before = self.prr.map(|_| self.congestion.cwnd());
-        let advancing = ack.after(self.snd_una);
+        let new_window = u32::from(h.window) << if self.scaling { self.peer_scale } else { 0 };
+        let send_window = if window_update { new_window } else { old_window };
         if advancing {
             self.tlp_pending = false;
         }
+        // A forward ACK on a flight with neither holes nor congestion
+        // feedback only retires data and grants ordinary congestion credit.
+        // A nonadvancing ACK carrying data supplies no duplicate-ACK signal.
+        let drained = ack == self.snd_nxt;
+        if (IN_ORDER || self.state == State::Established && !response_handshake && !ece)
+            && self.fin_sequence.is_none()
+            && self.rack_enabled()
+            && self.scoreboard.is_empty()
+            && !segment.carries_sack()
+            && self.sack_recovery.is_none()
+            && self.sack_post_rto.is_none()
+            && self.prr.is_none()
+            && !self.congestion.in_recovery()
+            && self.congestion.ecn_prr_end().is_none()
+            && self.ecn_backoff.is_none()
+            && self.ecn_pause.is_none()
+            && self.tlp_flight.is_none()
+            && self.tlp_end.is_none()
+            && let Some(count) = self.rack.in_order_ack(
+                self.snd_una,
+                ack,
+                self.snd_nxt,
+                advancing,
+                !segment.payload.is_empty(),
+            )
+        {
+            self.scoreboard.acknowledge_empty(ack);
+            self.refresh_work |= self.rack.split_refusals != 0;
+            if advancing {
+                let echo = segment.options.timestamps.map(|ts| ts.1);
+                self.rack.acknowledge_in_order(
+                    count,
+                    ack,
+                    self.snd_nxt,
+                    &mut self.scoreboard,
+                    now,
+                    echo.map(|ts| ts.wrapping_sub(self.timestamp_offset)),
+                    self.timestamps.then_some(self.config.timestamp_granularity),
+                    self.mss as u32,
+                    false,
+                );
+                if drained {
+                    self.accept_ack_inner::<true>(ack, false, echo, send_window, false, 0);
+                } else {
+                    self.accept_ack(ack, false, echo, send_window, false, 0);
+                }
+            } else {
+                debug_assert_eq!(count, 0);
+                self.rack.acknowledge_unchanged(ack, &mut self.scoreboard);
+                self.reset_limited_transmit();
+                self.congestion.reset_duplicate_acks();
+            }
+            if window_update {
+                self.apply_send_window(seq, ack, new_window, was_blocked);
+            }
+            debug_assert!(!drained || self.rack.empty_valid());
+            self.rack.deadline = None;
+            return true;
+        }
+        self.process_recovery_ack(
+            segment,
+            ece,
+            response_handshake,
+            advancing,
+            AckWindow {
+                prior: old_window,
+                offered: new_window,
+                update: window_update,
+                was_blocked,
+            },
+        )
+    }
+
+    #[inline(never)]
+    fn process_recovery_ack(
+        &mut self,
+        segment: &Segment<'_>,
+        ece: bool,
+        response_handshake: bool,
+        advancing: bool,
+        window: AckWindow,
+    ) -> bool {
+        let h = segment.header;
+        let now = self.now;
+        let seq = Seq(h.sequence);
+        let ack = Seq(h.acknowledgment);
+        let AckWindow {
+            prior: old_window,
+            offered: new_window,
+            update: window_update,
+            was_blocked,
+        } = window;
+        let send_window = if window_update { new_window } else { old_window };
+        let prr_window_before = self.prr.map(|_| self.congestion.cwnd());
         let ecn_one = ece
             && self.flight() != 0
             && (if self.congestion.ecn_prr_end().is_some() {
@@ -8110,7 +8466,7 @@ impl Connection {
         let mut dsack = false;
         let mut reo_grew = false;
         let tlp_flight = self.data_flight();
-        let had_sack_advice = !self.scoreboard.ranges().is_empty();
+        let had_sack_advice = !self.scoreboard.is_empty();
         //= https://www.rfc-editor.org/rfc/rfc3042#section-2
         //= reason=Scoreboard update must add previously unknown sent bytes without overflow. Empty/repeated SACK grants no new credit; fresh SACK including duplex ACK is asserted by sack_limited_transmit_requires_new_evidence_including_duplex_ack.
         //# Note: If the connection is using selective acknowledgments [RFC2018], the data sender MUST
@@ -8134,7 +8490,7 @@ impl Connection {
         self.rack.ack_sample = None;
         let sack_evidence = if sack_allowed {
             // Only blocks can SACK bytes inside the PTB bounds.
-            let ptb_sack = if segment.options.sack_blocks.iter().any(Option::is_some) {
+            let ptb_sack = if segment.carries_sack() {
                 self.ptb_sack_candidates(&segment.options.sack_blocks)
             } else {
                 [None; 4]
@@ -8225,8 +8581,7 @@ impl Connection {
             segment.payload.is_empty()
                 && h.flags & FIN == 0
                 && ack == self.snd_una
-                && old_window
-                    == (u32::from(h.window) << if self.scaling { self.peer_scale } else { 0 }),
+                && old_window == new_window,
         );
         // RFC 8985 section 7.4.2: an ACK beyond a retransmitted probe without
         // duplicate-delivery evidence needs the same loss/ECN epoch guards as
@@ -8250,11 +8605,7 @@ impl Connection {
                 ack,
                 ece || tlp_reduced,
                 segment.options.timestamps.map(|ts| ts.1),
-                if window_update {
-                    u32::from(h.window) << if self.scaling { self.peer_scale } else { 0 }
-                } else {
-                    old_window
-                },
+                send_window,
                 response_handshake,
                 growth_discount,
             );
@@ -8332,45 +8683,10 @@ impl Connection {
             self.rto_deadline = Some(self.rto_deadline.map_or(deadline, |rto| rto.max(deadline)));
         }
         if self.state == State::Closed || self.state == State::TimeWait {
-            return Ok(());
+            return false;
         }
-        //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
-        //# If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK)), set
-        //# SND.WND <- SEG.WND, set SND.WL1 <- SEG.SEQ, and set SND.WL2 <- SEG.ACK.
         if window_update {
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
-            //= reason=Changed WS on established data and ACK is ignored: negotiated shifts and subsequent effective incoming/outgoing windows remain fixed, including zero, nonzero and absent negotiation.
-            //# A Window Scale option in a segment
-            //# without a SYN bit MUST be ignored.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
-            //= reason=Incoming non-SYN SEG.WND is expanded with fixed negotiated peer_scale; raw SYN values stay unscaled.
-            //# o  The window field (SEG.WND) in the header of every incoming
-            //# segment, with the exception of <SYN> segments, MUST be left-
-            //# shifted by Snd.Wind.Shift bits before updating SND.WND:
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
-            //= reason=snd_wnd and receive acceptance credit are 32-bit; internal/congestion bytes are not scaled header values.
-            //# The scale factor applies only to the window field as transmitted in
-            //# the TCP header; each TCP using extended windows will maintain the
-            //# window values locally as 32-bit numbers.
-            self.snd_wnd = (h.window as u32) << if self.scaling { self.peer_scale } else { 0 };
-            // Also freeze CUBIC on accepted non-advancing window updates;
-            // otherwise a zero-window interval could age the cubic curve.
-            self.congestion.on_window_update(now, self.snd_wnd);
-            //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
-            //= reason=Initial SYN window is unscaled; accepted updates are scaled and monotonically maxed. Scaled growth/shrink/zero history and ACK lower bounds across wrap are asserted.
-            //# A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
-            // Actor/condition: TCP endpoint; largest historically received scaled sender window.
-            self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
-            self.wl1 = seq;
-            self.wl2 = ack;
-            self.shrink_unanswered_since = None;
-            // Only current, acceptable ACK/window feedback proves responsiveness.
-            // Old ACKs, stale window updates and rejected controls cannot prolong
-            // persist or shrink liveness. Reopening also gets a fresh timeout.
-            if was_blocked || self.flight() > self.snd_wnd {
-                self.progress_at = now;
-                self.persist_unanswered_since = None;
-            }
+            self.apply_send_window(seq, ack, new_window, was_blocked);
         }
         // Permission to receive SACK is directional, not proof that this
         // peer supplies it. Retained advice keeps RFC6675 active across ACKs
@@ -8398,9 +8714,9 @@ impl Connection {
         }
         // SACK evidence first: an ACK with none and no advice held (the
         // common case) tests nothing else.
-        if (!self.scoreboard.ranges().is_empty()
+        if (!self.scoreboard.is_empty()
             || self.sack_recovery.is_some()
-            || segment.options.sack_blocks.iter().any(Option::is_some))
+            || segment.carries_sack())
             && self.sack_recovery_enabled()
             && !self.congestion.in_fast_recovery()
         {
@@ -8568,15 +8884,46 @@ impl Connection {
             }
             self.prr = Some(prr);
         }
-        self.receive_text(seq, segment);
-        // MSG_MORE is a per-call hint, unlike persistent TCP_CORK. Linux's
-        // ACK-driven output uses socket Nagle policy, releasing a MORE tail
-        // without inventing PUSH: once Nagle (Minshall) no longer holds it.
-        if advancing && self.more && !self.cork && (!self.config.nagle || !self.minshall_check()) {
-            self.release_corked();
+        true
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
+    //# If (SND.WL1 < SEG.SEQ or (SND.WL1 = SEG.SEQ and SND.WL2 =< SEG.ACK)), set
+    //# SND.WND <- SEG.WND, set SND.WL1 <- SEG.SEQ, and set SND.WL2 <- SEG.ACK.
+    fn apply_send_window(&mut self, seq: Seq, ack: Seq, window: u32, was_blocked: bool) {
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.2
+        //= reason=Changed WS on established data and ACK is ignored: negotiated shifts and subsequent effective incoming/outgoing windows remain fixed, including zero, nonzero and absent negotiation.
+        //# A Window Scale option in a segment
+        //# without a SYN bit MUST be ignored.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+        //= reason=Incoming non-SYN SEG.WND is expanded with fixed negotiated peer_scale; raw SYN values stay unscaled.
+        //# o  The window field (SEG.WND) in the header of every incoming
+        //# segment, with the exception of <SYN> segments, MUST be left-
+        //# shifted by Snd.Wind.Shift bits before updating SND.WND:
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.3
+        //= reason=snd_wnd and receive acceptance credit are 32-bit; internal/congestion bytes are not scaled header values.
+        //# The scale factor applies only to the window field as transmitted in
+        //# the TCP header; each TCP using extended windows will maintain the
+        //# window values locally as 32-bit numbers.
+        self.snd_wnd = window;
+        // Also freeze CUBIC on accepted non-advancing window updates;
+        // otherwise a zero-window interval could age the cubic curve.
+        self.congestion.on_window_update(self.now, self.snd_wnd);
+        //= https://www.rfc-editor.org/rfc/rfc5961#section-5.2
+        //= reason=Initial SYN window is unscaled; accepted updates are scaled and monotonically maxed. Scaled growth/shrink/zero history and ACK lower bounds across wrap are asserted.
+        //# A new state variable MAX.SND.WND is defined as the largest window that the local sender has ever received from its peer. This window may be scaled to a value larger than 65,535 bytes ([RFC1323]).
+        // Actor/condition: TCP endpoint; largest historically received scaled sender window.
+        self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
+        self.wl1 = seq;
+        self.wl2 = ack;
+        self.shrink_unanswered_since = None;
+        // Only current, acceptable ACK/window feedback proves responsiveness.
+        // Old ACKs, stale window updates and rejected controls cannot prolong
+        // persist or shrink liveness. Reopening also gets a fresh timeout.
+        if was_blocked || self.flight() > self.snd_wnd {
+            self.progress_at = self.now;
+            self.persist_unanswered_since = None;
         }
-        self.arm_work_with_probe(advancing);
-        Ok(())
     }
 
     fn data_high(&self) -> Seq {
@@ -8774,10 +9121,36 @@ impl Connection {
         response_handshake: bool,
         growth_discount: u32,
     ) {
+        self.accept_ack_inner::<false>(
+            ack,
+            ece,
+            echo,
+            send_window,
+            response_handshake,
+            growth_discount,
+        );
+    }
+
+    fn accept_ack_inner<const DRAINED: bool>(
+        &mut self,
+        ack: Seq,
+        ece: bool,
+        echo: Option<u32>,
+        send_window: u32,
+        response_handshake: bool,
+        growth_discount: u32,
+    ) {
+        debug_assert!(
+            !DRAINED
+                || (self.state == State::Established
+                    && self.snd_nxt == ack
+                    && self.fin_sequence.is_none()
+                    && self.rack.empty_valid())
+        );
         if !response_handshake {
             self.congestion.observe_ack_advance(self.snd_una, ack);
         }
-        let syn_ack = self.snd_una == self.iss && self.handshake_pending();
+        let syn_ack = !DRAINED && self.snd_una == self.iss && self.handshake_pending();
         // A split handshake ACK owns one PMTU observation, at its actual full ACK.
         if self.pmtud.is_some() && !(response_handshake && syn_ack) {
             let cooldown = self.pmtu_cooldown();
@@ -8792,7 +9165,7 @@ impl Connection {
         // When the ledger is available, only its newly delivered complete
         // original qualifies. A scalar RTTM pending across a SACK must not
         // count that same transmission again on its later cumulative ACK.
-        let startup_scalar_allowed = !self.rack.valid();
+        let startup_scalar_allowed = !DRAINED && !self.rack.valid();
         if syn_ack {
             self.syn_delivered = true;
             self.syn_data_acked |=
@@ -8800,10 +9173,13 @@ impl Connection {
             self.syn_data_fully_acked |= self.syn_payload_sent != 0
                 && ack.at_or_after(self.iss.wrapping_add(1 + self.syn_payload_sent as u32));
         }
-        if self.fin_needs_separate_credit && self.fin_sequence.is_some_and(|fin| ack.after(fin)) {
+        if !DRAINED
+            && self.fin_needs_separate_credit
+            && self.fin_sequence.is_some_and(|fin| ack.after(fin))
+        {
             self.fin_delivered = true;
         }
-        if !self.sack_receive || self.handshake_pending() {
+        if !DRAINED && (!self.sack_receive || self.handshake_pending()) {
             let bound = self.split_bound();
             self.rack.acknowledge_within(
                 ack,
@@ -8820,10 +9196,12 @@ impl Connection {
         }
         // Timestamp storage follows cumulative send-buffer reclamation even
         // while SACK inference is suspended below its fallback boundary.
-        self.rack.trim_cumulative(ack);
+        if !DRAINED {
+            self.rack.trim_cumulative(ack);
+        }
         let limited = self
             .limited_end
-            .filter(|&end| self.sack_recovery_enabled() && end.after(ack))
+            .filter(|&end| !DRAINED && self.sack_recovery_enabled() && end.after(ack))
             .map(|end| (end, self.limited_sent.min(end.distance_from(ack))));
         self.reset_limited_transmit();
         if let Some((end, bytes)) = limited {
@@ -8838,11 +9216,14 @@ impl Connection {
             // this burst; a probe-only ACK leaves its accounting open.
             epoch.open = false;
         }
-        let bytes = ack
-            .distance_from(self.send_base)
-            .min(self.send.len() as u32);
-        let bytes = if ack.at_or_after(self.send_base) {
-            bytes
+        let distance = ack.distance_from(self.send_base);
+        let bytes = if DRAINED {
+            // Established and FIN-free: all newly acknowledged sequence
+            // space up to SND.NXT is data in the send buffer.
+            debug_assert!(ack.after(self.send_base) && distance as usize <= self.send.len());
+            distance
+        } else if ack.at_or_after(self.send_base) {
+            distance.min(self.send.len() as u32)
         } else {
             0
         };
@@ -8872,7 +9253,14 @@ impl Connection {
             );
             // sk_stream_write_space: SOCK_NOSPACE clears, and the writer is
             // told, once the space the ACK freed makes it writable.
-            if self.stream_writable(None) {
+            let writable = if DRAINED {
+                // Removing the last ledger entry leaves only payload charged.
+                self.writable_with(None, self.send.len(), self.send_space())
+            } else {
+                self.stream_writable(None)
+            };
+            debug_assert_eq!(writable, self.stream_writable(None));
+            if writable {
                 self.send_backpressured = false;
                 self.events.raise_if(Signal::Writable, !self.shutdown);
             }
@@ -8889,14 +9277,15 @@ impl Connection {
             self.sack_guard = None;
             self.sack_post_rto = None;
         }
-        if !self.sack_recovery_enabled()
+        if !DRAINED
+            && !self.sack_recovery_enabled()
             && self
                 .sack_post_rto
                 .is_some_and(|(_, boundary)| ack.at_or_after(boundary))
         {
             self.sack_post_rto = None;
         }
-        if self.sack_fallback.is_some_and(|end| ack.at_or_after(end)) {
+        if !DRAINED && self.sack_fallback.is_some_and(|end| ack.at_or_after(end)) {
             self.sack_fallback = None;
         }
 
@@ -8974,7 +9363,9 @@ impl Connection {
                 bytes,
                 send_window,
             );
-            self.congestion.discount_ack_growth(growth_discount);
+            if growth_discount != 0 {
+                self.congestion.discount_ack_growth(growth_discount);
+            }
             // Consume at most one fresh raw candidate, independent of the
             // causal-round gate used by the fixed-weight RTO estimator. RACK's
             // ledger excludes incomplete/retransmitted/previously delivered
@@ -8995,15 +9386,19 @@ impl Connection {
                     paced: self.pacing_enabled(),
                 });
         }
-        if !syn_ack
-            && self
-                .congestion
-                .on_ack_with_ecn(ack, bytes, self.data_flight(), ece)
-        {
+        let retransmit = if DRAINED && self.pmtud.is_none() {
+            // The ordinary ACK path already excluded loss and ECN
+            // recovery. Without PMTU feedback these have not changed.
+            self.congestion.on_drained_ack(ack, bytes)
+        } else {
+            let flight = if DRAINED { 0 } else { self.data_flight() };
+            !syn_ack && self.congestion.on_ack_with_ecn(ack, bytes, flight, ece)
+        };
+        if retransmit {
             self.note_probe_loss(ack, false);
             self.retx_pending = true;
         }
-        self.rto_deadline = if self.flight() == 0 {
+        self.rto_deadline = if DRAINED || self.flight() == 0 {
             if self.snd_wnd == 0 && self.persist_interval != 0 {
                 self.persist_deadline = self.rto_deadline;
             }
@@ -9014,7 +9409,7 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# if the FIN segment is now acknowledged, then enter FIN- WAIT-2 and continue
         //# processing in that state.
-        if self.fin_sequence.is_some_and(|fin| ack.after(fin)) {
+        if !DRAINED && self.fin_sequence.is_some_and(|fin| ack.after(fin)) {
             match self.state {
                 State::FinWait1 => self.state = State::FinWait2,
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
@@ -9154,17 +9549,32 @@ impl Connection {
     //= reason=Non-SACK and SACK receivers immediately emit cumulative ACKs after only part of an existing gap is filled, and after full fill; each input produces at most one committed ACK.
     //# To provide feedback to senders recovering from losses, the receiver SHOULD send an immediate
     //# ACK when it receives a data segment that fills in all or part of a gap in the sequence space.
-    fn receive_text(&mut self, seq: Seq, segment: &Segment<'_>) {
+    fn receive_text<const IN_ORDER: bool>(
+        &mut self,
+        seq: Seq,
+        segment: &Segment<'_>,
+        admitted_window: u32,
+        backing: Option<&mut Option<crate::RxFrame>>,
+    ) {
+        debug_assert!(
+            backing.is_none()
+                || IN_ORDER
+                    && !self.read_closed
+                    && self.input_timestamps == RxPacketTimestamps::default()
+        );
         let payload = segment.payload;
         let flags = segment.header.flags & !SYN;
         let urgent = segment
             .header
             .urgent_pointer
             .saturating_sub(u16::from(segment.header.flags & SYN != 0));
-        if !matches!(
-            self.state,
-            State::Established | State::FinWait1 | State::FinWait2
-        ) {
+        debug_assert!(!IN_ORDER || self.state == State::Established);
+        if !IN_ORDER
+            && !matches!(
+                self.state,
+                State::Established | State::FinWait1 | State::FinWait2
+            )
+        {
             // Text after the peer's FIN, or a duplicate of text before it.
             if !payload.is_empty() {
                 let next = self.receive.next();
@@ -9181,15 +9591,25 @@ impl Connection {
         // As Linux's tcp_rcv_established, every segment with a new echo,
         // before its text; only a tuned receive direction uses the estimate.
         if self.receive_tuned
-            && self.state == State::Established
+            && (IN_ORDER || self.state == State::Established)
             && self.timestamps
             && let Some((_, echo)) = segment.options.timestamps
         {
             self.rcv_rtt_measure_ts(echo, payload.len());
         }
-        let next = self.receive.next();
-        let window = self.receive_window();
-        if flags & URG != 0 && !self.read_closed {
+        if payload.is_empty() && flags & (URG | FIN) == 0 {
+            self.events
+                .raise_if(Signal::Pushed, self.receive.take_push());
+            return;
+        }
+        let next = if IN_ORDER { seq } else { self.receive.next() };
+        let window = if IN_ORDER {
+            admitted_window
+        } else {
+            self.receive_window()
+        };
+        debug_assert!(!IN_ORDER || (next == self.receive.next() && window == self.receive_window()));
+        if !IN_ORDER && flags & URG != 0 && !self.read_closed {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
             //# The urgent pointer MUST point to the sequence number of the octet
             //# following the urgent data (MUST-62).
@@ -9216,30 +9636,46 @@ impl Connection {
                 self.events.urgent(Some(end));
             }
         }
-        let skip = if next.after(seq) {
+        let skip = if !IN_ORDER && next.after(seq) {
             (next.distance_from(seq) as usize).min(payload.len())
         } else {
             0
         };
         let start = seq.wrapping_add(skip as u32);
-        let offset = start.distance_from(next);
-        let count = if offset < window {
+        debug_assert!(!IN_ORDER || (start == next && payload.len() <= window as usize));
+        let offset = if IN_ORDER {
+            0
+        } else {
+            start.distance_from(next)
+        };
+        let count = if IN_ORDER {
+            payload.len()
+        } else if offset < window {
             (payload.len() - skip).min((window - offset) as usize)
         } else {
             0
         };
         let fin_position = seq.wrapping_add(payload.len() as u32);
-        let fin = flags & FIN != 0 && fin_position.in_window(next, window) == Some(true);
+        let fin =
+            !IN_ORDER && flags & FIN != 0 && fin_position.in_window(next, window) == Some(true);
         if self.sack_send && (!payload.is_empty() || fin) {
             // A valid FIN-only arrival supersedes the previous duplicate report;
             // FIN itself is not a byte of data for D-SACK.
-            self.receive.record_duplicate(seq, payload.len());
+            if !IN_ORDER {
+                self.receive.record_duplicate(seq, payload.len());
+            } else {
+                debug_assert!(!self.receive.has_sack_blocks());
+            }
             self.sack_omit = false;
         }
         // Receive memory, in Linux's order (tcp_data_queue,
         // tcp_data_queue_ofo): schedule, prune, then refuse.
         if count != 0 {
-            let incoming = self.receive.incoming_truesize(count) + RX_ENTRY_TRUESIZE;
+            let frame_size = backing
+                .as_deref()
+                .and_then(Option::as_ref)
+                .map_or_else(|| self.receive.incoming_truesize(count), crate::RxFrame::truesize);
+            let incoming = frame_size + RX_ENTRY_TRUESIZE;
             if !self.try_rmem_schedule(start, incoming) {
                 if offset != 0 {
                     // tcp_data_queue_ofo: TCPOFODrop.
@@ -9264,14 +9700,31 @@ impl Connection {
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
         //# Segments with higher beginning sequence numbers SHOULD be held for later
         //# processing (SHLD-31).
-        let outcome = self.receive_payload(
-            start,
-            RxPayload::Borrowed(&payload[skip..skip + count]),
-            fin && skip + count == payload.len(),
-            flags & PSH != 0 && skip + count == payload.len(),
-            next.wrapping_add(window),
+        let text = &payload[skip..skip + count];
+        let push = flags & PSH != 0 && skip + count == payload.len();
+        let outcome = backing
+            .and_then(|slot| self.receive.append_backed(slot, text, push))
+            .unwrap_or_else(|| {
+                self.receive_payload::<IN_ORDER>(
+                    start,
+                    RxPayload::Borrowed(text),
+                    fin && skip + count == payload.len(),
+                    push,
+                    next.wrapping_add(window),
+                )
+            });
+        debug_assert!(
+            !IN_ORDER
+                || (!outcome.fin
+                    && !outcome.sack_overflow
+                    && !outcome.out_of_order
+                    && outcome.advanced == (outcome.new_bytes != 0)
+                    && (outcome.refused || outcome.new_bytes == payload.len()))
         );
         self.receive_used += outcome.new_bytes;
+        let size = self
+            .input_segment_size
+            .map_or(payload.len(), |s| usize::from(s.get()));
         // In-sequence data, as Linux's tcp_event_data_recv.
         if self.receive_tuned && offset == 0 && count != 0 && outcome.advanced {
             self.rcv_rtt_measure();
@@ -9280,9 +9733,6 @@ impl Connection {
         // tcp_event_data_recv runs tcp_measure_rcv_mss before
         // tcp_grow_window.
         if offset == 0 && count != 0 && outcome.advanced {
-            let size = self
-                .input_segment_size
-                .map_or(payload.len(), |s| usize::from(s.get()));
             self.measure_receive_scaling(size, outcome.new_bytes, outcome.truesize);
         }
         if self.receive_tuned
@@ -9298,16 +9748,13 @@ impl Connection {
         if outcome.new_bytes != 0 {
             self.last_data_received = self.now;
             let offer = self.receive_mss();
-            let size = self
-                .input_segment_size
-                .map_or(payload.len(), |s| usize::from(s.get()));
             let terminal = flags & (PSH | FIN) != 0 && size == payload.len();
             self.received_mss.observe(size, terminal, offer);
             if self.input_segment_size.is_some() && payload.len() / size >= 2 {
                 self.received_mss.observe(size, false, offer);
             }
         }
-        if outcome.sack_overflow && self.sack_send {
+        if !IN_ORDER && outcome.sack_overflow && self.sack_send {
             self.sack_omit = true;
             self.receive.clear_dsack();
         }
@@ -9342,13 +9789,18 @@ impl Connection {
         }
         self.events
             .raise_if(Signal::Pushed, self.receive.take_push());
-        let advanced = self.receive.next().distance_from(next);
-        self.received_total = self
-            .received_total
-            .saturating_add(advanced.saturating_sub(u32::from(outcome.fin)) as u64);
+        let advanced_data = if IN_ORDER {
+            outcome.new_bytes as u32
+        } else {
+            self.receive
+                .next()
+                .distance_from(next)
+                .saturating_sub(u32::from(outcome.fin))
+        };
+        self.received_total = self.received_total.saturating_add(advanced_data as u64);
         if outcome.advanced {
             self.events.set(Signal::Readable, !self.read_closed);
-            if self.state == State::FinWait2 {
+            if !IN_ORDER && self.state == State::FinWait2 {
                 self.progress_at = self.now;
             }
         }
@@ -9361,7 +9813,8 @@ impl Connection {
         // (tcp_event_data_recv), so a FIN on a connection that received none
         // is acknowledged at once, as is one in FIN-WAIT, which nothing
         // local follows (tcp_fin sends that ACK itself).
-        let fin_awaits_reply = self.config.adaptive_ack
+        let fin_awaits_reply = !IN_ORDER
+            && self.config.adaptive_ack
             && self.ack_engine_initialized
             && outcome.fin
             && self.state == State::Established;
@@ -9378,15 +9831,16 @@ impl Connection {
             //# or 2*RMSS bytes of new data (where RMSS is the MSS specified by the TCP
             //# endpoint receiving the segments to be acknowledged, or the default value
             //# if not specified) (SHLD-19).
-            self.unacked_bytes = self
-                .unacked_bytes
-                .saturating_add(advanced.saturating_sub(u32::from(outcome.fin)));
+            self.unacked_bytes = self.unacked_bytes.saturating_add(advanced_data);
             let rmss = self.receive_mss();
             if outcome.new_bytes != 0 {
                 let segments = self
                     .input_segment_size
                     .filter(|_| {
-                        skip == 0 && count == payload.len() && outcome.new_bytes == payload.len()
+                        IN_ORDER
+                            || skip == 0
+                                && count == payload.len()
+                                && outcome.new_bytes == payload.len()
                     })
                     .map_or(1, |size| {
                         payload
@@ -9397,7 +9851,7 @@ impl Connection {
                 self.unacked_segments = self.unacked_segments.saturating_add(segments);
             } else if !payload.is_empty() {
                 // None of the text was taken (Linux's tcp_data_queue drops).
-                self.dropped = Some(if outcome.refused {
+                self.dropped = Some(if IN_ORDER || outcome.refused {
                     DropReason::ProtoMem
                 } else if skip == payload.len() {
                     DropReason::TcpOldData
@@ -9417,13 +9871,20 @@ impl Connection {
             //# o A TCP implementation MAY send an ACK segment acknowledging RCV.NXT
             //# when a valid segment arrives that is in the window but not at the left
             //# window edge (MAY-13).
-            if seq != next
-                || outcome.out_of_order
-                || self.receive.has_sack_blocks()
+            let window_empty = if IN_ORDER {
+                advanced_data == window
+            } else {
+                self.receive_window() == 0
+            };
+            debug_assert_eq!(window_empty, self.receive_window() == 0);
+            if !IN_ORDER
+                && (seq != next
+                    || outcome.out_of_order
+                    || self.receive.has_sack_blocks()
+                    || advanced_data as usize > count
+                    || flags & FIN != 0 && !fin_awaits_reply)
                 || !outcome.advanced
-                || advanced.saturating_sub(u32::from(outcome.fin)) as usize > count
-                || (flags & FIN != 0 && !fin_awaits_reply)
-                || self.receive_window() == 0
+                || window_empty
                 || self.unacked_segments >= 2
                 || self.unacked_bytes >= 2 * u32::from(rmss)
                 || self.config.delayed_ack_us == 0
@@ -9434,13 +9895,11 @@ impl Connection {
                 self.ack_deadline = Some(self.now.saturating_add(if self.config.adaptive_ack {
                     self.ack_ato
                 } else {
-                    self.config
-                        .timebase
-                        .ticks_from_us(self.config.delayed_ack_us)
+                    u64::from(self.ack_max)
                 }));
             }
         }
-        if outcome.fin {
+        if !IN_ORDER && outcome.fin {
             self.events.raise(Signal::HalfClosed);
             match self.state {
                 State::Established => self.state = State::CloseWait,
@@ -9456,19 +9915,21 @@ impl Connection {
     }
 
     fn adaptive_receive(&mut self) {
-        let min = self.config.ack_timeout_floor();
-        let max = self
-            .config
-            .timebase
-            .ticks_from_us(self.config.delayed_ack_us);
-        if let Some((last, initialized)) = self.ack_receive
+        let min = u64::from(self.ack_floor);
+        let previous = self.ack_receive.replace((self.now, true));
+        if let Some((last, initialized)) = previous
             && (initialized || self.ack_engine_initialized)
         {
+            debug_assert!(self.ack_engine_initialized);
             let gap = self.now.saturating_sub(last);
             if gap > self.rto() {
                 self.ack_quick = self.adaptive_quick_budget();
                 self.ack_interactive = false;
             } else if gap <= min / 2 {
+                // At its floor the spacing filter has reached a fixed point.
+                if self.ack_ato == min {
+                    return;
+                }
                 self.ack_ato = self.ack_ato / 2 + min / 2;
             } else if gap < self.ack_ato {
                 self.ack_ato = (self.ack_ato / 2).saturating_add(gap);
@@ -9477,8 +9938,7 @@ impl Connection {
             self.ack_ato = min;
             self.ack_quick = self.adaptive_quick_budget();
         }
-        self.ack_ato = self.ack_ato.clamp(min, max);
-        self.ack_receive = Some((self.now, true));
+        self.ack_ato = self.ack_ato.clamp(min, u64::from(self.ack_max));
         self.ack_engine_initialized = true;
     }
 
@@ -9589,10 +10049,15 @@ impl Connection {
         // rcv_ssthresh (u32::MAX for a fixed or locked direction).
         let quota = (self.receive_free().min(u32::MAX as usize) as u32).min(self.rcv_ssthresh);
         // Never retract credit already offered to the peer on shrink.
-        let available = quota.max(self.receive_window());
         let old = self.receive_window();
-        // Apply both wire limits before SWS avoidance, not just at encoding.
-        let candidate = (available / unit).min(u32::from(u16::MAX));
+        let retained = (old >> shift).min(u32::from(u16::MAX));
+        // Apply both wire limits before SWS avoidance. If the available
+        // field is no larger than the retained field, no new unit can be
+        // offered regardless of the SWS threshold.
+        let candidate = (quota >> shift).min(u32::from(u16::MAX));
+        if candidate <= retained {
+            return retained as u16;
+        }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6
         //= reason=Retains prior acceptance credit; RFC 7323 rounding can retract the encoded edge by less than one scale unit.
         //# A TCP receiver SHOULD NOT shrink the window, i.e., move the right window
@@ -9600,8 +10065,11 @@ impl Connection {
         // RFC 7323 section 2.4: sub-scale advances can require retraction
         // on the wire. Never round beyond the free space; retain the old
         // promise separately so in-flight bytes remain acceptable.
-        let old_field = old.div_ceil(unit).min(candidate);
-        if candidate.saturating_mul(unit).saturating_sub(old) >= self.window_threshold() {
+        // The retained width is below half the sequence space and shift
+        // is at most 14, so rounding it up fits in u32.
+        let old_field = (old + (unit - 1)) >> shift;
+        debug_assert!(old_field <= candidate);
+        if (candidate << shift) - old >= self.window_threshold() {
             candidate as u16
         } else {
             old_field as u16
@@ -10604,7 +11072,7 @@ impl Connection {
             };
             if self.rack_enabled() {
                 self.rack.lowest_lost(repair_packet_mss as u32)
-            } else if !self.sack_recovery_enabled() || self.scoreboard.ranges().is_empty() {
+            } else if !self.sack_recovery_enabled() || self.scoreboard.is_empty() {
                 // Without SACKed data above SND.UNA no hole is reported and
                 // every byte below the timeout's boundary is unacknowledged:
                 // resend it in order under slow start, as without SACK,
@@ -11709,8 +12177,8 @@ impl Connection {
             self.advertised_window(syn)
         };
         let header = Header {
-            source_port: self.tuple.local.port(),
-            destination_port: self.tuple.remote.port(),
+            source_port: (self.wire_ports >> 16) as u16,
+            destination_port: self.wire_ports as u16,
             sequence: seq.0,
             acknowledgment: if reset_reply {
                 0
@@ -11721,10 +12189,7 @@ impl Connection {
             window,
             urgent_pointer,
         };
-        let ip = IpMetadata {
-            source: self.tuple.local.ip(),
-            destination: self.tuple.remote.ip(),
-        };
+        let ip = self.ip;
         // Include TCP options on every output path, before committing any state.
         //= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
         //= reason=Selected non-overlapping real-data probes; actual receiver-generated ACKs exercise multiple smaller gap repairs and prevent crossing the probe boundary.
@@ -13036,3 +13501,804 @@ pub(crate) struct ReceiveModelView {
 #[cfg(test)]
 #[path = "connection_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod fast_path_differential_tests {
+    use super::*;
+    use alloc::{vec, vec::Vec};
+    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn usize(&mut self, bound: usize) -> usize {
+            (self.next() >> 33) as usize % bound
+        }
+    }
+
+    fn test_tuple() -> Tuple {
+        Tuple {
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 40001),
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 80),
+        }
+    }
+
+    fn peer_ip(tuple: Tuple) -> IpMetadata {
+        IpMetadata {
+            source: tuple.remote.ip(),
+            destination: tuple.local.ip(),
+        }
+    }
+
+    fn local_ip(tuple: Tuple) -> IpMetadata {
+        IpMetadata {
+            source: tuple.local.ip(),
+            destination: tuple.remote.ip(),
+        }
+    }
+
+    fn encode_ts_opts(ts: Option<(u32, u32)>, buf: &mut [u8; 12]) -> &[u8] {
+        if let Some((val, ecr)) = ts {
+            buf[0..4].copy_from_slice(&[1, 1, 8, 10]);
+            buf[4..8].copy_from_slice(&val.to_be_bytes());
+            buf[8..12].copy_from_slice(&ecr.to_be_bytes());
+            &buf[..]
+        } else {
+            &[]
+        }
+    }
+
+    fn established_pair(config: ConnectionConfig, iss_a: u32, iss_b: u32) -> (Connection, Connection) {
+        let make = || {
+            let tuple = test_tuple();
+            let mut c = Connection::active(tuple, config.clone(), iss_a, 1_000).unwrap();
+            let mut out = [0u8; 256];
+            let n = c.transmit(1_000, &mut out).unwrap().unwrap();
+            let syn = wire::parse(local_ip(tuple), &out[..n]).unwrap();
+            let syn_ack_opts = wire::Options {
+                mss: Some(1460),
+                window_scale: Some(config.receive_capacity.trailing_zeros().min(7) as u8),
+                timestamps: if config.timestamps {
+                    Some((50_000, syn.options.timestamps.unwrap().0))
+                } else {
+                    None
+                },
+                sack_permitted: config.sack,
+                ..wire::Options::default()
+            };
+            let syn_ack_hdr = Header {
+                source_port: tuple.remote.port(),
+                destination_port: tuple.local.port(),
+                sequence: iss_b,
+                acknowledgment: iss_a.wrapping_add(1),
+                flags: SYN | ACK | if config.ecn { ECE } else { 0 },
+                window: 32_768,
+                urgent_pointer: 0,
+            };
+            let syn_ack = Segment {
+                header: syn_ack_hdr,
+                options: syn_ack_opts,
+                raw_options: &[],
+                payload: &[],
+            };
+            c.input_with_traffic_class(2_000, 0, &syn_ack).unwrap();
+            let _ = c.transmit(2_000, &mut out).unwrap();
+            let _ = c.take_events();
+            c
+        };
+        (make(), make())
+    }
+
+    fn forced_slow_input(
+        c: &mut Connection,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        backing: Option<&mut Option<crate::RxFrame>>,
+    ) -> Result<(), Error> {
+        c.accepted_metadata = false;
+        c.update_time(now)?;
+        c.receive.clear_dsack();
+        c.retransmit_burst = None;
+        c.with_input_lend(backing, |c| c.input_slow(now, traffic_class, segment, None))
+    }
+
+    fn forced_slow_ack_input(
+        c: &mut Connection,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+    ) -> Result<(), Error> {
+        c.accepted_metadata = false;
+        c.update_time(now)?;
+        c.receive.clear_dsack();
+        c.retransmit_burst = None;
+        let h = segment.header;
+        let seq = Seq(h.sequence);
+        let ack = Seq(h.acknowledgment);
+        let window = c.receive_window();
+        if c.timestamps
+            && let Some((ts, _)) = segment.options.timestamps
+        {
+            c.ts_latest = ts;
+            if c.last_ack_sent.at_or_after(seq) {
+                c.ts_recent = ts;
+                c.ts_recent_at = now;
+            }
+        }
+        c.accepted_metadata = true;
+        c.last_received = now;
+        c.keepalive_probes = 0;
+        c.keepalive_pending = false;
+        c.keepalive_deadline = None;
+        let ece = h.flags & ECE != 0 && c.ecn_feedback() && ack.at_or_after(c.snd_una);
+        if c.ecn_feedback() {
+            if h.flags & CWR != 0 && c.ecn_ce_end.is_none_or(|end| seq.at_or_after(end)) {
+                c.ecn_echo = false;
+                c.ecn_ce_end = None;
+            }
+            if traffic_class & 3 == 3 && !segment.payload.is_empty() {
+                c.ecn_echo = true;
+                let end = seq.wrapping_add(if window == 0 {
+                    0
+                } else {
+                    segment.payload.len() as u32
+                });
+                if c.ecn_ce_end.is_none_or(|old| end.after(old)) {
+                    c.ecn_ce_end = Some(end);
+                }
+                c.immediate_ack();
+            }
+        }
+        let advancing = ack.after(c.snd_una);
+        c.congestion.observe_ack(ack);
+        let old_window = c.snd_wnd;
+        let window_update = ack.at_or_after(c.snd_una)
+            && (seq.after(c.wl1) || seq == c.wl1 && ack.at_or_after(c.wl2));
+        let was_blocked = old_window == 0 || c.flight() > old_window;
+        let new_window = u32::from(h.window) << if c.scaling { c.peer_scale } else { 0 };
+        if advancing {
+            c.tlp_pending = false;
+        }
+        if !c.process_recovery_ack(
+            segment,
+            ece,
+            false,
+            advancing,
+            AckWindow {
+                prior: old_window,
+                offered: new_window,
+                update: window_update,
+                was_blocked,
+            },
+        ) {
+            return Ok(());
+        }
+        c.receive_text::<false>(seq, segment, window, None);
+        if advancing && c.more && !c.cork && (!c.config.nagle || !c.minshall_check()) {
+            c.release_corked();
+        }
+        c.arm_work_with_probe(advancing);
+        Ok(())
+    }
+
+    fn assert_connections_equal(a: &mut Connection, b: &mut Connection, now: Instant, step: &str) {
+        assert_eq!(a.state, b.state, "state mismatch at {step}");
+        assert_eq!(a.reason, b.reason, "reason mismatch at {step}");
+        assert_eq!(a.dropped, b.dropped, "drop reason mismatch at {step}");
+        assert_eq!(a.take_events(), b.take_events(), "events mismatch at {step}");
+        assert_eq!(a.next_deadline(), b.next_deadline(), "next_deadline mismatch at {step}");
+        assert_eq!(a.rto_deadline, b.rto_deadline, "rto_deadline mismatch at {step}");
+        assert_eq!(a.ack_deadline, b.ack_deadline, "ack_deadline mismatch at {step}");
+        assert_eq!(a.loss_timer, b.loss_timer, "loss_timer mismatch at {step}");
+        assert_eq!(a.tlp_deadline, b.tlp_deadline, "tlp_deadline mismatch at {step}");
+        assert_eq!(a.persist_deadline, b.persist_deadline, "persist_deadline mismatch at {step}");
+        assert_eq!(a.snd_una, b.snd_una, "snd_una mismatch at {step}");
+        assert_eq!(a.snd_nxt, b.snd_nxt, "snd_nxt mismatch at {step}");
+        assert_eq!(a.snd_wnd, b.snd_wnd, "snd_wnd mismatch at {step}");
+        assert_eq!(a.max_snd_wnd, b.max_snd_wnd, "max_snd_wnd mismatch at {step}");
+        assert_eq!(a.acknowledged, b.acknowledged, "acknowledged mismatch at {step}");
+        assert_eq!(a.receive.next(), b.receive.next(), "rcv.nxt mismatch at {step}");
+        assert_eq!(a.receive_window(), b.receive_window(), "rcv_wnd mismatch at {step}");
+        assert_eq!(
+            a.advertised_window(false),
+            b.advertised_window(false),
+            "advertised_window mismatch at {step}"
+        );
+        assert_eq!(a.readable_bytes(), b.readable_bytes(), "readable mismatch at {step}");
+        assert_eq!(a.receive_used, b.receive_used, "receive_used mismatch at {step}");
+        assert_eq!(a.received_total, b.received_total, "received_total mismatch at {step}");
+        assert_eq!(a.unacked_segments, b.unacked_segments, "unacked_segments mismatch at {step}");
+        assert_eq!(a.unacked_bytes, b.unacked_bytes, "unacked_bytes mismatch at {step}");
+        assert_eq!(a.ecn_echo, b.ecn_echo, "ecn_echo mismatch at {step}");
+        assert_eq!(a.ecn_ce_end, b.ecn_ce_end, "ecn_ce_end mismatch at {step}");
+        assert_eq!(a.ts_recent, b.ts_recent, "ts_recent mismatch at {step}");
+        assert_eq!(a.ts_latest, b.ts_latest, "ts_latest mismatch at {step}");
+        assert_eq!(a.receive_events, b.receive_events, "receive_events mismatch at {step}");
+        assert_eq!(a.loss_events, b.loss_events, "loss_events mismatch at {step}");
+        assert_eq!(
+            a.growth_dupack_bytes, b.growth_dupack_bytes,
+            "growth_dupack_bytes mismatch at {step}"
+        );
+        assert_eq!(a.rack.len(), b.rack.len(), "rack.len mismatch at {step}");
+        assert_eq!(a.rack.pipe(), b.rack.pipe(), "rack.pipe mismatch at {step}");
+        assert_eq!(a.rack.valid(), b.rack.valid(), "rack.valid mismatch at {step}");
+        assert_eq!(a.rack.deadline, b.rack.deadline, "rack.deadline mismatch at {step}");
+        assert_eq!(a.rtt.srtt(), b.rtt.srtt(), "srtt mismatch at {step}");
+        assert_eq!(a.rtt.rto(), b.rtt.rto(), "rto mismatch at {step}");
+        assert_eq!(a.congestion.cwnd(), b.congestion.cwnd(), "cwnd mismatch at {step}");
+        assert_eq!(
+            a.congestion.ssthresh(),
+            b.congestion.ssthresh(),
+            "ssthresh mismatch at {step}"
+        );
+        assert_eq!(
+            a.congestion.in_recovery(),
+            b.congestion.in_recovery(),
+            "in_recovery mismatch at {step}"
+        );
+        assert_eq!(
+            a.congestion.in_fast_recovery(),
+            b.congestion.in_fast_recovery(),
+            "in_fast_recovery mismatch at {step}"
+        );
+
+        // Drain wire output from both and compare byte-for-byte.
+        let mut out_a = [0u8; 2048];
+        let mut out_b = [0u8; 2048];
+        for pkt in 0..16 {
+            let na = a.transmit(now, &mut out_a).unwrap();
+            let nb = b.transmit(now, &mut out_b).unwrap();
+            assert_eq!(na, nb, "wire len mismatch at {step} pkt={pkt}");
+            if let Some(n) = na {
+                assert_eq!(&out_a[..n], &out_b[..n], "wire bytes mismatch at {step} pkt={pkt}");
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn in_order_receive_differential_matches_forced_slow_path() {
+        let mut rng = Lcg(0xC0FF_EE07_1234_5678);
+        for sack in [false, true] {
+            for timestamps in [false, true] {
+                for ecn in [false, true] {
+                    let mut config = test_support::upstream_config();
+                    config.sack = sack;
+                    config.rack = sack;
+                    config.tlp = sack;
+                    config.timestamps = timestamps;
+                    config.ecn = ecn;
+                    config.receive_capacity = 64 * 1024;
+                    let (mut fast, mut slow) = established_pair(config.clone(), 10_000, 20_000);
+                    let tuple = test_tuple();
+                    let mut now = 5_000u64;
+                    let mut peer_ts = 50_010u32;
+
+                    for step in 0..80 {
+                        now += 100 + (rng.usize(500) as u64);
+                        peer_ts = peer_ts.wrapping_add(1 + rng.usize(5) as u32);
+                        let rcv_nxt = fast.receive.next().0;
+                        let kind = rng.usize(10);
+                        let (seq, flags, payload_len, tc, ts_override) = match kind {
+                            // In-order data (most common, exercises fast path)
+                            0..=3 => (
+                                rcv_nxt,
+                                ACK | if rng.usize(2) == 0 { PSH } else { 0 },
+                                1 + rng.usize(600),
+                                if ecn && rng.usize(4) == 0 { 3 } else { 0 },
+                                None,
+                            ),
+                            // Duplicate segment
+                            4 => (
+                                rcv_nxt.wrapping_sub((1 + rng.usize(200)) as u32),
+                                ACK,
+                                1 + rng.usize(200),
+                                0,
+                                None,
+                            ),
+                            // Out-of-order segment
+                            5 => (
+                                rcv_nxt.wrapping_add((100 + rng.usize(400)) as u32),
+                                ACK | if rng.usize(2) == 0 { PSH } else { 0 },
+                                1 + rng.usize(300),
+                                if ecn && rng.usize(3) == 0 { 3 } else { 0 },
+                                None,
+                            ),
+                            // PAWS violation (old TSval)
+                            6 if timestamps => (
+                                rcv_nxt,
+                                ACK,
+                                1 + rng.usize(100),
+                                0,
+                                Some(fast.ts_recent.wrapping_sub(50)),
+                            ),
+                            // Empty ACK (with optional CWR)
+                            7 => (
+                                rcv_nxt,
+                                ACK | if ecn && rng.usize(2) == 0 { CWR } else { 0 },
+                                0,
+                                0,
+                                None,
+                            ),
+                            // Fill-in / in-order with PSH
+                            8 => (rcv_nxt, ACK | PSH, 1 + rng.usize(400), 0, None),
+                            // FIN on final step or in-order data otherwise
+                            _ => {
+                                if step == 79 {
+                                    (rcv_nxt, ACK | FIN, rng.usize(64), 0, None)
+                                } else {
+                                    (rcv_nxt, ACK, 1 + rng.usize(256), 0, None)
+                                }
+                            }
+                        };
+
+                        let payload: Vec<u8> = (0..payload_len)
+                            .map(|i| ((step + i) & 0xff) as u8)
+                            .collect();
+                        let ts_opt = if timestamps {
+                            Some((ts_override.unwrap_or(peer_ts), fast.timestamp_value(now)))
+                        } else {
+                            None
+                        };
+                        let mut opt_buf = [0u8; 12];
+                        let opt_bytes = encode_ts_opts(ts_opt, &mut opt_buf);
+                        let hdr = Header {
+                            source_port: tuple.remote.port(),
+                            destination_port: tuple.local.port(),
+                            sequence: seq,
+                            acknowledgment: fast.snd_una.0,
+                            flags,
+                            window: 32_768,
+                            urgent_pointer: 0,
+                        };
+                        let mut raw = vec![0u8; 64 + payload_len];
+                        let n =
+                            wire::encode(peer_ip(tuple), hdr, opt_bytes, &payload, &mut raw).unwrap();
+                        raw.truncate(n);
+                        let mut frame_fast = Some(crate::RxFrame::copy_from_slice(&raw));
+                        let mut frame_slow = Some(crate::RxFrame::copy_from_slice(&raw));
+                        let slice_fast = unsafe {
+                            core::slice::from_raw_parts(
+                                frame_fast.as_ref().unwrap().as_ptr(),
+                                frame_fast.as_ref().unwrap().len(),
+                            )
+                        };
+                        let slice_slow = unsafe {
+                            core::slice::from_raw_parts(
+                                frame_slow.as_ref().unwrap().as_ptr(),
+                                frame_slow.as_ref().unwrap().len(),
+                            )
+                        };
+                        let seg_fast = wire::parse(peer_ip(tuple), slice_fast).unwrap();
+                        let seg_slow = wire::parse(peer_ip(tuple), slice_slow).unwrap();
+
+                        let use_backing = rng.usize(2) == 0 && payload_len > 0;
+                        let rf = fast.input_backed_no_metadata(
+                            now,
+                            tc,
+                            &seg_fast,
+                            use_backing.then_some(&mut frame_fast),
+                        );
+                        let rs = forced_slow_input(
+                            &mut slow,
+                            now,
+                            tc,
+                            &seg_slow,
+                            use_backing.then_some(&mut frame_slow),
+                        );
+                        assert_eq!(rf, rs);
+                        assert_connections_equal(
+                            &mut fast,
+                            &mut slow,
+                            now,
+                            &alloc::format!("sack={sack} ts={timestamps} ecn={ecn} step={step}"),
+                        );
+
+                        // Periodically read available bytes from both and compare.
+                        if rng.usize(3) == 0 && fast.readable_bytes() > 0 {
+                            let mut buf_a = vec![0u8; 1 + rng.usize(1024)];
+                            let mut buf_b = vec![0u8; buf_a.len()];
+                            let ra = fast.read(&mut buf_a);
+                            let rb = slow.read(&mut buf_b);
+                            assert_eq!(ra, rb);
+                            if let Ok(n) = ra {
+                                assert_eq!(&buf_a[..n], &buf_b[..n]);
+                            }
+                            assert_connections_equal(
+                                &mut fast,
+                                &mut slow,
+                                now,
+                                &alloc::format!("read sack={sack} ts={timestamps} ecn={ecn} step={step}"),
+                            );
+                        }
+                    }
+
+                    // Dedicated test for read_closed with RxFrame backing on in-order fast path.
+                    let (mut fast_rc, mut slow_rc) = established_pair(config, 30_000, 40_000);
+                    fast_rc.close().unwrap();
+                    slow_rc.close().unwrap();
+                    let now_rc = 10_000;
+                    let payload = b"data-after-read-close";
+                    let ts_opt = if timestamps {
+                        Some((60_000, fast_rc.timestamp_value(now_rc)))
+                    } else {
+                        None
+                    };
+                    let mut opt_buf = [0u8; 12];
+                    let opt_bytes = encode_ts_opts(ts_opt, &mut opt_buf);
+                    let hdr = Header {
+                        source_port: tuple.remote.port(),
+                        destination_port: tuple.local.port(),
+                        sequence: fast_rc.receive.next().0,
+                        acknowledgment: fast_rc.snd_una.0,
+                        flags: ACK | PSH,
+                        window: 32_768,
+                        urgent_pointer: 0,
+                    };
+                    let mut raw = [0u8; 128];
+                    let n = wire::encode(peer_ip(tuple), hdr, opt_bytes, payload, &mut raw).unwrap();
+                    let mut bf = Some(crate::RxFrame::copy_from_slice(&raw[..n]));
+                    let mut bs = Some(crate::RxFrame::copy_from_slice(&raw[..n]));
+                    let sf = unsafe {
+                        core::slice::from_raw_parts(bf.as_ref().unwrap().as_ptr(), bf.as_ref().unwrap().len())
+                    };
+                    let ss = unsafe {
+                        core::slice::from_raw_parts(bs.as_ref().unwrap().as_ptr(), bs.as_ref().unwrap().len())
+                    };
+                    let seg_f = wire::parse(peer_ip(tuple), sf).unwrap();
+                    let seg_s = wire::parse(peer_ip(tuple), ss).unwrap();
+                    fast_rc
+                        .input_backed_no_metadata(now_rc, 0, &seg_f, Some(&mut bf))
+                        .unwrap();
+                    forced_slow_input(&mut slow_rc, now_rc, 0, &seg_s, Some(&mut bs)).unwrap();
+                    assert!(bf.is_some(), "read_closed must return backing frame");
+                    assert_eq!(bf.is_some(), bs.is_some());
+                    assert_eq!(fast_rc.dropped, Some(DropReason::TcpAbortOnData));
+                    assert_connections_equal(
+                        &mut fast_rc,
+                        &mut slow_rc,
+                        now_rc,
+                        &alloc::format!("read_closed sack={sack} ts={timestamps} ecn={ecn}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ack_shortcut_differential_matches_slow_recovery_path() {
+        for sack in [true, false] {
+            for ecn in [false, true] {
+                let mut config = test_support::upstream_config();
+                config.sack = sack;
+                config.rack = sack;
+                config.tlp = sack;
+                config.ecn = ecn;
+                config.timestamps = true;
+                let (mut fast, mut slow) = established_pair(config, 50_000, 60_000);
+                let tuple = test_tuple();
+                let mut now = 5_000u64;
+                let mut peer_ts = 70_000u32;
+
+                // Send 4 segments of data on both connections.
+                let data = vec![0xAB; 4 * 1448];
+                assert_eq!(fast.write(&data).unwrap(), data.len());
+                assert_eq!(slow.write(&data).unwrap(), data.len());
+                let mut out_a = [0u8; 2048];
+                let mut out_b = [0u8; 2048];
+                let mut sent_ends = Vec::new();
+                for _ in 0..4 {
+                    now += 50;
+                    let na = fast.transmit(now, &mut out_a).unwrap().unwrap();
+                    let nb = slow.transmit(now, &mut out_b).unwrap().unwrap();
+                    assert_eq!(&out_a[..na], &out_b[..nb]);
+                    let seg = wire::parse(local_ip(tuple), &out_a[..na]).unwrap();
+                    sent_ends.push((
+                        seg.header.sequence.wrapping_add(seg.payload.len() as u32),
+                        seg.options.timestamps.unwrap().0,
+                    ));
+                }
+                let _ = fast.take_events();
+                let _ = slow.take_events();
+
+                // 1. Advancing partial ACK (first segment) -> exercises in_order_ack partial path.
+                now += 1_000;
+                peer_ts += 10;
+                let make_ack = |seq: u32,
+                                ack: u32,
+                                flags: u8,
+                                window: u16,
+                                ts: (u32, u32),
+                                sack_blocks: [Option<(u32, u32)>; 4],
+                                payload: &'static [u8]| {
+                    Segment {
+                        header: Header {
+                            source_port: tuple.remote.port(),
+                            destination_port: tuple.local.port(),
+                            sequence: seq,
+                            acknowledgment: ack,
+                            flags,
+                            window,
+                            urgent_pointer: 0,
+                        },
+                        options: wire::Options {
+                            timestamps: Some(ts),
+                            sack_blocks,
+                            ..wire::Options::default()
+                        },
+                        raw_options: &[],
+                        payload,
+                    }
+                };
+
+                let seg1 = make_ack(
+                    fast.receive.next().0,
+                    sent_ends[0].0,
+                    ACK,
+                    32_768,
+                    (peer_ts, sent_ends[0].1),
+                    [None; 4],
+                    &[],
+                );
+                fast.input_with_traffic_class(now, 0, &seg1).unwrap();
+                forced_slow_ack_input(&mut slow, now, 0, &seg1).unwrap();
+                assert_connections_equal(&mut fast, &mut slow, now, "partial_ack");
+
+                // 2. Duplicate ACK carrying data -> exercises acknowledge_unchanged path!
+                now += 200;
+                peer_ts += 2;
+                let seg2 = make_ack(
+                    fast.receive.next().0,
+                    sent_ends[0].0,
+                    ACK | PSH,
+                    32_768,
+                    (peer_ts, sent_ends[0].1),
+                    [None; 4],
+                    b"duplex-data",
+                );
+                fast.input_with_traffic_class(now, 0, &seg2).unwrap();
+                forced_slow_ack_input(&mut slow, now, 0, &seg2).unwrap();
+                assert_connections_equal(&mut fast, &mut slow, now, "dup_ack_with_data");
+
+                // 3. Window update ACK (same ack, larger window).
+                now += 200;
+                peer_ts += 2;
+                let seg3 = make_ack(
+                    fast.receive.next().0,
+                    sent_ends[0].0,
+                    ACK,
+                    48_000,
+                    (peer_ts, sent_ends[0].1),
+                    [None; 4],
+                    &[],
+                );
+                fast.input_with_traffic_class(now, 0, &seg3).unwrap();
+                forced_slow_ack_input(&mut slow, now, 0, &seg3).unwrap();
+                assert_connections_equal(&mut fast, &mut slow, now, "window_update");
+
+                // 4. Drained ACK (acknowledges all remaining segments -> exercises DRAINED + on_drained_ack!).
+                now += 1_000;
+                peer_ts += 10;
+                let seg4 = make_ack(
+                    fast.receive.next().0,
+                    sent_ends[3].0,
+                    ACK,
+                    48_000,
+                    (peer_ts, sent_ends[3].1),
+                    [None; 4],
+                    &[],
+                );
+                fast.input_with_traffic_class(now, 0, &seg4).unwrap();
+                forced_slow_ack_input(&mut slow, now, 0, &seg4).unwrap();
+                assert_connections_equal(&mut fast, &mut slow, now, "drained_ack");
+
+                // Send 3 more segments to test SACK-carrying ACK, pure duplicate ACK (growth_dupack_bytes), and ECE.
+                let data2 = vec![0xCD; 3 * 1448];
+                assert_eq!(fast.write(&data2).unwrap(), data2.len());
+                assert_eq!(slow.write(&data2).unwrap(), data2.len());
+                let mut ends2 = Vec::new();
+                for _ in 0..3 {
+                    now += 50;
+                    let na = fast.transmit(now, &mut out_a).unwrap().unwrap();
+                    let nb = slow.transmit(now, &mut out_b).unwrap().unwrap();
+                    assert_eq!(&out_a[..na], &out_b[..nb]);
+                    let seg = wire::parse(local_ip(tuple), &out_a[..na]).unwrap();
+                    ends2.push((
+                        seg.header.sequence,
+                        seg.header.sequence.wrapping_add(seg.payload.len() as u32),
+                        seg.options.timestamps.unwrap().0,
+                    ));
+                }
+                let _ = fast.take_events();
+                let _ = slow.take_events();
+
+                // 5. Pure duplicate ACK (tests growth_dupack_bytes when !sack, and recovery path).
+                now += 300;
+                peer_ts += 3;
+                let seg5 = make_ack(
+                    fast.receive.next().0,
+                    fast.snd_una.0,
+                    ACK,
+                    48_000,
+                    (peer_ts, ends2[0].2),
+                    [None; 4],
+                    &[],
+                );
+                fast.input_with_traffic_class(now, 0, &seg5).unwrap();
+                forced_slow_ack_input(&mut slow, now, 0, &seg5).unwrap();
+                assert_connections_equal(&mut fast, &mut slow, now, "pure_dupack");
+
+                // 6. SACK-carrying ACK (must bypass shortcut into recovery path).
+                if sack {
+                    now += 300;
+                    peer_ts += 3;
+                    let seg6 = make_ack(
+                        fast.receive.next().0,
+                        fast.snd_una.0,
+                        ACK,
+                        48_000,
+                        (peer_ts, ends2[2].2),
+                        [Some((ends2[2].0, ends2[2].1)), None, None, None],
+                        &[],
+                    );
+                    fast.input_with_traffic_class(now, 0, &seg6).unwrap();
+                    forced_slow_ack_input(&mut slow, now, 0, &seg6).unwrap();
+                    assert_connections_equal(&mut fast, &mut slow, now, "sack_ack");
+                }
+
+                // 7. ECE-bearing advancing ACK (must bypass shortcut).
+                now += 500;
+                peer_ts += 5;
+                let seg7 = make_ack(
+                    fast.receive.next().0,
+                    ends2[2].1,
+                    ACK | if ecn { ECE } else { 0 },
+                    48_000,
+                    (peer_ts, ends2[2].2),
+                    [None; 4],
+                    &[],
+                );
+                fast.input_with_traffic_class(now, 0, &seg7).unwrap();
+                forced_slow_ack_input(&mut slow, now, 0, &seg7).unwrap();
+                assert_connections_equal(&mut fast, &mut slow, now, "ece_or_final_ack");
+            }
+        }
+    }
+
+    fn reference_advertised_window(c: &Connection) -> u16 {
+        let shift = if c.scaling { c.local_scale } else { 0 };
+        let unit = 1u32 << shift;
+        let quota = (c.receive_free().min(u32::MAX as usize) as u32).min(c.rcv_ssthresh);
+        let old = c.receive_window();
+        let available = quota.max(old);
+        let candidate = (available / unit).min(u32::from(u16::MAX));
+        let old_field = old.div_ceil(unit).min(candidate);
+        if candidate.saturating_mul(unit).saturating_sub(old) >= c.window_threshold() {
+            candidate as u16
+        } else {
+            old_field as u16
+        }
+    }
+
+    fn reference_read_window_update(c: &Connection) -> bool {
+        if c.receive.eof() || c.ack_pending && c.ack_deadline.is_none() {
+            return false;
+        }
+        let shift = if c.scaling { c.local_scale } else { 0 };
+        let credit = (u32::from(reference_advertised_window(c)) << shift)
+            .saturating_sub(c.receive_window());
+        credit >= c.read_window_threshold()
+    }
+
+    #[test]
+    fn receive_window_and_read_update_match_reference_across_scale_boundaries() {
+        for shift in 0u8..=14 {
+            let unit = 1u32 << shift;
+            let config = ConnectionConfig {
+                receive_capacity: (65535usize << shift).clamp(4096, 65535 << 14),
+                mss: 1460,
+                ..ConnectionConfig::default()
+            };
+            let (mut c, _) = established_pair(config, 1_000, 2_000);
+            c.scaling = true;
+            c.local_scale = shift;
+
+            let capacities = [
+                1usize,
+                unit as usize,
+                (unit as usize).saturating_mul(2),
+                (unit as usize).saturating_mul(4).min(65535 << 14),
+                (65535usize << shift).min(65535 << 14),
+            ];
+            let ssthresh_vals = [0u32, unit.saturating_sub(1), unit, unit.saturating_mul(2), u32::MAX];
+            let k_vals = [0u32, 1, 2, 10, 65534, 65535];
+
+            for &cap in &capacities {
+                c.config.receive_capacity = cap;
+                for &ssthresh in &ssthresh_vals {
+                    c.rcv_ssthresh = ssthresh;
+                    for &k in &k_vals {
+                        let base = k.saturating_mul(unit);
+                        for delta in [-1i64, 0, 1] {
+                            let old_i64 = i64::from(base) + delta;
+                            if !(0..(1i64 << 31)).contains(&old_i64) {
+                                continue;
+                            }
+                            let old = old_i64 as u32;
+                            c.advertised_edge = c.receive.next().wrapping_add(old);
+                            for coalesce in [false, true] {
+                                c.config.coalesce_read_window_updates = coalesce;
+                                c.ack_pending = false;
+                                c.ack_deadline = None;
+
+                                assert_eq!(
+                                    c.advertised_window(false),
+                                    reference_advertised_window(&c),
+                                    "advertised_window mismatch: shift={shift} cap={cap} ssthresh={ssthresh} old={old}"
+                                );
+                                let expected_update = reference_read_window_update(&c);
+                                let actual_update = c.read_window_update();
+                                assert_eq!(
+                                    actual_update, expected_update,
+                                    "read_window_update mismatch: shift={shift} cap={cap} ssthresh={ssthresh} old={old} coalesce={coalesce}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receive_limit_cache_matches_formula_and_handles_zero_capacity_sentinel() {
+        let config = ConnectionConfig {
+            receive_capacity: 65536,
+            ..ConnectionConfig::default()
+        };
+        let (mut c, _) = established_pair(config, 1_000, 2_000);
+
+        // R6 regression: before any call to receive_limit(), sentinel must NOT match capacity == 0.
+        c.config.receive_capacity = 0;
+        assert_eq!(c.receive_limit(), SOCK_MIN_RCVBUF);
+
+        // And after invalidation via measure_receive_scaling, capacity == 0 still returns SOCK_MIN_RCVBUF.
+        c.measure_receive_scaling(2000, 1460, 2048);
+        c.config.receive_capacity = 0;
+        assert_eq!(c.receive_limit(), SOCK_MIN_RCVBUF);
+
+        // Randomized parity check over (capacity, len, truesize).
+        let mut rng = Lcg(0x5236_CAFE_BABE_0001);
+        for _ in 0..500 {
+            let cap = if rng.usize(10) == 0 {
+                0
+            } else {
+                1 + rng.usize(16 * 1024 * 1024)
+            };
+            let len = 1 + rng.usize(65535);
+            let truesize = len + rng.usize(4096);
+            c.config.receive_capacity = cap;
+            if rng.usize(3) == 0 {
+                c.measure_receive_scaling(
+                    usize::from(c.received_mss.value(c.receive_mss())) + 1,
+                    len,
+                    truesize,
+                );
+            }
+            let (rl, rt) = c.rcv_limit_scaling;
+            let expected =
+                ((cap as u64 * u64::from(rt) / u64::from(rl)) as usize).max(SOCK_MIN_RCVBUF);
+            // Call twice to exercise both cache miss and cache hit!
+            assert_eq!(c.receive_limit(), expected);
+            assert_eq!(c.receive_limit(), expected);
+        }
+    }
+}

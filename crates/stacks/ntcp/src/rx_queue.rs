@@ -579,8 +579,6 @@ impl RxQueue {
 
     // The next in-sequence segment can append all its admitted text. This
     // also excludes a FIN held beyond a gap without accompanying text.
-    // Production callers land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn can_append(&self) -> bool {
         debug_assert!(!self.eof || self.fin_sequence.is_some());
         self.runs.is_empty() && self.fin_sequence.is_none()
@@ -1016,8 +1014,6 @@ impl RxQueue {
     // A predicted in-order segment on an open read side keeps its entire
     // text until a later input, read or clear. Keep ownership with the caller
     // until there is a slot for it, including when allocation fails.
-    // Production callers land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn append_backed(
         &mut self,
         backing: &mut Option<RxFrame>,
@@ -1053,8 +1049,6 @@ impl RxQueue {
         }
     }
 
-    // Production callers land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn insert_segment<const IN_ORDER: bool>(
         &mut self,
         sequence: Seq,

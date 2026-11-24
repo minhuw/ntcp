@@ -759,6 +759,95 @@ impl Host {
             .inspect_err(|&error| self.count_header_error(frame, error))?)
     }
 
+    /// Deliver a complete, optionless physical IPv4/TCP datagram directly.
+    /// A caller receiving a different kind of packet, or holding a transmit
+    /// reservation that could defer input, continues with `receive_processed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_tcp_frame(
+        &mut self,
+        endpoint: &mut ntcp::Endpoint,
+        context: IngressContext,
+        now: Instant,
+        bytes: &[u8],
+        frame: &mut Option<ntcp::RxFrame>,
+        metadata: RxPacketMetadata,
+        outgoing_dscp: u8,
+    ) -> Result<Option<InputDisposition>, Error> {
+        if endpoint.has_output_reservations() {
+            return Ok(None);
+        }
+        let Some(tcp) = ntcp_ip::PlainTcp::parse(bytes) else {
+            return Ok(None);
+        };
+        self.receive_plain_tcp(endpoint, context, now, tcp, frame, metadata, outgoing_dscp)
+            .map(Some)
+    }
+
+    /// Deliver an IPv4/TCP header validated while delimiting its link frame.
+    /// A caller that can defer reserved input checks the endpoint's output
+    /// reservations before delivery.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_plain_tcp(
+        &mut self,
+        endpoint: &mut ntcp::Endpoint,
+        context: IngressContext,
+        now: Instant,
+        tcp: ntcp_ip::PlainTcp<'_>,
+        frame: &mut Option<ntcp::RxFrame>,
+        metadata: RxPacketMetadata,
+        outgoing_dscp: u8,
+    ) -> Result<InputDisposition, Error> {
+        let bytes = tcp.bytes();
+        let (_, destination) = tcp.addresses();
+        let local = crate::LocalDestination {
+            link: context.link,
+            address: destination,
+            revision: self.paths.revision(),
+        };
+        if let Some((key, port)) = self.plain_ingress
+            && key == local
+            && bytes.len() <= port.max_ip_packet
+            && (metadata.tcp_segment_size.is_none() || port.gro)
+        {
+            self.check_endpoint(endpoint)?;
+        } else {
+            let port = self.port(context.link)?.receive;
+            if bytes.len() > port.max_ip_packet {
+                return Err(Error::Unsupported);
+            }
+            if port.ipv4.source_routes().is_none() {
+                return Err(self.version_refused(now, bytes, DropReason::UnhandledProto));
+            }
+            let ip_destination = core::net::IpAddr::V4(destination);
+            let owned = crate::LocalDestination {
+                link: local.link,
+                address: ip_destination,
+                revision: local.revision,
+            };
+            if self.local.get() != Some(owned) {
+                self.owned_in_context(context, ip_destination)?;
+            }
+            self.check_endpoint(endpoint)?;
+            self.owned_on_link(context, ip_destination)?;
+            if metadata.tcp_segment_size.is_some() && !port.gro {
+                return Err(Error::Unsupported);
+            }
+            self.plain_ingress = Some((local, port));
+        }
+        self.make_binding_room(endpoint)?;
+        let disposition = endpoint.input_ipv4_backed_with_path_provider(
+            now,
+            context.link,
+            bytes,
+            frame,
+            metadata,
+            outgoing_dscp,
+            self,
+        )?;
+        self.take_progress(endpoint);
+        Ok(disposition)
+    }
+
     /// Receive and process a datagram on this host in one pass. A complete
     /// physical IPv4 packet carries its validated header into destination
     /// processing. Fragments and neighbor traffic use the receive service.

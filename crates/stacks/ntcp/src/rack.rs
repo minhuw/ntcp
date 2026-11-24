@@ -2047,8 +2047,6 @@ impl Rack {
     // A drained flight has no remaining loss candidates. For a partial
     // ACK the unretired packets must all be intact originals transmitted
     // at or after everything that can advance RACK's delivery frontier.
-    // Callers in `connection.rs` land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) fn in_order_ack(
         &self,
@@ -2072,8 +2070,6 @@ impl Rack {
         }
     }
 
-    // Callers in `connection.rs` land in a later commit (via `in_order_ack`).
-    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(never)]
     fn in_order_prefix(&self, low: Seq, ack: Seq, high: Seq) -> Option<usize> {
         let len = self.intervals.len();
@@ -2134,8 +2130,6 @@ impl Rack {
 
     // A nonadvancing ordinary ACK delivers no interval or DSACK. It
     // still clears the previous ACK sample and can finish a DSACK round.
-    // Callers in `connection.rs` land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn acknowledge_unchanged(&mut self, ack: Seq, scoreboard: &mut Scoreboard) {
         self.begin_in_order_ack(scoreboard);
         self.finish_dsack_round(ack, ack, false);

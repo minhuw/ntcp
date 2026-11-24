@@ -6,6 +6,7 @@ pub(crate) mod mac_cost_tests;
 
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::{
+    cell::Cell,
     net::{IpAddr, SocketAddr},
     num::NonZeroU8,
 };
@@ -70,6 +71,12 @@ impl ConnectionId {
     /// embedding keeps per connection.
     pub fn index(self) -> usize {
         self.slot
+    }
+
+    /// Distinguishes successive connections at the same index. A live
+    /// connection's generation starts at one and never wraps.
+    pub fn generation(self) -> u64 {
+        self.generation
     }
 }
 
@@ -456,18 +463,10 @@ impl<'a> ConnectedIpHeader<'a> {
         self.len
     }
     pub fn address_protocol_sum(self) -> u16 {
-        wire::PseudoHeader::new(self.ip)
-            .expect("connected tuple shares one address family")
-            .address_protocol_sum()
+        self.slot.connection.pseudo_header().address_protocol_sum()
     }
     pub fn matches_route(self, route: &crate::ManagedRoute) -> bool {
-        let connection = &self.slot.connection;
-        connection.managed_path.as_ref().is_some_and(|binding| {
-            binding.client == route.client && binding.snapshot.stamp() == route.stamp
-        }) && self.slot.dscp == route.dscp
-            && connection.ip_header_len() == route.ip_header_len
-            && connection.scoped_tuple().zone() == route.zone
-            && self.ip.destination == route.forwarding_destination
+        self.slot.matches_route(route, self.ip.destination)
     }
 }
 
@@ -507,15 +506,54 @@ pub enum InputDisposition {
     Dropped,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Ipv4Flow {
+    addresses: [core::net::Ipv4Addr; 2],
+    ports: [u16; 2],
+}
+impl Ipv4Flow {
+    fn from_tuple(tuple: &ScopedTuple) -> Option<Self> {
+        let (SocketAddr::V4(local), SocketAddr::V4(remote)) =
+            (&tuple.tuple.local, &tuple.tuple.remote)
+        else {
+            return None;
+        };
+        tuple.zone.is_none().then(|| Self {
+            addresses: [*local.ip(), *remote.ip()],
+            ports: [local.port(), remote.port()],
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Entry {
     Empty,
     Deleted,
+    Ipv4(Ipv4Flow, usize),
     Occupied(ScopedTuple, usize),
+}
+impl Entry {
+    fn occupied(tuple: ScopedTuple, slot: usize) -> Self {
+        match Ipv4Flow::from_tuple(&tuple) {
+            Some(key) => Self::Ipv4(key, slot),
+            None => Self::Occupied(tuple, slot),
+        }
+    }
+
+    fn owner(&self, tuple: &ScopedTuple, v4: Option<Ipv4Flow>) -> Option<usize> {
+        match self {
+            Self::Ipv4(key, slot) if Some(*key) == v4 => Some(*slot),
+            Self::Occupied(key, slot) if key == tuple => Some(*slot),
+            _ => None,
+        }
+    }
 }
 
 struct TupleTable {
     entries: Vec<Entry>,
+    // Two remembered buckets per port-indexed set. A pair of flows
+    // hashing to one set can both use the checked table entries.
+    hints: [Cell<[u16; 2]>; 32],
 }
 impl TupleTable {
     fn new(capacity: usize) -> Result<Self, EndpointError> {
@@ -528,15 +566,66 @@ impl TupleTable {
             .try_reserve_exact(count)
             .map_err(|_| Error::NoMemory)?;
         entries.resize(count, Entry::Empty);
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            hints: [const { Cell::new([0; 2]) }; 32],
+        })
+    }
+    fn port_hint(&self, local: u16, remote: u16) -> &Cell<[u16; 2]> {
+        &self.hints[usize::from(local ^ remote) % self.hints.len()]
+    }
+    fn hint(&self, tuple: ScopedTuple) -> &Cell<[u16; 2]> {
+        self.port_hint(tuple.tuple.local.port(), tuple.tuple.remote.port())
+    }
+    fn hinted(&self, hints: [u16; 2], owner: impl Fn(&Entry) -> Option<usize>) -> Option<usize> {
+        let [first, prior] = hints;
+        owner(&self.entries[usize::from(first)]).or_else(|| {
+            if prior == first {
+                None
+            } else {
+                owner(&self.entries[usize::from(prior)])
+            }
+        })
+    }
+    // Both candidates are hints into the keyed table. Always check all
+    // four tuple fields before using an owner, including after slot reuse.
+    fn predicted_ipv4(
+        &self,
+        local: core::net::Ipv4Addr,
+        remote: core::net::Ipv4Addr,
+        local_port: u16,
+        remote_port: u16,
+    ) -> Option<usize> {
+        let hints = self.port_hint(local_port, remote_port).get();
+        self.hinted(hints, |entry| {
+            let Entry::Ipv4(key, slot) = entry else {
+                return None;
+            };
+            (key.addresses == [local, remote] && key.ports == [local_port, remote_port])
+                .then_some(*slot)
+        })
+    }
+    fn predicted(&self, tuple: ScopedTuple) -> Option<usize> {
+        let v4 = Ipv4Flow::from_tuple(&tuple);
+        self.hinted(self.hint(tuple).get(), |entry| entry.owner(&tuple, v4))
     }
     fn find(&self, hash: usize, tuple: ScopedTuple) -> Option<usize> {
+        let v4 = Ipv4Flow::from_tuple(&tuple);
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            match self.entries[position] {
-                Entry::Occupied(key, slot) if key == tuple => return Some(slot),
-                Entry::Empty => return None,
-                _ => {}
+            let entry = &self.entries[position];
+            if let Some(slot) = entry.owner(&tuple, v4) {
+                // Truncating a bucket beyond the range of a hint can
+                // only cause the next prediction to miss.
+                let hint = self.hint(tuple);
+                let first = hint.get()[0];
+                if position as u16 != first {
+                    hint.set([position as u16, first]);
+                }
+                return Some(slot);
+            }
+            if matches!(entry, Entry::Empty) {
+                return None;
             }
         }
         None
@@ -545,44 +634,45 @@ impl TupleTable {
         // A keyed hash plus a fixed probe budget bounds hostile lookup work.
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            if !matches!(self.entries[position], Entry::Occupied(..)) {
-                self.entries[position] = Entry::Occupied(tuple, slot);
+            if matches!(self.entries[position], Entry::Empty | Entry::Deleted) {
+                self.entries[position] = Entry::occupied(tuple, slot);
                 return Ok(());
             }
         }
         Err(EndpointError::LimitReached)
     }
     fn replace(&mut self, hash: usize, tuple: ScopedTuple, old: usize, new: usize) -> bool {
+        let v4 = Ipv4Flow::from_tuple(&tuple);
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            match self.entries[position] {
-                Entry::Occupied(key, slot) if key == tuple => {
-                    if slot != old {
-                        return false;
-                    }
-                    self.entries[position] = Entry::Occupied(tuple, new);
-                    return true;
+            let entry = &mut self.entries[position];
+            if let Some(slot) = entry.owner(&tuple, v4) {
+                if old != slot {
+                    return false;
                 }
-                Entry::Empty => return false,
-                _ => {}
+                *entry = Entry::occupied(tuple, new);
+                return true;
+            }
+            if matches!(entry, Entry::Empty) {
+                return false;
             }
         }
         false
     }
 
     fn remove(&mut self, hash: usize, tuple: ScopedTuple, owner: usize) {
+        let v4 = Ipv4Flow::from_tuple(&tuple);
         for probe in 0..self.entries.len().min(64) {
             let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            match self.entries[position] {
-                Entry::Occupied(key, slot) if key == tuple => {
-                    if slot != owner {
-                        return;
-                    }
-                    self.entries[position] = Entry::Deleted;
-                    return;
+            let entry = &mut self.entries[position];
+            if let Some(slot) = entry.owner(&tuple, v4) {
+                if slot == owner {
+                    *entry = Entry::Deleted;
                 }
-                Entry::Empty => return,
-                _ => {}
+                return;
+            }
+            if matches!(entry, Entry::Empty) {
+                return;
             }
         }
     }
@@ -750,7 +840,8 @@ impl Listener {
 #[path = "endpoint_managed.rs"]
 mod managed;
 pub use managed::{
-    ConfirmedProbe, CorrelatedPmtu, CorrelatedSegment, PendingPmtuApplied, PhysicalReceipt,
+    ConfirmedProbe, CorrelatedPmtu, CorrelatedSegment, ManagedProgress, PendingPmtuApplied,
+    PhysicalReceipt,
 };
 pub(crate) use managed::ManagedResults;
 
@@ -777,7 +868,7 @@ pub struct Endpoint {
     // found the attempt acceptable; `accept_transmit` consumes it (a Cell,
     // since a preflight reads only, and the Endpoint is !Sync anyway).
     preflighted: core::cell::Cell<Option<(crate::TransmitAttempt, Instant)>>,
-    address_policy: Box<dyn Fn(AddressValidation) -> bool>,
+    address_policy: AddressPolicy,
     config: EndpointConfig,
     routes: Vec<(IpAddr, crate::RoutePolicy)>,
     // HMAC-SHA256 keyed with the endpoint's secret, before any input: the
@@ -967,6 +1058,26 @@ fn valid_address(address: IpAddr) -> bool {
         && !matches!(address, IpAddr::V4(ip) if ip.octets()[0] == 0 || ip.octets()[0] >= 224)
 }
 
+enum AddressPolicy {
+    Local(IpAddr),
+    Callback(Box<dyn Fn(AddressValidation) -> bool>),
+}
+
+impl AddressPolicy {
+    fn allows(&self, request: AddressValidation) -> bool {
+        match self {
+            Self::Callback(check) => check(request),
+            Self::Local(address) => match request {
+                AddressValidation::Bind { local } | AddressValidation::Open { local, .. } => {
+                    local == *address
+                }
+                AddressValidation::Incoming { destination, .. } => destination == *address,
+                AddressValidation::Route { source, .. } => source == *address,
+            },
+        }
+    }
+}
+
 impl Endpoint {
     /// The most payload references a shared-output packet carries, and the
     /// most spans a connection's shared payload holds apart: Linux's IOV_MAX
@@ -977,10 +1088,35 @@ impl Endpoint {
     // initialized CSPRNG. The required callback captures authoritative network
     // context for this endpoint; the endpoint cannot prove the caller's policy true.
     pub fn new<F: Fn(AddressValidation) -> bool + 'static>(
-        mut config: EndpointConfig,
+        config: EndpointConfig,
         secret: [u8; 32],
         now: Instant,
         address_policy: F,
+    ) -> Result<Self, EndpointError> {
+        Self::with_policy(
+            config,
+            secret,
+            now,
+            AddressPolicy::Callback(Box::new(address_policy)),
+        )
+    }
+
+    /// An endpoint whose binds, opens, incoming destinations and route
+    /// sources are restricted to one local address throughout its life.
+    pub fn for_local_address(
+        config: EndpointConfig,
+        secret: [u8; 32],
+        now: Instant,
+        local: IpAddr,
+    ) -> Result<Self, EndpointError> {
+        Self::with_policy(config, secret, now, AddressPolicy::Local(local))
+    }
+
+    fn with_policy(
+        mut config: EndpointConfig,
+        secret: [u8; 32],
+        now: Instant,
+        address_policy: AddressPolicy,
     ) -> Result<Self, EndpointError> {
         config.validate()?;
         if config.ipv4_options_enabled {
@@ -1052,7 +1188,7 @@ impl Endpoint {
             free_reservations: 0,
             unattempted_reservations: ReadyQueue::new(0).map_err(|_| Error::NoMemory)?,
             preflighted: core::cell::Cell::new(None),
-            address_policy: Box::new(address_policy),
+            address_policy,
             passive_errors,
             tuples: TupleTable::new(count)?,
             occupied: ReadyQueue::new(count).map_err(|_| Error::NoMemory)?,
@@ -1226,7 +1362,7 @@ impl Endpoint {
         valid_address(source)
             && valid_address(destination)
             && valid_address(hop)
-            && (self.address_policy)(AddressValidation::Route {
+            && self.address_policy.allows(AddressValidation::Route {
                 source,
                 destination,
                 hop,
@@ -1588,7 +1724,7 @@ impl Endpoint {
         }
         if address.port() == 0
             || (!address.ip().is_unspecified() && !valid_address(address.ip()))
-            || !(self.address_policy)(AddressValidation::Bind {
+            || !self.address_policy.allows(AddressValidation::Bind {
                 local: address.ip(),
             })
             || backlog > self.config.max_connections
@@ -1714,7 +1850,7 @@ impl Endpoint {
             || !valid_address(tuple.local.ip())
             || !valid_address(tuple.remote.ip())
             || tuple.local.is_ipv4() != tuple.remote.is_ipv4()
-            || !(self.address_policy)(AddressValidation::Open {
+            || !self.address_policy.allows(AddressValidation::Open {
                 local: tuple.local.ip(),
                 remote: tuple.remote.ip(),
             })
@@ -3152,7 +3288,7 @@ impl Endpoint {
         ip: IpMetadata,
         options: OutgoingIpv4Options,
     ) -> Result<(), EndpointError> {
-        if options == OutgoingIpv4Options::default() {
+        if options.is_empty() {
             return Ok(());
         }
         let (IpAddr::V4(source), IpAddr::V4(destination)) = (ip.source, ip.destination) else {
@@ -3228,6 +3364,15 @@ impl Endpoint {
     //# route arrives in a later segment, the later definition SHOULD
     //# override the earlier one (SHLD-24).
     fn save_ipv4_options(slot: &mut Slot, options: Ipv4Options, route: Option<SourceRoute>) {
+        if route.is_none()
+            && options.is_empty()
+            && slot
+                .received_ipv4_options
+                .as_ref()
+                .is_some_and(Ipv4Options::is_empty)
+        {
+            return;
+        }
         if !slot.explicit_route && route.is_some() {
             slot.ipv4_options.source_route = route;
             Self::sync_ip_header_len(slot);
@@ -3340,6 +3485,9 @@ impl Endpoint {
     // The connection or TIME-WAIT record that owns `tuple`. At most one does:
     // a record whose tuple a reopened connection took is not in the index.
     fn lookup(&self, tuple: ScopedTuple) -> Option<Target> {
+        if let Some(index) = self.tuples.predicted(tuple) {
+            return Some(Target::Connection(index));
+        }
         let hash = self.hash(tuple);
         match self.tuples.find(hash, tuple) {
             Some(index) => Some(Target::Connection(index)),
@@ -4133,6 +4281,11 @@ impl Endpoint {
         bytes: &[u8],
         metadata: crate::RxPacketMetadata,
     ) -> Result<InputDisposition, EndpointError> {
+        if zone.is_none()
+            && let Some(index) = self.predicted_plain_input(ip, Some(&options), bytes)
+        {
+            return self.input_predicted(now, index, traffic_class, bytes, &metadata, None);
+        }
         let Some((route, segment)) = self.ingress_admission(ip, zone, options, bytes, metadata)? else {
             return Ok(InputDisposition::Dropped);
         };
@@ -4161,6 +4314,157 @@ impl Endpoint {
         )
     }
 
+    // The table entry identifies this connection and is its scoped tuple.
+    // Look at that tuple only on branches that actually need the addresses.
+    #[allow(clippy::too_many_arguments)]
+    fn input_connection<const PREDICTED: bool>(
+        &mut self,
+        now: Instant,
+        index: usize,
+        traffic_class: u8,
+        // None denotes the option-free IPv4 path.
+        received_options: Option<(&Ipv4Options, Option<&SourceRoute>)>,
+        segment: &wire::Segment<'_>,
+        metadata: Option<&crate::RxPacketMetadata>,
+        backing: Option<&mut Option<RxFrame>>,
+    ) -> Result<InputDisposition, EndpointError> {
+        debug_assert!(!PREDICTED || (segment.header.flags & SYN == 0 && received_options.is_none()));
+        if self.is_output_reserved(self.id(index)) {
+            return Err(EndpointError::OutputReserved);
+        }
+        self.clock(now)?;
+        let slot = self.slots[index].as_ref().unwrap();
+        // A connection keeps its tuple only until its terminal reset is
+        // generated (`poll_transmit`), then is unmapped: Linux sends that
+        // reset from tcp_close itself (tcp_send_active_reset) and keeps
+        // nothing of the tuple after it.
+        if slot.connection.reset_pending() {
+            self.drop_segment(DropReason::TcpClose, slot.connection.scoped_tuple(), segment);
+            return Ok(InputDisposition::Dropped);
+        }
+        // Apply freshness to the same connection requests accepted by the
+        // passive factory, including SYN data and auxiliary control flags.
+        //= https://www.rfc-editor.org/rfc/rfc6191#section-2
+        //= reason=Only a SYN without ACK or RST to a TIME-WAIT connection reaches reopen_time_wait, whose reuse_syn freshness uses both the incoming sequence number and its Timestamps option when present. Reuse enabled versus disabled leaves results, state, resources, deadlines and emitted bytes identical in CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING across flag, checksum, timestamp and sequence variants.
+        //# The following paragraphs summarize the processing of SYN segments
+        //# received for connections in the TIME-WAIT state. The processing of SYN
+        //# segments received for connections in all other states is unchanged. Both
+        //# the ISN (Initial Sequence Number) and the Timestamps option (if present)
+        //# of the incoming SYN segment are included in the heuristics performed for
+        //# allowing a high connection-establishment rate.
+        if !PREDICTED
+            && self.config.reuse_time_wait
+            && slot.connection.state() == State::TimeWait
+            && segment.header.flags & (SYN | ACK | RST) == SYN
+            && let Some(disposition) = self.reopen_time_wait(
+                Target::Connection(index),
+                slot.connection.scoped_tuple(),
+                traffic_class,
+                received_options.map_or_else(Ipv4Options::default, |(options, _)| *options),
+                segment,
+                metadata.map_or_else(Default::default, |m| m.timestamps),
+            )?
+        {
+            return Ok(disposition);
+        }
+        let slot = self.slots[index].as_ref().unwrap();
+        let authority = slot.receive_authority.filter(|_| {
+            !PREDICTED
+                && slot.connection.state() == State::SynSent
+                && segment.header.flags & (SYN | ACK | RST) == SYN
+        });
+        // An unaccepted child yet to join its listener's accept queue
+        // completes its handshake only if the queue has room.
+        let hold = slot
+            .listener
+            .filter(|_| !slot.accepted_ready)
+            .is_some_and(|parent| {
+                self.listener(parent)
+                    .is_ok_and(|listener| listener.accept_queue_full())
+            });
+        let authorization = if let Some(id) = authority {
+            let tuple = slot.connection.scoped_tuple();
+            Some(self.crossing_syn_authorization(id, tuple, segment))
+        } else {
+            None
+        };
+        let (receive_room, low, pressure) =
+            self.receive_budget(&self.slots[index].as_ref().unwrap().connection);
+        let slot = self.slots[index].as_mut().unwrap();
+        slot.connection.hold_establishment = hold;
+        slot.connection.memory_pressure = pressure;
+        slot.connection.receive_room = receive_room;
+        slot.connection.receive_memory_low = low;
+        slot.received_dscp = Some(traffic_class >> 2);
+        let backing = backing.unwrap_or(&mut self.ingress);
+        let backing = (!segment.payload.is_empty() && backing.is_some()).then_some(backing);
+        // Ingress admission checked these timestamps and any GRO size
+        // against the parsed segment before choosing an owner.
+        let admitted = if let Some(metadata) = metadata {
+            slot.connection.with_input_lend(backing, |c| {
+                c.input_validated(now, traffic_class, segment, metadata, authorization)
+            })
+        } else {
+            debug_assert!(authorization.is_none());
+            slot.connection
+                .input_backed_no_metadata(now, traffic_class, segment, backing)
+                .map(|()| false)
+        };
+        let dropped = slot.connection.dropped.take();
+        // Every receive memory event starts in try_rmem_schedule's prune
+        // path. Leave the counters in place when no pruning was attempted.
+        let counters = &mut slot.connection.receive_events;
+        debug_assert!(counters.prune_called != 0 || *counters == Default::default());
+        let events = (counters.prune_called != 0).then(|| core::mem::take(counters));
+        let admitted = admitted?;
+        debug_assert!(!PREDICTED || !admitted);
+        if !PREDICTED && admitted {
+            slot.fast_open_owner = authority;
+        }
+        if slot.connection.accepted_metadata {
+            if let Some((options, route)) = received_options {
+                Self::save_ipv4_options(slot, *options, route.copied());
+            } else if slot
+                .received_ipv4_options
+                .as_ref()
+                .is_none_or(|options| !options.is_empty())
+            {
+                Self::save_ipv4_options(slot, Ipv4Options::default(), None);
+            }
+        }
+        slot.connection.hold_establishment = false;
+        // Linux counts it at tcp_v4_syn_recv_sock's exit_overflow.
+        let mut held = false;
+        if let Some(reason) = dropped {
+            let tuple = slot.connection.scoped_tuple();
+            held = reason == DropReason::TcpListenOverflow;
+            if held {
+                self.count_listen_drop(true);
+            }
+            self.drop_segment(reason, tuple, segment);
+        }
+        if let Some(events) = events {
+            let tuple = self.slots[index].as_ref().unwrap().connection.scoped_tuple();
+            self.receive_memory_events(events, tuple);
+        }
+        // The data the input took into, or released from, the receive
+        // queue, as Linux charges an skb when it is queued.
+        if let Some((old, new)) = self.slots[index]
+            .as_mut()
+            .unwrap()
+            .connection
+            .settle_receive_charge()
+        {
+            self.recharge(old, new);
+        }
+        self.refresh(index);
+        Ok(if held {
+            InputDisposition::Dropped
+        } else {
+            InputDisposition::Processed
+        })
+    }
+
     // `input_scoped` of a segment `ingress_admission` admitted, for `tuple`,
     // whose connection slot or TIME-WAIT record (if any) is `target`.
     #[allow(clippy::too_many_arguments)]
@@ -4178,10 +4482,16 @@ impl Endpoint {
     ) -> Result<InputDisposition, EndpointError> {
         let timestamps = metadata.timestamps;
         let zone = tuple.zone;
-        if let Some(Target::Connection(index)) = target
-            && self.is_output_reserved(self.id(index))
-        {
-            return Err(EndpointError::OutputReserved);
+        if let Some(Target::Connection(index)) = target {
+            return self.input_connection::<false>(
+                now,
+                index,
+                traffic_class,
+                Some((&options, route.as_ref())),
+                segment,
+                Some(&metadata),
+                None,
+            );
         }
         self.clock(now)?;
         if let Some(Target::TimeWait(index)) = target {
@@ -4220,127 +4530,6 @@ impl Endpoint {
                 }
             }
             return Ok(InputDisposition::Processed);
-        }
-        if let Some(Target::Connection(index)) = target {
-            let slot = self.slots[index].as_ref().unwrap();
-            // A connection keeps its tuple only until its terminal reset is
-            // generated (`poll_transmit`), then is unmapped: Linux sends that
-            // reset from tcp_close itself (tcp_send_active_reset) and keeps
-            // nothing of the tuple after it.
-            if slot.connection.reset_pending() {
-                self.drop_segment(DropReason::TcpClose, tuple, segment);
-                return Ok(InputDisposition::Dropped);
-            }
-            // Apply freshness to the same connection requests accepted by the
-            // passive factory, including SYN data and auxiliary control flags.
-            //= https://www.rfc-editor.org/rfc/rfc6191#section-2
-            //= reason=Only a SYN without ACK or RST to a TIME-WAIT connection reaches reopen_time_wait, whose reuse_syn freshness uses both the incoming sequence number and its Timestamps option when present. Reuse enabled versus disabled leaves results, state, resources, deadlines and emitted bytes identical in CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED, FIN-WAIT-1/2, CLOSE-WAIT, LAST-ACK and CLOSING across flag, checksum, timestamp and sequence variants.
-            //# The following paragraphs summarize the processing of SYN segments
-            //# received for connections in the TIME-WAIT state. The processing of SYN
-            //# segments received for connections in all other states is unchanged. Both
-            //# the ISN (Initial Sequence Number) and the Timestamps option (if present)
-            //# of the incoming SYN segment are included in the heuristics performed for
-            //# allowing a high connection-establishment rate.
-            if self.config.reuse_time_wait
-                && slot.connection.state() == State::TimeWait
-                && segment.header.flags & (SYN | ACK | RST) == SYN
-                && let Some(disposition) = self.reopen_time_wait(
-                    Target::Connection(index),
-                    tuple,
-                    traffic_class,
-                    options,
-                    segment,
-                    timestamps,
-                )?
-            {
-                return Ok(disposition);
-            }
-            let slot = self.slots[index].as_ref().unwrap();
-            let authority = slot.receive_authority.filter(|_| {
-                slot.connection.state() == State::SynSent
-                    && segment.header.flags & (SYN | ACK | RST) == SYN
-            });
-            // An unaccepted child yet to join its listener's accept queue
-            // completes its handshake only if the queue has room.
-            let hold = slot
-                .listener
-                .filter(|_| !slot.accepted_ready)
-                .is_some_and(|parent| {
-                    self.listener(parent)
-                        .is_ok_and(|listener| listener.accept_queue_full())
-                });
-            let authorization =
-                authority.map(|id| self.crossing_syn_authorization(id, tuple, segment));
-            let (receive_room, receive_memory_low, memory_pressure) =
-                self.receive_budget(&self.slots[index].as_ref().unwrap().connection);
-            let slot = self.slots[index].as_mut().unwrap();
-            slot.connection.hold_establishment = hold;
-            slot.connection.memory_pressure = memory_pressure;
-            slot.connection.receive_room = receive_room;
-            slot.connection.receive_memory_low = receive_memory_low;
-            slot.received_dscp = Some(traffic_class >> 2);
-            let lent = if let Some(frame) = self.ingress.take() {
-                slot.connection.lend_frame(frame);
-                true
-            } else {
-                false
-            };
-            let admitted = if let Some(authorization) = authorization {
-                slot.connection.input_with_receive_authorization(
-                    now,
-                    traffic_class,
-                    segment,
-                    metadata,
-                    Some(authorization),
-                )
-            } else {
-                slot.connection
-                    .input_with_metadata(now, traffic_class, segment, metadata)
-                    .map(|()| false)
-            };
-            // The lend ends with the connection's input, with its slot in
-            // hand: the frame comes back unless the queue holds it.
-            if lent {
-                self.ingress = slot.connection.end_lend();
-            }
-            let dropped = slot.connection.dropped.take();
-            let events = core::mem::take(&mut slot.connection.receive_events);
-            let admitted = admitted?;
-            if admitted {
-                slot.fast_open_owner = authority;
-            }
-            if slot.connection.accepted_metadata {
-                Self::save_ipv4_options(slot, options, route);
-            }
-            slot.connection.hold_establishment = false;
-            // Linux counts it at tcp_v4_syn_recv_sock's exit_overflow.
-            let mut held = false;
-            if let Some(reason) = dropped {
-                held = reason == DropReason::TcpListenOverflow;
-                if held {
-                    self.count_listen_drop(true);
-                }
-                self.drop_segment(reason, tuple, segment);
-            }
-            if events != crate::memory::ReceiveMemoryEvents::default() {
-                self.receive_memory_events(events, tuple);
-            }
-            // The data the input took into, or released from, the receive
-            // queue, as Linux charges an skb when it is queued.
-            if let Some((old, new)) = self.slots[index]
-                .as_mut()
-                .unwrap()
-                .connection
-                .settle_receive_charge()
-            {
-                self.recharge(old, new);
-            }
-            self.refresh(index);
-            return Ok(if held {
-                InputDisposition::Dropped
-            } else {
-                InputDisposition::Processed
-            });
         }
         if let Some(listener) = self.match_listener(tuple.tuple.local, zone) {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.2
@@ -4451,6 +4640,150 @@ impl Endpoint {
             });
     }
 
+    // A prediction counts only after comparing both addresses and ports to
+    // a live IPv4 table entry. SYN can need a new path (TIME-WAIT reuse).
+    fn predicted_plain_input(
+        &self,
+        ip: IpMetadata,
+        options: Option<&Ipv4Options>,
+        bytes: &[u8],
+    ) -> Option<usize> {
+        let (IpAddr::V4(local), IpAddr::V4(remote)) = (ip.destination, ip.source) else {
+            return None;
+        };
+        if options.is_some_and(|o| !o.is_empty()) {
+            return None;
+        }
+        self.predict_ipv4_tcp(local, remote, bytes)
+    }
+
+    fn predict_ipv4_tcp(
+        &self,
+        local: core::net::Ipv4Addr,
+        remote: core::net::Ipv4Addr,
+        bytes: &[u8],
+    ) -> Option<usize> {
+        if bytes.len() < 20 || bytes.len() > u16::MAX as usize || bytes[13] & SYN != 0 {
+            return None;
+        }
+        let source = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let destination = u16::from_be_bytes([bytes[2], bytes[3]]);
+        self.tuples
+            .predicted_ipv4(local, remote, destination, source)
+    }
+
+    // Tuple prediction compares both transport endpoints. The connection
+    // therefore supplies the incoming addresses for policy and diagnostics.
+    fn predicted_addresses(&self, index: usize) -> IpMetadata {
+        let ip = &self.slots[index].as_ref().unwrap().connection.ip;
+        IpMetadata {
+            source: ip.destination,
+            destination: ip.source,
+        }
+    }
+
+    fn input_predicted(
+        &mut self,
+        now: Instant,
+        index: usize,
+        traffic_class: u8,
+        bytes: &[u8],
+        metadata: &crate::RxPacketMetadata,
+        backing: Option<&mut Option<RxFrame>>,
+    ) -> Result<InputDisposition, EndpointError> {
+        let ancillary = (metadata.tcp_segment_size.is_some()
+            || metadata.timestamps.software.is_some()
+            || metadata.timestamps.hardware.is_some())
+        .then_some(metadata);
+        if let Some(metadata) = ancillary {
+            metadata
+                .timestamps
+                .validate(self.config.connection.timebase)?;
+        }
+        // Tuple prediction already matched this destination against the
+        // socket. A fixed policy admitted that address at open; a callback
+        // can still change its decision while the socket is live.
+        #[cfg(debug_assertions)]
+        {
+            let ip = self.predicted_addresses(index);
+            debug_assert!(valid_address(ip.source) && valid_address(ip.destination));
+            debug_assert!(
+                !matches!(self.address_policy, AddressPolicy::Local(address) if address != ip.destination)
+            );
+        }
+        if let AddressPolicy::Callback(check) = &self.address_policy {
+            let ip = self.predicted_addresses(index);
+            if !check(AddressValidation::Incoming {
+                source: ip.source,
+                destination: ip.destination,
+            }) {
+                self.drop_input::<()>(DropReason::AddressPolicy, ip, bytes);
+                return Ok(InputDisposition::Dropped);
+            }
+        }
+        // The Internet checksum adds the addresses in either direction.
+        let pseudo = self.slots[index]
+            .as_ref()
+            .unwrap()
+            .connection
+            .pseudo_header();
+        let parsed = pseudo.parse(bytes, metadata.tcp_checksum_verified);
+        let Some(segment) = self.admit_segment(
+            |ep| ep.predicted_addresses(index),
+            bytes,
+            ancillary,
+            parsed.as_ref().map_err(|e| *e),
+        )?
+        else {
+            return Ok(InputDisposition::Dropped);
+        };
+        self.input_connection::<true>(
+            now,
+            index,
+            traffic_class,
+            None,
+            segment,
+            ancillary,
+            backing,
+        )
+    }
+
+    #[inline]
+    fn admit_segment<'a, S: core::borrow::Borrow<wire::Segment<'a>>>(
+        &mut self,
+        addresses: impl FnOnce(&Self) -> IpMetadata,
+        bytes: &[u8],
+        metadata: Option<&crate::RxPacketMetadata>,
+        parsed: Result<S, wire::WireError>,
+    ) -> Result<Option<S>, EndpointError> {
+        match parsed {
+            Ok(segment) => {
+                if let Some(metadata) = metadata {
+                    metadata.validate_segment(segment.borrow())?;
+                }
+                Ok(Some(segment))
+            }
+            Err(error) => {
+                self.wire_error(error, addresses(self), bytes);
+                Ok(None)
+            }
+        }
+    }
+
+    #[cold]
+    fn wire_error(&mut self, error: wire::WireError, ip: IpMetadata, bytes: &[u8]) {
+        self.checksum_errors += u64::from(error == wire::WireError::InvalidChecksum);
+        let reason = match error {
+            wire::WireError::InvalidChecksum => DropReason::TcpCsum,
+            wire::WireError::Truncated | wire::WireError::InvalidHeader => DropReason::PktTooSmall,
+            wire::WireError::InvalidOption => DropReason::TcpInvalidOption,
+            wire::WireError::AddressFamily => DropReason::IpInvalidDest,
+            wire::WireError::TooLong => DropReason::PktTooBig,
+            wire::WireError::OutputTooSmall => DropReason::NotSpecified,
+        };
+        self.drop_input::<()>(reason, ip, bytes);
+    }
+
     /// Non-constructing wire, address and received-route admission shared by
     /// raw and managed input. A managed factory runs this before preparing
     /// path authority, so input this Endpoint silently discards can neither
@@ -4514,7 +4847,7 @@ impl Endpoint {
         {
             return Ok(self.drop_input(DropReason::IpInvalidDest, ip, bytes));
         }
-        if !(self.address_policy)(AddressValidation::Incoming {
+        if !self.address_policy.allows(AddressValidation::Incoming {
             source: ip.source,
             destination: ip.destination,
         }) {
@@ -4532,24 +4865,9 @@ impl Endpoint {
         } else {
             wire::parse(ip, bytes)
         };
-        let segment = match segment {
-            Ok(segment) => segment,
-            Err(error) => {
-                self.checksum_errors += u64::from(error == wire::WireError::InvalidChecksum);
-                let reason = match error {
-                    wire::WireError::InvalidChecksum => DropReason::TcpCsum,
-                    wire::WireError::Truncated | wire::WireError::InvalidHeader => {
-                        DropReason::PktTooSmall
-                    }
-                    wire::WireError::InvalidOption => DropReason::TcpInvalidOption,
-                    wire::WireError::AddressFamily => DropReason::IpInvalidDest,
-                    wire::WireError::TooLong => DropReason::PktTooBig,
-                    wire::WireError::OutputTooSmall => DropReason::NotSpecified,
-                };
-                return Ok(self.drop_input(reason, ip, bytes));
-            }
+        let Some(segment) = self.admit_segment(|_| ip, bytes, Some(&metadata), segment)? else {
+            return Ok(None);
         };
-        metadata.validate_segment(&segment)?;
         Ok(Some((route, segment)))
     }
 
@@ -6406,8 +6724,14 @@ impl Endpoint {
             .min()
     }
 
-    pub fn has_pending_output(&self) -> bool {
+    /// Whether a selected transmission is still held by the caller. Input
+    /// targeting its owner may have to be retained for replay after submission.
+    pub fn has_output_reservations(&self) -> bool {
         self.free_reservations != self.reservations.len()
+    }
+
+    pub fn has_pending_output(&self) -> bool {
+        self.has_output_reservations()
             || !self.output.is_empty()
             || self.stateless_pending()
             || !self.cleanup.is_empty()
@@ -11693,5 +12017,644 @@ mod reserved_poll_tests {
             "expected GSO burst of at least 2 segments, got {segments}"
         );
         assert_eq!(covered, payload.len() as u64);
+    }
+}
+
+#[cfg(test)]
+mod commit7_ingress_policy_tests {
+    use super::*;
+    use alloc::{rc::Rc, vec::Vec};
+    use core::{
+        cell::Cell as CoreCell,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    };
+
+    fn v4(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))
+    }
+
+    fn v6(last: u8) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, u16::from(last)))
+    }
+
+    fn test_config() -> EndpointConfig {
+        EndpointConfig {
+            max_connections: 16,
+            max_listeners: 4,
+            max_time_wait: 16,
+            connection: ConnectionConfig {
+                nagle: false,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        }
+    }
+
+    fn drain_endpoint(ep: &mut Endpoint, now: Instant) -> Vec<(Transmit, Vec<u8>)> {
+        let mut out = [0u8; 2048];
+        let mut pkts = Vec::new();
+        for _ in 0..32 {
+            let poll = ep.poll_transmit(now, &mut out, 32).unwrap();
+            let Some(pkt) = poll.packet else {
+                break;
+            };
+            pkts.push((pkt, out[..pkt.len].to_vec()));
+            if !poll.more_work {
+                break;
+            }
+        }
+        pkts
+    }
+
+    fn establish_pair(
+        a: &mut Endpoint,
+        b: &mut Endpoint,
+        listener: ListenerId,
+        local: SocketAddr,
+        remote: SocketAddr,
+        now: &mut Instant,
+    ) -> (ConnectionId, ConnectionId) {
+        let client = a.connect(*now, local, remote).unwrap();
+        let syn = drain_endpoint(a, *now);
+        assert_eq!(syn.len(), 1);
+        *now += 100;
+        b.input(*now, syn[0].0.ip, &syn[0].1).unwrap();
+        let syn_ack = drain_endpoint(b, *now);
+        assert_eq!(syn_ack.len(), 1);
+        *now += 100;
+        a.input(*now, syn_ack[0].0.ip, &syn_ack[0].1).unwrap();
+        let ack = drain_endpoint(a, *now);
+        assert_eq!(ack.len(), 1);
+        *now += 100;
+        b.input(*now, ack[0].0.ip, &ack[0].1).unwrap();
+        let server = b.accept(listener).unwrap();
+        (client, server)
+    }
+
+    // Force the slow non-predicted ingress_admission + input_admitted path on an endpoint.
+    fn input_forced_unpredicted(
+        ep: &mut Endpoint,
+        now: Instant,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Ipv4Options,
+        bytes: &[u8],
+        metadata: crate::RxPacketMetadata,
+    ) -> Result<InputDisposition, EndpointError> {
+        let Some((route, segment)) =
+            ep.ingress_admission(ip, None, options, bytes, metadata)?
+        else {
+            return Ok(InputDisposition::Dropped);
+        };
+        let tuple = Tuple {
+            local: SocketAddr::new(ip.destination, segment.header.destination_port),
+            remote: SocketAddr::new(ip.source, segment.header.source_port),
+        };
+        let tuple = ScopedTuple { tuple, zone: None };
+        let target = ep.lookup(tuple);
+        ep.input_admitted(
+            now,
+            ip,
+            tuple,
+            target,
+            traffic_class,
+            options,
+            route,
+            &segment,
+            metadata,
+        )
+    }
+
+    #[test]
+    fn connection_id_generation_starts_at_one_and_increments_on_slot_reuse() {
+        let mut cfg = test_config();
+        cfg.max_connections = 1;
+        let mut a = Endpoint::for_local_address(cfg.clone(), [1; 32], 0, v4(1)).unwrap();
+        let mut b = Endpoint::for_local_address(cfg, [2; 32], 0, v4(2)).unwrap();
+        let listener = b.listen(SocketAddr::new(v4(2), 80), 1).unwrap();
+        let mut now = 100;
+
+        let (c1, s1) = establish_pair(
+            &mut a,
+            &mut b,
+            listener,
+            SocketAddr::new(v4(1), 40001),
+            SocketAddr::new(v4(2), 80),
+            &mut now,
+        );
+        assert_eq!(c1.index(), 0);
+        assert_eq!(c1.generation(), 1);
+        assert_eq!(s1.index(), 0);
+        assert_eq!(s1.generation(), 1);
+
+        // Abort both sides, drain resets, release, and open a second connection in the same slot.
+        a.abort(c1).unwrap();
+        let _ = drain_endpoint(&mut a, now);
+        a.release(c1).unwrap();
+        b.abort(s1).unwrap();
+        let _ = drain_endpoint(&mut b, now);
+        b.release(s1).unwrap();
+        now += 1_000;
+
+        let (c2, s2) = establish_pair(
+            &mut a,
+            &mut b,
+            listener,
+            SocketAddr::new(v4(1), 40002),
+            SocketAddr::new(v4(2), 80),
+            &mut now,
+        );
+        assert_eq!(c2.index(), 0);
+        assert_eq!(c2.generation(), 2);
+        assert_eq!(s2.index(), 0);
+        assert_eq!(s2.generation(), 2);
+    }
+
+    #[test]
+    fn address_policy_local_restricts_bind_open_incoming_and_route() {
+        // IPv4 Endpoint::for_local_address
+        let mut cfg = test_config();
+        cfg.ipv4_options_enabled = true;
+        let mut ep = Endpoint::for_local_address(cfg.clone(), [3; 32], 0, v4(10)).unwrap();
+
+        // Bind: matching local allowed; non-matching and unspecified rejected.
+        assert!(ep.listen(SocketAddr::new(v4(10), 8080), 4).is_ok());
+        assert_eq!(
+            ep.listen(SocketAddr::new(v4(11), 8081), 4),
+            Err(Error::InvalidArgument.into())
+        );
+        assert_eq!(
+            ep.listen(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8082), 4),
+            Err(Error::InvalidArgument.into())
+        );
+
+        // Open: matching local allowed; non-matching rejected.
+        let id = ep
+            .connect(10, SocketAddr::new(v4(10), 40000), SocketAddr::new(v4(20), 80))
+            .unwrap();
+        assert_eq!(
+            ep.connect(10, SocketAddr::new(v4(11), 40001), SocketAddr::new(v4(20), 80)),
+            Err(EndpointError::InvalidAddress)
+        );
+
+        // Route: source matching local allowed; wrong source rejected.
+        let sr = SourceRoute::new(&[Ipv4Addr::new(10, 0, 0, 99)], false).unwrap();
+        let opts = OutgoingIpv4Options {
+            source_route: Some(sr),
+            ..OutgoingIpv4Options::default()
+        };
+        assert!(
+            ep.connect_with_ipv4_options(
+                20,
+                SocketAddr::new(v4(10), 40002),
+                SocketAddr::new(v4(20), 80),
+                opts,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            ep.connect_with_ipv4_options(
+                20,
+                SocketAddr::new(v4(11), 40003),
+                SocketAddr::new(v4(20), 80),
+                opts,
+            ),
+            Err(EndpointError::InvalidAddress)
+        );
+        let _ = id;
+
+        // Incoming: matching destination accepted; wrong destination dropped with AddressPolicy.
+        let mut syn_bytes = [0u8; 64];
+        let hdr = Header {
+            source_port: 55555,
+            destination_port: 8080,
+            sequence: 1000,
+            acknowledgment: 0,
+            flags: SYN,
+            window: 32_768,
+            urgent_pointer: 0,
+        };
+        let ip_wrong = IpMetadata {
+            source: v4(20),
+            destination: v4(11),
+        };
+        let n = wire::encode(ip_wrong, hdr, &[], &[], &mut syn_bytes).unwrap();
+        let before = ep.drop_counts().get(DropReason::AddressPolicy);
+        assert_eq!(
+            ep.input(30, ip_wrong, &syn_bytes[..n]).unwrap(),
+            InputDisposition::Dropped
+        );
+        assert_eq!(ep.drop_counts().get(DropReason::AddressPolicy), before + 1);
+
+        let ip_ok = IpMetadata {
+            source: v4(20),
+            destination: v4(10),
+        };
+        let n = wire::encode(ip_ok, hdr, &[], &[], &mut syn_bytes).unwrap();
+        assert_eq!(
+            ep.input(30, ip_ok, &syn_bytes[..n]).unwrap(),
+            InputDisposition::Processed
+        );
+
+        // IPv6 Endpoint::for_local_address
+        let mut ep6 = Endpoint::for_local_address(test_config(), [4; 32], 0, v6(10)).unwrap();
+        assert!(ep6.listen(SocketAddr::new(v6(10), 8080), 4).is_ok());
+        assert_eq!(
+            ep6.listen(SocketAddr::new(v6(11), 8081), 4),
+            Err(Error::InvalidArgument.into())
+        );
+        assert!(
+            ep6.connect(10, SocketAddr::new(v6(10), 40000), SocketAddr::new(v6(20), 80))
+                .is_ok()
+        );
+        assert_eq!(
+            ep6.connect(10, SocketAddr::new(v6(11), 40001), SocketAddr::new(v6(20), 80)),
+            Err(EndpointError::InvalidAddress)
+        );
+    }
+
+    #[test]
+    fn predicted_ingress_differential_matches_ingress_admission() {
+        // Run two identical server endpoints: `fast` takes `input_with_metadata` (which hits
+        // `predicted_plain_input` -> `input_predicted`), while `slow` forces `ingress_admission`
+        // + `input_admitted`.
+        let allow = Rc::new(CoreCell::new(true));
+        let allow_fast = Rc::clone(&allow);
+        let allow_slow = Rc::clone(&allow);
+
+        let mut cfg = test_config();
+        cfg.reuse_time_wait = true;
+        let mut client_f = Endpoint::for_local_address(cfg.clone(), [10; 32], 0, v4(1)).unwrap();
+        let mut client_s = Endpoint::for_local_address(cfg.clone(), [10; 32], 0, v4(1)).unwrap();
+        let mut srv_f = Endpoint::new(cfg.clone(), [20; 32], 0, move |req| {
+            allow_fast.get()
+                && match req {
+                    AddressValidation::Bind { local } | AddressValidation::Open { local, .. } => {
+                        local == v4(2)
+                    }
+                    AddressValidation::Incoming { destination, .. } => destination == v4(2),
+                    AddressValidation::Route { source, .. } => source == v4(2),
+                }
+        })
+        .unwrap();
+        let mut srv_s = Endpoint::new(cfg, [20; 32], 0, move |req| {
+            allow_slow.get()
+                && match req {
+                    AddressValidation::Bind { local } | AddressValidation::Open { local, .. } => {
+                        local == v4(2)
+                    }
+                    AddressValidation::Incoming { destination, .. } => destination == v4(2),
+                    AddressValidation::Route { source, .. } => source == v4(2),
+                }
+        })
+        .unwrap();
+
+        let lf = srv_f.listen(SocketAddr::new(v4(2), 80), 8).unwrap();
+        let ls = srv_s.listen(SocketAddr::new(v4(2), 80), 8).unwrap();
+
+        // Open 3 flows whose (local ^ remote) % 32 all collide into the SAME TupleTable hint set!
+        // 80 ^ 40000, 80 ^ 40032, 80 ^ 40064 all have identical low 5 bits.
+        let ports = [40000u16, 40032u16, 40064u16];
+        let mut flows_f = Vec::new();
+        let mut flows_s = Vec::new();
+        let mut now = 1_000u64;
+        for &p in &ports {
+            let mut n1 = now;
+            let mut n2 = now;
+            let (cf, sf) = establish_pair(
+                &mut client_f,
+                &mut srv_f,
+                lf,
+                SocketAddr::new(v4(1), p),
+                SocketAddr::new(v4(2), 80),
+                &mut n1,
+            );
+            let (cs, ss) = establish_pair(
+                &mut client_s,
+                &mut srv_s,
+                ls,
+                SocketAddr::new(v4(1), p),
+                SocketAddr::new(v4(2), 80),
+                &mut n2,
+            );
+            now = n1;
+            flows_f.push((cf, sf));
+            flows_s.push((cs, ss));
+        }
+
+        let assert_same_server = |f: &mut Endpoint, s: &mut Endpoint, at: Instant, label: &str| {
+            assert_eq!(f.checksum_errors(), s.checksum_errors(), "csum {label}");
+            for reason in [
+                DropReason::AddressPolicy,
+                DropReason::TcpCsum,
+                DropReason::PktTooSmall,
+                DropReason::TcpInvalidOption,
+                DropReason::TcpClose,
+                DropReason::IpSourceRouteRefused,
+            ] {
+                assert_eq!(
+                    f.drop_counts().get(reason),
+                    s.drop_counts().get(reason),
+                    "drop {reason:?} {label}"
+                );
+            }
+            let pf = drain_endpoint(f, at);
+            let ps = drain_endpoint(s, at);
+            assert_eq!(pf, ps, "wire {label}");
+        };
+
+        // 1. Plain IPv4 data across all 3 hint-colliding flows (warms hints & triggers evictions).
+        for round in 0..4 {
+            for idx in 0..3 {
+                now += 50;
+                let msg = alloc::format!("round-{round}-flow-{idx}");
+                client_f.write(flows_f[idx].0, msg.as_bytes()).unwrap();
+                client_s.write(flows_s[idx].0, msg.as_bytes()).unwrap();
+                let pkts_f = drain_endpoint(&mut client_f, now);
+                let pkts_s = drain_endpoint(&mut client_s, now);
+                assert_eq!(pkts_f, pkts_s);
+                for (pkt, raw) in &pkts_f {
+                    // Ancillary on/off: alternate software rx timestamp & GRO metadata.
+                    let meta = if round % 2 == 1 {
+                        crate::RxPacketMetadata {
+                            timestamps: RxPacketTimestamps {
+                                software: Some(crate::RxTimestamp {
+                                    value: now + 1,
+                                    clock: crate::TimestampClock::CallerTicks(
+                                        srv_f.config.connection.timebase,
+                                    ),
+                                }),
+                                hardware: None,
+                            },
+                            tcp_segment_size: core::num::NonZeroU16::new(msg.len() as u16),
+                            tcp_checksum_verified: false,
+                        }
+                    } else {
+                        crate::RxPacketMetadata::default()
+                    };
+                    // Verify hint predicts the active flow on repeated packets.
+                    if round >= 1 && idx == 0 {
+                        let pred = srv_f.predicted_plain_input(pkt.ip, None, raw);
+                        assert!(pred.is_some() || srv_f.tuples.predicted_ipv4(
+                            Ipv4Addr::new(10, 0, 0, 2),
+                            Ipv4Addr::new(10, 0, 0, 1),
+                            80,
+                            ports[idx],
+                        ).is_none());
+                    }
+                    let df = srv_f
+                        .input_with_metadata(now + 5, pkt.ip, pkt.ecn, Ipv4Options::default(), raw, meta)
+                        .unwrap();
+                    let ds = input_forced_unpredicted(
+                        &mut srv_s,
+                        now + 5,
+                        pkt.ip,
+                        pkt.ecn,
+                        Ipv4Options::default(),
+                        raw,
+                        meta,
+                    )
+                    .unwrap();
+                    assert_eq!(df, ds, "disp round={round} idx={idx}");
+                    assert_same_server(&mut srv_f, &mut srv_s, now + 5, "plain_data");
+                }
+                let mut bf = [0u8; 64];
+                let mut bs = [0u8; 64];
+                let rf = srv_f.read(flows_f[idx].1, &mut bf).unwrap();
+                let rs = srv_s.read(flows_s[idx].1, &mut bs).unwrap();
+                assert_eq!(&bf[..rf], &bs[..rs]);
+            }
+        }
+
+        // 2. IPv4 options (source route refused when ipv4_options_enabled == false).
+        now += 100;
+        client_f.write(flows_f[0].0, b"with-lsrr").unwrap();
+        client_s.write(flows_s[0].0, b"with-lsrr").unwrap();
+        let pkts = drain_endpoint(&mut client_f, now);
+        let _ = drain_endpoint(&mut client_s, now);
+        let lsrr_wire = [131u8, 7, 8, 10, 0, 0, 99, 0];
+        let lsrr_opts = Ipv4Options::parse(&lsrr_wire, true).unwrap();
+        // Ensure prediction is bypassed when options are non-empty.
+        assert!(srv_f.predicted_plain_input(pkts[0].0.ip, Some(&lsrr_opts), &pkts[0].1).is_none());
+        let df = srv_f
+            .input_with_metadata(now + 5, pkts[0].0.ip, 0, lsrr_opts, &pkts[0].1, Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 5,
+            pkts[0].0.ip,
+            0,
+            lsrr_opts,
+            &pkts[0].1,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, InputDisposition::Dropped);
+        assert_eq!(df, ds);
+        assert_same_server(&mut srv_f, &mut srv_s, now + 5, "lsrr_refused");
+
+        // 3. Callback AddressPolicy dynamically denies while flow 0 is predicted!
+        // First warm flow 0 hint with a valid packet, then flip callback to false.
+        let df = srv_f
+            .input_with_metadata(now + 10, pkts[0].0.ip, 0, Ipv4Options::default(), &pkts[0].1, Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 10,
+            pkts[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &pkts[0].1,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, ds);
+        assert!(srv_f.predicted_plain_input(pkts[0].0.ip, None, &pkts[0].1).is_some());
+        allow.set(false);
+        let df = srv_f
+            .input_with_metadata(now + 15, pkts[0].0.ip, 0, Ipv4Options::default(), &pkts[0].1, Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 15,
+            pkts[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &pkts[0].1,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, InputDisposition::Dropped);
+        assert_eq!(df, ds);
+        assert_same_server(&mut srv_f, &mut srv_s, now + 15, "policy_denied");
+        allow.set(true);
+
+        // 4. Bad checksum on a predicted flow.
+        let mut bad_csum = pkts[0].1.clone();
+        bad_csum[16] ^= 0xff;
+        let df = srv_f
+            .input_with_metadata(now + 20, pkts[0].0.ip, 0, Ipv4Options::default(), &bad_csum, Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 20,
+            pkts[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &bad_csum,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, InputDisposition::Dropped);
+        assert_eq!(df, ds);
+        assert_same_server(&mut srv_f, &mut srv_s, now + 20, "bad_csum");
+
+        // 5. SYN on existing flow must miss prediction (`bytes[13] & SYN != 0`).
+        let mut syn_pkt = [0u8; 64];
+        let syn_hdr = Header {
+            source_port: ports[0],
+            destination_port: 80,
+            sequence: 99999,
+            acknowledgment: 0,
+            flags: SYN,
+            window: 32_768,
+            urgent_pointer: 0,
+        };
+        let n = wire::encode(pkts[0].0.ip, syn_hdr, &[], &[], &mut syn_pkt).unwrap();
+        assert!(srv_f.predicted_plain_input(pkts[0].0.ip, None, &syn_pkt[..n]).is_none());
+        let df = srv_f
+            .input_with_metadata(now + 25, pkts[0].0.ip, 0, Ipv4Options::default(), &syn_pkt[..n], Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 25,
+            pkts[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &syn_pkt[..n],
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, ds);
+        assert_same_server(&mut srv_f, &mut srv_s, now + 25, "syn_on_established");
+
+        // 6. Reserved owner on predicted flow returns OutputReserved identically.
+        srv_f.enable_output_reservations().unwrap();
+        srv_s.enable_output_reservations().unwrap();
+        srv_f.write(flows_f[0].1, b"reserve-me").unwrap();
+        srv_s.write(flows_s[0].1, b"reserve-me").unwrap();
+        let mut out_f = [0u8; 2048];
+        let mut out_s = [0u8; 2048];
+        let (_, att_f) = srv_f.poll_reserved_transmit(now + 30, &mut out_f, 1).unwrap();
+        let (_, att_s) = srv_s.poll_reserved_transmit(now + 30, &mut out_s, 1).unwrap();
+        let att_f = att_f.unwrap();
+        let att_s = att_s.unwrap();
+        assert_eq!(
+            srv_f.input_with_metadata(now + 35, pkts[0].0.ip, 0, Ipv4Options::default(), &pkts[0].1, Default::default()),
+            Err(EndpointError::OutputReserved)
+        );
+        assert_eq!(
+            input_forced_unpredicted(&mut srv_s, now + 35, pkts[0].0.ip, 0, Ipv4Options::default(), &pkts[0].1, Default::default()),
+            Err(EndpointError::OutputReserved)
+        );
+        srv_f.accept_transmit(now + 35, att_f).unwrap();
+        srv_s.accept_transmit(now + 35, att_s).unwrap();
+
+        // 7. reset_pending on predicted flow returns Dropped(TcpClose) identically.
+        srv_f.abort(flows_f[1].1).unwrap();
+        srv_s.abort(flows_s[1].1).unwrap();
+        client_f.write(flows_f[1].0, b"after-abort").unwrap();
+        client_s.write(flows_s[1].0, b"after-abort").unwrap();
+        let pkts1 = drain_endpoint(&mut client_f, now + 40);
+        let _ = drain_endpoint(&mut client_s, now + 40);
+        let df = srv_f
+            .input_with_metadata(now + 45, pkts1[0].0.ip, 0, Ipv4Options::default(), &pkts1[0].1, Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 45,
+            pkts1[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &pkts1[0].1,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, InputDisposition::Dropped);
+        assert_eq!(df, ds);
+        assert_same_server(&mut srv_f, &mut srv_s, now + 45, "reset_pending");
+
+        // 8. Deleted TupleTable entry: release flow 1 (after reset drained above -> Deleted entry),
+        // verify predicted_plain_input returns None and lookup/input on flow 2 (same hint set!) still works.
+        srv_f.release(flows_f[1].1).unwrap();
+        srv_s.release(flows_s[1].1).unwrap();
+        assert!(srv_f.predicted_plain_input(pkts1[0].0.ip, None, &pkts1[0].1).is_none());
+        client_f.write(flows_f[2].0, b"after-delete").unwrap();
+        client_s.write(flows_s[2].0, b"after-delete").unwrap();
+        let pkts2 = drain_endpoint(&mut client_f, now + 50);
+        let _ = drain_endpoint(&mut client_s, now + 50);
+        let df = srv_f
+            .input_with_metadata(now + 55, pkts2[0].0.ip, 0, Ipv4Options::default(), &pkts2[0].1, Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 55,
+            pkts2[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &pkts2[0].1,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, ds);
+        assert_same_server(&mut srv_f, &mut srv_s, now + 55, "after_deleted_entry");
+
+        // 9. TIME-WAIT slot on predicted flow (FIN handshake puts server flow 2 into TIME-WAIT).
+        srv_f.shutdown(flows_f[2].1).unwrap();
+        srv_s.shutdown(flows_s[2].1).unwrap();
+        let fin_s = drain_endpoint(&mut srv_f, now + 60);
+        let _ = drain_endpoint(&mut srv_s, now + 60);
+        for (p, b) in &fin_s {
+            client_f.input(now + 65, p.ip, b).unwrap();
+            client_s.input(now + 65, p.ip, b).unwrap();
+        }
+        client_f.shutdown(flows_f[2].0).unwrap();
+        client_s.shutdown(flows_s[2].0).unwrap();
+        let fin_c = drain_endpoint(&mut client_f, now + 70);
+        let _ = drain_endpoint(&mut client_s, now + 70);
+        for (p, b) in &fin_c {
+            let df = srv_f
+                .input_with_metadata(now + 75, p.ip, 0, Ipv4Options::default(), b, Default::default())
+                .unwrap();
+            let ds = input_forced_unpredicted(
+                &mut srv_s,
+                now + 75,
+                p.ip,
+                0,
+                Ipv4Options::default(),
+                b,
+                Default::default(),
+            )
+            .unwrap();
+            assert_eq!(df, ds);
+            assert_same_server(&mut srv_f, &mut srv_s, now + 75, "enter_time_wait");
+        }
+        assert_eq!(srv_f.state(flows_f[2].1).unwrap(), State::TimeWait);
+        // Send a duplicate non-SYN segment to TIME-WAIT slot via predicted path vs slow path.
+        let df = srv_f
+            .input_with_metadata(now + 80, fin_c[0].0.ip, 0, Ipv4Options::default(), &fin_c[0].1, Default::default())
+            .unwrap();
+        let ds = input_forced_unpredicted(
+            &mut srv_s,
+            now + 80,
+            fin_c[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &fin_c[0].1,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(df, ds);
+        assert_same_server(&mut srv_f, &mut srv_s, now + 80, "time_wait_dup");
     }
 }

@@ -85,8 +85,8 @@ pub use connection::{
 pub use endpoint::{
     ActiveOpenOptions, AddressValidation, ConfirmedProbe, ConnectedIpHeader, ConnectionId,
     CorrelatedPmtu, CorrelatedSegment, Endpoint, EndpointConfig, EndpointError, Event,
-    InputDisposition, IpHeader, ListenerId, PendingPmtuApplied, PhysicalReceipt, PollTransmit,
-    StreamState, Transmit,
+    InputDisposition, IpHeader, ListenerId, ManagedProgress, PendingPmtuApplied, PhysicalReceipt,
+    PollTransmit, StreamState, Transmit,
 };
 pub use ipv4_options::{
     EncodedIpv4Options, ExpectedRegistrations, ExpectedTimestamps, Ipv4Options, Ipv4OptionsError,

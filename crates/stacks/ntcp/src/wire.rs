@@ -95,8 +95,6 @@ pub struct Segment<'a> {
 impl Segment<'_> {
     // The parser fills a contiguous prefix in wire order, starting with
     // the DSACK block when present.
-    // Non-test callers land with the connection/endpoint ingress commits.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn carries_sack(&self) -> bool {
         let present = self.options.sack_blocks[0].is_some();
         debug_assert_eq!(present, self.options.sack_blocks.iter().any(Option::is_some));

@@ -858,8 +858,6 @@ impl Congestion {
 
     /// A cumulative data ACK that covers the whole flight, already
     /// validated for ordinary non-ECN congestion processing.
-    // Callers in `connection.rs` land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn on_drained_ack(&mut self, ack: Seq, acked: u32) -> bool {
         debug_assert!(acked != 0 && !self.in_recovery() && self.ecn_prr.is_none());
         self.on_delivery_ack::<true>(ack, acked, 0, false)

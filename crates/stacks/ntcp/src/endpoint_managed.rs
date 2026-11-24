@@ -4,6 +4,35 @@ use crate::{
     PathFactoryRequest, PathProvider, PreparedPath,
 };
 
+impl Slot {
+    pub(super) fn matches_route(&self, route: &ManagedRoute, destination: IpAddr) -> bool {
+        let connection = &self.connection;
+        connection.managed_path.as_ref().is_some_and(|binding| {
+            binding.client == route.client && binding.snapshot.stamp() == route.stamp
+        }) && self.dscp == route.dscp
+            && connection.ip_header_len() == route.ip_header_len
+            && connection.scoped_tuple().zone() == route.zone
+            && destination == route.forwarding_destination
+    }
+
+    pub(super) fn forwarding_destination(&self) -> IpAddr {
+        self.ipv4_options
+            .source_route
+            .as_ref()
+            .and_then(|route| route.hops().first().copied())
+            .map(IpAddr::V4)
+            .unwrap_or(self.connection.ip.destination)
+    }
+}
+
+/// Transport observations for one owner dequeued by a managed path provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagedProgress {
+    pub owner: ConnectionId,
+    pub delivered: Option<Instant>,
+    pub unpublished: bool,
+}
+
 /// What a managed Host proved about one physically submitted TCP segment of
 /// an exact connection generation: the sequence span it consumed and the
 /// complete IP packet and header lengths it was submitted with.
@@ -288,8 +317,14 @@ impl Endpoint {
     /// connection is given once per change, however many came before the
     /// call.
     pub fn next_progress(&mut self) -> Option<(ConnectionId, Option<Instant>)> {
+        self.next_managed_progress().map(|p| (p.owner, p.delivered))
+    }
+
+    #[inline]
+    pub fn next_managed_progress(&mut self) -> Option<ManagedProgress> {
         let index = self.progress.pop()?;
-        let connection = &self.slots[index].as_ref().unwrap().connection;
+        let slot = self.slots[index].as_ref().unwrap();
+        let connection = &slot.connection;
         let una = connection.unacknowledged();
         let delivered = if una != self.progress_una[index] {
             connection.delivered_sent_at()
@@ -297,7 +332,11 @@ impl Endpoint {
             None
         };
         self.progress_una[index] = una;
-        Some((self.id(index), delivered))
+        Some(ManagedProgress {
+            owner: self.id(index),
+            delivered,
+            unpublished: !slot.released && connection.managed_results.unpublished(),
+        })
     }
 
     /// The live connection an ICMP error quoting `tuple` is about, as RFC
@@ -542,7 +581,7 @@ impl Endpoint {
                 }
                 AddressValidation::Route { .. } => false,
             }
-            && (self.address_policy)(check)
+            && self.address_policy.allows(check)
     }
 
     fn path_factory<P: PathProvider, T>(
@@ -729,6 +768,7 @@ impl Endpoint {
     /// `arrival` is the link the packet arrived on: it scopes a tuple with
     /// an IPv6 link-local address and is otherwise not part of its identity.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn input_with_path_provider<P: PathProvider>(
         &mut self,
         now: Instant,
@@ -744,11 +784,43 @@ impl Endpoint {
         if self.managed_context != Some(arrival.context()) {
             return Err(EndpointError::Connection(Error::InvalidState).into());
         }
-        let tuple = Tuple {
-            local: SocketAddr::new(ip.destination, 0),
-            remote: SocketAddr::new(ip.source, 0),
-        };
-        let zone = crate::connection::needs_zone(tuple).then_some(arrival);
+        if let Some(index) = self.predicted_plain_input(ip, Some(&options), bytes) {
+            return self
+                .input_predicted(now, index, traffic_class, bytes, &metadata, None)
+                .map_err(ManagedError::Endpoint);
+        }
+        self.input_with_factory(
+            now,
+            arrival,
+            ip,
+            traffic_class,
+            options,
+            bytes,
+            metadata,
+            outgoing_dscp,
+            provider,
+        )
+    }
+
+    // A known, unscoped stream needs no factory transaction. Keep the
+    // listener and routing state off the established segment's call frame.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn input_with_factory<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        arrival: ntcp_path::LinkId,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Ipv4Options,
+        bytes: &[u8],
+        metadata: crate::RxPacketMetadata,
+        outgoing_dscp: u8,
+        provider: &mut P,
+    ) -> Result<InputDisposition, ManagedError<P::Error>> {
+        let zone = (crate::connection::link_local(ip.destination)
+            || crate::connection::link_local(ip.source))
+        .then_some(arrival);
         // Input the Endpoint discards (invalid/broadcast/multicast source or
         // destination, rejected received route, ...) prepares no path.
         let Some((route, segment)) = self.ingress_admission(ip, zone, options, bytes, metadata)?
@@ -857,6 +929,268 @@ impl Endpoint {
             let header = provider.reply_header_len(reply, zone, record.dscp);
             self.time_wait.record_mut(index).reply_header = header;
         }
+        result
+    }
+
+    /// Input of a TCP segment in a received IP datagram. The receive queue
+    /// may keep its backing frame when it covers these bytes. Reassembly
+    /// or option processing can instead supply bytes from a different buffer.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn input_backed_with_path_provider<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        arrival: ntcp_path::LinkId,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Option<&Ipv4Options>,
+        bytes: &[u8],
+        backing: &mut Option<RxFrame>,
+        metadata: crate::RxPacketMetadata,
+        outgoing_dscp: u8,
+        provider: &mut P,
+    ) -> Result<InputDisposition, ManagedError<P::Error>> {
+        let index = self.predicted_plain_input(ip, options, bytes);
+        self.input_checked_backed(
+            now,
+            arrival,
+            || ip,
+            traffic_class,
+            options,
+            bytes,
+            backing,
+            metadata,
+            outgoing_dscp,
+            provider,
+            index,
+        )
+    }
+
+    /// TCP from a complete, unfragmented IPv4 datagram (`datagram`, starting
+    /// at the IPv4 header). An option-free header (`version == 4`, `IHL == 5`)
+    /// uses the predicted IPv4 fast path directly; any datagram carrying IPv4
+    /// options (`IHL > 5`) is parsed and routed through the full admission
+    /// path so option and source-route checks cannot be bypassed.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn input_ipv4_backed_with_path_provider<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        arrival: ntcp_path::LinkId,
+        datagram: &[u8],
+        backing: &mut Option<RxFrame>,
+        metadata: crate::RxPacketMetadata,
+        outgoing_dscp: u8,
+        provider: &mut P,
+    ) -> Result<InputDisposition, ManagedError<P::Error>> {
+        let Some(header) = datagram.first_chunk::<20>() else {
+            return Err(EndpointError::Connection(Error::InvalidArgument).into());
+        };
+        if header[0] == 0x45
+            && header[9] == 6
+            && u16::from_be_bytes([header[6], header[7]]) & !0x4000 == 0
+            && usize::from(u16::from_be_bytes([header[2], header[3]])) == datagram.len()
+        {
+            let source =
+                core::net::Ipv4Addr::from([header[12], header[13], header[14], header[15]]);
+            let destination =
+                core::net::Ipv4Addr::from([header[16], header[17], header[18], header[19]]);
+            let payload = &datagram[20..];
+            let index = self.predict_ipv4_tcp(destination, source, payload);
+            return self.input_checked_backed(
+                now,
+                arrival,
+                || IpMetadata {
+                    source: source.into(),
+                    destination: destination.into(),
+                },
+                header[1],
+                None,
+                payload,
+                backing,
+                metadata,
+                outgoing_dscp,
+                provider,
+                index,
+            );
+        }
+        self.input_ipv4_non_plain_backed(
+            now,
+            arrival,
+            header,
+            datagram,
+            backing,
+            metadata,
+            outgoing_dscp,
+            provider,
+        )
+    }
+
+    #[cold]
+    #[allow(clippy::too_many_arguments)]
+    fn input_ipv4_non_plain_backed<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        arrival: ntcp_path::LinkId,
+        header: &[u8; 20],
+        datagram: &[u8],
+        backing: &mut Option<RxFrame>,
+        metadata: crate::RxPacketMetadata,
+        outgoing_dscp: u8,
+        provider: &mut P,
+    ) -> Result<InputDisposition, ManagedError<P::Error>> {
+        if self.managed_context != Some(arrival.context()) {
+            return Err(EndpointError::Connection(Error::InvalidState).into());
+        }
+        let version = header[0] >> 4;
+        let ihl = usize::from(header[0] & 0x0f) * 4;
+        let total_len = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        let unfragmented = u16::from_be_bytes([header[6], header[7]]) & !0x4000 == 0;
+        if version != 4
+            || ihl < 20
+            || ihl > datagram.len()
+            || total_len != datagram.len()
+            || header[9] != 6
+            || !unfragmented
+        {
+            return Err(EndpointError::Connection(Error::InvalidArgument).into());
+        }
+        let ip = IpMetadata {
+            source: core::net::Ipv4Addr::from([header[12], header[13], header[14], header[15]])
+                .into(),
+            destination: core::net::Ipv4Addr::from([
+                header[16], header[17], header[18], header[19],
+            ])
+            .into(),
+        };
+        let payload = &datagram[ihl..];
+        let Ok(options) = Ipv4Options::parse(&datagram[20..ihl], true) else {
+            self.drop_input::<()>(DropReason::IpInhdr, ip, payload);
+            return Ok(InputDisposition::Dropped);
+        };
+        let held = backing
+            .as_mut()
+            .is_some_and(|frame| frame.retain_slice(payload));
+        self.input_unpredicted_backed(
+            now,
+            arrival,
+            ip,
+            header[1],
+            Some(&options),
+            payload,
+            backing,
+            held,
+            metadata,
+            outgoing_dscp,
+            provider,
+        )
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn input_checked_backed<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        arrival: ntcp_path::LinkId,
+        ip: impl FnOnce() -> IpMetadata,
+        traffic_class: u8,
+        options: Option<&Ipv4Options>,
+        bytes: &[u8],
+        backing: &mut Option<RxFrame>,
+        metadata: crate::RxPacketMetadata,
+        outgoing_dscp: u8,
+        provider: &mut P,
+        index: Option<usize>,
+    ) -> Result<InputDisposition, ManagedError<P::Error>> {
+        // A socket can retain an accepted payload within these bytes. If it
+        // leaves the frame with the caller, the caller gets the TCP segment.
+        let held = backing
+            .as_mut()
+            .is_some_and(|frame| frame.retain_slice(bytes));
+        if self.managed_context == Some(arrival.context())
+            && let Some(index) = index
+        {
+            #[cfg(debug_assertions)]
+            {
+                let at = bytes.as_ptr() as usize;
+                self.ingress_bytes = held.then_some(at..at + bytes.len());
+            }
+            let result = self.input_predicted(
+                now,
+                index,
+                traffic_class,
+                bytes,
+                &metadata,
+                held.then_some(backing),
+            );
+            #[cfg(debug_assertions)]
+            {
+                self.ingress_bytes = None;
+            }
+            return result.map_err(ManagedError::Endpoint);
+        }
+        self.input_unpredicted_backed(
+            now,
+            arrival,
+            ip(),
+            traffic_class,
+            options,
+            bytes,
+            backing,
+            held,
+            metadata,
+            outgoing_dscp,
+            provider,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn input_unpredicted_backed<P: PathProvider>(
+        &mut self,
+        now: Instant,
+        arrival: ntcp_path::LinkId,
+        ip: IpMetadata,
+        traffic_class: u8,
+        options: Option<&Ipv4Options>,
+        bytes: &[u8],
+        backing: &mut Option<RxFrame>,
+        held: bool,
+        metadata: crate::RxPacketMetadata,
+        outgoing_dscp: u8,
+        provider: &mut P,
+    ) -> Result<InputDisposition, ManagedError<P::Error>> {
+        if self.managed_context != Some(arrival.context()) {
+            return Err(EndpointError::Connection(Error::InvalidState).into());
+        }
+        let options = options.copied().unwrap_or_default();
+        if !held {
+            return self.input_with_factory(
+                now,
+                arrival,
+                ip,
+                traffic_class,
+                options,
+                bytes,
+                metadata,
+                outgoing_dscp,
+                provider,
+            );
+        }
+        // SAFETY: `lent_bytes` serves this input alone, which ends before
+        // `end_ingress` (`lend_ingress`).
+        let lent_bytes = unsafe { self.lend_ingress(backing.take().unwrap()) };
+        let result = self.input_with_factory(
+            now,
+            arrival,
+            ip,
+            traffic_class,
+            options,
+            lent_bytes,
+            metadata,
+            outgoing_dscp,
+            provider,
+        );
+        *backing = self.end_ingress();
         result
     }
 
@@ -994,17 +1328,21 @@ impl Endpoint {
             stamp: binding.snapshot.stamp(),
             dscp: slot.dscp,
             zone: connection.scoped_tuple().zone(),
-            forwarding_destination: slot
-                .ipv4_options
-                .source_route
-                .as_ref()
-                .and_then(|route| route.hops().first().copied())
-                .map(IpAddr::V4)
-                .unwrap_or(connection.tuple().remote.ip()),
+            forwarding_destination: slot.forwarding_destination(),
             ip_header_len: connection.ip_header_len(),
             ordinary_ip_budget: connection.path_payload_limit() as u32
                 + u32::from(connection.ip_header_len()),
         })
+    }
+
+    /// Check the route selectors and bound snapshot of a retained generation.
+    /// A provider that already applied this snapshot can reuse its forwarding
+    /// decision without requesting transport payload ceilings.
+    pub fn managed_route_matches(&self, id: ConnectionId, route: &ManagedRoute) -> bool {
+        let Ok(slot) = self.retained_slot(id) else {
+            return false;
+        };
+        slot.matches_route(route, slot.forwarding_destination())
     }
 
     /// Read-only: whether `apply_path_budget(id, path)` would succeed now
@@ -1334,5 +1672,367 @@ mod managed_results_tests {
         assert!(results.active_mut().is_some());
         assert!(results.pending.is_none());
         assert_eq!(results.take_confirmed(), None);
+    }
+}
+
+#[cfg(test)]
+mod commit7_managed_ingress_tests {
+    use super::*;
+    use alloc::{vec, vec::Vec};
+    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use ntcp_path::{
+        ContextId, InterfaceKey, IpPrefix, Limits, LinkId, NextHop, PathRequest, PathService,
+        Route, ScopedAddress,
+    };
+
+    struct SimpleProvider {
+        service: PathService,
+        link: LinkId,
+        source: ntcp_path::SourceId,
+    }
+
+    impl SimpleProvider {
+        fn new(context: u64, local: Ipv4Addr) -> Self {
+            let mut service = PathService::new(
+                ContextId::new(context),
+                Limits {
+                    links: 2,
+                    sources: 2,
+                    source_owners: 2,
+                    routes: 4,
+                    paths: 8,
+                    clients: 8,
+                },
+                [context as u8; 16],
+            )
+            .unwrap();
+            let link = service.register_link(InterfaceKey(1), 1500).unwrap();
+            let source = service
+                .register_source(ScopedAddress::new(IpAddr::V4(local), None).unwrap(), link)
+                .unwrap();
+            service
+                .add_route(Route {
+                    destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+                    source: None,
+                    dscp: None,
+                    link,
+                    next_hop: NextHop::OnLink,
+                    metric: 0,
+                })
+                .unwrap();
+            Self {
+                service,
+                link,
+                source,
+            }
+        }
+    }
+
+    impl PathProvider for SimpleProvider {
+        type Error = ntcp_path::Error;
+
+        fn prepare(
+            &mut self,
+            request: PathFactoryRequest,
+        ) -> Result<crate::PreparedFactory, Self::Error> {
+            let (client, snapshot) = self.service.acquire(PathRequest {
+                source: self.source,
+                destination: ScopedAddress::new(request.tuple.remote.ip(), request.zone).unwrap(),
+                dscp: request.dscp,
+            })?;
+            Ok(crate::PreparedFactory {
+                path: PreparedPath { client, snapshot },
+                receive: crate::ReceiveIpCapability::new(self.service.context(), false, 1500)
+                    .unwrap(),
+            })
+        }
+
+        fn commit(&mut self, _prepared: PreparedPath, _owner: ConnectionId) {}
+
+        fn cancel(&mut self, prepared: PreparedPath) {
+            let _ = self.service.release(prepared.client);
+        }
+    }
+
+    fn build_ipv4_packet(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        ip_options: &[u8],
+        tcp_payload: &[u8],
+    ) -> Vec<u8> {
+        assert_eq!(ip_options.len() % 4, 0);
+        let ihl_bytes = 20 + ip_options.len();
+        let total_len = ihl_bytes + tcp_payload.len();
+        let mut pkt = vec![0u8; total_len];
+        pkt[0] = (4 << 4) | ((ihl_bytes / 4) as u8);
+        pkt[1] = 0;
+        pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        pkt[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+        pkt[8] = 64;
+        pkt[9] = 6; // TCP
+        pkt[12..16].copy_from_slice(&src.octets());
+        pkt[16..20].copy_from_slice(&dst.octets());
+        pkt[20..ihl_bytes].copy_from_slice(ip_options);
+        let csum = ntcp_ip_common::checksum(&pkt[..ihl_bytes]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        pkt[ihl_bytes..].copy_from_slice(tcp_payload);
+        pkt
+    }
+
+    fn drain(ep: &mut Endpoint, now: Instant) -> Vec<(Transmit, Vec<u8>)> {
+        let mut out = [0u8; 2048];
+        let mut pkts = Vec::new();
+        for _ in 0..16 {
+            let p = ep.poll_transmit(now, &mut out, 16).unwrap();
+            let Some(pkt) = p.packet else { break };
+            pkts.push((pkt, out[..pkt.len].to_vec()));
+            if !p.more_work {
+                break;
+            }
+        }
+        pkts
+    }
+
+    fn setup_managed_pair(
+        ipv4_options_enabled: bool,
+    ) -> (
+        Endpoint,
+        SimpleProvider,
+        Endpoint,
+        SimpleProvider,
+        ConnectionId,
+        ConnectionId,
+    ) {
+        let a_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let b_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let mut pa = SimpleProvider::new(1, a_ip);
+        let mut pb = SimpleProvider::new(2, b_ip);
+
+        let cfg = EndpointConfig {
+            max_connections: 8,
+            max_listeners: 4,
+            ipv4_options_enabled,
+            connection: ConnectionConfig {
+                nagle: false,
+                delayed_ack_us: 0,
+                ..ConnectionConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        let mut a = Endpoint::for_local_address(cfg.clone(), [1; 32], 0, IpAddr::V4(a_ip)).unwrap();
+        let mut b = Endpoint::for_local_address(cfg, [2; 32], 0, IpAddr::V4(b_ip)).unwrap();
+        a.enable_managed_paths(pa.service.context()).unwrap();
+        b.enable_managed_paths(pb.service.context()).unwrap();
+
+        let listener = b.listen(SocketAddr::new(IpAddr::V4(b_ip), 80), 4).unwrap();
+        let client = a
+            .connect_with_path_provider(
+                100,
+                SocketAddr::new(IpAddr::V4(a_ip), 40001),
+                SocketAddr::new(IpAddr::V4(b_ip), 80),
+                ManagedOpenOptions {
+                    transport: ActiveOpenOptions::from(&EndpointConfig::default().connection),
+                    dscp: 0,
+                    ipv4_options: OutgoingIpv4Options::default(),
+                    registration: None,
+                    receive_authority: None,
+                },
+                &mut pa,
+            )
+            .unwrap();
+        let syn = drain(&mut a, 100);
+        b.input_with_path_provider(
+            110,
+            pb.link,
+            syn[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &syn[0].1,
+            Default::default(),
+            0,
+            &mut pb,
+        )
+        .unwrap();
+        let syn_ack = drain(&mut b, 110);
+        a.input_with_path_provider(
+            120,
+            pa.link,
+            syn_ack[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &syn_ack[0].1,
+            Default::default(),
+            0,
+            &mut pa,
+        )
+        .unwrap();
+        let ack = drain(&mut a, 120);
+        b.input_with_path_provider(
+            130,
+            pb.link,
+            ack[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &ack[0].1,
+            Default::default(),
+            0,
+            &mut pb,
+        )
+        .unwrap();
+        let server = b.accept(listener).unwrap();
+        (a, pa, b, pb, client, server)
+    }
+
+    #[test]
+    fn input_ipv4_backed_never_bypasses_options_admission_or_source_route_refusal() {
+        let a_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let b_ip = Ipv4Addr::new(10, 0, 0, 2);
+
+        // Case 1: ipv4_options_enabled = false, established connection with warmed TupleTable hint.
+        let (mut a, _pa, mut b, mut pb, client, server) = setup_managed_pair(false);
+
+        // Send one plain packet first so TupleTable hint predicts `server`.
+        a.write(client, b"warm").unwrap();
+        let warm = drain(&mut a, 200);
+        let warm_ip = build_ipv4_packet(a_ip, b_ip, &[], &warm[0].1);
+        let mut warm_frame = Some(RxFrame::copy_from_slice(&warm_ip));
+        let warm_slice = unsafe {
+            core::slice::from_raw_parts(
+                warm_frame.as_ref().unwrap().as_ptr(),
+                warm_frame.as_ref().unwrap().len(),
+            )
+        };
+        assert_eq!(
+            b.input_ipv4_backed_with_path_provider(
+                210,
+                pb.link,
+                warm_slice,
+                &mut warm_frame,
+                Default::default(),
+                0,
+                &mut pb,
+            )
+            .unwrap(),
+            InputDisposition::Processed
+        );
+        assert!(warm_frame.is_none(), "plain in-order frame should be retained by RxQueue");
+        let mut buf = [0u8; 32];
+        assert_eq!(b.read(server, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"warm");
+        // Confirm hint IS warm for this 4-tuple!
+        assert!(b.predict_ipv4_tcp(b_ip, a_ip, &warm[0].1).is_some());
+
+        // Now send a packet carrying an IPv4 LSRR source-route option (IHL = 7, 28 bytes).
+        a.write(client, b"source-routed").unwrap();
+        let sr_tcp = drain(&mut a, 300);
+        let lsrr = [131u8, 7, 8, 10, 0, 0, 99, 0]; // LSRR + EOOL padding to 8 bytes
+        let sr_ip = build_ipv4_packet(a_ip, b_ip, &lsrr, &sr_tcp[0].1);
+        let mut sr_frame = Some(RxFrame::copy_from_slice(&sr_ip));
+        let sr_slice = unsafe {
+            core::slice::from_raw_parts(
+                sr_frame.as_ref().unwrap().as_ptr(),
+                sr_frame.as_ref().unwrap().len(),
+            )
+        };
+        let refused_before = b.drop_counts().get(DropReason::IpSourceRouteRefused);
+        let disp = b
+            .input_ipv4_backed_with_path_provider(
+                310,
+                pb.link,
+                sr_slice,
+                &mut sr_frame,
+                Default::default(),
+                0,
+                &mut pb,
+            )
+            .unwrap();
+        assert_eq!(disp, InputDisposition::Dropped);
+        assert_eq!(
+            b.drop_counts().get(DropReason::IpSourceRouteRefused),
+            refused_before + 1,
+            "LSRR packet must be refused via ingress_admission, never admitted on option-free fast path"
+        );
+        assert_eq!(b.readable_bytes(server).unwrap(), 0);
+        assert!(sr_frame.is_some());
+
+        // Malformed / non-TCP datagram must fail fast with InvalidArgument.
+        let mut bad_proto = sr_ip.clone();
+        bad_proto[9] = 17; // UDP
+        let mut none_frame = None;
+        assert_eq!(
+            b.input_ipv4_backed_with_path_provider(
+                320,
+                pb.link,
+                &bad_proto,
+                &mut none_frame,
+                Default::default(),
+                0,
+                &mut pb,
+            ),
+            Err(ManagedError::Endpoint(EndpointError::Connection(
+                Error::InvalidArgument
+            )))
+        );
+
+        // Case 2: ipv4_options_enabled = true with Record Route option (IHL = 7).
+        // Verify received IPv4 options ARE recorded on the socket (not bypassed by option-free fast path).
+        let (mut a2, _pa2, mut b2, mut pb2, client2, server2) = setup_managed_pair(true);
+        a2.write(client2, b"rr-data").unwrap();
+        let rr_tcp = drain(&mut a2, 400);
+        // Record Route option: kind=7, len=7, ptr=8, 1 recorded addr (10.0.0.5), EOOL pad.
+        let rr = [7u8, 7, 8, 10, 0, 0, 5, 0];
+        let rr_ip = build_ipv4_packet(a_ip, b_ip, &rr, &rr_tcp[0].1);
+        let mut rr_frame = Some(RxFrame::copy_from_slice(&rr_ip));
+        let rr_slice = unsafe {
+            core::slice::from_raw_parts(
+                rr_frame.as_ref().unwrap().as_ptr(),
+                rr_frame.as_ref().unwrap().len(),
+            )
+        };
+        assert_eq!(
+            b2.input_ipv4_backed_with_path_provider(
+                410,
+                pb2.link,
+                rr_slice,
+                &mut rr_frame,
+                Default::default(),
+                0,
+                &mut pb2,
+            )
+            .unwrap(),
+            InputDisposition::Processed
+        );
+        let saved = b2
+            .received_ipv4_options(server2)
+            .unwrap()
+            .expect("received IPv4 options must be saved");
+        assert!(!saved.is_empty());
+
+        // Also check managed_route_matches and next_managed_progress.
+        let route = b2.managed_route(server2).unwrap();
+        assert!(b2.managed_route_matches(server2, &route));
+        let mut wrong_route = route;
+        wrong_route.dscp = route.dscp.wrapping_add(1);
+        assert!(!b2.managed_route_matches(server2, &wrong_route));
+
+        // Deliver an ACK to client2 so next_managed_progress reports owner + delivered timestamp.
+        let ack_b2 = drain(&mut b2, 410);
+        let mut pa2_tmp = SimpleProvider::new(1, a_ip);
+        let _ = a2.input_with_path_provider(
+            420,
+            pa2_tmp.link,
+            ack_b2[0].0.ip,
+            0,
+            Ipv4Options::default(),
+            &ack_b2[0].1,
+            Default::default(),
+            0,
+            &mut pa2_tmp,
+        );
+        let prog = a2.next_managed_progress();
+        assert!(prog.is_some());
+        let prog = prog.unwrap();
+        assert_eq!(prog.owner, client2);
+        assert!(!prog.unpublished);
     }
 }
