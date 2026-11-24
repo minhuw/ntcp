@@ -640,6 +640,16 @@ impl Budget {
                 .store(waiting, Ordering::SeqCst);
         }
     }
+
+    pub(crate) fn has_group_waiters(&self) -> bool {
+        self.share.as_ref().is_some_and(|share| {
+            share
+                .group
+                .owners
+                .iter()
+                .any(|o| o.waiting.load(Ordering::Relaxed))
+        })
+    }
 }
 
 impl Budget {

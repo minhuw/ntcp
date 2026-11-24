@@ -1,55 +1,78 @@
 extern crate alloc;
 
 use alloc::{collections::VecDeque, vec::Vec};
+use core::mem::size_of;
 
-use crate::Payload;
+use ntcp_buffer::{ChunkArena, ChunkRef, ChunkSlice, PayloadSlice, TxPart};
+
+use crate::{Payload, tx_pool::TxPool};
 
 #[path = "send_marks.rs"]
 mod send_marks;
-use send_marks::SendMarks;
+use send_marks::PtbMarks;
 
-#[derive(Clone, Debug)]
-struct SharedSpan {
-    start: u64,
-    payload: Payload,
+// Per-entry flag bits, carried on the last byte of a `TxSeg` (D5).
+// Interior bytes never carry PUSH or EOR; setting a flag mid-entry splits it.
+const FLAG_PUSH: u8 = 1 << 0;
+const FLAG_EOR: u8 = 1 << 1;
+const FLAG_MARK_MASK: u8 = FLAG_PUSH | FLAG_EOR;
+// Set on a `TxSegData::Shared` entry when it continues the immediately
+// preceding `TxSegData::Shared` entry in the same storage and lease (e.g.
+// separated only by a PUSH/EOR boundary or an interior split).
+const FLAG_CONTIGUOUS_SHARED: u8 = 1 << 2;
+
+/// Initial entry-deque reservation on first write (8 entries = 512 bytes).
+pub(crate) const SEND_ENTRY_RESERVE: usize = 8;
+
+/// Spare entry slots kept beyond what a write adds so `collapse_push` and
+/// `finish_send` do not allocate on the output/shutdown path.
+pub(crate) const ENTRY_SPLIT_SPARE: usize = 2;
+
+#[derive(Debug)]
+enum TxSegData {
+    Chunk {
+        chunk: ChunkRef,
+        offset: u32,
+        len: u32,
+    },
+    Shared(Payload),
+    // Shared payload dropped eagerly on `release_shared()` at connection
+    // termination while preserving `SendBuffer::len()` until reclaim.
+    Released(u32),
 }
 
-// Per-byte metadata bits beside PUSH (bit 0) and EOR (bit 1).
-// A Packet Too Big notification reported this byte's original copy dropped.
-const PTB_PENDING: u8 = 1 << 2;
-// A copy of this byte was (possibly) submitted again after its original.
-const RETRANSMITTED: u8 = 1 << 3;
-// A PTB replacement copy of this byte is outstanding and RFC 6675 SetPipe's
-// HighRxt term did not count it when it was committed.
-const PTB_COPY: u8 = 1 << 4;
+#[derive(Debug)]
+struct TxSeg {
+    // Stream position relative to `SendBuffer::head` via `wrapping_sub`.
+    start: u64,
+    data: TxSegData,
+    // Bit 0 = PUSH on last byte of this entry, bit 1 = EOR on last byte.
+    flags: u8,
+}
 
-// Up to `count` positions from `offset` of a ring of `len` whose first
-// slice holds `split`, as ranges of its first and second slice.
-fn ring_ranges(
-    split: usize,
-    len: usize,
-    offset: usize,
-    count: usize,
-) -> [core::ops::Range<usize>; 2] {
-    let start = offset.min(len);
-    let end = start + count.min(len - start);
-    [
-        start.min(split)..end.min(split),
-        start.max(split) - split..end.max(split) - split,
-    ]
+impl TxSeg {
+    #[inline]
+    fn len(&self) -> usize {
+        match &self.data {
+            TxSegData::Chunk { len, .. } => *len as usize,
+            TxSegData::Shared(payload) => payload.len(),
+            TxSegData::Released(len) => *len as usize,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
-    // The queued bytes and, at the same positions, their bounded PUSH/EOR
-    // and PTB-pending/retransmitted bits. ACK, truncation, and resize move
-    // metadata with the data. Kept apart so a segment's payload copies as
-    // whole slices and its metadata scans as plain bytes.
-    data: VecDeque<u8>,
-    marks: SendMarks,
+    entries: VecDeque<TxSeg>,
+    ptb: PtbMarks,
+    len: usize,
+    chunk_bytes: usize,
     capacity: usize,
     head: u64,
-    shared: VecDeque<SharedSpan>,
+    shared_entries: usize,
+    // Discontiguous shared Payload spans (Shared entries without
+    // `FLAG_CONTIGUOUS_SHARED`), bounded by `MAX_SHARED_SEGMENTS`.
+    shared_spans: usize,
     shared_output: Option<usize>,
     // Queue offsets immediately after the last PUSH and EOR, zero if absent.
     // A prefix ACK subtracts its byte count from both boundaries.
@@ -60,19 +83,28 @@ pub(crate) struct SendBuffer {
 }
 
 impl SendBuffer {
-    // Rings reserved for `capacity` queued bytes at once.
+    // Entry deque reserved up front for tests that write directly into
+    // `SendBuffer` without going through `Connection::grow_send_storage`.
     #[cfg(test)]
     pub(crate) fn new(capacity: usize) -> Result<Self, ()> {
-        let mut data = VecDeque::new();
-        data.try_reserve_exact(capacity).map_err(|_| ())?;
-        let mut marks = SendMarks::default();
-        marks.reserve(capacity)?;
+        if capacity > (1 << 30) {
+            return Err(());
+        }
+        let mut entries = VecDeque::new();
+        if capacity > 0 {
+            entries
+                .try_reserve_exact(SEND_ENTRY_RESERVE)
+                .map_err(|_| ())?;
+        }
         Ok(Self {
-            data,
-            marks,
+            entries,
+            ptb: PtbMarks::default(),
+            len: 0,
+            chunk_bytes: 0,
             capacity,
             head: 0,
-            shared: VecDeque::new(),
+            shared_entries: 0,
+            shared_spans: 0,
             shared_output: None,
             push_end: 0,
             single_push_len: 0,
@@ -80,16 +112,19 @@ impl SendBuffer {
         })
     }
 
-    // A limit of `capacity` queued bytes with no ring yet: the rings are
-    // allocated by `grow`, at the first write, as Linux allocates a
-    // socket's skbs in sendmsg and none at socket creation.
+    // A logical capacity limit with zero heap storage allocated: entries are
+    // allocated on the first write, as Linux allocates a socket's skbs in
+    // sendmsg and none at socket creation.
     pub(crate) fn unallocated(capacity: usize) -> Self {
         Self {
-            data: VecDeque::new(),
-            marks: SendMarks::default(),
+            entries: VecDeque::new(),
+            ptb: PtbMarks::default(),
+            len: 0,
+            chunk_bytes: 0,
             capacity,
             head: 0,
-            shared: VecDeque::new(),
+            shared_entries: 0,
+            shared_spans: 0,
             shared_output: None,
             push_end: 0,
             single_push_len: 0,
@@ -97,65 +132,84 @@ impl SendBuffer {
         }
     }
 
+    #[inline]
+    pub(crate) fn entries_storage_bytes(&self) -> usize {
+        self.entries.capacity() * size_of::<TxSeg>()
+    }
+
+    #[inline]
+    pub(crate) fn ptb_storage_bytes(&self) -> usize {
+        self.ptb.storage_bytes()
+    }
+
+    #[cfg(test)]
+    #[inline]
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.data.capacity() + self.marks.capacity() + self.shared_storage_bytes()
+        self.entries_storage_bytes() + self.ptb_storage_bytes()
     }
 
-    // Queued bytes both rings hold without allocating.
-    pub(crate) fn allocation_capacity(&self) -> usize {
-        self.data.capacity().min(self.marks.capacity())
+    #[inline]
+    pub(crate) fn chunk_bytes(&self) -> usize {
+        self.chunk_bytes
     }
 
-    // The bytes `grow(capacity)` allocates: a ring that reallocates holds
-    // its old storage, which storage_bytes already counts, until the new
-    // one is filled, so this is also what the growth adds at its peak.
-    pub(crate) fn growth_bytes(&self, capacity: usize) -> usize {
-        let ring = |held: usize| if held < capacity { capacity } else { 0 };
-        ring(self.data.capacity()) + ring(self.marks.capacity())
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
     }
 
-    // Grows the payload and mark rings in place to hold `capacity` queued
-    // bytes; the limit stays as it is. Each ring reallocates at most once and
-    // moves only the shorter side of its wrap. On failure the queued bytes,
-    // their marks and the limit are as they were: a ring that grew before the
-    // other failed keeps its storage, which storage_bytes counts and the next
-    // growth reuses.
-    pub(crate) fn grow(&mut self, capacity: usize) -> Result<(), ()> {
-        let additional = capacity.saturating_sub(self.data.len());
-        self.data.try_reserve_exact(additional).map_err(|_| ())?;
-        self.marks.reserve(capacity)
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[inline]
+    pub(crate) fn remaining(&self) -> usize {
+        self.capacity.saturating_sub(self.len)
     }
 
     pub(crate) fn set_limit(&mut self, capacity: usize) {
         self.capacity = capacity;
     }
 
-    // Frees the storage of an empty queue, as Linux frees an emptied write
-    // queue's skbs (tcp_clean_rtx_queue, sk_wmem_free_skb): deallocation
-    // only, and the next write grows the rings again. No PUSH or EOR mark
-    // and no shared span is left with no byte queued; the limit and the
-    // stream position stay.
-    pub(crate) fn release(&mut self) {
-        assert!(self.data.is_empty());
-        debug_assert!(self.shared.is_empty());
-        debug_assert!(self.push_end == 0 && self.eor_end == 0);
-        self.data = VecDeque::new();
-        self.marks = SendMarks::default();
-        self.shared = VecDeque::new();
+    /// Whether no `TxSegData::Chunk` handles remain in this buffer.
+    #[cfg(test)]
+    pub(crate) fn has_no_chunks(&self) -> bool {
+        self.entries
+            .iter()
+            .all(|seg| !matches!(seg.data, TxSegData::Chunk { .. }))
+    }
+
+    /// Releases every live `ChunkRef` back to `pool` and empties the queue.
+    pub(crate) fn clear_chunks(&mut self, pool: &mut TxPool) {
+        for seg in self.entries.drain(..) {
+            if let TxSegData::Chunk { chunk, .. } = seg.data {
+                pool.release(chunk);
+            }
+        }
+        self.ptb.clear();
+        self.len = 0;
+        self.chunk_bytes = 0;
+        self.shared_entries = 0;
+        self.shared_spans = 0;
         self.push_end = 0;
+        self.single_push_len = 0;
         self.eor_end = 0;
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub(crate) fn remaining(&self) -> usize {
-        self.capacity.saturating_sub(self.len())
+    // Frees the entry deque and PTB storage of an empty queue.
+    pub(crate) fn release(&mut self) {
+        assert!(self.entries.is_empty());
+        debug_assert_eq!(self.len, 0);
+        debug_assert_eq!(self.chunk_bytes, 0);
+        debug_assert_eq!(self.shared_entries, 0);
+        debug_assert_eq!(self.shared_spans, 0);
+        debug_assert!(self.push_end == 0 && self.eor_end == 0);
+        self.entries = VecDeque::new();
+        self.ptb.clear();
+        self.push_end = 0;
+        self.single_push_len = 0;
+        self.eor_end = 0;
     }
 
     pub(crate) fn admission_room(&self, notsent: usize, lowat: Option<u32>) -> usize {
@@ -166,76 +220,319 @@ impl SendBuffer {
         remaining.min((lowat as usize).saturating_sub(notsent))
     }
 
-    // The rings hold what the limit admits (`grow`, at write admission):
-    // queueing never allocates.
-    fn assert_reserved(&self, count: usize) {
-        assert!(count <= self.data.capacity() - self.data.len());
-        assert!(count <= self.marks.capacity() - self.marks.len());
+    /// Whether a copying append into `pool`'s current tail chunk can extend
+    /// `self.entries.back()` in place without creating a new `TxSeg`.
+    #[inline]
+    pub(crate) fn can_extend_tail(&self, pool: &TxPool) -> bool {
+        let Some(back) = self.entries.back() else {
+            return false;
+        };
+        if back.flags != 0 {
+            return false;
+        }
+        match &back.data {
+            TxSegData::Chunk { chunk, offset, len } => pool.tail_continues(chunk, *offset + *len),
+            _ => false,
+        }
     }
 
-    pub(crate) fn append(&mut self, input: &[u8]) {
+    /// Worst-case number of new `TxSeg` entries a copying write of `copy_bytes`
+    /// will append into `pool`.
+    pub(crate) fn needed_entries_for_copy(&self, pool: &TxPool, copy_bytes: usize) -> usize {
+        if copy_bytes == 0 {
+            return 0;
+        }
+        let tail_rem = pool.tail_remaining();
+        if copy_bytes <= tail_rem {
+            return usize::from(!self.can_extend_tail(pool));
+        }
+        let chunk_size = pool.chunk_size().max(1);
+        let first = usize::from(tail_rem > 0 && !self.can_extend_tail(pool));
+        first + (copy_bytes - tail_rem).div_ceil(chunk_size)
+    }
+
+    /// Target entry-deque capacity to accommodate `new_entries` plus split
+    /// headroom.
+    fn entry_target(&self, new_entries: usize) -> usize {
+        let needed = self
+            .entries
+            .len()
+            .saturating_add(new_entries)
+            .saturating_add(ENTRY_SPLIT_SPARE);
+        if self.entries.capacity() >= needed {
+            return self.entries.capacity();
+        }
+        needed
+            .max(SEND_ENTRY_RESERVE)
+            .max(self.entries.capacity().saturating_mul(2))
+            .checked_next_power_of_two()
+            .unwrap_or(needed)
+    }
+
+    /// Whether `self.entries` already has capacity for `new_entries` plus
+    /// `ENTRY_SPLIT_SPARE` spare slots without reallocating.
+    #[inline]
+    pub(crate) fn has_entry_room(&self, new_entries: usize) -> bool {
+        self.entries
+            .len()
+            .checked_add(new_entries)
+            .and_then(|n| n.checked_add(ENTRY_SPLIT_SPARE))
+            .is_some_and(|needed| self.entries.capacity() >= needed)
+    }
+
+    /// Peak additional bytes reallocating `self.entries` for `new_entries`
+    /// plus `ENTRY_SPLIT_SPARE` would allocate, or `0` if already reserved.
+    pub(crate) fn entry_growth_bytes(&self, new_entries: usize) -> Option<usize> {
+        let needed = self
+            .entries
+            .len()
+            .checked_add(new_entries)?
+            .checked_add(ENTRY_SPLIT_SPARE)?;
+        if self.entries.capacity() >= needed {
+            return Some(0);
+        }
+        let target = self.entry_target(new_entries);
+        target.checked_mul(size_of::<TxSeg>())
+    }
+
+    /// Ensures `self.entries` holds at least `new_entries + ENTRY_SPLIT_SPARE`
+    /// free slots without mutating any queued bytes on failure.
+    pub(crate) fn reserve_entries(&mut self, new_entries: usize) -> Result<(), ()> {
+        let needed = self
+            .entries
+            .len()
+            .checked_add(new_entries)
+            .and_then(|n| n.checked_add(ENTRY_SPLIT_SPARE))
+            .ok_or(())?;
+        if self.entries.capacity() >= needed {
+            return Ok(());
+        }
+        let target = self.entry_target(new_entries);
+        let additional = target.saturating_sub(self.entries.len());
+        self.entries.try_reserve_exact(additional).map_err(|_| ())
+    }
+
+    /// Appends up to `input.len()` bytes by copying into `pool`'s tail and
+    /// freshly allocated chunks. Extends `entries.back_mut()` in place when
+    /// `back.flags == 0` and it continues the tail chunk (zero `dup`/`release`).
+    ///
+    /// Returns the number of bytes actually copied (`< input.len()` only if the
+    /// chunk source ran dry or arena page allocation failed).
+    pub(crate) fn append(&mut self, pool: &mut TxPool, input: &[u8]) -> usize {
         debug_assert!(input.len() <= self.remaining());
-        self.assert_reserved(input.len());
-        self.data.extend(input);
-        self.marks.extend_to(self.data.len());
+        if input.is_empty() {
+            return 0;
+        }
+        let entries = &mut self.entries;
+        let head = self.head;
+        let len_ref = &mut self.len;
+        let chunk_bytes_ref = &mut self.chunk_bytes;
+        pool.append_into(input, |arena, tail, off, taken| {
+            if let Some(back) = entries.back_mut()
+                && back.flags == 0
+                && let TxSegData::Chunk {
+                    chunk,
+                    offset: back_off,
+                    len: back_len,
+                } = &mut back.data
+                && core::ptr::eq(arena.get(chunk), arena.get(tail))
+                && *back_off + *back_len == off
+            {
+                *back_len += taken;
+            } else {
+                assert!(
+                    entries.len() < entries.capacity(),
+                    "TxSeg entries not reserved before append"
+                );
+                let start = head.wrapping_add(*len_ref as u64);
+                entries.push_back(TxSeg {
+                    start,
+                    data: TxSegData::Chunk {
+                        chunk: arena.dup(tail),
+                        offset: off,
+                        len: taken,
+                    },
+                    flags: 0,
+                });
+            }
+            *len_ref += taken as usize;
+            *chunk_bytes_ref += taken as usize;
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn write(&mut self, input: &[u8]) -> usize {
+    pub(crate) fn write(&mut self, pool: &mut TxPool, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
-        self.append(&input[..count]);
-        count
-    }
-
-    fn mark_slices(&self, offset: usize, count: usize) -> [&[u8]; 2] {
-        debug_assert!(self.marks.singleton().is_none_or(|(_, bits)| bits == 0));
-        let (front, back) = self.marks.ring.as_slices();
-        let [first, second] = ring_ranges(front.len(), self.marks.ring.len(), offset, count);
-        [&front[first], &back[second]]
-    }
-
-    fn mark_slices_mut(&mut self, offset: usize, count: usize) -> [&mut [u8]; 2] {
-        let len = self.marks.len();
-        let (front, back) = self.marks.materialize().as_mut_slices();
-        let [first, second] = ring_ranges(front.len(), len, offset, count);
-        [&mut front[first], &mut back[second]]
-    }
-
-    // Offset within the marks of up to `count` bytes from `offset` of the
-    // first carrying `flag`. Each block is first tested whole, which needs
-    // no early exit and so runs many marks per instruction.
-    fn first_flagged(&self, flag: u8, offset: usize, count: usize) -> Option<usize> {
-        if let Some((at, bits)) = self.marks.singleton() {
-            return at
-                .checked_sub(offset)
-                .filter(|&distance| bits & flag != 0 && distance < count);
+        if count == 0 {
+            return 0;
         }
-        let mut at = 0;
-        for part in self.mark_slices(offset, count) {
-            for block in part.chunks(64) {
-                if block.iter().fold(0, |any, mark| any | mark) & flag != 0 {
-                    return block
-                        .iter()
-                        .position(|mark| mark & flag != 0)
-                        .map(|n| at + n);
+        let needed = self.needed_entries_for_copy(pool, count);
+        self.reserve_entries(needed)
+            .expect("test SendBuffer::write entry reservation failed");
+        self.append(pool, &input[..count])
+    }
+
+    #[inline]
+    fn seg_start(&self, seg: &TxSeg) -> usize {
+        seg.start.wrapping_sub(self.head) as usize
+    }
+
+    /// Index of the entry containing byte `offset`, or `None` if `offset >= self.len`.
+    /// O(1) when hitting the front or back entry; O(log E) otherwise.
+    #[inline]
+    fn entry_at(&self, offset: usize) -> Option<usize> {
+        if offset >= self.len {
+            return None;
+        }
+        debug_assert!(!self.entries.is_empty());
+        if offset < self.entries[0].len() {
+            return Some(0);
+        }
+        let last = self.entries.len() - 1;
+        if offset >= self.seg_start(&self.entries[last]) {
+            return Some(last);
+        }
+        let head = self.head;
+        let idx = self
+            .entries
+            .partition_point(|seg| seg.start.wrapping_sub(head) as usize + seg.len() <= offset);
+        debug_assert!(idx < self.entries.len());
+        Some(idx)
+    }
+
+    /// Sets `bits` (subset of `FLAG_PUSH | FLAG_EOR`) on byte `offset`,
+    /// splitting its `TxSeg` only when `offset` is an interior byte.
+    fn set_flags_at(&mut self, pool: &mut TxPool, offset: usize, bits: u8) -> bool {
+        if offset >= self.len {
+            return false;
+        }
+        if bits == 0 {
+            return true;
+        }
+        let idx = self.entry_at(offset).unwrap();
+        let seg_start = self.seg_start(&self.entries[idx]);
+        let seg_len = self.entries[idx].len();
+        let seg_end = seg_start + seg_len;
+        if offset + 1 == seg_end {
+            self.entries[idx].flags |= bits;
+            return true;
+        }
+        let left_len = offset + 1 - seg_start;
+        let right_len = seg_len - left_len;
+        let left_contig = self.entries[idx].flags & FLAG_CONTIGUOUS_SHARED;
+        let old_marks = self.entries[idx].flags & FLAG_MARK_MASK;
+        let right_start = self.entries[idx].start.wrapping_add(left_len as u64);
+        let mut right_flags = old_marks;
+        let right_data = match &mut self.entries[idx].data {
+            TxSegData::Chunk {
+                chunk,
+                offset: chunk_off,
+                len,
+            } => {
+                let right_off = *chunk_off + left_len as u32;
+                *len = left_len as u32;
+                TxSegData::Chunk {
+                    chunk: pool.dup(chunk),
+                    offset: right_off,
+                    len: right_len as u32,
                 }
-                at += block.len();
             }
+            TxSegData::Shared(payload) => {
+                let right = payload.slice(left_len..seg_len).unwrap();
+                *payload = payload.slice(0..left_len).unwrap();
+                self.shared_entries += 1;
+                right_flags |= FLAG_CONTIGUOUS_SHARED;
+                TxSegData::Shared(right)
+            }
+            TxSegData::Released(len) => {
+                *len = left_len as u32;
+                TxSegData::Released(right_len as u32)
+            }
+        };
+        self.entries[idx].flags = left_contig | bits;
+        self.entries.insert(
+            idx + 1,
+            TxSeg {
+                start: right_start,
+                data: right_data,
+                flags: right_flags,
+            },
+        );
+        true
+    }
+
+    /// Try to coalesce `entries[idx]` (which must have no PUSH/EOR flags) with
+    /// `entries[idx + 1]` when both reference contiguous storage.
+    fn try_coalesce_with_next(&mut self, pool: &mut TxPool, idx: usize) -> bool {
+        if idx + 1 >= self.entries.len() || (self.entries[idx].flags & FLAG_MARK_MASK) != 0 {
+            return false;
         }
-        None
+        let can_merge = match (&self.entries[idx].data, &self.entries[idx + 1].data) {
+            (
+                TxSegData::Chunk {
+                    chunk: c1,
+                    offset: o1,
+                    len: l1,
+                },
+                TxSegData::Chunk {
+                    chunk: c2,
+                    offset: o2,
+                    ..
+                },
+            ) => pool.same_chunk(c1, c2) && *o1 + *l1 == *o2,
+            (TxSegData::Shared(p1), TxSegData::Shared(p2)) => p1.join(p2).is_some(),
+            (TxSegData::Released(_), TxSegData::Released(_)) => true,
+            _ => false,
+        };
+        if !can_merge {
+            return false;
+        }
+        let next = self.entries.remove(idx + 1).unwrap();
+        let cur = &mut self.entries[idx];
+        let left_contig = cur.flags & FLAG_CONTIGUOUS_SHARED;
+        let next_contig = next.flags & FLAG_CONTIGUOUS_SHARED;
+        cur.flags = left_contig | (next.flags & FLAG_MARK_MASK);
+        match (&mut cur.data, next.data) {
+            (
+                TxSegData::Chunk { len: l1, .. },
+                TxSegData::Chunk {
+                    chunk: c2,
+                    len: l2,
+                    ..
+                },
+            ) => {
+                *l1 += l2;
+                pool.release(c2);
+            }
+            (TxSegData::Shared(p1), TxSegData::Shared(p2)) => {
+                *p1 = p1.join(&p2).unwrap();
+                self.shared_entries -= 1;
+                if next_contig == 0 {
+                    self.shared_spans -= 1;
+                }
+            }
+            (TxSegData::Released(l1), TxSegData::Released(l2)) => {
+                *l1 += l2;
+            }
+            _ => unreachable!(),
+        }
+        true
     }
 
     pub(crate) fn mark_push(&mut self) {
-        if self.marks.or_back(1) {
-            self.note_push(self.marks.len() - 1);
+        if let Some(back) = self.entries.back_mut() {
+            back.flags |= FLAG_PUSH;
+            self.note_push(self.len - 1);
         }
     }
 
     // Offset of the last queued byte carrying PUSH.
+    #[inline]
     fn push_offset(&self) -> Option<usize> {
         self.push_end.checked_sub(1)
     }
 
+    #[inline]
     pub(crate) fn push_after(&self, offset: usize) -> bool {
         self.push_end > offset
     }
@@ -254,14 +551,22 @@ impl SendBuffer {
         }
     }
 
+    fn find_last_flag(&self, flag: u8) -> usize {
+        for seg in self.entries.iter().rev() {
+            if seg.flags & flag != 0 {
+                return self.seg_start(seg) + seg.len();
+            }
+        }
+        0
+    }
+
     // Finds the last PUSH mark again after marks at or past it went away.
     fn find_last_push(&mut self) {
-        self.push_end = self.marks.last(1).map_or(0, |offset| offset + 1);
+        self.push_end = self.find_last_flag(FLAG_PUSH);
         self.single_push_len = 1;
     }
 
-    // Whether a byte of the range carries PUSH. Only a range ending past the
-    // last mark is folded, and then only its own bytes.
+    // Whether a byte of the range carries PUSH (D5 entry walk fallback).
     pub(crate) fn pushed(&self, offset: usize, count: usize) -> bool {
         let Some(last) = self.push_offset() else {
             return false;
@@ -276,14 +581,29 @@ impl SendBuffer {
         if distance < self.single_push_len {
             return false;
         }
-        let [front, back] = self.mark_slices(offset, count);
-        front.iter().chain(back).fold(0, |any, mark| any | mark) & 1 != 0
+        let range_end = offset.saturating_add(count).min(self.len);
+        if offset >= range_end {
+            return false;
+        }
+        let Some(mut idx) = self.entry_at(offset) else {
+            return false;
+        };
+        while idx < self.entries.len() {
+            let seg = &self.entries[idx];
+            let seg_end = self.seg_start(seg) + seg.len();
+            if seg_end > range_end {
+                return false;
+            }
+            if seg.flags & FLAG_PUSH != 0 {
+                return true;
+            }
+            idx += 1;
+        }
+        false
     }
 
     // Index of the first of `segments` consecutive `size`-byte ranges from
-    // `offset` holding a PUSH mark. Only the ranges before the one holding
-    // the last mark are scanned, in blocks folded whole (as `pushed` folds),
-    // up to the first block with a mark, which smaller blocks then narrow.
+    // `offset` holding a PUSH mark (D5 entry walk fallback).
     pub(crate) fn first_pushed_segment(
         &self,
         offset: usize,
@@ -296,19 +616,21 @@ impl SendBuffer {
         if distance < self.single_push_len {
             return (holding_last < segments).then_some(holding_last);
         }
-        let mut at = 0;
-        for part in self.mark_slices(offset, holding_last.min(segments) * size) {
-            for block in part.chunks(4096) {
-                if block.iter().fold(0, |any, mark| any | mark) & 1 != 0 {
-                    for small in block.chunks(64) {
-                        if small.iter().fold(0, |any, mark| any | mark) & 1 != 0 {
-                            let n = small.iter().position(|mark| mark & 1 != 0).unwrap();
-                            return Some((at + n) / size);
-                        }
-                        at += small.len();
-                    }
+        let scan_len = holding_last.min(segments).saturating_mul(size);
+        let scan_end = offset.saturating_add(scan_len).min(self.len);
+        if offset < scan_end
+            && let Some(mut idx) = self.entry_at(offset)
+        {
+            while idx < self.entries.len() {
+                let seg = &self.entries[idx];
+                let seg_end = self.seg_start(seg) + seg.len();
+                if seg_end > scan_end {
+                    break;
                 }
-                at += block.len();
+                if seg.flags & FLAG_PUSH != 0 {
+                    return Some((seg_end - 1 - offset) / size);
+                }
+                idx += 1;
             }
         }
         (holding_last < segments).then_some(holding_last)
@@ -316,35 +638,59 @@ impl SendBuffer {
 
     // Only the last byte of this nonempty range carries PUSH. Selecting
     // it leaves its persisted retransmission boundary unchanged.
+    #[inline]
     pub(crate) fn push_at_end(&self, offset: usize, count: usize) -> bool {
         count != 0
             && offset.checked_add(count) == Some(self.push_end)
             && count <= self.single_push_len
     }
 
-    pub(crate) fn collapse_push(&mut self, offset: usize, count: usize) {
-        if self.push_at_end(offset, count) {
+    pub(crate) fn collapse_push(&mut self, pool: &mut TxPool, offset: usize, count: usize) {
+        if count == 0 || self.push_at_end(offset, count) {
             return;
         }
-        for part in self.mark_slices_mut(offset, count) {
-            for mark in part {
-                *mark &= !1;
+        let range_end = offset.saturating_add(count).min(self.len);
+        let mut cleared_last = false;
+        if offset < range_end
+            && let Some(mut idx) = self.entry_at(offset)
+        {
+            while idx < self.entries.len() {
+                let seg_end = self.seg_start(&self.entries[idx]) + self.entries[idx].len();
+                if seg_end > range_end {
+                    break;
+                }
+                if self.entries[idx].flags & FLAG_PUSH != 0 {
+                    if Some(seg_end - 1) == self.push_offset() {
+                        cleared_last = true;
+                    }
+                    self.entries[idx].flags &= !FLAG_PUSH;
+                    if (self.entries[idx].flags & FLAG_MARK_MASK) == 0
+                        && self.try_coalesce_with_next(pool, idx)
+                    {
+                        // Re-inspect merged entry at `idx` (its new end may still be <= range_end).
+                        continue;
+                    }
+                }
+                idx += 1;
             }
         }
-        let cleared = self
-            .push_offset()
-            .is_some_and(|last| last >= offset && last - offset < count);
         let end = offset + count - 1;
-        if self.marks.or_at(end, 1) {
+        if self.set_flags_at(pool, end, FLAG_PUSH) {
             self.note_push(end);
-        } else if cleared {
+        } else if cleared_last {
             self.find_last_push();
         }
     }
 
-    pub(crate) fn finish_send(&mut self, offset: usize, push: bool, end_of_record: bool) {
+    pub(crate) fn finish_send(
+        &mut self,
+        pool: &mut TxPool,
+        offset: usize,
+        push: bool,
+        end_of_record: bool,
+    ) {
         let bits = u8::from(push) | (u8::from(end_of_record) << 1);
-        if self.marks.or_at(offset, bits) {
+        if self.set_flags_at(pool, offset, bits) {
             if push {
                 self.note_push(offset);
             }
@@ -357,11 +703,12 @@ impl SendBuffer {
     // A nonempty append puts its last byte strictly past all old marks.
     pub(crate) fn finish_append(&mut self, push: bool, end_of_record: bool) {
         if push || end_of_record {
-            let end = self.len();
-            let marked = self
-                .marks
-                .or_back(u8::from(push) | (u8::from(end_of_record) << 1));
-            assert!(marked, "finish_append requires a nonempty buffer");
+            let end = self.len;
+            let back = self
+                .entries
+                .back_mut()
+                .expect("finish_append requires a nonempty buffer");
+            back.flags |= u8::from(push) | (u8::from(end_of_record) << 1);
             if push {
                 debug_assert!(end > self.push_end);
                 self.single_push_len = end - self.push_end;
@@ -375,14 +722,13 @@ impl SendBuffer {
 
     #[cfg(test)]
     pub(crate) fn mark_end_of_record(&mut self) {
-        if self.marks.or_back(2) {
-            self.eor_end = self.marks.len();
+        if let Some(back) = self.entries.back_mut() {
+            back.flags |= FLAG_EOR;
+            self.eor_end = self.len;
         }
     }
 
     // Records an EOR mark at `offset`, where none is past the last one.
-    // EOR marks are never cleared, so the last one moves only forward here
-    // and back only when its byte goes.
     fn note_end_of_record(&mut self, offset: usize) {
         if self.eor_end <= offset {
             self.eor_end = offset + 1;
@@ -392,112 +738,103 @@ impl SendBuffer {
     // Whether the last queued byte carries EOR: the queue's tail ends a
     // record, and nothing written later joins it.
     pub(crate) fn ends_record(&self) -> bool {
-        self.len() != 0 && self.record_ends_after(self.len() - 1)
+        self.len != 0 && self.record_ends_after(self.len - 1)
     }
 
     // Whether a byte at or past `offset` carries EOR.
+    #[inline]
     fn record_ends_after(&self, offset: usize) -> bool {
         self.eor_end > offset
     }
 
     // EOR is a local coalescing boundary, not a TCP wire flag or framing
     // guarantee (RFC 9293 section 3.7.1). PUSH may collapse; EOR never does.
-    // Only a selection reaching the last EOR scans its marks.
     pub(crate) fn record_len(&self, offset: usize, limit: usize) -> usize {
-        self.record_len_within(offset, limit.min(self.len().saturating_sub(offset)))
+        self.record_len_within(offset, limit.min(self.len.saturating_sub(offset)))
     }
 
     // The selector already bounded this range by its unsent bytes.
     #[inline]
     pub(crate) fn record_len_within(&self, offset: usize, limit: usize) -> usize {
-        debug_assert!(limit <= self.len().saturating_sub(offset));
-        if !self.record_ends_after(offset) {
+        debug_assert!(limit <= self.len.saturating_sub(offset));
+        if !self.record_ends_after(offset) || limit == 0 {
             return limit;
         }
-        self.first_flagged(2, offset, limit)
-            .map_or(limit, |n| n + 1)
+        let range_end = offset + limit;
+        let Some(mut idx) = self.entry_at(offset) else {
+            return limit;
+        };
+        while idx < self.entries.len() {
+            let seg = &self.entries[idx];
+            let seg_end = self.seg_start(seg) + seg.len();
+            if seg_end > range_end {
+                break;
+            }
+            if seg.flags & FLAG_EOR != 0 {
+                return seg_end - offset;
+            }
+            idx += 1;
+        }
+        limit
     }
 
     // A tail rescue must contain the highest selected byte. Start after the
     // last intervening EOR, rather than clipping a prefix and losing the tail.
     pub(crate) fn tail_record_offset(&self, offset: usize, count: usize) -> usize {
-        let count = count.min(self.len().saturating_sub(offset));
-        if !self.record_ends_after(offset) {
+        let count = count.min(self.len.saturating_sub(offset));
+        if count <= 1 || !self.record_ends_after(offset) {
             return offset;
         }
-        if let Some((at, bits)) = self.marks.singleton() {
-            return if bits & 2 != 0 && at >= offset && at + 1 < offset + count {
-                at + 1
-            } else {
-                offset
-            };
+        let search_end = offset + count - 1;
+        let Some(mut idx) = self.entry_at(search_end - 1) else {
+            return offset;
+        };
+        loop {
+            let seg = &self.entries[idx];
+            let seg_end = self.seg_start(seg) + seg.len();
+            if seg_end <= offset {
+                break;
+            }
+            if seg_end <= search_end && seg.flags & FLAG_EOR != 0 {
+                return seg_end;
+            }
+            if idx == 0 {
+                break;
+            }
+            idx -= 1;
         }
-        self.marks
-            .ring
-            .iter()
-            .skip(offset)
-            .take(count.saturating_sub(1))
-            .rposition(|mark| mark & 2 != 0)
-            .map_or(offset, |n| offset + n + 1)
+        offset
     }
 
     // Mark eligible bytes (never retransmitted, not already pending) of one
     // range as PTB repair work; returns how many became pending.
     pub(crate) fn mark_ptb(&mut self, offset: usize, count: usize) -> usize {
-        let mut marked = 0;
-        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
-            if *mark & (PTB_PENDING | RETRANSMITTED) == 0 {
-                *mark |= PTB_PENDING;
-                marked += 1;
-            }
-        }
-        marked
+        self.ptb.mark_ptb(offset, count, self.len)
     }
 
     // Delivery or abandonment of one range: withdraw its PTB work and its
     // outstanding PTB copies. Returns (pending, copies) cleared.
     pub(crate) fn release_ptb(&mut self, offset: usize, count: usize) -> (usize, usize) {
-        let (mut pending, mut copies) = (0, 0);
-        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
-            pending += usize::from(*mark & PTB_PENDING != 0);
-            copies += usize::from(*mark & PTB_COPY != 0);
-            *mark &= !(PTB_PENDING | PTB_COPY);
-        }
-        (pending, copies)
+        self.ptb.release_ptb(offset, count, self.len)
     }
 
     // Mark an outstanding PTB copy on one range; returns how many bytes were
     // newly marked.
     pub(crate) fn mark_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
-        let mut marked = 0;
-        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
-            marked += usize::from(*mark & PTB_COPY == 0);
-            *mark |= PTB_COPY;
-        }
-        marked
+        self.ptb.mark_ptb_copy(offset, count, self.len)
     }
 
     // HighRxt moved over one range: SetPipe's retransmission term now counts
     // its outstanding PTB copies. Returns how many marks were cleared.
     pub(crate) fn clear_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
-        let mut cleared = 0;
-        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
-            cleared += usize::from(*mark & PTB_COPY != 0);
-            *mark &= !PTB_COPY;
-        }
-        cleared
+        self.ptb.clear_ptb_copy(offset, count, self.len)
     }
 
     // Record a (possibly) submitted retransmitted copy: those bytes lose any
     // PTB work and never become eligible again. Returns the pending bytes it
     // withdrew.
     pub(crate) fn mark_retransmitted(&mut self, offset: usize, count: usize) -> usize {
-        let mut cleared = 0;
-        for mark in self.mark_slices_mut(offset, count).into_iter().flatten() {
-            cleared += usize::from(*mark & PTB_PENDING != 0);
-            *mark = (*mark & !PTB_PENDING) | RETRANSMITTED;
-        }
-        cleared
+        self.ptb.mark_retransmitted(offset, count, self.len)
     }
 
     // First contiguous run of PTB work in [offset, end): (offset, length),
@@ -508,90 +845,90 @@ impl SendBuffer {
         end: usize,
         limit: usize,
     ) -> Option<(usize, usize)> {
-        self.next_flagged(PTB_PENDING, offset, end, limit)
+        self.ptb.next_ptb(offset, end, limit, self.len)
     }
 
     // First contiguous run of outstanding PTB copies in [offset, end).
     pub(crate) fn next_ptb_copy(&self, offset: usize, end: usize) -> Option<(usize, usize)> {
-        self.next_flagged(PTB_COPY, offset, end, usize::MAX)
-    }
-
-    fn next_flagged(
-        &self,
-        flag: u8,
-        offset: usize,
-        end: usize,
-        limit: usize,
-    ) -> Option<(usize, usize)> {
-        debug_assert_eq!(flag & 0b11, 0);
-        let end = end.min(self.marks.ring.len());
-        let start = (offset..end).find(|&i| self.marks.ring[i] & flag != 0)?;
-        let len = self
-            .marks
-            .ring
-            .range(start..end)
-            .take(limit)
-            .take_while(|&byte| byte & flag != 0)
-            .count();
-        Some((start, len))
+        self.ptb.next_ptb_copy(offset, end, self.len)
     }
 
     // Bytes of one range that carry PTB work.
     pub(crate) fn count_ptb(&self, offset: usize, count: usize) -> usize {
-        self.marks
-            .ring
-            .range(offset.min(self.marks.ring.len())..)
-            .take(count)
-            .filter(|&byte| byte & PTB_PENDING != 0)
-            .count()
+        self.ptb.count_ptb(offset, count, self.len)
     }
 
     #[cfg(test)]
     pub(crate) fn ptb_pending(&self, offset: usize) -> bool {
-        self.marks
-            .ring
-            .get(offset)
-            .is_some_and(|&byte| byte & PTB_PENDING != 0)
+        self.ptb.ptb_pending(offset, self.len)
     }
 
     #[cfg(test)]
     pub(crate) fn ptb_copy(&self, offset: usize) -> bool {
-        self.marks
-            .ring
-            .get(offset)
-            .is_some_and(|&byte| byte & PTB_COPY != 0)
+        self.ptb.ptb_copy(offset, self.len)
     }
 
     #[cfg(test)]
     pub(crate) fn retransmitted(&self, offset: usize) -> bool {
-        self.marks
-            .ring
-            .get(offset)
-            .is_some_and(|&byte| byte & RETRANSMITTED != 0)
+        self.ptb.retransmitted(offset, self.len)
     }
 
-    pub(crate) fn truncate(&mut self, len: usize) {
-        self.data.truncate(len);
-        self.marks.truncate(len);
-        // Discarding queued bytes is rare; only then is the queue searched
-        // back to its new last mark.
+    pub(crate) fn truncate(&mut self, pool: &mut TxPool, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        if len == 0 {
+            self.clear_chunks(pool);
+            return;
+        }
+        let mut drop_bytes = self.len - len;
+        while drop_bytes > 0 {
+            let back_len = self.entries.back().unwrap().len();
+            if drop_bytes >= back_len {
+                let seg = self.entries.pop_back().unwrap();
+                match seg.data {
+                    TxSegData::Chunk { chunk, len: n, .. } => {
+                        self.chunk_bytes -= n as usize;
+                        pool.release(chunk);
+                    }
+                    TxSegData::Shared(_) => {
+                        self.shared_entries -= 1;
+                        if seg.flags & FLAG_CONTIGUOUS_SHARED == 0 {
+                            self.shared_spans -= 1;
+                        }
+                    }
+                    TxSegData::Released(_) => {}
+                }
+                drop_bytes -= back_len;
+            } else {
+                let back = self.entries.back_mut().unwrap();
+                let keep = back_len - drop_bytes;
+                // Truncating drops the entry's old last byte and any PUSH/EOR
+                // flags on it while preserving its contiguity with the entry
+                // before it.
+                back.flags &= !FLAG_MARK_MASK;
+                match &mut back.data {
+                    TxSegData::Chunk { len: n, .. } => {
+                        self.chunk_bytes -= drop_bytes;
+                        *n = keep as u32;
+                    }
+                    TxSegData::Shared(payload) => {
+                        *payload = payload.slice(0..keep).unwrap();
+                    }
+                    TxSegData::Released(n) => {
+                        *n = keep as u32;
+                    }
+                }
+                drop_bytes = 0;
+            }
+        }
+        self.len = len;
+        self.ptb.truncate(len);
         if self.push_end > len {
             self.find_last_push();
         }
         if self.eor_end > len {
-            self.eor_end = self.marks.last(2).map_or(0, |offset| offset + 1);
-        }
-        while self
-            .shared
-            .back()
-            .is_some_and(|span| span.start.wrapping_sub(self.head) as usize >= len)
-        {
-            self.shared.pop_back();
-        }
-        if let Some(span) = self.shared.back_mut() {
-            let start = span.start.wrapping_sub(self.head) as usize;
-            let keep = span.payload.len().min(len.saturating_sub(start));
-            span.payload = span.payload.slice(0..keep).unwrap();
+            self.eor_end = self.find_last_flag(FLAG_EOR);
         }
     }
 
@@ -601,122 +938,262 @@ impl SendBuffer {
     //# The acknowledgment mechanism employed is cumulative so that an acknowledgment of
     //# sequence number X indicates that all octets up to but not including X have been
     //# received.
-    pub(crate) fn acknowledge(&mut self, count: usize) -> Result<(), ()> {
-        if count > self.len() {
+    pub(crate) fn acknowledge(&mut self, pool: &mut TxPool, count: usize) -> Result<(), ()> {
+        if count > self.len {
             return Err(());
         }
-        if count == self.len() {
-            self.data.clear();
-            self.marks.clear();
-            self.shared.clear();
-            self.head = self.head.wrapping_add(count as u64);
-            self.push_end = 0;
-            self.eor_end = 0;
+        if count == 0 {
             return Ok(());
         }
-        self.data.drain(..count);
-        self.marks.drop_prefix(count);
-        self.head = self.head.wrapping_add(count as u64);
-        self.push_end = self.push_end.saturating_sub(count);
-        self.eor_end = self.eor_end.saturating_sub(count);
-        while let Some(span) = self.shared.front_mut() {
-            let consumed = self.head.wrapping_sub(span.start) as usize;
-            if consumed >= 1usize << (usize::BITS - 1) {
-                break;
-            }
-            if consumed >= span.payload.len() {
-                self.shared.pop_front();
+        if count == self.len {
+            self.clear_chunks(pool);
+            self.head = self.head.wrapping_add(count as u64);
+            return Ok(());
+        }
+        let mut rem = count;
+        while rem > 0 {
+            let front_len = self.entries.front().unwrap().len();
+            if rem >= front_len {
+                let seg = self.entries.pop_front().unwrap();
+                match seg.data {
+                    TxSegData::Chunk { chunk, len: n, .. } => {
+                        self.chunk_bytes -= n as usize;
+                        pool.release(chunk);
+                    }
+                    TxSegData::Shared(_) => {
+                        self.shared_entries -= 1;
+                        if seg.flags & FLAG_CONTIGUOUS_SHARED == 0 {
+                            self.shared_spans -= 1;
+                        }
+                    }
+                    TxSegData::Released(_) => {}
+                }
+                rem -= front_len;
             } else {
-                span.start = self.head;
-                span.payload = span.payload.slice(consumed..span.payload.len()).unwrap();
-                break;
+                let front = self.entries.front_mut().unwrap();
+                front.start = front.start.wrapping_add(rem as u64);
+                match &mut front.data {
+                    TxSegData::Chunk { offset, len: n, .. } => {
+                        *offset += rem as u32;
+                        *n -= rem as u32;
+                        self.chunk_bytes -= rem;
+                    }
+                    TxSegData::Shared(payload) => {
+                        *payload = payload.slice(rem..payload.len()).unwrap();
+                    }
+                    TxSegData::Released(n) => {
+                        *n -= rem as u32;
+                    }
+                }
+                rem = 0;
             }
         }
+        if let Some(front) = self.entries.front_mut()
+            && front.flags & FLAG_CONTIGUOUS_SHARED != 0
+        {
+            front.flags &= !FLAG_CONTIGUOUS_SHARED;
+            self.shared_spans += 1;
+        }
+        self.len -= count;
+        self.head = self.head.wrapping_add(count as u64);
+        self.ptb.drop_prefix(count);
+        self.push_end = self.push_end.saturating_sub(count);
+        self.eor_end = self.eor_end.saturating_sub(count);
         Ok(())
     }
 
     // Borrow a scalar payload directly when the selected bytes all come
-    // from one slice of the ring. Shared spans overlay the ring's bytes.
-    pub(crate) fn contiguous(&self, offset: usize, limit: usize) -> Option<&[u8]> {
-        self.selected_slice(offset, self.record_len(offset, limit))
+    // from one chunk entry and no shared payloads are queued.
+    pub(crate) fn contiguous<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        limit: usize,
+    ) -> Option<&'a [u8]> {
+        self.selected_slice(arena, offset, self.record_len(offset, limit))
     }
 
     // The caller has already clipped these bytes to the record boundary.
-    pub(crate) fn selected_slice(&self, offset: usize, count: usize) -> Option<&[u8]> {
+    pub(crate) fn selected_slice<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        count: usize,
+    ) -> Option<&'a [u8]> {
         debug_assert_eq!(self.record_len(offset, count), count);
-        if !self.shared.is_empty() {
+        if self.shared_entries != 0 {
             return None;
         }
-        let (front, back) = self.data.as_slices();
-        if offset < front.len() {
-            front.get(offset..offset + count)
-        } else {
-            let start = offset - front.len();
-            back.get(start..start + count)
+        if count == 0 {
+            return (offset <= self.len).then_some(&[][..]);
+        }
+        let idx = self.entry_at(offset)?;
+        let seg = &self.entries[idx];
+        let rel = offset - self.seg_start(seg);
+        match &seg.data {
+            TxSegData::Chunk {
+                chunk,
+                offset: chunk_off,
+                len,
+            } => {
+                if rel.checked_add(count)? > *len as usize {
+                    return None;
+                }
+                let start = *chunk_off as usize + rel;
+                Some(arena.get(chunk).bytes(start..start + count))
+            }
+            TxSegData::Shared(_) | TxSegData::Released(_) => None,
         }
     }
 
-    pub(crate) fn copy(&self, offset: usize, out: &mut [u8]) -> usize {
+    pub(crate) fn copy(&self, arena: &ChunkArena, offset: usize, out: &mut [u8]) -> usize {
         let count = self.selection_len(offset, self.record_len(offset, out.len()));
-        if self.shared_output.is_some()
-            && self.shared_prefix(offset, count, usize::MAX) == count
-            && count != 0
-        {
+        if count == 0 {
+            return 0;
+        }
+        if self.shared_output.is_some() && self.shared_prefix(offset, count, usize::MAX) == count {
             return count;
         }
-        let (front, back) = self.data.as_slices();
-        let [first, second] = ring_ranges(front.len(), self.data.len(), offset, count);
-        let split = first.len();
-        out[..split].copy_from_slice(&front[first]);
-        out[split..count].copy_from_slice(&back[second]);
-        for span in &self.shared {
-            let start = span.start.wrapping_sub(self.head) as usize;
-            let left = start.max(offset);
-            let right = (start + span.payload.len()).min(offset + count);
-            if left < right {
-                out[left - offset..right - offset]
-                    .copy_from_slice(&span.payload.as_slice()[left - start..right - start]);
+        let Some(mut idx) = self.entry_at(offset) else {
+            return 0;
+        };
+        let mut at = offset;
+        let mut written = 0;
+        while written < count {
+            let seg = &self.entries[idx];
+            let rel = at - self.seg_start(seg);
+            let take = (seg.len() - rel).min(count - written);
+            match &seg.data {
+                TxSegData::Chunk {
+                    chunk,
+                    offset: chunk_off,
+                    ..
+                } => {
+                    let start = *chunk_off as usize + rel;
+                    out[written..written + take]
+                        .copy_from_slice(arena.get(chunk).bytes(start..start + take));
+                }
+                TxSegData::Shared(payload) => {
+                    out[written..written + take]
+                        .copy_from_slice(&payload.as_slice()[rel..rel + take]);
+                }
+                TxSegData::Released(_) => {
+                    debug_assert!(false, "copy from released shared segment");
+                    out[written..written + take].fill(0);
+                }
             }
+            at += take;
+            written += take;
+            idx += 1;
         }
         count
     }
 
+    /// Borrow covering `TxPart` slices for `[offset, offset + count)` directly
+    /// from the queue's chunks and shared payloads (zero copy).
+    #[allow(dead_code)]
+    pub(crate) fn tx_parts<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        count: usize,
+        out: &mut Vec<TxPart<'a>>,
+    ) -> usize {
+        let count = count.min(self.len.saturating_sub(offset));
+        if count == 0 {
+            return 0;
+        }
+        let Some(mut idx) = self.entry_at(offset) else {
+            return 0;
+        };
+        let mut at = offset;
+        let mut covered = 0;
+        while covered < count {
+            let seg = &self.entries[idx];
+            let rel = at - self.seg_start(seg);
+            let take = (seg.len() - rel).min(count - covered);
+            match &seg.data {
+                TxSegData::Chunk {
+                    chunk,
+                    offset: chunk_off,
+                    ..
+                } => {
+                    let start = *chunk_off as usize + rel;
+                    let slice = ChunkSlice::new(arena.get(chunk), start..start + take)
+                        .expect("chunk slice within filled prefix");
+                    out.push(TxPart::Chunk(slice));
+                }
+                TxSegData::Shared(payload) => {
+                    let slice = PayloadSlice::new(payload, rel..rel + take)
+                        .expect("payload slice within bounds");
+                    out.push(TxPart::Shared(slice));
+                }
+                TxSegData::Released(_) => {
+                    debug_assert!(false, "tx_parts from released shared segment");
+                    break;
+                }
+            }
+            at += take;
+            covered += take;
+            idx += 1;
+        }
+        covered
+    }
+
     #[cfg(test)]
     pub(crate) fn shared_spans(&self) -> usize {
-        self.shared.len()
+        self.shared_spans
     }
 
-    // Whether `payload` fits beside at most `max_spans` spans: it joins the
-    // last one or fewer are held.
+    // Whether `payload` continues the back entry in the same storage and lease
+    // (regardless of any PUSH/EOR mark on the back entry's last byte).
+    fn continues_shared(&self, payload: &Payload) -> bool {
+        matches!(
+            self.entries.back(),
+            Some(TxSeg {
+                data: TxSegData::Shared(existing),
+                ..
+            }) if existing.join(payload).is_some()
+        )
+    }
+
+    // Whether `payload` fits beside at most `max_spans` discontiguous shared
+    // spans: it continues the last span or fewer than `max_spans` spans are held.
     pub(crate) fn shared_room(&self, payload: &Payload, max_spans: usize) -> bool {
-        self.shared.len() < max_spans || self.joined(payload).is_some()
+        self.shared_spans < max_spans || self.continues_shared(payload)
     }
 
-    pub(crate) fn shared_storage_bytes(&self) -> usize {
-        self.shared.capacity() * core::mem::size_of::<SharedSpan>()
+    // Number of new `TxSeg` entries a shared write of `payload` will add (0 if
+    // it merges into the back entry in place, 1 otherwise).
+    pub(crate) fn needed_entries_for_shared(&self, payload: &Payload) -> usize {
+        if payload.is_empty() || self.joined_shared(payload).is_some() {
+            0
+        } else {
+            1
+        }
     }
 
+    // The last entry extended by `payload` in place when it has no PUSH/EOR
+    // marks and `payload` continues it in the same storage and lease.
+    fn joined_shared(&self, payload: &Payload) -> Option<Payload> {
+        let back = self.entries.back()?;
+        if (back.flags & FLAG_MARK_MASK) != 0 {
+            return None;
+        }
+        match &back.data {
+            TxSegData::Shared(existing) => existing.join(payload),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepare_shared(&mut self, payload: &Payload, peak_room: usize) -> Result<(), ()> {
-        if self.shared.len() < self.shared.capacity() || self.joined(payload).is_some() {
-            return Ok(());
-        }
-        let needed = self.shared.len().checked_add(1).ok_or(())?;
-        let bound = needed
-            .checked_next_power_of_two()
-            .ok_or(())?
-            .checked_mul(core::mem::size_of::<SharedSpan>())
-            .ok_or(())?;
-        if bound > peak_room {
+        let needed = self.needed_entries_for_shared(payload);
+        let cost = self.entry_growth_bytes(needed).ok_or(())?;
+        if cost > peak_room {
             return Err(());
         }
-        let mut staged = VecDeque::new();
-        staged.try_reserve_exact(needed).map_err(|_| ())?;
-        if staged.capacity() * core::mem::size_of::<SharedSpan>() > peak_room {
-            return Err(());
-        }
-        staged.extend(self.shared.iter().cloned());
-        self.shared = staged;
-        Ok(())
+        self.reserve_entries(needed)
     }
 
     pub(crate) fn write_shared(&mut self, payload: Payload) -> usize {
@@ -724,33 +1201,32 @@ impl SendBuffer {
         if count == 0 {
             return 0;
         }
-        self.assert_reserved(count);
         let payload = payload.slice(0..count).unwrap();
-        if let Some(joined) = self.joined(&payload) {
-            self.shared.back_mut().unwrap().payload = joined;
+        if let Some(joined) = self.joined_shared(&payload) {
+            self.entries.back_mut().unwrap().data = TxSegData::Shared(joined);
         } else {
-            assert!(self.shared.len() < self.shared.capacity());
-            let start = self.head.wrapping_add(self.data.len() as u64);
-            self.shared.push_back(SharedSpan { start, payload });
+            assert!(
+                self.entries.len() < self.entries.capacity(),
+                "TxSeg entries not reserved before write_shared"
+            );
+            let contiguous = self.continues_shared(&payload);
+            let start = self.head.wrapping_add(self.len as u64);
+            self.entries.push_back(TxSeg {
+                start,
+                data: TxSegData::Shared(payload),
+                flags: if contiguous {
+                    FLAG_CONTIGUOUS_SHARED
+                } else {
+                    0
+                },
+            });
+            self.shared_entries += 1;
+            if !contiguous {
+                self.shared_spans += 1;
+            }
         }
-        // Only PUSH/EOR bookkeeping is initialized. Payload remains in its
-        // original immutable allocation and is never read/copied here.
-        self.data.resize(self.data.len() + count, 0);
-        self.marks.extend_to(self.data.len());
+        self.len += count;
         count
-    }
-
-    // The last span extended by `payload` when it ends where the queue does
-    // and `payload` continues it in the same storage and lease, as Linux
-    // coalesces adjacent zerocopy fragments: contiguous writes then cost one
-    // span, not one per write.
-    fn joined(&self, payload: &Payload) -> Option<Payload> {
-        let span = self.shared.back()?;
-        let end = span.start.wrapping_add(span.payload.len() as u64);
-        if end != self.head.wrapping_add(self.data.len() as u64) {
-            return None;
-        }
-        span.payload.join(payload)
     }
 
     pub(crate) fn set_shared_output(&mut self, segments: Option<usize>) {
@@ -758,22 +1234,31 @@ impl SendBuffer {
     }
 
     fn shared_prefix(&self, offset: usize, count: usize, max_segments: usize) -> usize {
+        if self.shared_entries == 0 || count == 0 || max_segments == 0 {
+            return 0;
+        }
+        let Some(mut idx) = self.entry_at(offset) else {
+            return 0;
+        };
         let mut at = offset;
         let mut used = 0;
-        for span in &self.shared {
-            let start = span.start.wrapping_sub(self.head) as usize;
-            let end = start + span.payload.len();
-            if end <= at {
-                continue;
-            }
-            if start > at || used == max_segments {
-                break;
-            }
-            let n = (end - at).min(count - (at - offset));
-            at += n;
-            used += 1;
-            if at - offset == count {
-                break;
+        while idx < self.entries.len() && at - offset < count {
+            let seg = &self.entries[idx];
+            match &seg.data {
+                TxSegData::Shared(payload) => {
+                    let starts_new = used == 0 || (seg.flags & FLAG_CONTIGUOUS_SHARED) == 0;
+                    if starts_new {
+                        if used >= max_segments {
+                            break;
+                        }
+                        used += 1;
+                    }
+                    let end = self.seg_start(seg) + payload.len();
+                    let n = (end - at).min(count - (at - offset));
+                    at += n;
+                    idx += 1;
+                }
+                _ => break,
             }
         }
         at - offset
@@ -783,15 +1268,29 @@ impl SendBuffer {
         let Some(max) = self.shared_output else {
             return count;
         };
+        if self.shared_entries == 0 || count == 0 {
+            return count;
+        }
         let shared = self.shared_prefix(offset, count, max);
         if shared != 0 {
             return shared;
         }
-        self.shared
-            .iter()
-            .map(|s| s.start.wrapping_sub(self.head) as usize)
-            .find(|&start| start > offset)
-            .map_or(count, |start| count.min(start - offset))
+        let Some(mut idx) = self.entry_at(offset) else {
+            return count;
+        };
+        let limit = offset.saturating_add(count);
+        while idx < self.entries.len() {
+            let seg = &self.entries[idx];
+            let start = self.seg_start(seg);
+            if start >= limit {
+                break;
+            }
+            if matches!(seg.data, TxSegData::Shared(_)) {
+                return start - offset;
+            }
+            idx += 1;
+        }
+        count
     }
 
     pub(crate) fn shared_slices(
@@ -803,25 +1302,92 @@ impl SendBuffer {
         if count == 0 || self.shared_prefix(offset, count, out.capacity()) != count {
             return false;
         }
+        let Some(mut idx) = self.entry_at(offset) else {
+            return false;
+        };
         let mut at = offset;
-        for span in &self.shared {
-            let start = span.start.wrapping_sub(self.head) as usize;
-            let end = start + span.payload.len();
-            if end <= at {
-                continue;
+        while at - offset < count {
+            let seg = &self.entries[idx];
+            let start = self.seg_start(seg);
+            let TxSegData::Shared(payload) = &seg.data else {
+                unreachable!("shared_prefix already verified covering Shared entries");
+            };
+            let rel = at - start;
+            let n = (payload.len() - rel).min(count - (at - offset));
+            let slice = payload.slice(rel..rel + n).unwrap();
+            if (seg.flags & FLAG_CONTIGUOUS_SHARED) != 0
+                && let Some(last) = out.last_mut()
+            {
+                *last = last
+                    .join(&slice)
+                    .expect("contiguous shared entries must join");
+            } else {
+                out.push(slice);
             }
-            let n = (end - at).min(count - (at - offset));
-            out.push(span.payload.slice(at - start..at - start + n).unwrap());
             at += n;
-            if at - offset == count {
-                break;
-            }
+            idx += 1;
         }
         true
     }
 
     pub(crate) fn release_shared(&mut self) {
-        self.shared.clear();
+        if self.shared_entries == 0 {
+            return;
+        }
+        for seg in &mut self.entries {
+            if let TxSegData::Shared(payload) = &seg.data {
+                let len = payload.len() as u32;
+                seg.data = TxSegData::Released(len);
+                seg.flags &= !FLAG_CONTIGUOUS_SHARED;
+            }
+        }
+        self.shared_entries = 0;
+        self.shared_spans = 0;
+    }
+
+    #[cfg(test)]
+    fn debug_check_invariants(&self) {
+        let mut pos = 0usize;
+        let mut chunk_sum = 0usize;
+        let mut shared_count = 0usize;
+        let mut span_count = 0usize;
+        for (i, seg) in self.entries.iter().enumerate() {
+            assert!(seg.len() > 0, "empty TxSeg");
+            assert_eq!(self.seg_start(seg), pos, "non-contiguous TxSeg");
+            match &seg.data {
+                TxSegData::Chunk { len, .. } => {
+                    assert_eq!(seg.flags & FLAG_CONTIGUOUS_SHARED, 0);
+                    chunk_sum += *len as usize;
+                }
+                TxSegData::Shared(cur) => {
+                    shared_count += 1;
+                    if (seg.flags & FLAG_CONTIGUOUS_SHARED) == 0 {
+                        span_count += 1;
+                    } else {
+                        assert!(i > 0, "front entry cannot be FLAG_CONTIGUOUS_SHARED");
+                        match &self.entries[i - 1].data {
+                            TxSegData::Shared(prev) => {
+                                assert!(
+                                    prev.join(cur).is_some(),
+                                    "FLAG_CONTIGUOUS_SHARED entry does not join predecessor"
+                                );
+                            }
+                            _ => panic!("FLAG_CONTIGUOUS_SHARED must follow Shared entry"),
+                        }
+                    }
+                }
+                TxSegData::Released(_) => {
+                    assert_eq!(seg.flags & FLAG_CONTIGUOUS_SHARED, 0);
+                }
+            }
+            pos += seg.len();
+        }
+        assert_eq!(pos, self.len);
+        assert_eq!(chunk_sum, self.chunk_bytes);
+        assert_eq!(shared_count, self.shared_entries);
+        assert_eq!(span_count, self.shared_spans);
+        assert_eq!(self.push_end, self.find_last_flag(FLAG_PUSH));
+        assert_eq!(self.eor_end, self.find_last_flag(FLAG_EOR));
     }
 }
 
@@ -835,29 +1401,32 @@ pub(crate) mod receive_differential;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    const PTB_PENDING: u8 = 1 << 2;
+    const RETRANSMITTED: u8 = 1 << 3;
+    const PTB_COPY: u8 = 1 << 4;
 
     #[test]
     fn send_shrink_saturates_and_failed_growth_preserves_data() {
+        let mut pool = TxPool::heap(16);
         let mut send = SendBuffer::new(8).unwrap();
-        send.write(b"abcdef");
+        send.write(&mut pool, b"abcdef");
         send.mark_push();
         send.set_limit(2);
         assert_eq!(send.remaining(), 0);
-        assert_eq!(send.write(b"!"), 0);
-        assert!(send.grow(usize::MAX).is_err());
-        send.grow(16).unwrap();
+        assert_eq!(send.write(&mut pool, b"!"), 0);
+        assert!(send.reserve_entries(usize::MAX).is_err());
         send.set_limit(16);
-        let mut grown = send;
         let mut out = [0; 6];
-        assert_eq!(grown.copy(0, &mut out), 6);
+        assert_eq!(send.copy(pool.arena(), 0, &mut out), 6);
         assert_eq!(&out, b"abcdef");
-        assert!(grown.pushed(0, 6));
-        grown.acknowledge(5).unwrap();
-        grown.set_limit(2);
-        assert_eq!(grown.write(b"xy"), 1);
+        assert!(send.pushed(0, 6));
+        send.acknowledge(&mut pool, 5).unwrap();
+        send.set_limit(2);
+        assert_eq!(send.write(&mut pool, b"xy"), 1);
+        send.clear_chunks(&mut pool);
     }
-
-    use super::*;
 
     #[test]
     // Checks prefix removal by byte count, not wire ACK validation.
@@ -867,34 +1436,35 @@ mod tests {
     //# sequence number X indicates that all octets up to but not including X have been
     //# received.
     fn send_retains_partial_copy_and_acknowledges_without_growth() {
+        let mut pool = TxPool::heap(16);
         let mut send = SendBuffer::new(4).unwrap();
         assert_eq!(send.capacity(), 4);
         assert_eq!(send.remaining(), 4);
-        assert_eq!(send.write(b"abcdef"), 4);
-        assert_eq!(send.write(b"x"), 0);
-        assert_eq!(send.acknowledge(5), Err(()));
+        assert_eq!(send.write(&mut pool, b"abcdef"), 4);
+        assert_eq!(send.write(&mut pool, b"x"), 0);
+        assert_eq!(send.acknowledge(&mut pool, 5), Err(()));
         let mut out = [b'!'; 6];
-        assert_eq!(send.copy(1, &mut out), 3);
+        assert_eq!(send.copy(pool.arena(), 1, &mut out), 3);
         assert_eq!(&out, b"bcd!!!");
-        assert_eq!(send.copy(usize::MAX, &mut out), 0);
+        assert_eq!(send.copy(pool.arena(), usize::MAX, &mut out), 0);
         assert_eq!(send.len(), 4);
-        assert_eq!(send.acknowledge(2), Ok(()));
-        assert_eq!(send.write(b"efg"), 2);
-        assert_eq!(send.copy(0, &mut out[..4]), 4);
+        assert_eq!(send.acknowledge(&mut pool, 2), Ok(()));
+        assert_eq!(send.write(&mut pool, b"efg"), 2);
+        assert_eq!(send.copy(pool.arena(), 0, &mut out[..4]), 4);
         assert_eq!(&out[..4], b"cdef");
-        assert_eq!(send.acknowledge(4), Ok(()));
-        assert_eq!(send.acknowledge(0), Ok(()));
+        assert_eq!(send.acknowledge(&mut pool, 4), Ok(()));
+        assert_eq!(send.acknowledge(&mut pool, 0), Ok(()));
         assert_eq!(send.remaining(), 4);
         let mut empty = SendBuffer::new(0).unwrap();
-        assert_eq!(empty.write(b"a"), 0);
+        assert_eq!(empty.write(&mut pool, b"a"), 0);
         assert!(SendBuffer::new(usize::MAX).is_err());
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
-    fn send_payload_and_marks_match_a_byte_model_across_wrap() {
-        // Payload and marks live in separate rings: their slices, the
-        // block scans and the clamping must agree with one (byte, mark)
-        // sequence while the rings wrap.
+    fn send_payload_and_marks_match_a_byte_model_across_chunks() {
+        let mut pool = TxPool::heap(32);
         let mut send = SendBuffer::new(300).unwrap();
         let mut model: VecDeque<(u8, u8)> = VecDeque::new();
         let mut state = 0x9e37_79b9_u32;
@@ -904,230 +1474,172 @@ mod tests {
             state ^= state << 5;
             state as usize % bound.max(1)
         };
-        let mut out = [0; 400];
         for step in 0..4000 {
             match next(7) {
                 0 | 1 => {
-                    let len = next(200);
-                    let input: Vec<u8> = (0..len).map(|i| (step + i) as u8).collect();
-                    let count = send.write(&input);
-                    assert_eq!(count, len.min(300 - model.len()));
+                    let input: Vec<u8> = (0..next(48)).map(|i| (step + i) as u8).collect();
+                    let count = send.write(&mut pool, &input);
+                    assert_eq!(count, input.len().min(send.capacity() - model.len()));
                     model.extend(input[..count].iter().map(|&b| (b, 0)));
                 }
                 2 => {
                     send.mark_push();
-                    send.mark_end_of_record();
                     if let Some(last) = model.back_mut() {
-                        last.1 |= 3;
+                        last.1 |= FLAG_PUSH;
                     }
                 }
                 3 => {
                     let count = next(model.len() + 1);
-                    send.acknowledge(count).unwrap();
+                    send.acknowledge(&mut pool, count).unwrap();
                     model.drain(..count);
                 }
                 4 if !model.is_empty() => {
                     let offset = next(model.len());
                     let count = 1 + next(model.len() - offset);
-                    send.collapse_push(offset, count);
-                    for mark in model.range_mut(offset..offset + count) {
-                        mark.1 &= !1;
+                    let needed = 1;
+                    send.reserve_entries(needed).unwrap();
+                    send.collapse_push(&mut pool, offset, count);
+                    for entry in model.range_mut(offset..offset + count) {
+                        entry.1 &= !FLAG_PUSH;
                     }
-                    model[offset + count - 1].1 |= 1;
+                    model[offset + count - 1].1 |= FLAG_PUSH;
                 }
                 5 => {
                     let len = next(model.len() + 1);
-                    send.truncate(len);
+                    send.truncate(&mut pool, len);
                     model.truncate(len);
                 }
-                _ => {
-                    let offset = next(model.len() + 1);
-                    let (push, end_of_record) = (next(2) == 0, next(4) == 0);
-                    send.finish_send(offset, push, end_of_record);
-                    if let Some(mark) = model.get_mut(offset) {
-                        mark.1 |= u8::from(push) | u8::from(end_of_record) << 1;
-                    }
+                _ if !model.is_empty() => {
+                    let offset = next(model.len());
+                    let (push, end_of_record) = (next(2) == 0, next(3) == 0);
+                    send.reserve_entries(1).unwrap();
+                    send.finish_send(&mut pool, offset, push, end_of_record);
+                    model[offset].1 |= u8::from(push) | (u8::from(end_of_record) << 1);
                 }
+                _ => {}
             }
-            let offset = next(model.len() + 2);
-            let limit = next(out.len() + 1);
+            send.debug_check_invariants();
+            let offset = next(model.len() + 4);
+            let limit = next(64);
             let tail: Vec<(u8, u8)> = model.iter().skip(offset).take(limit).copied().collect();
             let record = tail
                 .iter()
-                .position(|byte| byte.1 & 2 != 0)
+                .position(|(_, mark)| mark & FLAG_EOR != 0)
                 .map_or(tail.len(), |n| n + 1);
             assert_eq!(send.record_len(offset, limit), record);
-            assert_eq!(
-                send.pushed(offset, limit),
-                tail.iter().any(|byte| byte.1 & 1 != 0)
-            );
-            assert_eq!(
-                send.pushed(offset, model.len().saturating_sub(offset)),
-                model.iter().skip(offset).any(|byte| byte.1 & 1 != 0)
-            );
-            assert_eq!(send.copy(offset, &mut out[..limit]), record);
-            assert!(
-                out[..record]
-                    .iter()
-                    .eq(tail[..record].iter().map(|byte| &byte.0))
-            );
-            match send.contiguous(offset, limit) {
-                Some(slice) => assert_eq!(slice, &out[..record]),
-                None => {
-                    let (front, back) = send.data.as_slices();
-                    assert!(
-                        offset < front.len() && offset + record > front.len()
-                            || offset >= front.len() && offset - front.len() + record > back.len(),
-                        "contiguous returned None without spanning ring wrap"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn first_pushed_segment_agrees_with_a_byte_model_across_wrap() {
-        // Segments of queued bytes, the PUSH marks of writes and ACKs that
-        // move the ring's head around it: the first segment holding a mark
-        // is the model's, whichever block of the scan it falls in.
-        let mut send = SendBuffer::new(20_000).unwrap();
-        let mut model: VecDeque<bool> = VecDeque::new();
-        let mut state = 0x9e37_79b9_u32;
-        let mut next = |bound: usize| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as usize % bound.max(1)
-        };
-        for _ in 0..3000 {
-            if next(3) == 0 && !model.is_empty() {
-                let count = next(model.len() + 1);
-                send.acknowledge(count).unwrap();
-                model.drain(..count);
-            } else {
-                let count = send.write(&[7; 6000][..next(6001)]);
-                model.extend(core::iter::repeat_n(false, count));
-                if count != 0 && next(2) == 0 {
-                    send.mark_push();
-                    *model.back_mut().unwrap() = true;
-                }
-            }
-            let size = 1 + next(1500);
-            let offset = next(model.len() + 1);
-            let segments = next((model.len() - offset) / size + 1);
-            let expected = (0..segments).find(|&n| {
-                model
-                    .range(offset + n * size..offset + (n + 1) * size)
-                    .any(|&push| push)
-            });
-            assert_eq!(
-                send.first_pushed_segment(offset, size, segments),
-                expected,
-                "offset {offset} size {size} segments {segments}"
-            );
-        }
-    }
-
-    #[test]
-    fn record_ends_follow_the_last_eor_across_ack_truncate_and_wrap() {
-        // record_len and tail_record_offset skip their scan past the last
-        // EOR: both must agree with a byte model of the EOR marks whatever
-        // writes, marks, ACKs and truncations moved it.
-        let mut send = SendBuffer::new(300).unwrap();
-        let mut model: VecDeque<bool> = VecDeque::new();
-        let mut state = 0x2545_f491_u32;
-        let mut next = |bound: usize| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as usize % bound.max(1)
-        };
-        for _ in 0..4000 {
-            match next(6) {
-                0 | 1 => {
-                    let count = send.write(&[7; 64][..next(65)]);
-                    model.extend(core::iter::repeat_n(false, count));
-                }
-                2 => {
-                    send.mark_end_of_record();
-                    if let Some(last) = model.back_mut() {
-                        *last = true;
-                    }
-                }
-                3 => {
-                    let count = next(model.len() + 1);
-                    send.acknowledge(count).unwrap();
-                    model.drain(..count);
-                }
-                4 => {
-                    let len = next(model.len() + 1);
-                    send.truncate(len);
-                    model.truncate(len);
-                }
-                _ => {
-                    let offset = next(model.len() + 1);
-                    send.finish_send(offset, false, true);
-                    if let Some(mark) = model.get_mut(offset) {
-                        *mark = true;
-                    }
-                }
-            }
-            let offset = next(model.len() + 2);
-            let limit = next(400);
-            let tail: Vec<bool> = model.iter().skip(offset).take(limit).copied().collect();
-            assert_eq!(
-                send.record_len(offset, limit),
-                tail.iter()
-                    .position(|&eor| eor)
-                    .map_or(tail.len(), |n| n + 1)
-            );
             assert_eq!(
                 send.tail_record_offset(offset, limit),
                 tail.iter()
                     .take(tail.len().saturating_sub(1))
-                    .rposition(|&eor| eor)
+                    .rposition(|(_, mark)| mark & FLAG_EOR != 0)
                     .map_or(offset, |n| offset + n + 1)
             );
+            assert_eq!(
+                send.pushed(offset, limit),
+                tail.iter().any(|(_, mark)| mark & FLAG_PUSH != 0)
+            );
+            let mut out = [0; 64];
+            assert_eq!(send.copy(pool.arena(), offset, &mut out[..limit]), record);
+            assert!(
+                out[..record]
+                    .iter()
+                    .copied()
+                    .eq(tail[..record].iter().map(|&(byte, _)| byte))
+            );
+            if let Some(slice) = send.contiguous(pool.arena(), offset, limit) {
+                assert_eq!(slice, &out[..record]);
+            }
         }
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
-    fn eor_survives_push_collapse_resize_ack_and_truncate_without_growth() {
+    fn first_pushed_segment_matches_segment_scan() {
+        let mut pool = TxPool::heap(4096);
+        let mut send = SendBuffer::new(20_000).unwrap();
+        let mut marks: VecDeque<bool> = VecDeque::new();
+        let mut state = 0x51a7_9b23_u32;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % bound.max(1)
+        };
+        for _ in 0..400 {
+            match next(5) {
+                0..=2 => {
+                    let count = send.write(&mut pool, &alloc::vec![0; next(4000)]);
+                    marks.extend(core::iter::repeat_n(false, count));
+                }
+                3 => {
+                    let count = next(marks.len() + 1);
+                    send.acknowledge(&mut pool, count).unwrap();
+                    marks.drain(..count);
+                }
+                _ => {
+                    send.mark_push();
+                    if let Some(last) = marks.back_mut() {
+                        *last = true;
+                    }
+                }
+            }
+            let offset = next(marks.len() + 1);
+            let size = 1 + next(1500);
+            let segments = next(16);
+            let expected = (0..segments).find(|&segment| {
+                let start = offset + segment * size;
+                let end = (start + size).min(marks.len());
+                start < end && marks.range(start..end).any(|&push| push)
+            });
+            assert_eq!(send.first_pushed_segment(offset, size, segments), expected);
+        }
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
+    }
+
+    #[test]
+    fn eor_boundaries_survive_push_collapse_ack_and_truncation() {
+        let mut pool = TxPool::heap(16);
         let mut send = SendBuffer::new(8).unwrap();
-        let charge = send.storage_bytes();
-        send.write(b"abc");
+        assert_eq!(send.write(&mut pool, b"abc"), 3);
         send.mark_end_of_record();
         send.mark_push();
-        send.write(b"defgh");
+        send.write(&mut pool, b"defgh");
         send.mark_end_of_record();
-        send.collapse_push(0, 5); // PUSH collapse never moves EOR.
+        send.collapse_push(&mut pool, 0, 5); // PUSH collapse never moves EOR.
         assert_eq!(send.record_len(0, 8), 3);
         assert_eq!(send.tail_record_offset(0, 8), 3);
         assert_eq!(send.tail_record_offset(0, 3), 0);
         let mut bytes = [0; 8];
-        assert_eq!(send.copy(0, &mut bytes), 3);
+        assert_eq!(send.copy(pool.arena(), 0, &mut bytes), 3);
         assert_eq!(&bytes[..3], b"abc");
-        assert_eq!(send.storage_bytes(), charge);
-        send.grow(16).unwrap();
         send.set_limit(16);
-        send.acknowledge(2).unwrap();
-        assert_eq!(send.copy(0, &mut bytes), 1);
+        send.acknowledge(&mut pool, 2).unwrap();
+        assert_eq!(send.copy(pool.arena(), 0, &mut bytes), 1);
         assert_eq!(bytes[0], b'c');
-        send.acknowledge(1).unwrap();
-        send.truncate(3); // Discarded EOR cannot affect later writes.
-        send.write(b"ij");
-        assert_eq!(send.copy(0, &mut bytes), 5);
+        send.acknowledge(&mut pool, 1).unwrap();
+        send.truncate(&mut pool, 3); // Discarded EOR cannot affect later writes.
+        send.write(&mut pool, b"ij");
+        assert_eq!(send.copy(pool.arena(), 0, &mut bytes), 5);
         assert_eq!(&bytes[..5], b"defij");
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
+
     #[test]
     fn lowat_byte_admission_preserves_capacity_across_resize_discard_and_ack() {
+        let mut pool = TxPool::heap(64);
         for capacity in [0, 1, 6, 16384, 32768, 65536] {
             let mut send = SendBuffer::new(capacity).unwrap();
             let charge = send.storage_bytes();
             assert_eq!(send.admission_room(0, Some(0)), 0);
             assert_eq!(send.admission_room(0, None), capacity);
             assert_eq!(send.admission_room(0, Some(u32::MAX)), capacity);
-            send.write(&alloc::vec![1; capacity.min(3)]);
+            send.write(&mut pool, &alloc::vec![1; capacity.min(3)]);
             for notsent in [0, 3, 4, 5, usize::MAX] {
                 assert_eq!(
                     send.admission_room(notsent, Some(4)),
@@ -1135,285 +1647,172 @@ mod tests {
                 );
             }
             assert_eq!(send.storage_bytes(), charge);
+            send.clear_chunks(&mut pool);
         }
         let mut send = SendBuffer::new(32).unwrap();
-        send.write(&[1; 8]);
+        send.write(&mut pool, &[1; 8]);
         send.mark_end_of_record();
         send.mark_push();
         assert_eq!(send.admission_room(8, Some(10)), 2);
-        send.grow(64).unwrap();
         send.set_limit(64);
         assert_eq!(send.admission_room(8, Some(10)), 2);
-        send.truncate(5);
+        send.truncate(&mut pool, 5);
         assert_eq!(send.admission_room(5, Some(10)), 5);
         send.set_limit(6);
         assert_eq!(send.admission_room(5, Some(10)), 1);
         send.set_limit(4);
         assert_eq!(send.admission_room(5, Some(10)), 0);
-        send.acknowledge(5).unwrap();
+        send.acknowledge(&mut pool, 5).unwrap();
         assert_eq!(send.admission_room(0, Some(10)), 4);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
-    fn send_growth_in_place_keeps_bytes_and_marks_across_wraps() {
-        let mut state = 0x9e37_79b9_u32;
-        let mut next = |bound: usize| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as usize % bound.max(1)
-        };
-        let mut send = SendBuffer::new(32).unwrap();
-        let mut model: VecDeque<(u8, u8)> = VecDeque::new();
-        let (mut wrapped, mut released) = (0, 0);
-        for step in 0..4000 {
-            match next(5) {
-                0 | 1 => {
-                    let input: Vec<u8> = (0..next(100)).map(|i| (step + i) as u8).collect();
-                    // As Connection::send_ring_target: double, within the
-                    // limit, before queueing.
-                    let live = (model.len() + input.len()).min(send.capacity());
-                    if live > send.allocation_capacity() {
-                        let ring = live
-                            .max(2 * send.allocation_capacity())
-                            .next_power_of_two()
-                            .min(send.capacity());
-                        send.grow(ring).unwrap();
-                    }
-                    let count = send.write(&input);
-                    assert_eq!(count, input.len().min(send.capacity() - model.len()));
-                    model.extend(input[..count].iter().map(|&b| (b, 0)));
-                }
-                2 => {
-                    // Sometimes everything, so that the queue drains.
-                    let count = if next(4) == 0 {
-                        model.len()
-                    } else {
-                        next(model.len() + 1)
-                    };
-                    send.acknowledge(count).unwrap();
-                    model.drain(..count);
-                    // A drained queue may free its rings.
-                    if model.is_empty() && next(2) == 0 {
-                        send.release();
-                        assert_eq!(send.storage_bytes(), 0);
-                        released += 1;
-                    }
-                }
-                3 if !model.is_empty() => {
-                    let offset = next(model.len());
-                    let (push, end_of_record) = (next(2) == 0, next(3) == 0);
-                    send.finish_send(offset, push, end_of_record);
-                    model[offset].1 |= u8::from(push) | u8::from(end_of_record) << 1;
-                    let count = 1 + next(model.len() - offset);
-                    send.mark_ptb(offset, count);
-                    for mark in model.range_mut(offset..offset + count) {
-                        if mark.1 & (PTB_PENDING | RETRANSMITTED) == 0 {
-                            mark.1 |= PTB_PENDING;
-                        }
-                    }
-                }
-                4 if next(4) == 0 && send.capacity() < 2048 => {
-                    wrapped += usize::from(!send.data.as_slices().1.is_empty());
-                    let capacity = send.capacity() + 1 + next(16);
-                    send.grow(capacity).unwrap();
-                    assert!(send.allocation_capacity() >= capacity);
-                    assert!(send.marks.capacity() >= capacity);
-                    send.set_limit(capacity);
-                }
-                _ => {}
-            }
-            assert!(send.data.iter().copied().eq(model.iter().map(|b| b.0)));
-            assert!(send.marks.iter().copied().eq(model.iter().map(|b| b.1)));
-            if !model.is_empty() {
-                let offset = next(model.len());
-                let count = 1 + next(model.len() - offset);
-                let range = model.range(offset..offset + count);
-                assert_eq!(
-                    send.pushed(offset, count),
-                    range.clone().any(|b| b.1 & 1 != 0)
-                );
-                assert_eq!(
-                    send.record_len(offset, count),
-                    range
-                        .clone()
-                        .position(|b| b.1 & 2 != 0)
-                        .map_or(count, |n| n + 1)
-                );
-            }
-        }
-        assert!(wrapped > 20 && released > 20, "{wrapped} {released}");
-    }
-
-    // Releasing an empty queue's storage keeps its limit and stream
-    // position and leaves no PUSH, EOR or shared span behind: the regrown
-    // ring marks, finds and copies its new bytes as a fresh one would.
-    #[test]
-    fn release_and_regrowth_keep_marks_positions_and_spans() {
+    fn release_and_reuse_preserve_empty_invariants() {
+        let mut pool = TxPool::heap(32);
         let mut send = SendBuffer::new(16).unwrap();
-        send.write(&[1; 12]);
-        send.acknowledge(8).unwrap();
-        send.write(b"abcdefghij");
-        send.mark_end_of_record();
+        send.write(&mut pool, b"0123456789abcd");
+        send.acknowledge(&mut pool, 8).unwrap();
+        send.write(&mut pool, b"efghijkl");
         send.mark_push();
-        send.finish_send(2, true, true);
-        send.mark_ptb(0, 14);
-        assert!(send.pushed(13, 1) && send.record_len(0, 14) == 3);
-        send.acknowledge(14).unwrap();
+        send.finish_send(&mut pool, 2, true, true);
+        send.acknowledge(&mut pool, 14).unwrap();
         send.release();
-        assert_eq!((send.storage_bytes(), send.allocation_capacity()), (0, 0));
-        assert_eq!((send.capacity(), send.remaining()), (16, 16));
-        send.grow(8).unwrap();
-        assert_eq!(send.write(b"xyz"), 3);
-        assert!(!send.pushed(0, 3) && !send.ptb_pending(0) && !send.retransmitted(0));
-        assert_eq!(send.record_len(0, 8), 3);
-        assert_eq!(send.tail_record_offset(0, 3), 0);
-        send.finish_send(0, false, true);
+        assert_eq!(send.storage_bytes(), 0);
+
+        send.write(&mut pool, b"xyz");
+        send.finish_send(&mut pool, 0, false, true);
         send.mark_push();
-        assert!(send.pushed(2, 1) && !send.pushed(0, 2));
-        assert_eq!(send.record_len(0, 8), 1);
-        send.acknowledge(1).unwrap();
-        assert!(send.pushed(0, 2) && send.record_len(0, 8) == 2);
+        send.acknowledge(&mut pool, 1).unwrap();
         let mut out = [0; 8];
-        assert_eq!(send.copy(0, &mut out), 2);
+        assert_eq!(send.copy(pool.arena(), 0, &mut out), 2);
         assert_eq!(&out[..2], b"yz");
-        // Shared spans start at the stream position the queue reached.
-        send.set_shared_output(Some(4));
-        let payload = Payload::from_vec(alloc::vec![7; 5]);
-        send.acknowledge(2).unwrap();
+        send.acknowledge(&mut pool, 2).unwrap();
         send.release();
-        send.grow(8).unwrap();
+        assert_eq!(send.storage_bytes(), 0);
+
+        let payload = Payload::from_vec(alloc::vec![9; 5]);
         send.prepare_shared(&payload, usize::MAX).unwrap();
         assert_eq!(send.write_shared(payload.clone()), 5);
         let mut parts = Vec::with_capacity(4);
         assert!(send.shared_slices(0, 5, &mut parts));
-        assert_eq!(parts[0].as_slice(), &[7; 5]);
-        send.acknowledge(5).unwrap();
-        assert_eq!(send.shared_spans(), 0);
+        send.acknowledge(&mut pool, 5).unwrap();
         send.release();
         assert_eq!(send.storage_bytes(), 0);
-        send.grow(8).unwrap();
+
         send.prepare_shared(&payload, usize::MAX).unwrap();
         assert_eq!(send.write_shared(payload), 5);
-        assert_eq!(send.copy(0, &mut out), 5);
+        assert_eq!(send.copy(pool.arena(), 0, &mut out), 5);
+        assert_eq!(&out[..5], &[9; 5]);
         assert!(send.shared_slices(0, 5, &mut Vec::with_capacity(4)));
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
-    fn failed_send_growth_leaves_the_ring_unchanged_and_retry_reuses_storage() {
+    fn failed_entry_reservation_leaves_queue_unchanged() {
         use crate::allocation_tests::fail_after;
-        let mut send = SendBuffer::new(16).unwrap();
-        send.write(&[1; 12]);
-        send.acknowledge(8).unwrap();
-        send.write(b"abcdefghij");
+        let mut pool = TxPool::heap(16);
+        let mut send = SendBuffer::new(64).unwrap();
+        send.write(&mut pool, &[1; 12]);
+        send.acknowledge(&mut pool, 8).unwrap();
+        send.write(&mut pool, b"abcdefghij");
         send.mark_push();
-        assert!(!send.data.as_slices().1.is_empty());
-        let before = (send.data.clone(), send.marks.clone(), send.capacity());
         let storage = send.storage_bytes();
-        assert_eq!(fail_after(0, || send.grow(64)), Err(()));
+        // Already fits 1 new entry without allocating.
+        assert_eq!(fail_after(0, || send.reserve_entries(1)), Ok(()));
+        // Growing past current capacity fails cleanly under fail_after(0).
+        assert_eq!(fail_after(0, || send.reserve_entries(64)), Err(()));
         assert_eq!(send.storage_bytes(), storage);
-        assert_eq!(fail_after(1, || send.grow(64)), Err(()));
-        assert_eq!(
-            (send.data.clone(), send.marks.clone(), send.capacity()),
-            before
-        );
-        assert!(send.storage_bytes() >= storage + 48);
-        assert!(fail_after(0, || send.grow(16) == Ok(()) && SendBuffer::new(1).is_err()));
-        // Only the marks are left to reserve.
-        assert_eq!(fail_after(1, || send.grow(64)), Ok(()));
-        assert_eq!(
-            (send.data.clone(), send.marks.clone(), send.capacity()),
-            before
-        );
-        send.set_limit(64);
-        assert_eq!(send.write(&[2; 60]), 50);
-        let mut out = [0; 64];
-        assert_eq!(send.copy(0, &mut out), 64);
-        assert_eq!(&out[..14], b"\x01\x01\x01\x01abcdefghij");
+        assert!(fail_after(0, || SendBuffer::new(1).is_err()));
+        // Succeeds once allocation is allowed, preserving existing bytes and marks.
+        assert_eq!(send.reserve_entries(64), Ok(()));
+        assert!(send.storage_bytes() > storage);
+        let mut out = [0; 14];
+        assert_eq!(send.copy(pool.arena(), 0, &mut out), 14);
+        assert_eq!(&out, b"\x01\x01\x01\x01abcdefghij");
         assert!(send.pushed(13, 1) && !send.pushed(0, 13));
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
-    fn collapse_push_early_return_and_contiguous_ring_wrap_and_shared() {
-        let mut send = SendBuffer::new(16).unwrap();
+    fn collapse_push_early_return_and_multi_chunk_contiguous_and_shared() {
+        let mut pool = TxPool::heap(16);
+        let mut send = SendBuffer::new(32).unwrap();
         // Single PUSH at index 5 -> single_push_len == 6.
-        assert_eq!(send.write(b"abcdef"), 6);
+        assert_eq!(send.write(&mut pool, b"abcdef"), 6);
         send.mark_push();
         assert_eq!(send.single_push_len, 6);
-        // count == single_push_len takes the early return without altering marks.
-        send.collapse_push(0, 6);
+        send.collapse_push(&mut pool, 0, 6);
         assert!(send.pushed(5, 1) && !send.pushed(0, 5));
 
         // Adding an earlier PUSH via finish_send narrows single_push_len to 5 - 2 = 3.
-        send.finish_send(2, true, false);
+        send.finish_send(&mut pool, 2, true, false);
         assert_eq!(send.single_push_len, 3);
-        // count == 3 (indices 3..=5) early-returns and leaves earlier PUSH at 2 intact.
-        send.collapse_push(3, 3);
+        send.collapse_push(&mut pool, 3, 3);
         assert!(send.pushed(2, 1) && send.pushed(5, 1) && !send.pushed(3, 2));
-        // count == 4 (indices 2..=5) > single_push_len clears the earlier PUSH at 2.
-        send.collapse_push(2, 4);
+        send.collapse_push(&mut pool, 2, 4);
         assert!(!send.pushed(0, 5) && send.pushed(5, 1));
 
         // After acknowledge keeping last_push, collapse_push still preserves correctness.
-        send.acknowledge(3).unwrap(); // remaining: "def" with PUSH at index 2
-        send.finish_send(0, true, false); // PUSH at 0 and 2 -> single_push_len = 2
-        send.collapse_push(1, 2); // early return on 1..=2
+        send.acknowledge(&mut pool, 3).unwrap();
+        send.finish_send(&mut pool, 0, true, false);
+        send.collapse_push(&mut pool, 1, 2);
         assert!(send.pushed(0, 1) && send.pushed(2, 1));
-        send.collapse_push(0, 3); // clears PUSH at 0
+        send.collapse_push(&mut pool, 0, 3);
         assert!(!send.pushed(0, 2) && send.pushed(2, 1));
 
         // After truncate drops last_push, find_last_push resets single_push_len = 1.
-        send.finish_send(0, true, false);
-        send.truncate(2); // remaining: "de" with PUSH at 0
+        send.finish_send(&mut pool, 0, true, false);
+        send.truncate(&mut pool, 2);
         assert_eq!(send.single_push_len, 1);
-        send.collapse_push(0, 1);
+        send.collapse_push(&mut pool, 0, 1);
         assert!(send.pushed(0, 1) && !send.pushed(1, 1));
 
-        // After release + grow, single_push_len works cleanly for new writes.
-        send.acknowledge(2).unwrap();
+        send.acknowledge(&mut pool, 2).unwrap();
         send.release();
-        send.grow(16).unwrap();
+        pool.release_tail();
 
-        // Force a ring wrap: write 12, ack 10, write 10 -> front has 6 bytes, back has 6 bytes
-        // (exact split depends on VecDeque capacity, so verify wrap explicitly).
-        assert_eq!(send.write(b"0123456789ab"), 12);
-        send.acknowledge(10).unwrap();
-        assert_eq!(send.write(b"ABCDEFGHIJ"), 10);
-        let (front, back) = send.data.as_slices();
-        assert!(
-            !front.is_empty() && !back.is_empty(),
-            "expected wrapped ring"
-        );
-        let (front_len, back_len, first_byte) = (front.len(), back.len(), front[0]);
-        let mut out = [0; 16];
-        // Front-only slice returns Some matching copy.
-        let front_slice = send.contiguous(0, front_len).unwrap();
-        let n = send.copy(0, &mut out[..front_len]);
-        assert_eq!(front_slice, &out[..n]);
-        // Back-only slice returns Some matching copy.
-        let back_slice = send.contiguous(front_len, back_len).unwrap();
-        let n = send.copy(front_len, &mut out[..back_len]);
-        assert_eq!(back_slice, &out[..n]);
-        // Selection spanning front..back returns None, while copy still succeeds.
-        assert!(send.contiguous(front_len - 1, 2).is_none());
-        assert_eq!(send.copy(front_len - 1, &mut out[..2]), 2);
-        // EOR inside the front slice limits contiguous to the record end.
-        send.finish_send(0, false, true);
-        assert_eq!(send.contiguous(0, send.len()), Some(&[first_byte][..]));
+        // Span two 16-byte chunks cleanly.
+        assert_eq!(send.write(&mut pool, b"0123456789abcdef"), 16);
+        assert_eq!(send.write(&mut pool, b"ABCDEFGHIJ"), 10);
+        let mut out = [0; 26];
+        let first_slice = send.contiguous(pool.arena(), 0, 16).unwrap();
+        assert_eq!(first_slice, b"0123456789abcdef");
+        let second_slice = send.contiguous(pool.arena(), 16, 10).unwrap();
+        assert_eq!(second_slice, b"ABCDEFGHIJ");
+        // Spanning chunk boundary returns None, while copy succeeds.
+        assert!(send.contiguous(pool.arena(), 15, 2).is_none());
+        assert_eq!(send.copy(pool.arena(), 15, &mut out[..2]), 2);
+        assert_eq!(&out[..2], b"fA");
 
-        // Non-empty shared payloads must make contiguous return None.
+        // EOR inside the first chunk limits contiguous to the record end.
+        send.finish_send(&mut pool, 0, false, true);
+        assert_eq!(send.contiguous(pool.arena(), 0, send.len()), Some(&b"0"[..]));
+
+        // Non-empty shared payloads make contiguous return None.
         send.set_shared_output(Some(4));
         let payload = Payload::from_vec(alloc::vec![b'Z'; 4]);
         send.prepare_shared(&payload, usize::MAX).unwrap();
         assert_eq!(send.write_shared(payload), 4);
-        assert!(send.contiguous(0, 1).is_none());
-        assert!(send.contiguous(send.len() - 4, 4).is_none());
+        assert!(send.contiguous(pool.arena(), 0, 1).is_none());
+        assert!(send.contiguous(pool.arena(), send.len() - 4, 4).is_none());
+
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
-    fn send_marks_and_buffer_operations_match_vecdeque_oracle() {
+    fn send_buffer_chunk_shared_and_marks_match_oracle_6000_steps() {
+        let mut pool = TxPool::heap(32);
         let mut send = SendBuffer::new(256).unwrap();
-        let mut oracle: VecDeque<u8> = VecDeque::new();
+        // Oracle stores (byte, mark_bits) per queued byte.
+        let mut oracle: VecDeque<(u8, u8)> = VecDeque::new();
         let mut state = 0x7319_a5c1_u32;
         let mut next = |bound: usize| {
             state ^= state << 13;
@@ -1422,87 +1821,109 @@ mod tests {
             state as usize % bound.max(1)
         };
 
-        let mut saw_singleton_push = false;
-        let mut saw_singleton_eor = false;
-        let mut saw_materialized = false;
-        let mut saw_full_ack_return_to_singleton = false;
+        let shared_backing = Payload::from_vec((0..256u16).map(|i| (i ^ 0x5a) as u8).collect());
+        let mut saw_shared = false;
+        let mut saw_multi_chunk = false;
         let mut saw_ptb = false;
+        let mut saw_tx_parts = false;
 
         for step in 0..6000 {
-            let was_materialized = send.marks.singleton().is_none();
-            match next(14) {
+            match next(16) {
                 0..=2 => {
-                    // Nonempty append + optional finish_append.
                     let room = send.remaining();
                     if room != 0 {
                         let len = 1 + next(room.min(48));
                         let input: Vec<u8> = (0..len).map(|i| (step + i) as u8).collect();
-                        send.append(&input);
-                        oracle.extend(core::iter::repeat_n(0u8, len));
+                        let needed = send.needed_entries_for_copy(&pool, len);
+                        send.reserve_entries(needed).unwrap();
+                        let taken = send.append(&mut pool, &input);
+                        assert_eq!(taken, len);
+                        oracle.extend(input.into_iter().map(|b| (b, 0)));
                         let push = next(3) == 0;
                         let eor = next(4) == 0;
                         send.finish_append(push, eor);
                         if push || eor {
-                            *oracle.back_mut().unwrap() |= u8::from(push) | (u8::from(eor) << 1);
+                            oracle.back_mut().unwrap().1 |= u8::from(push) | (u8::from(eor) << 1);
+                        }
+                        if pool.live() >= 2 {
+                            saw_multi_chunk = true;
                         }
                     }
                 }
                 3 => {
-                    send.mark_push();
-                    if let Some(last) = oracle.back_mut() {
-                        *last |= 1;
+                    // Shared write (sometimes contiguous with previous shared slice).
+                    let room = send.remaining();
+                    if room != 0 {
+                        let start = next(200);
+                        let len = 1 + next(room.min(32).min(256 - start));
+                        let slice = shared_backing.slice(start..start + len).unwrap();
+                        let needed = send.needed_entries_for_shared(&slice);
+                        send.reserve_entries(needed).unwrap();
+                        let taken = send.write_shared(slice.clone());
+                        assert_eq!(taken, len);
+                        oracle.extend(slice.as_slice().iter().map(|&b| (b, 0)));
+                        let push = next(3) == 0;
+                        let eor = next(5) == 0;
+                        send.finish_append(push, eor);
+                        if push || eor {
+                            oracle.back_mut().unwrap().1 |= u8::from(push) | (u8::from(eor) << 1);
+                        }
+                        saw_shared = true;
                     }
                 }
                 4 => {
+                    send.mark_push();
+                    if let Some(last) = oracle.back_mut() {
+                        last.1 |= FLAG_PUSH;
+                    }
+                }
+                5 => {
                     send.mark_end_of_record();
                     if let Some(last) = oracle.back_mut() {
-                        *last |= 2;
+                        last.1 |= FLAG_EOR;
                     }
                 }
-                5 if !oracle.is_empty() => {
+                6 if !oracle.is_empty() => {
                     let offset = next(oracle.len());
                     let count = 1 + next(oracle.len() - offset);
-                    send.collapse_push(offset, count);
-                    for mark in oracle.range_mut(offset..offset + count) {
-                        *mark &= !1;
+                    send.reserve_entries(1).unwrap();
+                    send.collapse_push(&mut pool, offset, count);
+                    for entry in oracle.range_mut(offset..offset + count) {
+                        entry.1 &= !FLAG_PUSH;
                     }
-                    oracle[offset + count - 1] |= 1;
+                    oracle[offset + count - 1].1 |= FLAG_PUSH;
                 }
-                6 => {
+                7 => {
                     let offset = next(oracle.len() + 2);
                     let push = next(2) == 0;
                     let eor = next(3) == 0;
-                    send.finish_send(offset, push, eor);
-                    if let Some(mark) = oracle.get_mut(offset) {
-                        *mark |= u8::from(push) | (u8::from(eor) << 1);
+                    send.reserve_entries(1).unwrap();
+                    send.finish_send(&mut pool, offset, push, eor);
+                    if let Some(entry) = oracle.get_mut(offset) {
+                        entry.1 |= u8::from(push) | (u8::from(eor) << 1);
                     }
                 }
-                7 => {
-                    // Full ACK back to singleton, or partial ACK.
+                8 => {
                     let count = if next(3) == 0 {
                         oracle.len()
                     } else {
                         next(oracle.len() + 1)
                     };
-                    send.acknowledge(count).unwrap();
+                    send.acknowledge(&mut pool, count).unwrap();
                     oracle.drain(..count);
-                    if was_materialized && count > 0 && oracle.is_empty() {
-                        assert!(send.marks.singleton().is_some());
-                        saw_full_ack_return_to_singleton = true;
-                    }
-                }
-                8 => {
-                    let len = next(oracle.len() + 1);
-                    send.truncate(len);
-                    oracle.truncate(len);
                 }
                 9 => {
+                    let len = next(oracle.len() + 1);
+                    send.truncate(&mut pool, len);
+                    oracle.truncate(len);
+                }
+                10 => {
                     let offset = next(oracle.len() + 2);
                     let count = next(oracle.len().saturating_sub(offset) + 4);
-                    let end = (offset + count).min(oracle.len());
                     let start = offset.min(oracle.len());
+                    let end = (start + count).min(oracle.len());
                     let mut expected = 0;
-                    for m in oracle.range_mut(start..end) {
+                    for (_, m) in oracle.range_mut(start..end) {
                         if *m & (PTB_PENDING | RETRANSMITTED) == 0 {
                             *m |= PTB_PENDING;
                             expected += 1;
@@ -1513,96 +1934,75 @@ mod tests {
                         saw_ptb = true;
                     }
                 }
-                10 => {
+                11 => {
                     let offset = next(oracle.len() + 2);
                     let count = next(oracle.len().saturating_sub(offset) + 4);
-                    let end = (offset + count).min(oracle.len());
                     let start = offset.min(oracle.len());
+                    let end = (start + count).min(oracle.len());
                     let (mut pending, mut copies) = (0, 0);
-                    for m in oracle.range_mut(start..end) {
+                    for (_, m) in oracle.range_mut(start..end) {
                         pending += usize::from(*m & PTB_PENDING != 0);
                         copies += usize::from(*m & PTB_COPY != 0);
                         *m &= !(PTB_PENDING | PTB_COPY);
                     }
                     assert_eq!(send.release_ptb(offset, count), (pending, copies));
                 }
-                11 => {
-                    let offset = next(oracle.len() + 2);
-                    let count = next(oracle.len().saturating_sub(offset) + 4);
-                    let end = (offset + count).min(oracle.len());
-                    let start = offset.min(oracle.len());
-                    let mut marked = 0;
-                    for m in oracle.range_mut(start..end) {
-                        marked += usize::from(*m & PTB_COPY == 0);
-                        *m |= PTB_COPY;
-                    }
-                    assert_eq!(send.mark_ptb_copy(offset, count), marked);
-                }
                 12 => {
                     let offset = next(oracle.len() + 2);
                     let count = next(oracle.len().saturating_sub(offset) + 4);
-                    let end = (offset + count).min(oracle.len());
                     let start = offset.min(oracle.len());
-                    let mut cleared = 0;
-                    for m in oracle.range_mut(start..end) {
-                        cleared += usize::from(*m & PTB_COPY != 0);
-                        *m &= !PTB_COPY;
+                    let end = (start + count).min(oracle.len());
+                    let mut expected = 0;
+                    for (_, m) in oracle.range_mut(start..end) {
+                        expected += usize::from(*m & PTB_COPY == 0);
+                        *m |= PTB_COPY;
                     }
-                    assert_eq!(send.clear_ptb_copy(offset, count), cleared);
+                    assert_eq!(send.mark_ptb_copy(offset, count), expected);
                 }
-                _ => {
+                13 => {
                     let offset = next(oracle.len() + 2);
                     let count = next(oracle.len().saturating_sub(offset) + 4);
-                    let end = (offset + count).min(oracle.len());
                     let start = offset.min(oracle.len());
-                    let mut cleared = 0;
-                    for m in oracle.range_mut(start..end) {
-                        cleared += usize::from(*m & PTB_PENDING != 0);
+                    let end = (start + count).min(oracle.len());
+                    let mut expected = 0;
+                    for (_, m) in oracle.range_mut(start..end) {
+                        expected += usize::from(*m & PTB_COPY != 0);
+                        *m &= !PTB_COPY;
+                    }
+                    assert_eq!(send.clear_ptb_copy(offset, count), expected);
+                }
+                14 => {
+                    let offset = next(oracle.len() + 2);
+                    let count = next(oracle.len().saturating_sub(offset) + 4);
+                    let start = offset.min(oracle.len());
+                    let end = (start + count).min(oracle.len());
+                    let mut expected = 0;
+                    for (_, m) in oracle.range_mut(start..end) {
+                        expected += usize::from(*m & PTB_PENDING != 0);
                         *m = (*m & !PTB_PENDING) | RETRANSMITTED;
                     }
-                    assert_eq!(send.mark_retransmitted(offset, count), cleared);
+                    assert_eq!(send.mark_retransmitted(offset, count), expected);
+                }
+                _ => {
+                    if oracle.is_empty() {
+                        send.release();
+                        pool.shrink();
+                    }
                 }
             }
 
-            // Core invariants: marks match oracle, push_end/eor_end exact, singleton has no PTB bits.
+            send.debug_check_invariants();
             assert_eq!(send.len(), oracle.len());
-            assert!(send.marks.iter().copied().eq(oracle.iter().copied()));
-            let expected_push_end = oracle
-                .iter()
-                .rposition(|&m| m & 1 != 0)
-                .map_or(0, |i| i + 1);
-            let expected_eor_end = oracle
-                .iter()
-                .rposition(|&m| m & 2 != 0)
-                .map_or(0, |i| i + 1);
-            assert_eq!(send.push_end, expected_push_end);
-            assert_eq!(send.eor_end, expected_eor_end);
-            if let Some((pos, bits)) = send.marks.singleton() {
-                assert_eq!(bits & !(1 | 2), 0, "singleton must not hold PTB bits");
-                if bits & 1 != 0 {
-                    saw_singleton_push = true;
-                }
-                if bits & 2 != 0 {
-                    saw_singleton_eor = true;
-                }
-                if bits != 0 {
-                    assert!(pos < oracle.len());
-                    assert_eq!(oracle[pos], bits);
-                }
-            } else {
-                saw_materialized = true;
-            }
 
-            // Query checks across random offset/count/end/size.
             let offset = next(oracle.len() + 3);
             let count = next(oracle.len() + 5);
             let available = oracle.len().saturating_sub(offset);
             let bounded = count.min(available);
-            let tail: Vec<u8> = oracle.iter().skip(offset).take(bounded).copied().collect();
+            let tail: Vec<(u8, u8)> = oracle.iter().skip(offset).take(bounded).copied().collect();
 
             let expected_record = tail
                 .iter()
-                .position(|&m| m & 2 != 0)
+                .position(|&(_, m)| m & FLAG_EOR != 0)
                 .map_or(tail.len(), |n| n + 1);
             assert_eq!(send.record_len(offset, count), expected_record);
             assert_eq!(send.record_len_within(offset, bounded), expected_record);
@@ -1610,23 +2010,24 @@ mod tests {
                 send.tail_record_offset(offset, count),
                 tail.iter()
                     .take(tail.len().saturating_sub(1))
-                    .rposition(|&m| m & 2 != 0)
+                    .rposition(|&(_, m)| m & FLAG_EOR != 0)
                     .map_or(offset, |n| offset + n + 1)
             );
-            assert_eq!(send.pushed(offset, count), tail.iter().any(|&m| m & 1 != 0));
+            assert_eq!(
+                send.pushed(offset, count),
+                tail.iter().any(|&(_, m)| m & FLAG_PUSH != 0)
+            );
             assert_eq!(
                 send.push_after(offset),
-                oracle.iter().skip(offset).any(|&m| m & 1 != 0)
+                oracle.iter().skip(offset).any(|&(_, m)| m & FLAG_PUSH != 0)
             );
-            // If push_at_end returns true, PUSH must be ONLY on the last byte of [offset..offset+count)
-            // and must also be the last PUSH in the buffer.
             if send.push_at_end(offset, count) {
-                assert!(count != 0 && offset + count == expected_push_end);
-                assert!(oracle[offset + count - 1] & 1 != 0);
+                assert!(count != 0 && offset + count == send.push_end);
+                assert!(oracle[offset + count - 1].1 & FLAG_PUSH != 0);
                 assert!(
                     oracle
                         .range(offset..offset + count - 1)
-                        .all(|&m| m & 1 == 0)
+                        .all(|&(_, m)| m & FLAG_PUSH == 0)
                 );
             }
             let size = 1 + next(16);
@@ -1634,7 +2035,7 @@ mod tests {
             let expected_seg = (0..segments).find(|&s| {
                 let start = offset + s * size;
                 let end = (start + size).min(oracle.len());
-                start < end && oracle.range(start..end).any(|&m| m & 1 != 0)
+                start < end && oracle.range(start..end).any(|&(_, m)| m & FLAG_PUSH != 0)
             });
             assert_eq!(
                 send.first_pushed_segment(offset, size, segments),
@@ -1646,10 +2047,10 @@ mod tests {
             let limit = 1 + next(16);
             let expected_next_flag = |flag: u8, lim: usize| -> Option<(usize, usize)> {
                 let hi = end.min(oracle.len());
-                let start = (offset..hi).find(|&i| oracle[i] & flag != 0)?;
+                let start = (offset..hi).find(|&i| oracle[i].1 & flag != 0)?;
                 let run = (start..hi)
                     .take(lim)
-                    .take_while(|&i| oracle[i] & flag != 0)
+                    .take_while(|&i| oracle[i].1 & flag != 0)
                     .count();
                 Some((start, run))
             };
@@ -1664,33 +2065,60 @@ mod tests {
             let expected_count_ptb = oracle
                 .range(offset.min(oracle.len())..)
                 .take(count)
-                .filter(|&&m| m & PTB_PENDING != 0)
+                .filter(|&&(_, m)| m & PTB_PENDING != 0)
                 .count();
             assert_eq!(send.count_ptb(offset, count), expected_count_ptb);
             assert_eq!(
                 send.ptb_pending(offset),
-                oracle.get(offset).is_some_and(|&m| m & PTB_PENDING != 0)
+                oracle.get(offset).is_some_and(|&(_, m)| m & PTB_PENDING != 0)
             );
             assert_eq!(
                 send.ptb_copy(offset),
-                oracle.get(offset).is_some_and(|&m| m & PTB_COPY != 0)
+                oracle.get(offset).is_some_and(|&(_, m)| m & PTB_COPY != 0)
             );
             assert_eq!(
                 send.retransmitted(offset),
-                oracle.get(offset).is_some_and(|&m| m & RETRANSMITTED != 0)
+                oracle
+                    .get(offset)
+                    .is_some_and(|&(_, m)| m & RETRANSMITTED != 0)
             );
 
-            // selected_slice agrees with contiguous on record-clipped count.
-            assert_eq!(
-                send.selected_slice(offset, expected_record),
-                send.contiguous(offset, count)
+            // Verify copy, selected_slice, contiguous, and tx_parts byte-for-byte.
+            let mut out = alloc::vec![0u8; bounded];
+            let copied = send.copy(pool.arena(), offset, &mut out);
+            assert_eq!(copied, expected_record);
+            assert!(
+                out[..copied]
+                    .iter()
+                    .copied()
+                    .eq(tail[..copied].iter().map(|&(b, _)| b))
             );
+            assert_eq!(
+                send.selected_slice(pool.arena(), offset, expected_record),
+                send.contiguous(pool.arena(), offset, count)
+            );
+            if let Some(slice) = send.selected_slice(pool.arena(), offset, expected_record) {
+                assert_eq!(slice, &out[..copied]);
+            }
+            let mut parts = Vec::new();
+            let covered = send.tx_parts(pool.arena(), offset, expected_record, &mut parts);
+            assert_eq!(covered, expected_record);
+            let mut flattened = Vec::with_capacity(covered);
+            for part in &parts {
+                flattened.extend_from_slice(part.bytes());
+            }
+            assert_eq!(flattened, &out[..copied]);
+            if !parts.is_empty() {
+                saw_tx_parts = true;
+            }
         }
 
-        assert!(saw_singleton_push);
-        assert!(saw_singleton_eor);
-        assert!(saw_materialized);
-        assert!(saw_full_ack_return_to_singleton);
+        assert!(saw_shared);
+        assert!(saw_multi_chunk);
         assert!(saw_ptb);
+        assert!(saw_tx_parts);
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 }

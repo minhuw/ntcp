@@ -142,6 +142,7 @@ fn shared_ranges_can_be_copied_by_legacy_output_without_corruption() {
 fn shared_metadata_partial_ack_resize_and_fragment_limits_preserve_bytes() {
     use crate::buffer::SendBuffer;
     let mut buffer = SendBuffer::new(128).unwrap();
+    let mut pool = crate::tx_pool::TxPool::heap_default();
     let count = Arc::new(AtomicUsize::new(0));
     let state = count.clone();
     let base = Payload::from_vec(vec![2; 13]);
@@ -150,30 +151,32 @@ fn shared_metadata_partial_ack_resize_and_fragment_limits_preserve_bytes() {
     });
     buffer.prepare_shared(&leased, 4096).unwrap();
     buffer.write_shared(leased);
-    buffer.write(&[3; 7]);
+    buffer.write(&mut pool, &[3; 7]);
     let next = Payload::from_vec(vec![4; 11]);
     buffer.prepare_shared(&next, 4096).unwrap();
     buffer.write_shared(next);
     buffer.mark_end_of_record();
-    buffer.acknowledge(5).unwrap();
+    buffer.acknowledge(&mut pool, 5).unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 0);
-    buffer.grow(256).unwrap();
     buffer.set_limit(256);
     let mut out = [0; 26];
-    assert_eq!(buffer.copy(0, &mut out), 26);
+    assert_eq!(buffer.copy(pool.arena(), 0, &mut out), 26);
     assert_eq!(&out[..8], &[2; 8]);
     assert_eq!(&out[8..15], &[3; 7]);
     assert_eq!(&out[15..], &[4; 11]);
     buffer.set_shared_output(Some(1));
-    assert_eq!(buffer.copy(0, &mut out), 8);
-    assert_eq!(buffer.copy(8, &mut out), 7);
-    assert_eq!(buffer.copy(15, &mut out), 11);
-    buffer.acknowledge(8).unwrap();
+    assert_eq!(buffer.copy(pool.arena(), 0, &mut out), 8);
+    assert_eq!(buffer.copy(pool.arena(), 8, &mut out), 7);
+    assert_eq!(buffer.copy(pool.arena(), 15, &mut out), 11);
+    buffer.acknowledge(&mut pool, 8).unwrap();
     assert_eq!(count.load(Ordering::SeqCst), 1);
-    buffer.truncate(10);
+    buffer.truncate(&mut pool, 10);
     buffer.set_shared_output(None);
-    assert_eq!(buffer.copy(0, &mut out), 10);
+    assert_eq!(buffer.copy(pool.arena(), 0, &mut out), 10);
     assert_eq!(&out[..10], &[3, 3, 3, 3, 3, 3, 3, 4, 4, 4]);
+    buffer.clear_chunks(&mut pool);
+    pool.release_tail();
+    assert_eq!(pool.live(), 0);
 }
 
 #[test]
@@ -242,15 +245,16 @@ fn shared_writes_join_only_contiguous_ranges_of_one_lease() {
     write(&mut buffer, base.slice(16..20).unwrap());
     assert_eq!(buffer.shared_spans(), 3);
     // Copied bytes between: the next range is contiguous in storage only.
-    buffer.write(&[0xff; 2]);
+    let mut pool = crate::tx_pool::TxPool::heap_default();
+    buffer.write(&mut pool, &[0xff; 2]);
     write(&mut buffer, base.slice(20..24).unwrap());
     assert_eq!(buffer.shared_spans(), 4);
     // A span cut by truncate continues from its new end.
-    buffer.truncate(buffer.len() - 2);
+    buffer.truncate(&mut pool, buffer.len() - 2);
     write(&mut buffer, base.slice(22..26).unwrap());
     assert_eq!(buffer.shared_spans(), 4);
     let mut out = [0; 27];
-    assert_eq!(buffer.copy(0, &mut out), 27);
+    assert_eq!(buffer.copy(pool.arena(), 0, &mut out), 27);
     let expected: Vec<u8> = (0..12)
         .chain(13..20)
         .chain([0xff, 0xff])
@@ -258,9 +262,12 @@ fn shared_writes_join_only_contiguous_ranges_of_one_lease() {
         .collect();
     assert_eq!(&out[..], &expected[..]);
     // Partial ACKs slice the joined front span.
-    buffer.acknowledge(6).unwrap();
+    buffer.acknowledge(&mut pool, 6).unwrap();
     buffer.set_shared_output(Some(1));
-    assert_eq!(buffer.copy(0, &mut out), 2);
+    assert_eq!(buffer.copy(pool.arena(), 0, &mut out), 2);
+    buffer.clear_chunks(&mut pool);
+    pool.release_tail();
+    assert_eq!(pool.live(), 0);
 }
 
 #[test]

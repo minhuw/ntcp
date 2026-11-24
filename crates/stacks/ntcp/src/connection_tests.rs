@@ -1807,24 +1807,30 @@ fn live_buffer_resize_is_atomic_and_preserves_recovery_and_window_promises() {
     a.set_buffer_capacities(4, 4, usize::MAX).unwrap();
     assert_eq!(a.write(b"!"), Err(Error::WouldBlock));
     assert!(!a.take_events().writable);
-    a.accept_ack(
-        a.send_base.wrapping_add(10),
-        false,
-        None,
-        a.snd_wnd,
-        false,
-        0,
-    );
+    a.with_local_tx(|a, pool| {
+        a.accept_ack(
+            pool,
+            a.send_base.wrapping_add(10),
+            false,
+            None,
+            a.snd_wnd,
+            false,
+            0,
+        );
+    });
     assert_eq!(a.send.len(), 16);
     assert!(!a.take_events().writable);
-    a.accept_ack(
-        a.send_base.wrapping_add(13),
-        false,
-        None,
-        a.snd_wnd,
-        false,
-        0,
-    );
+    a.with_local_tx(|a, pool| {
+        a.accept_ack(
+            pool,
+            a.send_base.wrapping_add(13),
+            false,
+            None,
+            a.snd_wnd,
+            false,
+            0,
+        );
+    });
     assert_eq!(a.send.len(), 3);
     assert!(a.take_events().writable);
     b.set_buffer_capacities(4, 4, usize::MAX).unwrap();
@@ -3484,8 +3490,7 @@ fn syn_received_close_send_history_survives_flush_and_empty_send() {
 
     let (mut a, _) = opening_for_close(config(64, 8), 100, false);
     // Exhaust storage without a successful application SEND.
-    a.send.grow(64).unwrap();
-    a.send.write(&[0; 64]);
+    a.with_local_tx(|a, pool| a.send.write(pool, &[0; 64]));
     assert_eq!(a.write(b"failed"), Err(Error::WouldBlock));
     assert!(!a.send_issued);
     a.snd_wnd = 0;
@@ -3782,7 +3787,10 @@ fn send_state_matrix_preserves_queue_on_rejection() {
             assert_eq!(a.write(b"de"), Ok(1));
             assert_eq!(a.write(b"f"), Err(Error::WouldBlock));
             let mut queued = [0; 4];
-            assert_eq!(a.send.copy(0, &mut queued), 4);
+            assert_eq!(
+                a.send.copy(a.local_tx.as_ref().unwrap().arena(), 0, &mut queued),
+                4
+            );
             assert_eq!(&queued, b"abcd");
             assert_eq!(
                 (a.snd_una, a.snd_nxt, a.acknowledged()),
@@ -20116,7 +20124,7 @@ fn logical_send_finish_marks_only_selected_byte_and_releases_cork() {
     assert!(a.more); // A later write owns the current MORE state.
     a.finish_send(end, true, false, true);
     assert!(a.cork_flush.is_some());
-    a.send.acknowledge(6).unwrap();
+    a.with_local_tx(|a, pool| a.send.acknowledge(pool, 6).unwrap());
     a.acknowledged += 6;
     a.finish_send(end, false, true, false);
     assert_eq!(a.send.record_len(0, 2), 2);

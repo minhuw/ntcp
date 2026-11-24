@@ -15,10 +15,11 @@ fn storage(a: &Connection) -> alloc::string::String {
 
 // The bytes queued, from the first unacknowledged one.
 fn queued(a: &Connection) -> alloc::vec::Vec<u8> {
+    let arena = a.local_tx.as_ref().unwrap().arena();
     let mut out = alloc::vec![0; a.send.len()];
     let mut at = 0;
     while at < out.len() {
-        at += a.send.copy(at, &mut out[at..]);
+        at += a.send.copy(arena, at, &mut out[at..]);
     }
     out
 }
@@ -42,48 +43,41 @@ fn idle_sender_backing_is_independent_of_configured_payload_limit() {
         let charge = a.buffer_charge();
         let idle = metadata_bytes(&a);
         assert_eq!(a.send.storage_bytes(), 0);
+        assert_eq!(a.local_tx.as_ref().unwrap().storage_bytes(), 0);
         a.write(&[1; 18]).unwrap();
         assert_eq!(
             metadata_bytes(&a),
             Rack::storage_bytes(32).unwrap() + Scoreboard::allocation_bytes(32).unwrap()
         );
-        // The first write allocates a page of ring, within the limit, and
-        // is charged what it allocates.
-        let ring = 2 * limit.min(SEND_RING_RESERVE / 2);
-        assert_eq!(a.send.storage_bytes(), ring);
-        assert_eq!(a.buffer_charge(), charge + ring + metadata_bytes(&a) - idle);
+        // The first write allocates entry metadata on the connection and one
+        // shared chunk in the TxPool (independent of the configured limit).
+        let entries_bytes = a.send.storage_bytes();
+        assert!(entries_bytes > 0 && entries_bytes <= SEND_RING_RESERVE);
+        assert_eq!(a.buffer_charge(), charge + entries_bytes + metadata_bytes(&a) - idle);
+        assert!(a.local_tx.as_ref().unwrap().live() == 1);
         assert!(metadata_bytes(&a) < 4096);
     }
 }
 
-// The ring grows with the bytes queued, doubling within the limit, as
-// Linux's tcp_sendmsg allocates skbs as bytes are written rather than
-// sk_sndbuf at once: a stream of writes grows it logarithmically many
-// times, it never holds more than twice the queued bytes beyond its first
-// page, and the bytes survive every growth.
+// Send storage grows in bounded chunks in the TxPool plus compact TxSeg
+// entries on the connection, independent of the configured send limit until
+// data is actually queued, and all queued bytes survive every chunk/entry
+// growth.
 #[test]
 fn send_ring_grows_geometrically_within_the_limit() {
     for limit in [3000, 1 << 20] {
         let (mut a, _) = pair(config(limit, 1000), u32::MAX - 20);
+        let chunk_size = a.local_tx.as_ref().unwrap().chunk_size();
         let mut written = alloc::vec::Vec::new();
-        let mut held = alloc::vec::Vec::new();
         while a.send.len() < limit {
             let chunk: alloc::vec::Vec<u8> = (0..1000).map(|i| (written.len() + i) as u8).collect();
             let count = a.write(&chunk).unwrap();
             written.extend_from_slice(&chunk[..count]);
-            let ring = a.send.allocation_capacity();
-            assert!(ring >= a.send.len() && ring <= 2 * a.send.len().max(1024));
-            assert_eq!(a.send.storage_bytes(), 2 * ring);
-            if held.last() != Some(&ring) {
-                held.push(ring);
-            }
+            let pool = a.local_tx.as_ref().unwrap();
+            let expected_chunks = a.send.len().div_ceil(chunk_size);
+            assert_eq!(pool.live(), expected_chunks);
+            assert_eq!(pool.chunk_bytes(), expected_chunks * chunk_size);
         }
-        let expected: alloc::vec::Vec<usize> = (11..)
-            .map(|shift| (1usize << shift).min(limit))
-            .take_while(|&ring| ring < limit)
-            .chain([limit])
-            .collect();
-        assert_eq!(held, expected);
         assert_eq!(queued(&a), written);
     }
 }

@@ -18,6 +18,7 @@ use crate::{
     rx_timestamp::RxTimestamps,
     sack::Scoreboard,
     seq::Seq,
+    tx_pool::TxPool,
     tx_timestamp::TxTimestamps,
     wire::{self, ACK, CWR, ECE, FIN, Header, IpMetadata, PSH, RST, SYN, Segment, URG},
 };
@@ -965,6 +966,12 @@ struct AckWindow {
     was_blocked: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendWriteKind {
+    Copy,
+    Shared { new_entries: usize },
+}
+
 pub(crate) struct Connection {
     pub(crate) managed_path: Option<crate::PreparedPath>,
     // The immutable snapshot's packet budget, updated on a path rebind.
@@ -989,6 +996,9 @@ pub(crate) struct Connection {
     // aged by a serial half-range. New samples can only move it later.
     sample_review: Instant,
     send: SendBuffer,
+    send_ptb_charged: usize,
+    #[cfg(test)]
+    local_tx: Option<TxPool>,
     receive: RxQueue,
     // The receive queue's storage as last settled with the Endpoint's
     // budget (`settle_receive_charge`), the part of buffer_charge it holds.
@@ -1322,7 +1332,39 @@ pub(crate) struct Connection {
     keepalive_probes: u32,
 }
 
+#[cfg(test)]
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(mut pool) = self.local_tx.take() {
+            self.send.clear_chunks(&mut pool);
+            pool.release_tail();
+            debug_assert_eq!(pool.live(), 0, "standalone Connection leaked ChunkRefs");
+        } else {
+            debug_assert!(
+                self.send.has_no_chunks(),
+                "Endpoint Connection dropped with live ChunkRefs"
+            );
+        }
+    }
+}
+
 impl Connection {
+    #[cfg(test)]
+    pub(crate) fn with_local_tx<R>(&mut self, f: impl FnOnce(&mut Self, &mut TxPool) -> R) -> R {
+        extern crate std;
+        let mut pool = self
+            .local_tx
+            .take()
+            .expect("standalone Connection method requires local_tx");
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, &mut pool)));
+        self.local_tx = Some(pool);
+        match outcome {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn active(
         tuple: Tuple,
@@ -1332,6 +1374,28 @@ impl Connection {
     ) -> Result<Self, Error> {
         Self::active_with_path(tuple, config, iss, now, None, None, None)
             .map(|connection| *connection)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn active_in_endpoint(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+        managed_path: Option<crate::PreparedPath>,
+        receive_capability: Option<crate::ReceiveIpCapability>,
+        initial_ip_header_len: Option<u16>,
+    ) -> Result<Box<Self>, Error> {
+        Self::active_with_path_inner(
+            tuple,
+            config,
+            iss,
+            now,
+            managed_path,
+            receive_capability,
+            initial_ip_header_len,
+            false,
+        )
     }
 
     //= https://www.rfc-editor.org/rfc/rfc8201#section-1
@@ -1345,7 +1409,30 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc8985#section-4
     //= reason=Constructor rejects TLP unless both RACK and SACK are configured; runtime additionally requires negotiated SACK.
     //# TLP requires RACK.
+    #[cfg(test)]
     pub(crate) fn active_with_path(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+        managed_path: Option<crate::PreparedPath>,
+        receive_capability: Option<crate::ReceiveIpCapability>,
+        initial_ip_header_len: Option<u16>,
+    ) -> Result<Box<Self>, Error> {
+        Self::active_with_path_inner(
+            tuple,
+            config,
+            iss,
+            now,
+            managed_path,
+            receive_capability,
+            initial_ip_header_len,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn active_with_path_inner(
         tuple: Tuple,
         mut config: ConnectionConfig,
         iss: u32,
@@ -1353,6 +1440,7 @@ impl Connection {
         managed_path: Option<crate::PreparedPath>,
         receive_capability: Option<crate::ReceiveIpCapability>,
         initial_ip_header_len: Option<u16>,
+        #[allow(unused_variables)] with_local_tx: bool,
     ) -> Result<Box<Self>, Error> {
         config.validate(tuple.local.is_ipv4())?;
         if tuple.local.is_ipv4() != tuple.remote.is_ipv4() {
@@ -1494,6 +1582,9 @@ impl Connection {
             events: PendingEvents::default(),
             now,
             send,
+            send_ptb_charged: 0,
+            #[cfg(test)]
+            local_tx: with_local_tx.then(TxPool::heap_default),
             receive: RxQueue::new(Seq(0)),
             receive_charged: 0,
             scratch,
@@ -1787,6 +1878,37 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn passive_in_endpoint(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+        syn: &Segment<'_>,
+        early_authorized: bool,
+        rx_timestamps: RxTimestamps,
+        timestamps: RxPacketTimestamps,
+        managed_path: Option<crate::PreparedPath>,
+        receive_capability: Option<crate::ReceiveIpCapability>,
+        initial_ip_header_len: Option<u16>,
+    ) -> Result<Box<Self>, Error> {
+        Self::passive_with_path_inner(
+            tuple,
+            config,
+            iss,
+            now,
+            syn,
+            early_authorized,
+            rx_timestamps,
+            timestamps,
+            managed_path,
+            receive_capability,
+            initial_ip_header_len,
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn passive_with_path(
         tuple: Tuple,
         config: ConnectionConfig,
@@ -1800,6 +1922,37 @@ impl Connection {
         receive_capability: Option<crate::ReceiveIpCapability>,
         initial_ip_header_len: Option<u16>,
     ) -> Result<Box<Self>, Error> {
+        Self::passive_with_path_inner(
+            tuple,
+            config,
+            iss,
+            now,
+            syn,
+            early_authorized,
+            rx_timestamps,
+            timestamps,
+            managed_path,
+            receive_capability,
+            initial_ip_header_len,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn passive_with_path_inner(
+        tuple: Tuple,
+        config: ConnectionConfig,
+        iss: u32,
+        now: Instant,
+        syn: &Segment<'_>,
+        early_authorized: bool,
+        rx_timestamps: RxTimestamps,
+        timestamps: RxPacketTimestamps,
+        managed_path: Option<crate::PreparedPath>,
+        receive_capability: Option<crate::ReceiveIpCapability>,
+        initial_ip_header_len: Option<u16>,
+        with_local_tx: bool,
+    ) -> Result<Box<Self>, Error> {
         if syn.header.flags & (SYN | ACK | RST) != SYN {
             return Err(Error::InvalidArgument);
         }
@@ -1812,7 +1965,7 @@ impl Connection {
         if early_authorized {
             config.initial_window = InitialWindow::Rfc5681;
         }
-        let mut connection = Self::active_with_path(
+        let mut connection = Self::active_with_path_inner(
             tuple,
             config,
             iss,
@@ -1820,6 +1973,7 @@ impl Connection {
             managed_path,
             receive_capability,
             initial_ip_header_len,
+            with_local_tx,
         )?;
         connection.rx_timestamps = rx_timestamps;
         connection.input_timestamps = timestamps;
@@ -1860,13 +2014,29 @@ impl Connection {
     // settled with the Endpoint: its share of the endpoint's
     // max_buffer_bytes.
     pub(crate) fn buffer_charge(&self) -> usize {
-        self.send.storage_bytes()
+        self.send.entries_storage_bytes()
+            + self.send_ptb_charged
             + self.receive_charged
             + self.scoreboard.storage_bytes()
             + self.rack.allocation_bytes()
             + self.scratch.capacity()
             + self.tx_timestamps.storage_bytes()
             + self.rx_timestamps.storage_bytes()
+    }
+
+    pub(crate) fn settle_send_ptb_charge(&mut self) -> Option<(usize, usize)> {
+        let storage = self.send.ptb_storage_bytes();
+        let old = core::mem::replace(&mut self.send_ptb_charged, storage);
+        (old != storage).then_some((old, storage))
+    }
+
+    #[inline]
+    pub(crate) fn send_chunk_bytes(&self) -> usize {
+        self.send.chunk_bytes()
+    }
+
+    pub(crate) fn release_send_chunks(&mut self, pool: &mut TxPool) {
+        self.send.clear_chunks(pool);
     }
 
     // The receive queue's storage now and as charged, when they differ:
@@ -2029,56 +2199,94 @@ impl Connection {
         cached: Option<crate::fast_open::CachedCookie>,
         initial: &[u8],
     ) -> Result<usize, Error> {
-        self.prepare_fast_open_with_budget(cached, initial, usize::MAX)
+        self.with_local_tx(|c, pool| c.prepare_fast_open_with_budget_in(pool, cached, initial, usize::MAX))
     }
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
     //= reason=Server policy selection does not change the ordinary active-open path: cold client accepts zero initial data and sends a cookie request.
     //# To open a TFO connection, the client MUST have obtained a cookie from the server:
+    #[cfg(test)]
     pub(crate) fn prepare_fast_open_with_budget(
         &mut self,
         cached: Option<crate::fast_open::CachedCookie>,
         initial: &[u8],
         max_charge: usize,
     ) -> Result<usize, Error> {
+        self.with_local_tx(|c, pool| {
+            let max_additional =
+                max_charge.saturating_sub(c.buffer_charge().saturating_add(pool.storage_bytes()));
+            c.prepare_fast_open_with_budget_in(pool, cached, initial, max_additional)
+        })
+    }
+
+    pub(crate) fn prepare_fast_open_with_budget_in(
+        &mut self,
+        pool: &mut TxPool,
+        cached: Option<crate::fast_open::CachedCookie>,
+        initial: &[u8],
+        max_additional: usize,
+    ) -> Result<usize, Error> {
         self.fast_open = Some(cached.map_or(wire::FastOpenCookie::request(), |c| c.cookie));
         let Some(cached) = cached else {
             return Ok(0);
         };
-        self.prepare_fast_open_with_server_cookie(cached.cookie, cached.mss, initial, max_charge)
+        self.prepare_fast_open_with_server_cookie_in(
+            pool,
+            cached.cookie,
+            cached.mss,
+            initial,
+            max_additional,
+        )
     }
 
     // A supplied cookie is a credential obtained from this server, including
     // an explicitly agreed zero cookie for a protected RFC7413 section7.3 service.
     // It is still serialized as a Fast Open option; no omitted-option bypass.
-    pub(crate) fn prepare_fast_open_with_server_cookie(
+    pub(crate) fn prepare_fast_open_with_server_cookie_in(
         &mut self,
+        pool: &mut TxPool,
         cookie: wire::FastOpenCookie,
         peer_mss: Option<u16>,
         initial: &[u8],
-        max_charge: usize,
+        max_additional: usize,
     ) -> Result<usize, Error> {
         self.fast_open = Some(cookie);
-        self.prepare_fast_open_data(peer_mss, initial, max_charge)
+        self.prepare_fast_open_data_in(pool, peer_mss, initial, max_additional)
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare_fast_open_without_cookie(
         &mut self,
         peer_mss: Option<u16>,
         initial: &[u8],
         max_charge: usize,
     ) -> Result<usize, Error> {
+        self.with_local_tx(|c, pool| {
+            let max_additional =
+                max_charge.saturating_sub(c.buffer_charge().saturating_add(pool.storage_bytes()));
+            c.prepare_fast_open_without_cookie_in(pool, peer_mss, initial, max_additional)
+        })
+    }
+
+    pub(crate) fn prepare_fast_open_without_cookie_in(
+        &mut self,
+        pool: &mut TxPool,
+        peer_mss: Option<u16>,
+        initial: &[u8],
+        max_additional: usize,
+    ) -> Result<usize, Error> {
         self.fast_open_client_policy = crate::FastOpenClientPolicy::ApplicationProtected;
-        self.prepare_fast_open_data(peer_mss, initial, max_charge)
+        self.prepare_fast_open_data_in(pool, peer_mss, initial, max_additional)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.1.3
     //= reason=Deliberate Linux-style deviation (c167): without a cached server MSS, SYN data is sized for the MSS this end offers (Linux's advmss: route/receive limit, user MSS, advertised-MSS cap), bounded by the path, less the whole 40-byte option space, as Linux 6.12 tcp_send_syn_data does (mss_clamp = advmss unless tcp_fastopen_cache_get supplies the cached MSS; space = __tcp_mtu_to_mss(pmtu) - MAX_TCP_OPTION_SPACE). On a 1500-byte path that is 1420 bytes for IPv4 and 1400 for IPv6 (1180 for IPv6 without path MTU discovery), not 496. A SYN-ACK acknowledging only part of the data gets the rest retransmitted after establishment (tcp_rcv_fastopen_synack). A cached server MSS still bounds the data, and the peer MSS defaults 536/1220 still apply to a SYN-ACK without an MSS option.
     //# Without a cached server MSS, the amount of data in the SYN packet is limited to the default MSS of 536 bytes for IPv4 [RFC1122] and 1220 bytes for IPv6 [RFC2460].
-    fn prepare_fast_open_data(
+    fn prepare_fast_open_data_in(
         &mut self,
+        pool: &mut TxPool,
         peer_mss: Option<u16>,
         initial: &[u8],
-        max_charge: usize,
+        max_additional: usize,
     ) -> Result<usize, Error> {
         self.peer_mss = peer_mss.unwrap_or(if self.tuple.remote.is_ipv4() {
             536
@@ -2110,12 +2318,20 @@ impl Connection {
         // apply to SYN data and are never suppressed by the output path.
         // Storage refused for the data leaves a plain SYN, as Linux's
         // tcp_send_syn_data falls back when it cannot allocate syn_data.
-        if self.prepare_send_metadata(count, None, max_charge, None)? {
+        if self.prepare_send_metadata_in(pool, count, None, max_additional, None)? {
             self.send_memory_waiting = false;
             self.send_backpressured = false;
             return Ok(0);
         }
-        let count = self.write_with_push(&initial[..count], false)?;
+        let count = match self.write_with_push_in(pool, &initial[..count], false) {
+            Ok(n) => n,
+            Err(Error::WouldBlock) => {
+                self.send_memory_waiting = false;
+                self.send_backpressured = false;
+                return Ok(0);
+            }
+            Err(err) => return Err(err),
+        };
         self.fast_open_initial = count;
         self.deferred_tfo_push = true;
         Ok(count)
@@ -3055,12 +3271,15 @@ impl Connection {
     ) -> Result<(), Error> {
         metadata.timestamps.validate(self.config.timebase)?;
         metadata.validate_segment(segment)?;
-        self.input_validated(now, traffic_class, segment, &metadata, None)
-            .map(|_| ())
+        self.with_local_tx(|c, pool| {
+            c.input_validated_in(pool, now, traffic_class, segment, &metadata, None)
+        })
+        .map(|_| ())
     }
 
-    pub(crate) fn input_validated(
+    pub(crate) fn input_validated_in(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         traffic_class: u8,
         segment: &Segment<'_>,
@@ -3077,7 +3296,7 @@ impl Connection {
             debug_assert_eq!(self.input_timestamps, RxPacketTimestamps::default());
             debug_assert!(self.input_segment_size.is_none());
             return self
-                .input_with_traffic_class(now, traffic_class, segment)
+                .input_with_traffic_class_in(pool, now, traffic_class, segment)
                 .map(|()| false);
         }
         self.input_timestamps = metadata.timestamps;
@@ -3085,9 +3304,9 @@ impl Connection {
         let was_early = self.fast_open_early;
         let authorized = authorization.is_some();
         let result = if authorized {
-            self.input_authorized(now, traffic_class, segment, authorization, None)
+            self.input_authorized(pool, now, traffic_class, segment, authorization, None)
         } else {
-            self.input_with_traffic_class(now, traffic_class, segment)
+            self.input_with_traffic_class_in(pool, now, traffic_class, segment)
         };
         self.input_timestamps = RxPacketTimestamps::default();
         self.input_segment_size = None;
@@ -3577,21 +3796,24 @@ impl Connection {
         finished: bool,
     ) -> Result<bool, Error> {
         self.validate_reserved_output(now, d, offset, count)?;
-        Ok(self.accept_validated_output(now, d, offset, count, finished))
+        Ok(self.with_local_tx(|c, pool| {
+            c.accept_validated_output_in(pool, now, d, offset, count, finished)
+        }))
     }
 
     /// `accept_reserved_output` once `validate_reserved_output` held for
     /// the same arguments, with the connection unchanged since (a held
     /// reservation freezes it). Structurally infallible after validation.
-    pub(crate) fn accept_validated_output(
+    pub(crate) fn accept_validated_output_in(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         d: &mut Departure,
         offset: usize,
         count: usize,
         finished: bool,
     ) -> bool {
-        self.commit_selected_checked(now, d, offset, count, finished, false)
+        self.commit_selected_checked(pool, now, d, offset, count, finished, false)
     }
 
     // Called immediately after selecting this scalar packet, before releasing
@@ -3614,7 +3836,17 @@ impl Connection {
 
     // Structurally infallible synchronous departure commit for a stream record
     // selected at `now` with the owner held exclusively.
+    #[cfg(test)]
     pub(crate) fn submit_immediate_stream(&mut self, now: Instant, r: StreamRecord) {
+        self.with_local_tx(|c, pool| c.submit_immediate_stream_in(pool, now, r));
+    }
+
+    pub(crate) fn submit_immediate_stream_in(
+        &mut self,
+        pool: &mut TxPool,
+        now: Instant,
+        r: StreamRecord,
+    ) {
         if !r.has_data() {
             // Selection settled the advertised window and idle timers.
             // This ACK consumes no send sequence space or RACK entry.
@@ -3635,27 +3867,39 @@ impl Connection {
         debug_assert!(self.reserved_ledger.is_none());
         debug_assert!(self.pmtud.is_none());
         let withdrawn =
-            self.accept_departed_output_checked::<true>(now, &mut d, 0, count, true, false);
+            self.accept_departed_output_checked::<true>(pool, now, &mut d, 0, count, true, false);
         debug_assert!(!withdrawn);
     }
 
     // Structurally infallible synchronous departure commit for a preflighted
     // scalar selection at `now` (proven by `can_submit_immediate(now)`).
+    #[cfg(test)]
     pub(crate) fn submit_immediate_departure(
         &mut self,
+        now: Instant,
+        d: Departure,
+        receipt: crate::PhysicalReceipt,
+    ) {
+        self.with_local_tx(|c, pool| c.submit_immediate_departure_in(pool, now, d, receipt));
+    }
+
+    pub(crate) fn submit_immediate_departure_in(
+        &mut self,
+        pool: &mut TxPool,
         now: Instant,
         mut d: Departure,
         receipt: crate::PhysicalReceipt,
     ) {
         let count = d.payload;
         debug_assert_eq!(d.selected_at, now);
-        let withdrawn = self.commit_selected_checked(now, &mut d, 0, count, true, true);
+        let withdrawn = self.commit_selected_checked(pool, now, &mut d, 0, count, true, true);
         debug_assert!(!withdrawn);
         self.certify_submission(&d, 0, count, receipt);
     }
 
     fn commit_selected_checked(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         d: &mut Departure,
         offset: usize,
@@ -3684,6 +3928,7 @@ impl Connection {
             false
         };
         self.accept_departed_output_checked::<false>(
+            pool,
             now,
             d,
             offset,
@@ -3701,8 +3946,9 @@ impl Connection {
     /// sees every segment committed either way. Fresh data only; SYN,
     /// retransmission and PTB repair acceptances, which record more in RACK,
     /// take each segment alone.
-    pub(crate) fn accept_reserved_group(
+    pub(crate) fn accept_reserved_group_in(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         d: &mut Departure,
         offset: usize,
@@ -3731,9 +3977,9 @@ impl Connection {
             // The group preflight covers every segment, and nothing else
             // runs between these acceptances.
             let withdrawn = if whole {
-                self.accept_departed_output_checked::<false>(now, d, at, count, last, false)
+                self.accept_departed_output_checked::<false>(pool, now, d, at, count, last, false)
             } else {
-                self.accept_validated_output(now, d, at, count, last)
+                self.accept_validated_output_in(pool, now, d, at, count, last)
             };
             // Only PTB repairs withdraw a suffix; GSO selects fresh data.
             debug_assert!(!withdrawn);
@@ -3744,6 +3990,7 @@ impl Connection {
     // `check_time(now)` has already been proven. Structurally infallible.
     fn accept_departed_output_checked<const ORIGINAL: bool>(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         d: &mut Departure,
         offset: usize,
@@ -3788,6 +4035,7 @@ impl Connection {
         }
         if finished && d.defer_push {
             self.send.collapse_push(
+                pool,
                 Seq(d.start).distance_from(self.send_base) as usize,
                 d.payload,
             );
@@ -5375,7 +5623,7 @@ impl Connection {
     //# data is available.
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
     //# 3. Advance to the ESTABLISHED state.
-    fn establish(&mut self) {
+    fn establish(&mut self, pool: &mut TxPool) {
         // Linux's tcp_init_buffer_space sizes an unlocked send buffer for
         // the initial window as the connection is established.
         if self.send_tuned {
@@ -5396,7 +5644,7 @@ impl Connection {
             // ACK processing has already reclaimed accepted SYN data. Promote
             // only its still-buffered original endpoint, not later queued data.
             if end.after(self.send_base) && remaining <= self.send.len() {
-                self.send.finish_send(remaining - 1, true, false);
+                self.send.finish_send(pool, remaining - 1, true, false);
             }
         }
         if self.fast_open_initial != 0 && self.snd_nxt.after(self.snd_una) {
@@ -5937,27 +6185,23 @@ impl Connection {
     //# NOT buffer data indefinitely (MUST-60), and (2) MUST set the PSH bit
     //# in the last buffered segment (i.e., when there is no more queued data
     //# to be sent) (MUST-61).
+    #[cfg(test)]
     pub(crate) fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
         self.write_with_push(data, true)
     }
 
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
-    //# A TCP endpoint MAY implement PUSH flags on SEND calls (MAY-15).
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
-    //= reason=Explicit PUSH marks survive packetization and partial acknowledgment; Nagle still applies.
-    //# If the PUSH flag is set, the application intends the data to be transmitted promptly to
-    //# the receiver, and the PSH bit will be set in the last TCP segment created from the
-    //# buffer.
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
-    //= reason=FIFO byte queue across successive writes, not per-write completion records.
-    //# Multiple SENDs are served in first come, first served order, so the TCP endpoint will
-    //# queue those it cannot service immediately.
-    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.2
-    //= reason=Handshake SEND queue; focused send_state_matrix_preserves_queue_on_rejection additionally tests exhaustion.
-    //# Queue the data for transmission after entering ESTABLISHED state. If no space to queue,
-    //# respond with "error: insufficient resources".
+    #[cfg(test)]
     pub(crate) fn write_with_push(&mut self, data: &[u8], push: bool) -> Result<usize, Error> {
-        self.queue_write(data, push, false, false, None)
+        self.with_local_tx(|c, pool| c.queue_write_in(pool, data, push, false, false, None))
+    }
+
+    pub(crate) fn write_with_push_in(
+        &mut self,
+        pool: &mut TxPool,
+        data: &[u8],
+        push: bool,
+    ) -> Result<usize, Error> {
+        self.queue_write_in(pool, data, push, false, false, None)
     }
 
     #[cfg(test)]
@@ -5978,7 +6222,9 @@ impl Connection {
         end_of_record: bool,
         lowat: Option<u32>,
     ) -> Result<usize, Error> {
-        self.queue_write(data, !more && !data.is_empty(), more, end_of_record, lowat)
+        self.with_local_tx(|c, pool| {
+            c.queue_write_in(pool, data, !more && !data.is_empty(), more, end_of_record, lowat)
+        })
     }
 
     #[cfg(test)]
@@ -6038,10 +6284,29 @@ impl Connection {
     // growth stays refused (`send_memory_waiting`) no more than the
     // allocated storage holds, as tcp_sendmsg copies into what
     // sk_wmem_schedule granted and then waits for memory.
+    #[cfg(test)]
     pub(crate) fn send_admission_room(&self, lowat: Option<u32>) -> usize {
+        self.send_admission_room_in(
+            self.local_tx
+                .as_ref()
+                .expect("standalone Connection method requires local_tx"),
+            lowat,
+        )
+    }
+
+    pub(crate) fn send_admission_room_in(&self, pool: &TxPool, lowat: Option<u32>) -> usize {
+        self.send_admission_room_for(pool, lowat, SendWriteKind::Copy)
+    }
+
+    fn send_admission_room_for(
+        &self,
+        pool: &TxPool,
+        lowat: Option<u32>,
+        kind: SendWriteKind,
+    ) -> usize {
         let room = self.admission_room(lowat, self.send_space_remaining());
         if self.send_memory_waiting {
-            room.min(self.allocated_send_room())
+            room.min(self.allocated_send_room_for(pool, kind))
         } else {
             room
         }
@@ -6088,13 +6353,13 @@ impl Connection {
     pub(crate) fn send_ring_reclaimable(&self) -> bool {
         debug_assert_eq!(
             self.large_send_ring,
-            self.send.storage_bytes() > SEND_RING_RESERVE
+            self.send.entries_storage_bytes() > SEND_RING_RESERVE
         );
         self.large_send_ring && self.send.len() == 0
     }
 
-    // Frees the drained send ring (`send_ring_reclaimable`); nothing
-    // allocates, the send limit stays, and the next write grows the ring
+    // Frees the drained send entries (`send_ring_reclaimable`); nothing
+    // allocates, the send limit stays, and the next write grows the entries
     // again.
     pub(crate) fn reclaim_send_ring(&mut self) {
         self.send.release();
@@ -6191,13 +6456,37 @@ impl Connection {
         self.rack.split_refusals
     }
 
-    // Bytes the send ring and both sender ledgers, as allocated, hold beyond
-    // those queued.
-    pub(crate) fn allocated_send_room(&self) -> usize {
-        self.send
-            .allocation_capacity()
-            .saturating_sub(self.send.len())
-            .min(self.ledger_room())
+    // Bytes the pool tail, send entry deque, and both sender ledgers hold
+    // allocated beyond those queued without requiring any new allocation.
+    pub(crate) fn allocated_send_room_in(&self, pool: &TxPool) -> usize {
+        self.allocated_send_room_for(pool, SendWriteKind::Copy)
+    }
+
+    fn allocated_send_room_for(&self, pool: &TxPool, kind: SendWriteKind) -> usize {
+        match kind {
+            SendWriteKind::Copy => {
+                let tail = pool.tail_remaining();
+                let entry_ok = if tail == 0 {
+                    false
+                } else if self.send.can_extend_tail(pool) {
+                    self.send.has_entry_room(0)
+                } else {
+                    self.send.has_entry_room(1)
+                };
+                if entry_ok {
+                    tail.min(self.ledger_room())
+                } else {
+                    0
+                }
+            }
+            SendWriteKind::Shared { new_entries } => {
+                if self.send.has_entry_room(new_entries) {
+                    self.ledger_room()
+                } else {
+                    0
+                }
+            }
+        }
     }
 
     // Entries both ledgers hold allocated: the RACK ledger's, as far as the
@@ -6286,11 +6575,12 @@ impl Connection {
     // flight through for a socket at its new sndbuf, so the limit keeps
     // those bytes too. It allocates and frees nothing; the next ACKs that
     // free room let writes in within it.
-    pub(crate) fn moderate_send(&mut self) {
+    pub(crate) fn moderate_send_in(&mut self, pool: &TxPool, approved: usize) {
         if !self.send_tuned {
             return;
         }
-        let limit = (self.send.len() + self.allocated_send_room()).max(self.send_min);
+        let limit = (self.send.len() + self.allocated_send_room_in(pool).max(approved))
+            .max(self.send_min);
         if limit < self.config.send_capacity {
             self.set_send_limit(limit);
         }
@@ -6547,6 +6837,7 @@ impl Connection {
     // writes take no more than that until memory comes back or their own
     // growth succeeds. Writability does not change (`stream_writable`).
     // Returns whether growth was refused.
+    #[cfg(test)]
     pub(crate) fn prepare_send_metadata(
         &mut self,
         bytes: usize,
@@ -6554,21 +6845,43 @@ impl Connection {
         max_charge: usize,
         timestamp: Option<TxTimestampRequest>,
     ) -> Result<bool, Error> {
-        self.prepare_send_storage(bytes, lowat, max_charge, timestamp)
-            .map(|refused| refused.is_some())
+        self.with_local_tx(|c, pool| {
+            let max_additional =
+                max_charge.saturating_sub(c.buffer_charge().saturating_add(pool.storage_bytes()));
+            let (approved, refused) =
+                c.prepare_send_storage_in(pool, bytes, lowat, max_additional, timestamp)?;
+            if approved > 0 && !pool.ensure_tail_for(approved) {
+                c.throttle_send();
+                return Ok(true);
+            }
+            Ok(refused.is_some())
+        })
+    }
+
+    pub(crate) fn prepare_send_metadata_in(
+        &mut self,
+        pool: &TxPool,
+        bytes: usize,
+        lowat: Option<u32>,
+        max_additional: usize,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> Result<bool, Error> {
+        self.prepare_send_storage_in(pool, bytes, lowat, max_additional, timestamp)
+            .map(|(_, refused)| refused.is_some())
     }
 
     // As prepare_send_metadata; a refused growth gives the bytes the whole
-    // write's growth would have charged.
-    pub(crate) fn prepare_send_storage(
+    // write's growth would have charged, along with the approved prefix length.
+    pub(crate) fn prepare_send_storage_in(
         &mut self,
+        pool: &TxPool,
         bytes: usize,
         lowat: Option<u32>,
-        max_charge: usize,
+        max_additional: usize,
         timestamp: Option<TxTimestampRequest>,
-    ) -> Result<Option<usize>, Error> {
+    ) -> Result<(usize, Option<usize>), Error> {
         let accepted = self.write_prefix(bytes, lowat, timestamp)?;
-        Ok(self.grow_send_prefix(accepted, max_charge))
+        Ok(self.grow_send_prefix_in(pool, accepted, SendWriteKind::Copy, max_additional))
     }
 
     pub(crate) fn write_prefix(
@@ -6596,11 +6909,40 @@ impl Connection {
         Ok(bytes.min(self.admission_room(lowat, self.send_space_remaining())))
     }
 
+    #[cfg(test)]
     pub(crate) fn send_storage_fits(&self, accepted: usize) -> bool {
-        let live = self.send.len() + accepted;
-        if live > self.send.allocation_capacity() {
-            return false;
+        self.send_storage_fits_in(
+            self.local_tx
+                .as_ref()
+                .expect("standalone Connection method requires local_tx"),
+            accepted,
+            SendWriteKind::Copy,
+        )
+    }
+
+    pub(crate) fn send_storage_fits_in(
+        &self,
+        pool: &TxPool,
+        accepted: usize,
+        kind: SendWriteKind,
+    ) -> bool {
+        match kind {
+            SendWriteKind::Copy => {
+                if accepted > pool.tail_remaining() {
+                    return false;
+                }
+                let needed = self.send.needed_entries_for_copy(pool, accepted);
+                if !self.send.has_entry_room(needed) {
+                    return false;
+                }
+            }
+            SendWriteKind::Shared { new_entries } => {
+                if !self.send.has_entry_room(new_entries) {
+                    return false;
+                }
+            }
         }
+        let live = self.send.len() + accepted;
         // Growth asks for twice the needed entries plus the split reserve,
         // bounded by the configured ceiling. Work backwards from the held
         // entries. If even all live bytes fit, no send cursor is needed.
@@ -6620,64 +6962,89 @@ impl Connection {
         fits
     }
 
-    pub(crate) fn grow_send_prefix(&mut self, accepted: usize, max_charge: usize) -> Option<usize> {
+    pub(crate) fn grow_send_prefix_in(
+        &mut self,
+        pool: &TxPool,
+        accepted: usize,
+        kind: SendWriteKind,
+        max_additional: usize,
+    ) -> (usize, Option<usize>) {
         if accepted == 0 {
-            return None;
+            return (0, None);
         }
-        let live = self.send.len().saturating_add(accepted);
-        let Err(wanted) = self.grow_send_storage(live, max_charge) else {
+        let Err(wanted) = self.grow_send_storage_in(pool, accepted, kind, max_additional) else {
             // A writer waiting for memory found it before any wake: its
             // wait ends as with one, and the room beyond the allocated
             // storage it was held to is writable.
             self.memory_released();
-            return None;
+            return (accepted, None);
         };
         // As tcp_sendmsg copies skb by skb until sk_wmem_schedule refuses,
-        // grow for the longest prefix the budget takes, halving the bytes
-        // asked for (costs only, until one fits); the write takes that.
-        // With no byte spare in the storage the last prefix holds one more
-        // byte, the growth a wake asks to fit (`send_next_growth`).
-        let held = self.send.len() + self.allocated_send_room();
-        let mut part = accepted / 2;
-        while self.send.len() + part > held {
-            let prefix = self.send.len() + part;
+        // grow for the longest prefix the budget takes (binary-searching costs
+        // only, then allocating once); the write takes that. With no byte
+        // spare in the storage the smallest prefix checked is 1 byte, matching
+        // the growth a wake asks to fit (`send_next_growth_in`).
+        let held = self.allocated_send_room_for(pool, kind);
+        let mut lo = held.min(accepted);
+        let mut hi = accepted;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
             if self
-                .send_growth_cost(prefix)
-                .is_some_and(|cost| self.buffer_charge().saturating_add(cost) <= max_charge)
+                .send_growth_cost_in(pool, mid, kind)
+                .is_some_and(|cost| cost <= max_additional)
             {
-                // The allocator may still refuse it; the write then takes
-                // what the storage held before.
-                let _ = self.grow_send_storage(prefix, max_charge);
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let mut approved = held.min(accepted);
+        let mut candidate = lo;
+        while candidate > held {
+            if self
+                .grow_send_storage_in(pool, candidate, kind, max_additional)
+                .is_ok()
+            {
+                approved = candidate;
                 break;
             }
-            part /= 2;
+            candidate = held + (candidate - held) / 2;
         }
         self.throttle_send();
-        Some(wanted)
+        (approved, Some(wanted))
     }
 
     // What the next write needs added to the charge to take any byte: none
     // while the allocated storage holds one beyond those queued, and
     // otherwise the growth to hold one byte more, the last a refused write
     // tries (`prepare_send_storage`); None if it overflows. Derived from
-    // the storage as it is now, so a ring or ledgers freed since the
-    // refusal change it at once.
-    pub(crate) fn send_next_growth(&self) -> Option<usize> {
-        if self.allocated_send_room() != 0 {
+    // the storage as it is now, so chunks, entries, or ledgers freed since
+    // the refusal change it at once.
+    pub(crate) fn send_next_growth_in(&self, pool: &TxPool) -> Option<usize> {
+        if self.allocated_send_room_in(pool) != 0 {
             return Some(0);
         }
-        self.send_growth_cost(self.send.len().checked_add(1)?)
+        self.send_growth_cost_in(pool, 1, SendWriteKind::Copy)
     }
 
-    // The peak bytes growing the send ring and both ledgers to hold `live`
-    // queued bytes adds to the charge, or None if it overflows.
-    fn send_growth_cost(&self, live: usize) -> Option<usize> {
-        let grow_ring = live > self.send.allocation_capacity();
-        let ring = if grow_ring {
-            self.send.growth_bytes(self.send_ring_target(live))
-        } else {
-            0
+    // The peak bytes growing the pool chunks, send entries, and both ledgers
+    // to hold `bytes` additional queued bytes adds to the charge, or None if
+    // it overflows.
+    fn send_growth_cost_in(
+        &self,
+        pool: &TxPool,
+        bytes: usize,
+        kind: SendWriteKind,
+    ) -> Option<usize> {
+        let live = self.send.len().checked_add(bytes)?;
+        let (chunk_cost, needed_entries) = match kind {
+            SendWriteKind::Copy => (
+                pool.growth_bytes(bytes),
+                self.send.needed_entries_for_copy(pool, bytes),
+            ),
+            SendWriteKind::Shared { new_entries } => (0, new_entries),
         };
+        let entries = self.send.entry_growth_bytes(needed_entries)?;
         let (wanted, target) = self.ledger_growth(live);
         let rack = if self.rack.capacity() >= wanted {
             0
@@ -6689,57 +7056,56 @@ impl Connection {
         } else {
             Scoreboard::allocation_bytes(target)?
         };
-        ring.checked_add(rack)?.checked_add(scoreboard)
+        chunk_cost
+            .checked_add(entries)?
+            .checked_add(rack)?
+            .checked_add(scoreboard)
     }
 
-    // The queued bytes the send ring grows to when it must hold `live`:
-    // twice what it holds, and no less than `live` and SEND_RING_RESERVE,
-    // rounded up to a power of two, within the send limit. Linux's
-    // tcp_sendmsg allocates skbs as bytes are written (tcp_stream_alloc_skb
-    // and page frags), not sk_sndbuf at once, so a connection that writes
-    // little holds little; doubling keeps a stream of writes to
-    // logarithmically many in-place growths, each moving at most what is
-    // queued.
-    fn send_ring_target(&self, live: usize) -> usize {
-        live.max(SEND_RING_RESERVE / 2)
-            .max(self.send.allocation_capacity().saturating_mul(2))
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX)
-            .min(self.send.capacity())
-    }
-
-    // Grow the send ring and the ledgers to hold `live` queued bytes, or
-    // leave them as they were and give the bytes the growth needed. The
+    // Grow the send entries and the ledgers to hold `bytes` additional queued
+    // bytes (and verify `pool.growth_bytes(bytes)` fits in `max_additional`),
+    // or leave them as they were and give the bytes the growth needed. The
     // ledgers' headroom beyond the entries those bytes need is taken only
     // if the budget and the allocator grant it.
-    fn grow_send_storage(&mut self, live: usize, max_charge: usize) -> Result<(), usize> {
-        match self.grow_send_storage_to(live, max_charge) {
-            Err(_) if live <= self.send.len().saturating_add(self.allocated_send_room()) => Ok(()),
+    fn grow_send_storage_in(
+        &mut self,
+        pool: &TxPool,
+        bytes: usize,
+        kind: SendWriteKind,
+        max_additional: usize,
+    ) -> Result<(), usize> {
+        match self.grow_send_storage_to(pool, bytes, kind, max_additional) {
+            Err(_) if bytes <= self.allocated_send_room_for(pool, kind) => Ok(()),
             result => result,
         }
     }
 
-    fn grow_send_storage_to(&mut self, live: usize, max_charge: usize) -> Result<(), usize> {
+    fn grow_send_storage_to(
+        &mut self,
+        pool: &TxPool,
+        bytes: usize,
+        kind: SendWriteKind,
+        max_additional: usize,
+    ) -> Result<(), usize> {
+        let live = self.send.len().saturating_add(bytes);
         let (wanted, target) = self.ledger_growth(live);
-        let grow_ring = live > self.send.allocation_capacity();
+        let (chunk_cost, needed_entries) = match kind {
+            SendWriteKind::Copy => (
+                pool.growth_bytes(bytes),
+                self.send.needed_entries_for_copy(pool, bytes),
+            ),
+            SendWriteKind::Shared { new_entries } => (0, new_entries),
+        };
+        let grow_entries = !self.send.has_entry_room(needed_entries);
         let grow_rack = self.rack.capacity() < wanted;
         let grow_scoreboard = !self.scoreboard.admits_entries(wanted);
-        if !grow_ring && !grow_rack && !grow_scoreboard {
+        if chunk_cost == 0 && !grow_entries && !grow_rack && !grow_scoreboard {
             return Ok(());
         }
-        // Admission keeps live bytes within the limit.
-        let limit = if grow_ring {
-            self.send_ring_target(live)
-        } else {
-            self.send.allocation_capacity()
-        };
-        debug_assert!(live <= limit);
-        let existing = self.buffer_charge();
-        let staged = self.send_growth_cost(live).ok_or(usize::MAX)?;
-        if existing
-            .checked_add(staged)
-            .is_none_or(|peak| peak > max_charge)
-        {
+        let staged = self
+            .send_growth_cost_in(pool, bytes, kind)
+            .ok_or(usize::MAX)?;
+        if staged > max_additional {
             return Err(staged);
         }
         let rack = if grow_rack {
@@ -6752,26 +7118,25 @@ impl Connection {
         } else {
             None
         };
-        let ring = if grow_ring {
-            self.send.growth_bytes(limit)
+        let entries_cost = if grow_entries {
+            self.send
+                .entry_growth_bytes(needed_entries)
+                .ok_or(usize::MAX)?
         } else {
             0
         };
-        let actual = rack.as_ref().map_or(0, |growth| growth.allocation_bytes())
-            + scoreboard.as_ref().map_or(0, Scoreboard::storage_bytes)
-            + ring;
-        if existing
-            .checked_add(actual)
-            .is_none_or(|peak| peak > max_charge)
-        {
+        let actual = rack
+            .as_ref()
+            .map_or(0, |growth| growth.allocation_bytes())
+            .saturating_add(scoreboard.as_ref().map_or(0, Scoreboard::storage_bytes))
+            .saturating_add(entries_cost)
+            .saturating_add(chunk_cost);
+        if actual > max_additional {
             return Err(actual);
         }
-        // The ring grows in place, last: a failure leaves the ledgers staged
-        // aside to drop, and the queued bytes as they were.
-        if grow_ring {
-            let result = self.send.grow(limit);
-            // One ring may have grown even if the other allocation failed.
-            self.large_send_ring = self.send.storage_bytes() > SEND_RING_RESERVE;
+        if grow_entries {
+            let result = self.send.reserve_entries(needed_entries);
+            self.large_send_ring = self.send.entries_storage_bytes() > SEND_RING_RESERVE;
             result.map_err(|_| staged)?;
         }
         if let Some(rack) = rack {
@@ -6789,6 +7154,11 @@ impl Connection {
         self.send.shared_room(payload, max_spans)
     }
 
+    pub(crate) fn needed_entries_for_shared(&self, payload: &crate::Payload) -> usize {
+        self.send.needed_entries_for_shared(payload)
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepare_shared_storage(
         &mut self,
         payload: &crate::Payload,
@@ -6801,10 +7171,47 @@ impl Connection {
         self.send
             .prepare_shared(payload, peak_room)
             .map_err(|_| Error::NoMemory)?;
-        self.large_send_ring = self.send.storage_bytes() > SEND_RING_RESERVE;
+        self.large_send_ring = self.send.entries_storage_bytes() > SEND_RING_RESERVE;
         Ok(())
     }
 
+    pub(crate) fn write_shared_prepared(
+        &mut self,
+        payload: crate::Payload,
+        more: bool,
+        end_of_record: bool,
+        room: usize,
+    ) -> Result<usize, Error> {
+        if payload.is_empty() {
+            self.send_issued = true;
+            if !more {
+                self.send.mark_push();
+            }
+            return Ok(0);
+        }
+        let input_len = payload.len();
+        let count = input_len.min(room);
+        self.send_backpressured |= count < input_len;
+        if count == 0 {
+            return Err(Error::WouldBlock);
+        }
+        let application_idle = !self.application_timer_needed();
+        debug_assert_ne!(self.state, State::FinWait2);
+        debug_assert_eq!(application_idle, !self.user_timer_needed());
+        let accepted = self.send.write_shared(payload.slice(0..count).unwrap());
+        debug_assert_eq!(count, accepted);
+        self.send_issued = true;
+        self.more = more;
+        self.send.finish_append(!more, end_of_record);
+        if application_idle {
+            self.progress_at = self.now;
+            self.application_progress_at = self.now;
+        }
+        self.arm_after_write();
+        Ok(accepted)
+    }
+
+    #[cfg(test)]
     pub(crate) fn write_shared(
         &mut self,
         payload: crate::Payload,
@@ -6812,22 +7219,26 @@ impl Connection {
         end_of_record: bool,
         lowat: Option<u32>,
     ) -> Result<usize, Error> {
-        self.queue_write_input(&[], Some(payload), !more, more, end_of_record, lowat)
+        self.with_local_tx(|c, pool| {
+            c.queue_write_input_in(pool, &[], Some(payload), !more, more, end_of_record, lowat)
+        })
     }
 
-    fn queue_write(
+    fn queue_write_in(
         &mut self,
+        pool: &mut TxPool,
         data: &[u8],
         push: bool,
         more: bool,
         end_of_record: bool,
         lowat: Option<u32>,
     ) -> Result<usize, Error> {
-        self.queue_write_input(data, None, push, more, end_of_record, lowat)
+        self.queue_write_input_in(pool, data, None, push, more, end_of_record, lowat)
     }
 
-    fn queue_write_input(
+    fn queue_write_input_in(
         &mut self,
+        pool: &mut TxPool,
         data: &[u8],
         shared: Option<crate::Payload>,
         push: bool,
@@ -6851,19 +7262,29 @@ impl Connection {
             }
             return Ok(0);
         }
+        let kind = match shared.as_ref() {
+            Some(payload) => SendWriteKind::Shared {
+                new_entries: self.send.needed_entries_for_shared(payload),
+            },
+            None => SendWriteKind::Copy,
+        };
         // A write the endpoint found short of memory takes what the storage
         // holds; it grows nothing here.
-        if !self.send_memory_waiting {
-            self.prepare_send_metadata(input_len, lowat, usize::MAX, None)?;
-        }
-        let room = self.send_admission_room(lowat);
-        self.enqueue_prepared(data, shared, push, more, end_of_record, room)
+        let room = if !self.send_memory_waiting {
+            let accepted = self.write_prefix(input_len, lowat, None)?;
+            let (approved, _) = self.grow_send_prefix_in(pool, accepted, kind, usize::MAX);
+            approved
+        } else {
+            self.send_admission_room_for(pool, lowat, kind)
+        };
+        self.enqueue_prepared_in(pool, data, shared, push, more, end_of_record, room)
     }
 
     // The endpoint has already checked the connection state, timestamp
     // capacity and storage growth against its memory budget.
-    pub(crate) fn write_prepared(
+    pub(crate) fn write_prepared_in(
         &mut self,
+        pool: &mut TxPool,
         data: &[u8],
         push: bool,
         more: bool,
@@ -6878,7 +7299,7 @@ impl Connection {
             }
             return Ok(0);
         }
-        let count = self.enqueue_prepared(data, None, push, more, end_of_record, room)?;
+        let count = self.enqueue_prepared_in(pool, data, None, push, more, end_of_record, room)?;
         if let Some(request) = request {
             let target = self.acknowledged + self.send.len() as u64 - 1;
             self.tx_timestamps.insert(request, target);
@@ -6886,8 +7307,9 @@ impl Connection {
         Ok(count)
     }
 
-    fn enqueue_prepared(
+    fn enqueue_prepared_in(
         &mut self,
+        pool: &mut TxPool,
         data: &[u8],
         shared: Option<crate::Payload>,
         push: bool,
@@ -6906,12 +7328,20 @@ impl Connection {
         // accept a stream write.
         debug_assert_ne!(self.state, State::FinWait2);
         debug_assert_eq!(application_idle, !self.user_timer_needed());
-        if let Some(payload) = shared {
+        let accepted = if let Some(payload) = shared {
             let accepted = self.send.write_shared(payload.slice(0..count).unwrap());
             debug_assert_eq!(count, accepted);
+            accepted
         } else {
-            self.send.append(&data[..count]);
-        }
+            let accepted = self.send.append(pool, &data[..count]);
+            if accepted < count {
+                self.throttle_send();
+                if accepted == 0 {
+                    return Err(Error::WouldBlock);
+                }
+            }
+            accepted
+        };
         self.send_issued = true;
         self.more = more;
         self.send.finish_append(push, end_of_record);
@@ -6920,14 +7350,37 @@ impl Connection {
             self.application_progress_at = self.now;
         }
         self.arm_after_write();
-        Ok(count)
+        Ok(accepted)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
     //# However, TCP implementations MUST still include support for the urgent mechanism
     //# (MUST-30).
+    #[cfg(test)]
     pub(crate) fn write_urgent(&mut self, data: &[u8]) -> Result<usize, Error> {
-        let count = self.write(data)?;
+        self.with_local_tx(|c, pool| c.write_urgent_in(pool, data))
+    }
+
+    pub(crate) fn write_urgent_prepared_in(
+        &mut self,
+        pool: &mut TxPool,
+        data: &[u8],
+        room: usize,
+    ) -> Result<usize, Error> {
+        let count = self.write_prepared_in(pool, data, true, false, false, room, None)?;
+        if count != 0 {
+            self.snd_up = Some(self.send_base.wrapping_add(self.send.len() as u32));
+        }
+        Ok(count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_urgent_in(
+        &mut self,
+        pool: &mut TxPool,
+        data: &[u8],
+    ) -> Result<usize, Error> {
+        let count = self.write_with_push_in(pool, data, true)?;
         if count != 0 {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.5
             //# The urgent pointer MUST point to the sequence number of the octet
@@ -6939,7 +7392,12 @@ impl Connection {
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.7
     //# The FLUSH call MAY be implemented (MAY-14).
+    #[cfg(test)]
     pub(crate) fn flush(&mut self) -> Result<usize, Error> {
+        self.with_local_tx(|c, pool| c.flush_in(pool))
+    }
+
+    pub(crate) fn flush_in(&mut self, pool: &mut TxPool) -> Result<usize, Error> {
         // FIN and SYN occupy sequence space, not buffer slots.
         if self.shutdown
             || !matches!(
@@ -6980,7 +7438,7 @@ impl Connection {
         }
         self.tx_timestamps
             .cancel_from(self.acknowledged + retained as u64);
-        self.send.truncate(retained);
+        self.send.truncate(pool, retained);
         let end = self.send_base.wrapping_add(retained as u32);
         if self.cork_flush.is_some_and(|flush| flush.after(end)) {
             self.cork_flush = Some(end);
@@ -7670,13 +8128,25 @@ impl Connection {
         self.send_backpressured |= self.send_space_remaining() == 0;
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_send(&mut self, end: u64, more: bool, end_of_record: bool, force: bool) {
+        self.with_local_tx(|c, pool| c.finish_send_in(pool, end, more, end_of_record, force));
+    }
+
+    pub(crate) fn finish_send_in(
+        &mut self,
+        pool: &mut TxPool,
+        end: u64,
+        more: bool,
+        end_of_record: bool,
+        force: bool,
+    ) {
         if let Some(offset) = end
             .checked_sub(self.acknowledged)
             .and_then(|n| n.checked_sub(1))
             && let Ok(offset) = usize::try_from(offset)
         {
-            self.send.finish_send(offset, !more, end_of_record);
+            self.send.finish_send(pool, offset, !more, end_of_record);
         }
         if end == self.acknowledged + self.send.len() as u64 {
             self.more = more;
@@ -7835,15 +8305,27 @@ impl Connection {
     //= reason=Negotiated SACK; RFC 6675 algorithm evidence is for rack=false, prr=false. ACK below recovery boundary recomputes pipe; test gains credit after partial ACK then sends new data.
     //# (B.2) Use SetPipe () to re-calculate the number of octets still in the
     //# network.
+    #[cfg(test)]
     pub(crate) fn input_with_traffic_class(
         &mut self,
         now: Instant,
         traffic_class: u8,
         segment: &Segment<'_>,
     ) -> Result<(), Error> {
-        self.input_authorized(now, traffic_class, segment, None, None)
+        self.with_local_tx(|c, pool| c.input_with_traffic_class_in(pool, now, traffic_class, segment))
     }
 
+    pub(crate) fn input_with_traffic_class_in(
+        &mut self,
+        pool: &mut TxPool,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+    ) -> Result<(), Error> {
+        self.input_authorized(pool, now, traffic_class, segment, None, None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn input_backed_no_metadata(
         &mut self,
         now: Instant,
@@ -7851,7 +8333,20 @@ impl Connection {
         segment: &Segment<'_>,
         backing: Option<&mut Option<crate::RxFrame>>,
     ) -> Result<(), Error> {
-        self.input_authorized(now, traffic_class, segment, None, backing)
+        self.with_local_tx(|c, pool| {
+            c.input_backed_no_metadata_in(pool, now, traffic_class, segment, backing)
+        })
+    }
+
+    pub(crate) fn input_backed_no_metadata_in(
+        &mut self,
+        pool: &mut TxPool,
+        now: Instant,
+        traffic_class: u8,
+        segment: &Segment<'_>,
+        backing: Option<&mut Option<crate::RxFrame>>,
+    ) -> Result<(), Error> {
+        self.input_authorized(pool, now, traffic_class, segment, None, backing)
     }
 
     //= https://www.rfc-editor.org/rfc/rfc7413#section-4.2.2
@@ -7859,6 +8354,7 @@ impl Connection {
     //# A special case is simultaneous open where the SYN receiver is a client in SYN-SENT state. The protocol remains the same because [RFC793] already supports both data in the SYN and simultaneous open.
     fn input_authorized(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         traffic_class: u8,
         segment: &Segment<'_>,
@@ -7902,20 +8398,21 @@ impl Connection {
             }
             if self.read_closed && backing.is_some() {
                 self.with_input_lend(backing, |c| {
-                    c.input_connected::<true>(now, traffic_class, segment, false, window, None);
+                    c.input_connected::<true>(pool, now, traffic_class, segment, false, window, None);
                 });
             } else {
-                self.input_connected::<true>(now, traffic_class, segment, false, window, backing);
+                self.input_connected::<true>(pool, now, traffic_class, segment, false, window, backing);
             }
             return Ok(());
         }
         self.with_input_lend(backing, |c| {
-            c.input_slow(now, traffic_class, segment, authorization)
+            c.input_slow(pool, now, traffic_class, segment, authorization)
         })
     }
 
     fn input_slow(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         traffic_class: u8,
         segment: &Segment<'_>,
@@ -8031,6 +8528,7 @@ impl Connection {
             self.last_received = now;
             if valid_ack {
                 self.accept_ack(
+                    pool,
                     ack,
                     false,
                     segment.options.timestamps.map(|ts| ts.1),
@@ -8039,7 +8537,7 @@ impl Connection {
                     0,
                 );
                 self.learn_fast_open_response(segment);
-                self.establish();
+                self.establish(pool);
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.3
                 //# Data or controls that were queued for transmission MAY be included.
                 // Pending ACKs share the output path with queued stream data.
@@ -8239,6 +8737,7 @@ impl Connection {
             self.wl2 = ack;
             self.congestion.on_window_update(now, self.snd_wnd);
             self.accept_ack(
+                pool,
                 ack,
                 false,
                 segment.options.timestamps.map(|ts| ts.1),
@@ -8247,7 +8746,7 @@ impl Connection {
                 0,
             );
             self.learn_fast_open_response(segment);
-            self.establish();
+            self.establish(pool);
             self.last_received = now;
             self.immediate_ack();
             self.receive_text::<false>(seq.wrapping_add(1), segment, self.receive_window(), None);
@@ -8602,6 +9101,7 @@ impl Connection {
             }
             // Leave response delivery for the normal ACK/SACK/PRR snapshot below.
             self.accept_ack(
+                pool,
                 if split_response_ack {
                     self.iss.wrapping_add(1)
                 } else {
@@ -8613,17 +9113,26 @@ impl Connection {
                 split_response_ack,
                 0,
             );
-            self.establish();
+            self.establish(pool);
         }
         if self.state == State::TimeWait {
             return Ok(());
         }
-        self.input_connected::<false>(now, traffic_class, segment, response_handshake, window, None);
+        self.input_connected::<false>(
+            pool,
+            now,
+            traffic_class,
+            segment,
+            response_handshake,
+            window,
+            None,
+        );
         Ok(())
     }
 
     fn input_connected<const IN_ORDER: bool>(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         traffic_class: u8,
         segment: &Segment<'_>,
@@ -8716,7 +9225,7 @@ impl Connection {
             }
         }
         let advancing = ack.after(self.snd_una);
-        if !self.process_ack::<IN_ORDER>(segment, ece, response_handshake, advancing) {
+        if !self.process_ack::<IN_ORDER>(pool, segment, ece, response_handshake, advancing) {
             return;
         }
         self.receive_text::<IN_ORDER>(seq, segment, window, backing);
@@ -8733,6 +9242,7 @@ impl Connection {
     #[inline]
     fn process_ack<const IN_ORDER: bool>(
         &mut self,
+        pool: &mut TxPool,
         segment: &Segment<'_>,
         ece: bool,
         response_handshake: bool,
@@ -8797,9 +9307,9 @@ impl Connection {
                     false,
                 );
                 if drained {
-                    self.accept_ack_inner::<true>(ack, false, echo, send_window, false, 0);
+                    self.accept_ack_inner::<true>(pool, ack, false, echo, send_window, false, 0);
                 } else {
-                    self.accept_ack(ack, false, echo, send_window, false, 0);
+                    self.accept_ack(pool, ack, false, echo, send_window, false, 0);
                 }
             } else {
                 debug_assert_eq!(count, 0);
@@ -8815,6 +9325,7 @@ impl Connection {
             return true;
         }
         self.process_recovery_ack(
+            pool,
             segment,
             ece,
             response_handshake,
@@ -8831,6 +9342,7 @@ impl Connection {
     #[inline(never)]
     fn process_recovery_ack(
         &mut self,
+        pool: &mut TxPool,
         segment: &Segment<'_>,
         ece: bool,
         response_handshake: bool,
@@ -9037,6 +9549,7 @@ impl Connection {
         if advancing {
             // Do not grow cwnd on the ACK that just triggered a loss reduction.
             self.accept_ack(
+                pool,
                 ack,
                 ece || tlp_reduced,
                 segment.options.timestamps.map(|ts| ts.1),
@@ -9549,6 +10062,7 @@ impl Connection {
     //# To minimize spurious retransmissions, implementations MUST follow RFC 6298 [RFC6298] to restart the retransmission timer with the current value of RTO for each ACK received that acknowledges new data.
     fn accept_ack(
         &mut self,
+        pool: &mut TxPool,
         ack: Seq,
         ece: bool,
         echo: Option<u32>,
@@ -9557,6 +10071,7 @@ impl Connection {
         growth_discount: u32,
     ) {
         self.accept_ack_inner::<false>(
+            pool,
             ack,
             ece,
             echo,
@@ -9568,6 +10083,7 @@ impl Connection {
 
     fn accept_ack_inner<const DRAINED: bool>(
         &mut self,
+        pool: &mut TxPool,
         ack: Seq,
         ece: bool,
         echo: Option<u32>,
@@ -9666,7 +10182,7 @@ impl Connection {
         if bytes != 0 {
             self.initial_pacing_open = false;
             self.send
-                .acknowledge(bytes as usize)
+                .acknowledge(pool, bytes as usize)
                 .expect("ACK is bounded by sent sequence space");
             // As Linux's tcp_check_space calls tcp_new_space once ACKs free
             // space while SOCK_NOSPACE is set: a writer that found no room
@@ -10888,25 +11404,48 @@ impl Connection {
     //= https://www.rfc-editor.org/rfc/rfc3168#section-6.1.2
     //= reason=ACK/eligible duplicate ACK/RTO output follows the selected ordinary congestion algorithm or negotiated advanced-recovery budget, with RFC8985 one-probe extension; output_policy and ECN wire traces test those paths. Not whole RFC2581/5681 compliance or a section4.3 half-flight claim.
     //# TCP follows existing algorithms for sending data packets in response to incoming ACKs, multiple duplicate acknowledgments, or retransmit timeouts [RFC2581].
+    #[cfg(test)]
     pub(crate) fn transmit(
         &mut self,
         now: Instant,
         out: &mut [u8],
     ) -> Result<Option<usize>, Error> {
-        self.transmit_selected(now, out, false)
+        self.with_local_tx(|c, pool| c.transmit_selected_in(pool, now, out, false))
     }
 
+    #[cfg(test)]
     pub(crate) fn transmit_selected(
         &mut self,
         now: Instant,
         out: &mut [u8],
         reserve: bool,
     ) -> Result<Option<usize>, Error> {
-        self.transmit_selected_with_gso(now, out, reserve, None)
+        self.with_local_tx(|c, pool| c.transmit_selected_in(pool, now, out, reserve))
     }
 
+    pub(crate) fn transmit_selected_in(
+        &mut self,
+        pool: &mut TxPool,
+        now: Instant,
+        out: &mut [u8],
+        reserve: bool,
+    ) -> Result<Option<usize>, Error> {
+        self.transmit_selected_with_gso_in(pool, now, out, reserve, None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn transmit_shared_selected(
         &mut self,
+        now: Instant,
+        out: &mut [u8],
+        payload: &mut Vec<crate::Payload>,
+    ) -> Result<Option<usize>, Error> {
+        self.with_local_tx(|c, pool| c.transmit_shared_selected_in(pool, now, out, payload))
+    }
+
+    pub(crate) fn transmit_shared_selected_in(
+        &mut self,
+        pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
         payload: &mut Vec<crate::Payload>,
@@ -10916,7 +11455,8 @@ impl Connection {
             return Err(Error::InvalidArgument);
         }
         self.send.set_shared_output(Some(payload.capacity()));
-        let result = self.transmit_selected_payload(now, out, true, None, Some(&mut *payload));
+        let result =
+            self.transmit_selected_payload(pool, now, out, true, None, Some(&mut *payload));
         self.send.set_shared_output(None);
         if result.is_err() {
             payload.clear();
@@ -10924,6 +11464,7 @@ impl Connection {
         result
     }
 
+    #[cfg(test)]
     pub(crate) fn transmit_selected_with_gso(
         &mut self,
         now: Instant,
@@ -10931,11 +11472,33 @@ impl Connection {
         reserve: bool,
         gso: Option<crate::output_reservation::GsoBuffer<'_>>,
     ) -> Result<Option<usize>, Error> {
-        self.transmit_selected_payload(now, out, reserve, gso, None)
+        self.with_local_tx(|c, pool| c.transmit_selected_with_gso_in(pool, now, out, reserve, gso))
     }
 
+    pub(crate) fn transmit_selected_with_gso_in(
+        &mut self,
+        pool: &mut TxPool,
+        now: Instant,
+        out: &mut [u8],
+        reserve: bool,
+        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+    ) -> Result<Option<usize>, Error> {
+        self.transmit_selected_payload(pool, now, out, reserve, gso, None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn transmit_offered(
         &mut self,
+        now: Instant,
+        out: &mut [u8],
+        record: &mut Option<StreamRecord>,
+    ) -> Result<Option<usize>, Error> {
+        self.with_local_tx(|c, pool| c.transmit_offered_in(pool, now, out, record))
+    }
+
+    pub(crate) fn transmit_offered_in(
+        &mut self,
+        pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
         record: &mut Option<StreamRecord>,
@@ -10954,12 +11517,28 @@ impl Connection {
                 return self.check_time(now).map(|()| None);
             }
             if self.send.len() == 0 && self.flight() == 0 {
-                self.select_output::<true, true, true>(now, out, true, None, None, Some(record))
+                self.select_output::<true, true, true>(
+                    pool,
+                    now,
+                    out,
+                    true,
+                    None,
+                    None,
+                    Some(record),
+                )
             } else {
-                self.select_output::<true, true, false>(now, out, true, None, None, Some(record))
+                self.select_output::<true, true, false>(
+                    pool,
+                    now,
+                    out,
+                    true,
+                    None,
+                    None,
+                    Some(record),
+                )
             }
         } else {
-            self.transmit_selected(now, out, true)
+            self.transmit_selected_in(pool, now, out, true)
         }
     }
 
@@ -10992,6 +11571,7 @@ impl Connection {
 
     fn transmit_selected_payload(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
         reserve: bool,
@@ -11009,16 +11589,18 @@ impl Connection {
             // so.
             #[cfg(debug_assertions)]
             debug_assert_eq!(
-                self.select_output::<false, false, false>(now, out, reserve, gso, shared, None),
+                self.select_output::<false, false, false>(
+                    pool, now, out, reserve, gso, shared, None
+                ),
                 idle,
                 "an idle connection selected output"
             );
             return idle;
         }
         if gso.is_none() && shared.is_none() && self.selects_stream() {
-            self.select_output::<true, false, false>(now, out, reserve, None, None, None)
+            self.select_output::<true, false, false>(pool, now, out, reserve, None, None, None)
         } else {
-            self.select_output::<false, false, false>(now, out, reserve, gso, shared, None)
+            self.select_output::<false, false, false>(pool, now, out, reserve, gso, shared, None)
         }
     }
 
@@ -11109,6 +11691,7 @@ impl Connection {
 
     fn select_output<const STREAM: bool, const OFFERED: bool, const ACK_ONLY: bool>(
         &mut self,
+        pool: &mut TxPool,
         now: Instant,
         out: &mut [u8],
         reserve: bool,
@@ -11732,7 +12315,7 @@ impl Connection {
                     )
                     .min(self.fresh_send_allowance())
                     .min(self.fresh_entry_room());
-                count = self.send.copy(0, &mut self.scratch[..limit]);
+                count = self.send.copy(pool.arena(), 0, &mut self.scratch[..limit]);
             }
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.1
         //# Probing of zero (offered) windows MUST be supported (MUST-36).
@@ -11753,6 +12336,7 @@ impl Connection {
                 .prr
                 .map_or(credit, |prr| credit.min(self.prr_bytes(prr)));
             count = self.send.copy(
+                pool.arena(),
                 seq.distance_from(self.send_base) as usize,
                 &mut self.scratch[..(right.distance_from(left) as usize)
                     .min(repair_packet_mss)
@@ -11762,6 +12346,7 @@ impl Connection {
         } else if let Some((left, payload, fin)) = ptb_segment {
             seq = left;
             count = self.send.copy(
+                pool.arena(),
                 left.distance_from(self.send_base) as usize,
                 &mut self.scratch[..payload],
             );
@@ -11782,9 +12367,11 @@ impl Connection {
                 .min(self.fresh_send_allowance())
                 .min(self.fresh_entry_room());
             if unsent != 0 && credit >= unsent.min(packet_mss) {
-                count = self
-                    .send
-                    .copy(offset, &mut self.scratch[..unsent.min(packet_mss)]);
+                count = self.send.copy(
+                    pool.arena(),
+                    offset,
+                    &mut self.scratch[..unsent.min(packet_mss)],
+                );
             } else if let Some(fin) = self.fin_sequence.filter(|&fin| {
                 fin.at_or_after(self.snd_una) && (self.fin_standalone || fin == self.snd_una)
             }) {
@@ -11800,6 +12387,7 @@ impl Connection {
                 seq = left;
                 let limit = self.retry_limit(left, right.distance_from(left)) as usize;
                 count = self.send.copy(
+                    pool.arena(),
                     seq.distance_from(self.send_base) as usize,
                     &mut self.scratch[..limit],
                 );
@@ -11828,6 +12416,7 @@ impl Connection {
                 credit = credit.min(self.recovery_credit(recovery));
             }
             count = self.send.copy(
+                pool.arena(),
                 start.distance_from(self.send_base) as usize,
                 &mut self.scratch[..limit.min(repair_packet_mss).min(credit as usize)],
             );
@@ -11888,7 +12477,7 @@ impl Connection {
                 self.prr
                     .map_or(limit, |prr| limit.min(self.prr_bytes(prr) as usize))
             };
-            count = self.send.copy(offset, &mut self.scratch[..limit]);
+            count = self.send.copy(pool.arena(), offset, &mut self.scratch[..limit]);
             retransmitted = seq != self.snd_nxt;
             if self.fin_sequence == Some(seq.wrapping_add(count as u32))
                 && !probe
@@ -12495,19 +13084,19 @@ impl Connection {
                 && self.send.push_after(offset);
             if segmentation.is_none() {
                 direct_payload = if STREAM {
-                    self.send.selected_slice(offset, count)
+                    self.send.selected_slice(pool.arena(), offset, count)
                 } else {
-                    self.send.contiguous(offset, count)
+                    self.send.contiguous(pool.arena(), offset, count)
                 };
                 count = match direct_payload {
                     Some(bytes) => bytes.len(),
-                    None => self.send.copy(offset, &mut self.scratch[..count]),
+                    None => self.send.copy(pool.arena(), offset, &mut self.scratch[..count]),
                 };
             } else {
                 // The reservation's payload, whose first segment is encoded
                 // from it below: copied from the send buffer once.
                 let buffer = gso.as_mut().unwrap();
-                self.send.copy(offset, &mut buffer.payload[..count]);
+                self.send.copy(pool.arena(), offset, &mut buffer.payload[..count]);
             }
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4
             //# Queue this until all preceding SENDs have been segmentized, then form a
@@ -13208,8 +13797,11 @@ impl Connection {
             && flags & PSH != 0
             && (application_push || !group_push)
         {
-            self.send
-                .collapse_push(seq.distance_from(self.send_base) as usize, count);
+            self.send.collapse_push(
+                pool,
+                seq.distance_from(self.send_base) as usize,
+                count,
+            );
         }
         // Selection validated the clock before planning any output.
         self.commit_checked_time(now);
@@ -14367,7 +14959,9 @@ mod fast_path_differential_tests {
         c.update_time(now)?;
         c.receive.clear_dsack();
         c.retransmit_burst = None;
-        c.with_input_lend(backing, |c| c.input_slow(now, traffic_class, segment, None))
+        c.with_local_tx(|c, pool| {
+            c.with_input_lend(backing, |c| c.input_slow(pool, now, traffic_class, segment, None))
+        })
     }
 
     fn forced_slow_ack_input(
@@ -14427,18 +15021,21 @@ mod fast_path_differential_tests {
         if advancing {
             c.tlp_pending = false;
         }
-        if !c.process_recovery_ack(
-            segment,
-            ece,
-            false,
-            advancing,
-            AckWindow {
-                prior: old_window,
-                offered: new_window,
-                update: window_update,
-                was_blocked,
-            },
-        ) {
+        if !c.with_local_tx(|c, pool| {
+            c.process_recovery_ack(
+                pool,
+                segment,
+                ece,
+                false,
+                advancing,
+                AckWindow {
+                    prior: old_window,
+                    offered: new_window,
+                    update: window_update,
+                    was_blocked,
+                },
+            )
+        }) {
             return Ok(());
         }
         c.receive_text::<false>(seq, segment, window, None);
@@ -15318,8 +15915,12 @@ mod fast_path_differential_tests {
             );
             let mut out_f = [0xAAu8; 2048];
             let mut out_s = [0xAAu8; 2048];
-            let rf = fast.select_output::<true, false, false>(now, &mut out_f, reserve, None, None, None);
-            let rs = slow.select_output::<false, false, false>(now, &mut out_s, reserve, None, None, None);
+            let rf = fast.with_local_tx(|c, pool| {
+                c.select_output::<true, false, false>(pool, now, &mut out_f, reserve, None, None, None)
+            });
+            let rs = slow.with_local_tx(|c, pool| {
+                c.select_output::<false, false, false>(pool, now, &mut out_s, reserve, None, None, None)
+            });
             assert_eq!(rf, rs, "result mismatch in {label} (reserve={reserve})");
             if let Ok(Some(len)) = rf {
                 assert_eq!(
@@ -15619,10 +16220,13 @@ mod fast_path_differential_tests {
                     }
                 }
             }
-            // Verify send_storage_fits against the direct ledger_growth formula.
+            // Verify send_storage_fits against the direct pool + entry + ledger formula.
             for accepted in [0usize, 1, 64, 512, 1460, 4096] {
                 let live = c.send.len() + accepted;
-                let expected = live <= c.send.allocation_capacity()
+                let pool = c.local_tx.as_ref().unwrap();
+                let expected = accepted <= pool.tail_remaining()
+                    && c.send
+                        .has_entry_room(c.send.needed_entries_for_copy(pool, accepted))
                     && c.ledger_growth(live).0 <= c.ledger_capacity();
                 assert_eq!(
                     c.send_storage_fits(accepted),

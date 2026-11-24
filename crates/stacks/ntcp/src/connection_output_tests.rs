@@ -2494,10 +2494,12 @@ fn lowat_byte_admission_transmission_ack_resize_flush_and_wrap() {
             a.write_with_options_and_notsent_lowat(&[1; 3999], true, false, Some(4000)),
             Ok(3999)
         );
-        // The first write allocated the ring for its bytes, rounded up to
-        // a power of two.
+        // The first write allocated entry metadata on the connection and one
+        // shared chunk in the TxPool; subsequent writes within the tail chunk
+        // allocate nothing more.
         let charge = a.send.storage_bytes();
-        assert_eq!(charge, 2 * 4096);
+        assert!(charge > 0 && charge <= SEND_RING_RESERVE);
+        assert_eq!(a.local_tx.as_ref().unwrap().live(), 1);
         assert_eq!(a.send_admission_room(Some(4000)), 1);
         assert_eq!(
             a.write_with_options_and_notsent_lowat(&[2; 9000], true, true, Some(4000)),

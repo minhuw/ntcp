@@ -4917,12 +4917,18 @@ fn connection_charge(cfg: &EndpointConfig) -> usize {
     usize::from(cfg.connection.mss) + open_ledgers()
 }
 
-// What a connection's first write, of `live` bytes, adds to its charge: the
-// send ring for its whole limit and the sender ledgers grown for the
-// segments those bytes take.
+// What a connection's first write, of `live` bytes, adds to the endpoint's
+// charge: the TxPool chunk(s) + arena page, the connection's TxSeg entries,
+// and the sender ledgers grown for the segments those bytes take.
 fn first_write_charge(cfg: &EndpointConfig, live: usize) -> usize {
     let segments = live.div_ceil(usize::from(cfg.connection.mss));
-    2 * cfg.connection.send_capacity + ledgers(ledger_target(segments)) - open_ledgers()
+    let pool = crate::tx_pool::TxPool::heap_default();
+    let pool_bytes = pool.growth_bytes(live);
+    let send = crate::buffer::SendBuffer::unallocated(cfg.connection.send_capacity);
+    let entries_bytes = send
+        .entry_growth_bytes(send.needed_entries_for_copy(&pool, live))
+        .unwrap();
+    pool_bytes + entries_bytes + ledgers(ledger_target(segments)) - open_ledgers()
 }
 
 // preallocate_connections reserves nothing since the receive rings it
@@ -5093,10 +5099,25 @@ fn opens_are_charged_as_they_happen_and_reclaims_return_everything() {
     let later = 2 * time_wait + 1_000_001;
     b.on_timeout(later, 64).unwrap();
     packets(&mut b, later);
-    // The read released the frame: the server holds its open charge.
+    // The read released the frame: the server holds its open charge, and
+    // the sender's idle TxPool chunk was reclaimed under the tight cap (or
+    // stays at most first_write_charge when below memory.low).
+    let sender_expected = charge + first_write_charge(&cfg, 3) - a.tx_pool_bytes();
     assert_eq!(
         (a.buffer_bytes(), b.buffer_bytes()),
-        (charge + first_write_charge(&cfg, 3), charge)
+        (
+            if a.tx_pool_bytes() == 0 {
+                charge
+                    + crate::buffer::SendBuffer::unallocated(cfg.connection.send_capacity)
+                        .entry_growth_bytes(1)
+                        .unwrap()
+                    + ledgers(ledger_target(1))
+                    - open_ledgers()
+            } else {
+                sender_expected + a.tx_pool_bytes()
+            },
+            charge
+        )
     );
 }
 
@@ -6351,7 +6372,7 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     assert_eq!(a.buffer_bytes(), original_charge);
     crate::allocation_tests::fail_after(0, || a.set_buffer_capacities(client, 4096, 4096)).unwrap();
     let info = a.transport_info(client).unwrap();
-    assert_eq!(a.buffer_bytes(), info.buffer_charge);
+    assert_eq!(a.buffer_bytes(), info.buffer_charge + a.tx_pool_bytes());
     assert_eq!(a.buffer_bytes(), original_charge);
     assert_eq!(info.send_used, 512);
     assert_eq!(
@@ -6516,9 +6537,10 @@ fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
         a.write_with_options_and_notsent_lowat(client, &[1; 40], true, true, Some(24)),
         Ok(24)
     );
-    // Charged what was allocated for the 24 bytes admitted: the send ring
-    // for the 32-byte limit and ledgers grown for their segment.
-    let charge = charge + 2 * 32 + ledgers(ledger_target(1)) - open_ledgers();
+    // Charged what was allocated for the 24 bytes admitted: the TxPool
+    // chunk + arena page, the connection's TxSeg entries, and ledgers grown
+    // for their segment.
+    let charge = charge + first_write_charge(&config(), 24);
     assert_eq!(a.buffer_bytes(), charge);
     assert_eq!(a.send_admission_room(client, Some(24)), Ok(0));
     assert_eq!(
@@ -6538,9 +6560,9 @@ fn endpoint_lowat_partial_eor_and_unlimited_admission_preserve_heap_quota() {
         a.write_with_options_and_notsent_lowat(client, &[3; 32], true, false, Some(u32::MAX)),
         Ok(24)
     );
-    // The ring grew in place to the 64-byte limit; the ledgers' entries
-    // still hold the 64 bytes' segments.
-    assert_eq!(a.buffer_bytes(), charge + 2 * (64 - 32));
+    // Both writes fit inside the already-allocated shared TxPool tail chunk,
+    // send entries, and sender ledgers with zero additional heap allocation.
+    assert_eq!(a.buffer_bytes(), charge);
 }
 
 #[test]
@@ -7255,13 +7277,10 @@ fn checked_external_write_admission_covers_bytes_phases_and_shutdown() {
     a.set_buffer_capacities(client, 32, 32).unwrap();
     let before = a.buffer_bytes();
     assert_eq!(a.prepare_write_admission(client, 32, None, request), Ok(32));
-    // Preparation allocated and charged the send ring and the ledgers; the
-    // write that follows allocates nothing.
+    // Preparation allocated and charged the TxPool tail chunk, send entries,
+    // and ledgers; the write that follows allocates nothing.
     let charged = a.buffer_bytes();
-    assert_eq!(
-        charged,
-        before + 2 * 32 + ledgers(ledger_target(1)) - open_ledgers()
-    );
+    assert_eq!(charged, before + first_write_charge(&config(), 32));
     crate::allocation_tests::fail_after(0, || {
         assert_eq!(a.check_write_admission(client, None, request), Ok(32));
         assert_eq!(

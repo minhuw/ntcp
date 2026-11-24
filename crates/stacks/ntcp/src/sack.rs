@@ -653,13 +653,14 @@ mod tests {
     //# removed from the TCP's retransmission buffer until the data is cumulatively
     //# acknowledged [RFC2018].
     fn sack_advice_keeps_send_storage_until_cumulative_ack() {
+        let mut pool = crate::tx_pool::TxPool::heap_default();
         let mut send = crate::buffer::SendBuffer::new(16).unwrap();
-        assert_eq!(send.write(b"abcdefghijklmnop"), 16);
+        assert_eq!(send.write(&mut pool, b"abcdefghijklmnop"), 16);
         let mut s = Scoreboard::new();
         assert_eq!(update(&mut s, 100, 116, &[(100, 116)]).newly_sacked, 16);
         assert_eq!(s.pipe(Seq(100), Seq(116), Seq(100), 4), 0);
         let mut out = [0; 16];
-        assert_eq!(send.copy(0, &mut out), 16);
+        assert_eq!(send.copy(pool.arena(), 0, &mut out), 16);
         assert_eq!(&out, b"abcdefghijklmnop");
         s.clear(); // RTO makes even a previously SACKed head eligible again.
         assert_eq!(s.pipe(Seq(100), Seq(116), Seq(100), 4), 16);
@@ -668,12 +669,14 @@ mod tests {
             Some((Seq(100), Seq(116)))
         );
         assert_eq!(send.len(), 16);
-        send.acknowledge(7).unwrap();
+        send.acknowledge(&mut pool, 7).unwrap();
         update(&mut s, 107, 116, &[(110, 116)]);
-        assert_eq!(send.copy(0, &mut out), 9);
+        assert_eq!(send.copy(pool.arena(), 0, &mut out), 9);
         assert_eq!(&out[..9], b"hijklmnop");
-        send.acknowledge(9).unwrap();
+        send.acknowledge(&mut pool, 9).unwrap();
         assert_eq!(send.len(), 0);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]

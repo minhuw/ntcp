@@ -928,6 +928,7 @@ fn pmtud_probe_rwnd_queue_eor_timestamp_and_pacing_gates() {
         match gate {
             0 => a.snd_wnd = 1500,
             1 => {
+                a.with_local_tx(|a, pool| a.send.clear_chunks(pool));
                 a.send = SendBuffer::new(65_536).unwrap();
                 a.write(&[1; 1500]).unwrap();
             }

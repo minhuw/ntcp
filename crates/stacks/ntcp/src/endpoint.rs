@@ -19,11 +19,13 @@ use crate::{
     TimestampRequest, TxTimestampClock, TxTimestampEvent, TxTimestampRequest, TxTimestampSource,
     TxTimestampStage, TxTimestampToken,
     connection::{
-        Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple, State, Tuple,
+        Connection, ConnectionConfig, ConnectionEvents, Error, Instant, ScopedTuple,
+        SendWriteKind, State, Tuple,
     },
     rx_timestamp::RxTimestamps,
     schedule::{ReadyQueue, SocketTimers},
     seq::Seq,
+    tx_pool::TxPool,
     wire::{self, ACK, Header, IpMetadata, RST, SYN},
 };
 
@@ -239,12 +241,57 @@ impl StreamIo<'_> {
         } else if !connection.at_time(endpoint.now) {
             connection.update_time(endpoint.now)?;
         }
-        let room = endpoint.prepare_write_accessed(self.id, bytes.len(), lowat, request)?;
+        let room = endpoint.prepare_write_accessed(
+            self.id,
+            bytes.len(),
+            lowat,
+            request,
+            SendWriteKind::Copy,
+        )?;
         let index = self.id.slot;
+        let result = endpoint.slots[index]
+            .as_mut()
+            .unwrap()
+            .connection
+            .write_prepared_in(
+                &mut endpoint.tx_pool,
+                bytes,
+                push,
+                more,
+                end_of_record,
+                room,
+                request,
+            );
+        endpoint.settle_tx_pool_charge();
+        let count = match result {
+            Ok(count) => {
+                if count < room
+                    && endpoint.slots[index]
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .send_memory_throttled()
+                    && endpoint.slots[index].as_ref().unwrap().memory_retry.is_none()
+                {
+                    endpoint.memory_throttled(index);
+                }
+                count
+            }
+            Err(err) => {
+                if err == Error::WouldBlock
+                    && endpoint.slots[index]
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .send_memory_throttled()
+                    && endpoint.slots[index].as_ref().unwrap().memory_retry.is_none()
+                {
+                    endpoint.memory_throttled(index);
+                }
+                return Err(err.into());
+            }
+        };
         let slot = endpoint.slots[index].as_mut().unwrap();
-        let count =
-            slot.connection
-                .write_prepared(bytes, push, more, end_of_record, room, request)?;
         // Appending to a synchronized stream leaves new unsent bytes. It
         // changes the write timers and can free a memory-waiting writer,
         // but cannot advance SND.UNA or the managed path's delivery.
@@ -393,10 +440,10 @@ impl FreshTransmit<'_> {
         };
         let connection = &mut slot.connection;
         let stream = if let Some(record) = self.record.take() {
-            connection.submit_immediate_stream(now, record);
+            connection.submit_immediate_stream_in(&mut endpoint.tx_pool, now, record);
             true
         } else if let Some(d) = departure {
-            connection.submit_immediate_departure(now, d, receipt);
+            connection.submit_immediate_departure_in(&mut endpoint.tx_pool, now, d, receipt);
             false
         } else {
             debug_assert!(false, "preflighted immediate submission missing selection");
@@ -1384,6 +1431,9 @@ pub struct Endpoint {
     // input has it lent (`input_admitted`) or after its receive queue kept
     // it: the segment borrows its bytes until that input returns.
     ingress: Option<RxFrame>,
+    // Per-owner shared transmit chunk pool and its last settled budget charge.
+    tx_pool: TxPool,
+    tx_pool_charged: usize,
     // The bytes of the frame `input_frame` is processing, for the check
     // that no connection holding it is reclaimed before the input returns.
     #[cfg(debug_assertions)]
@@ -1394,6 +1444,15 @@ pub struct Endpoint {
 // (`Endpoint::leave_buffer_memory`).
 impl Drop for Endpoint {
     fn drop(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            slot.connection.release_send_chunks(&mut self.tx_pool);
+        }
+        self.tx_pool.release_tail();
+        debug_assert_eq!(
+            self.tx_pool.live(),
+            0,
+            "Endpoint dropped with live TxPool ChunkRefs"
+        );
         self.budget.leave_group(self.now);
     }
 }
@@ -1672,6 +1731,8 @@ impl Endpoint {
             budget,
             embedding_charge: 0,
             ingress: None,
+            tx_pool: TxPool::heap_default(),
+            tx_pool_charged: 0,
             #[cfg(debug_assertions)]
             ingress_bytes: None,
             receive_memory: crate::memory::ReceiveMemoryEvents::default(),
@@ -2624,7 +2685,7 @@ impl Endpoint {
         }
         let syn = filtered_syn.as_ref().or(syn);
         let mut result = match syn {
-            Some(syn) => Connection::passive_with_path(
+            Some(syn) => Connection::passive_in_endpoint(
                 tuple,
                 connection_config,
                 iss,
@@ -2637,7 +2698,7 @@ impl Endpoint {
                 receive_capability,
                 initial_ip_header_len,
             ),
-            None => Connection::active_with_path(
+            None => Connection::active_in_endpoint(
                 tuple,
                 connection_config,
                 iss,
@@ -2702,8 +2763,60 @@ impl Endpoint {
         admission
     }
 
-    fn recycle_connection(&mut self, connection: Box<Connection>) {
-        self.uncharge(connection.buffer_charge());
+    #[cfg(test)]
+    pub(crate) fn tx_pool_bytes(&self) -> usize {
+        self.tx_pool_charged
+    }
+
+    fn settle_tx_pool_charge(&mut self) {
+        let storage = self.tx_pool.storage_bytes();
+        let old = core::mem::replace(&mut self.tx_pool_charged, storage);
+        if old != storage {
+            self.recharge(old, storage);
+        }
+    }
+
+    fn shrink_tx_pool(&mut self) {
+        self.tx_pool.shrink();
+        self.settle_tx_pool_charge();
+    }
+
+    fn tx_pool_should_shrink(&self) -> bool {
+        self.budget.under_pressure()
+            || !self.memory_waiters.is_empty()
+            || self.budget.has_group_waiters()
+            || self.budget.allocated() >= self.memory().low
+            || self.occupied.is_empty()
+    }
+
+    fn maybe_shrink_and_settle_tx_pool(&mut self) {
+        if self.tx_pool_charged > 0
+            && ((self.tx_pool_should_shrink()
+                && (self.tx_pool.has_idle_tail() || self.tx_pool.live() == 0))
+                || self.tx_pool.has_excess_arena_pages())
+        {
+            self.tx_pool.shrink();
+        }
+        self.settle_tx_pool_charge();
+    }
+
+    fn recycle_connection(&mut self, mut connection: Box<Connection>) {
+        connection.release_send_chunks(&mut self.tx_pool);
+        if (self.tx_pool_should_shrink()
+            && (self.tx_pool.has_idle_tail() || self.tx_pool.live() == 0))
+            || self.tx_pool.has_excess_arena_pages()
+        {
+            self.tx_pool.shrink();
+        }
+        let storage = self.tx_pool.storage_bytes();
+        let old_tx = core::mem::replace(&mut self.tx_pool_charged, storage);
+        let conn_charge = connection.buffer_charge();
+        if old_tx >= storage {
+            self.uncharge(conn_charge.saturating_add(old_tx - storage));
+        } else {
+            self.uncharge(conn_charge);
+            self.charge(storage - old_tx);
+        }
     }
 
     // `replaces` names the TIME-WAIT incarnation, a connection the
@@ -3433,26 +3546,37 @@ impl Endpoint {
             receive_authority,
         )?;
         let old_charge = connection.buffer_charge();
-        let budget = self
-            .buffer_room()
-            .saturating_add(connection.buffer_charge());
+        let budget = self.buffer_room();
         let accepted = match if let Some(cookie) = cookie {
-            connection.prepare_fast_open_with_server_cookie(cookie, peer_mss, initial, budget)
+            connection.prepare_fast_open_with_server_cookie_in(
+                &mut self.tx_pool,
+                cookie,
+                peer_mss,
+                initial,
+                budget,
+            )
         } else if policy == crate::FastOpenClientPolicy::ApplicationProtected {
-            connection.prepare_fast_open_without_cookie(peer_mss, initial, budget)
+            connection.prepare_fast_open_without_cookie_in(
+                &mut self.tx_pool,
+                peer_mss,
+                initial,
+                budget,
+            )
         } else {
-            connection.prepare_fast_open_with_budget(cached, initial, budget)
+            connection.prepare_fast_open_with_budget_in(&mut self.tx_pool, cached, initial, budget)
         } {
             Ok(count) => count,
             Err(error) => {
-                // A send ring that grew before the other failed is charged
-                // until recycling releases it.
+                // A send entry deque or chunk that grew before the other
+                // failed is charged until recycling releases it.
                 self.recharge(old_charge, connection.buffer_charge());
+                self.settle_tx_pool_charge();
                 self.recycle_connection(connection);
                 return Err(error.into());
             }
         };
         self.recharge(old_charge, connection.buffer_charge());
+        self.settle_tx_pool_charge();
         let id = self.insert(connection, None, None)?;
         self.slots[id.slot].as_mut().unwrap().receive_authority = receive_authority;
         Ok((id, accepted))
@@ -4210,6 +4334,12 @@ impl Endpoint {
         {
             slot.connection.reclaim_receive_spare();
         }
+        if let Some(slot) = self.slots[index].as_mut()
+            && let Some((old, new)) = slot.connection.settle_send_ptb_charge()
+        {
+            self.recharge(old, new);
+        }
+        self.maybe_shrink_and_settle_tx_pool();
         // A change of the receive queue outside input and reads: a clear,
         // or report anchors SACK output took or put back.
         if let Some(slot) = self.slots[index].as_mut()
@@ -4858,13 +4988,14 @@ impl Endpoint {
         // Ingress admission checked these timestamps and any GRO size
         // against the parsed segment before choosing an owner.
         let admitted = if let Some(metadata) = metadata {
+            let tx_pool = &mut self.tx_pool;
             slot.connection.with_input_lend(backing, |c| {
-                c.input_validated(now, traffic_class, segment, metadata, authorization)
+                c.input_validated_in(tx_pool, now, traffic_class, segment, metadata, authorization)
             })
         } else {
             debug_assert!(authorization.is_none());
             slot.connection
-                .input_backed_no_metadata(now, traffic_class, segment, backing)
+                .input_backed_no_metadata_in(&mut self.tx_pool, now, traffic_class, segment, backing)
                 .map(|()| false)
         };
         let dropped = slot.connection.dropped.take();
@@ -4914,6 +5045,7 @@ impl Endpoint {
         {
             self.recharge(old, new);
         }
+        self.maybe_shrink_and_settle_tx_pool();
         self.refresh(index);
         Ok(if held {
             InputDisposition::Dropped
@@ -5544,9 +5676,10 @@ impl Endpoint {
         len: usize,
         lowat: Option<u32>,
         timestamp: Option<TxTimestampRequest>,
+        kind: SendWriteKind,
     ) -> Result<usize, EndpointError> {
         self.access_slot(id, true)?;
-        self.prepare_write_accessed(id, len, lowat, timestamp)
+        self.prepare_write_accessed(id, len, lowat, timestamp, kind)
     }
 
     fn prepare_write_accessed(
@@ -5555,13 +5688,15 @@ impl Endpoint {
         len: usize,
         lowat: Option<u32>,
         timestamp: Option<TxTimestampRequest>,
+        kind: SendWriteKind,
     ) -> Result<usize, EndpointError> {
         let slot = self.slots[id.slot].as_mut().unwrap();
         let connection = &mut slot.connection;
         let accepted = connection.write_prefix(len, lowat, timestamp)?;
-        // A write into the existing ring and ledgers has no allocation to
-        // charge. Only consult the shared budget when storage can grow.
-        if accepted == 0 || connection.send_storage_fits(accepted) {
+        // A write into the existing tail chunk, entries, and ledgers has no
+        // allocation to charge. Only consult the shared budget when storage
+        // can grow.
+        if accepted == 0 || connection.send_storage_fits_in(&self.tx_pool, accepted, kind) {
             if accepted != 0 {
                 connection.memory_released();
             }
@@ -5574,7 +5709,7 @@ impl Endpoint {
             }
             return Ok(accepted);
         }
-        self.prepare_write_growth(id, accepted, lowat)
+        self.prepare_write_growth(id, accepted, lowat, kind)
     }
 
     fn prepare_write_growth(
@@ -5582,15 +5717,40 @@ impl Endpoint {
         id: ConnectionId,
         accepted: usize,
         lowat: Option<u32>,
+        kind: SendWriteKind,
     ) -> Result<usize, EndpointError> {
+        let _ = lowat;
         let connection = &self.slots[id.slot].as_ref().unwrap().connection;
         let own_charge = connection.buffer_charge();
-        let available = self
-            .send_growth_room(connection, own_charge)
-            .saturating_add(own_charge);
+        let fair_share = own_charge.saturating_add(connection.send_chunk_bytes());
+        let mut available = self.send_growth_room(connection, fair_share);
+        // Before refusing on a tight budget, reclaim any idle unreferenced
+        // tail chunk when this write would need a new chunk anyway (or is a
+        // shared write that doesn't use the tail chunk).
+        if self.tx_pool.has_idle_tail() {
+            let needs_new_chunk = match kind {
+                SendWriteKind::Copy => accepted > self.tx_pool.tail_remaining(),
+                SendWriteKind::Shared { .. } => true,
+            };
+            if needs_new_chunk {
+                let needed_hint = match kind {
+                    SendWriteKind::Copy => self.tx_pool.growth_bytes(accepted),
+                    SendWriteKind::Shared { .. } => 4096,
+                };
+                if available < needed_hint {
+                    self.shrink_tx_pool();
+                    let connection = &self.slots[id.slot].as_ref().unwrap().connection;
+                    let fair_share = connection
+                        .buffer_charge()
+                        .saturating_add(connection.send_chunk_bytes());
+                    available = self.send_growth_room(connection, fair_share);
+                }
+            }
+        }
         let before = self.budget.allocated();
         let connection = &mut self.slots[id.slot].as_mut().unwrap().connection;
-        let refused = connection.grow_send_prefix(accepted, available);
+        let (approved, refused) =
+            connection.grow_send_prefix_in(&self.tx_pool, accepted, kind, available);
         let charge = connection.buffer_charge();
         self.recharge(own_charge, charge);
         if let Some(wanted) = refused {
@@ -5601,17 +5761,17 @@ impl Endpoint {
             self.budget
                 .attempted(before.saturating_add(wanted), self.now, memory);
             if self.budget.under_pressure() {
-                self.slot_mut(id)?.connection.moderate_send();
+                self.slots[id.slot]
+                    .as_mut()
+                    .unwrap()
+                    .connection
+                    .moderate_send_in(&self.tx_pool, approved);
             }
             self.memory_throttled(id.slot);
-            return Ok(self
-                .slot(id)?
-                .connection
-                .send_admission_room(lowat)
-                .min(accepted));
+            return Ok(approved.min(accepted));
         }
         self.stop_memory_wait(id.slot);
-        Ok(accepted)
+        Ok(approved)
     }
 
     // What `connection`, charged `charge`, may add to the budget for its send
@@ -5640,9 +5800,12 @@ impl Endpoint {
             // A connection's charged storage is part of this endpoint's
             // charge even in a shared group. Walk the socket's allocations
             // only if this upper bound could reach its fair share.
-            debug_assert!(connection.buffer_charge() <= self.budget.charged());
+            let conn_charge = connection
+                .buffer_charge()
+                .saturating_add(connection.send_chunk_bytes());
+            debug_assert!(conn_charge <= self.budget.charged());
             if self.budget.charged().saturating_mul(sockets) >= memory.high
-                && connection.buffer_charge().saturating_mul(sockets) >= memory.high
+                && conn_charge.saturating_mul(sockets) >= memory.high
             {
                 room = if pressure {
                     0
@@ -5772,11 +5935,14 @@ impl Endpoint {
     // they fit what it may add (`send_growth_room`) less `spent`, taken by
     // the writers a wake woke before it: then that write takes bytes.
     fn send_growth_fit(&self, connection: &Connection, spent: usize) -> Option<usize> {
+        let fair_share = connection
+            .buffer_charge()
+            .saturating_add(connection.send_chunk_bytes());
         let room = self
-            .send_growth_room(connection, connection.buffer_charge())
+            .send_growth_room(connection, fair_share)
             .saturating_sub(spent);
         connection
-            .send_next_growth()
+            .send_next_growth_in(&self.tx_pool)
             .filter(|&growth| growth <= room)
     }
 
@@ -5855,30 +6021,22 @@ impl Endpoint {
         {
             return Err(Error::InvalidArgument.into());
         }
-        self.prepare_write_metadata(id, payload.len(), lowat, None)?;
-        if !payload.is_empty() {
-            let room = self.buffer_room();
-            let before = self.slot(id)?.connection.buffer_charge();
-            let result = self.slot_mut(id)?.connection.prepare_shared_storage(
-                &payload,
-                Self::MAX_SHARED_SEGMENTS,
-                room,
-            );
-            let after = self.slot(id)?.connection.buffer_charge();
-            self.recharge(before, after);
-            // Span storage refused for memory admits nothing: the payload
-            // waits for memory as a copied write would.
-            if result == Err(Error::NoMemory) {
-                self.slot_mut(id)?.connection.throttle_send();
-                self.memory_throttled(id.slot);
-                return Err(Error::WouldBlock.into());
-            }
-            result?;
-        }
-        let result =
-            self.slot_mut(id)?
-                .connection
-                .write_shared(payload, more, end_of_record, lowat);
+        let new_entries = if payload.is_empty() {
+            0
+        } else {
+            self.slot(id)?.connection.needed_entries_for_shared(&payload)
+        };
+        let room = self.prepare_write_metadata(
+            id,
+            payload.len(),
+            lowat,
+            None,
+            SendWriteKind::Shared { new_entries },
+        )?;
+        let result = self
+            .slot_mut(id)?
+            .connection
+            .write_shared_prepared(payload, more, end_of_record, room);
         self.refresh(id.slot);
         result.map_err(Into::into)
     }
@@ -6058,9 +6216,30 @@ impl Endpoint {
             .connection
             .check_write_admission(lowat, request)?;
         let count = capacity.min(room);
-        self.prepare_write_metadata(id, count, lowat, Some(request))?;
+        let mut approved = self.prepare_write_metadata(
+            id,
+            count,
+            lowat,
+            Some(request),
+            SendWriteKind::Copy,
+        )?;
+        if approved > 0 {
+            if !self.tx_pool.ensure_tail_for(approved) {
+                let slot = self.slots[id.slot].as_mut().unwrap();
+                slot.connection.throttle_send();
+                if slot.memory_retry.is_none() {
+                    self.memory_throttled(id.slot);
+                }
+                approved = self.slots[id.slot]
+                    .as_ref()
+                    .unwrap()
+                    .connection
+                    .allocated_send_room_in(&self.tx_pool);
+            }
+            self.settle_tx_pool_charge();
+        }
         // Storage refused for memory admits what the allocated storage holds.
-        match count.min(self.slot(id)?.connection.send_admission_room(lowat)) {
+        match count.min(approved) {
             0 => Err(Error::WouldBlock.into()),
             count => Ok(count),
         }
@@ -6206,9 +6385,12 @@ impl Endpoint {
         end_of_record: bool,
         force: bool,
     ) -> Result<(), EndpointError> {
-        self.access_slot(id, true)?
+        self.access_slot(id, true)?;
+        self.slots[id.slot]
+            .as_mut()
+            .unwrap()
             .connection
-            .finish_send(end, more, end_of_record, force);
+            .finish_send_in(&mut self.tx_pool, end, more, end_of_record, force);
         self.refresh(id.slot);
         Ok(())
     }
@@ -6228,7 +6410,10 @@ impl Endpoint {
         id: ConnectionId,
         lowat: Option<u32>,
     ) -> Result<usize, EndpointError> {
-        Ok(self.slot(id)?.connection.send_admission_room(lowat))
+        Ok(self
+            .slot(id)?
+            .connection
+            .send_admission_room_in(&self.tx_pool, lowat))
     }
 
     /// Hold partial output until uncork, explicit NODELAY, or a 200ms timeout.
@@ -6239,7 +6424,13 @@ impl Endpoint {
     }
 
     pub fn flush(&mut self, id: ConnectionId) -> Result<usize, EndpointError> {
-        let count = self.access_slot(id, true)?.connection.flush()?;
+        self.access_slot(id, true)?;
+        let count = self.slots[id.slot]
+            .as_mut()
+            .unwrap()
+            .connection
+            .flush_in(&mut self.tx_pool)?;
+        self.maybe_shrink_and_settle_tx_pool();
         self.refresh(id.slot);
         Ok(count)
     }
@@ -6250,9 +6441,44 @@ impl Endpoint {
         Ok(())
     }
     pub fn write_urgent(&mut self, id: ConnectionId, bytes: &[u8]) -> Result<usize, EndpointError> {
-        self.prepare_write_metadata(id, bytes.len(), None, None)?;
-        let count = self.slot_mut(id)?.connection.write_urgent(bytes)?;
-        self.refresh(id.slot);
+        let room =
+            self.prepare_write_metadata(id, bytes.len(), None, None, SendWriteKind::Copy)?;
+        let index = id.slot;
+        let result = self.slots[index]
+            .as_mut()
+            .unwrap()
+            .connection
+            .write_urgent_prepared_in(&mut self.tx_pool, bytes, room);
+        self.settle_tx_pool_charge();
+        let count = match result {
+            Ok(count) => {
+                if count < room
+                    && self.slots[index]
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .send_memory_throttled()
+                    && self.slots[index].as_ref().unwrap().memory_retry.is_none()
+                {
+                    self.memory_throttled(index);
+                }
+                count
+            }
+            Err(err) => {
+                if err == Error::WouldBlock
+                    && self.slots[index]
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .send_memory_throttled()
+                    && self.slots[index].as_ref().unwrap().memory_retry.is_none()
+                {
+                    self.memory_throttled(index);
+                }
+                return Err(err.into());
+            }
+        };
+        self.refresh(index);
         Ok(count)
     }
     // Inspect accepted contiguous bytes without consuming receive credit or
@@ -7874,8 +8100,12 @@ impl Endpoint {
         let finished = offset + group.bytes == departure.payload;
         // Checked above.
         self.clock(now)?;
-        let owner = &mut self.retained_slot_mut(id)?.connection;
-        owner.accept_reserved_group(now, &mut departure, offset, group.bytes, finished);
+        self.retained_slot(id)?;
+        self.slots[id.slot]
+            .as_mut()
+            .unwrap()
+            .connection
+            .accept_reserved_group_in(&mut self.tx_pool, now, &mut departure, offset, group.bytes, finished);
         let r = self.reservations[index].current.as_mut().unwrap();
         r.emitted_bytes = group.bytes;
         r.emitted_sacks = 0;
@@ -8805,7 +9035,14 @@ impl Endpoint {
                     } else {
                         d.payload
                     };
-                    withdrawn = owner.accept_validated_output(now, d, r.offset, count, finished);
+                    withdrawn = owner.accept_validated_output_in(
+                        &mut self.tx_pool,
+                        now,
+                        d,
+                        r.offset,
+                        count,
+                        finished,
+                    );
                     if let Some(receipt) = receipt {
                         owner.certify_submission(d, r.offset, count, receipt);
                         if r.probe
@@ -9346,14 +9583,17 @@ impl Endpoint {
         let index = id.slot;
         let slot = self.slots[index].as_mut().unwrap();
         let output = if let Some(record) = offered {
-            slot.connection.transmit_offered(now, out, record)
+            slot.connection
+                .transmit_offered_in(&mut self.tx_pool, now, out, record)
         } else if let Some(parts) = shared {
-            slot.connection.transmit_shared_selected(now, out, parts)
+            slot.connection
+                .transmit_shared_selected_in(&mut self.tx_pool, now, out, parts)
         } else if reserve {
             slot.connection
-                .transmit_selected_with_gso(now, out, true, gso)
+                .transmit_selected_with_gso_in(&mut self.tx_pool, now, out, true, gso)
         } else {
-            slot.connection.transmit(now, out)
+            slot.connection
+                .transmit_selected_in(&mut self.tx_pool, now, out, false)
         };
         match output {
             Ok(Some(len)) => {
@@ -9742,7 +9982,7 @@ mod recovery_observation_tests {
         assert!(prepared > charged);
         assert_eq!(
             prepared,
-            endpoint.slot(id).unwrap().connection.buffer_charge()
+            endpoint.slot(id).unwrap().connection.buffer_charge() + endpoint.tx_pool_bytes()
         );
         crate::allocation_tests::fail_after(0, || {
             assert_eq!(
@@ -10352,7 +10592,7 @@ mod recovery_observation_tests {
             .unwrap();
         assert_eq!(
             endpoint.buffer_bytes(),
-            endpoint.slot(id).unwrap().connection.buffer_charge()
+            endpoint.slot(id).unwrap().connection.buffer_charge() + endpoint.tx_pool_bytes()
         );
         let retained = endpoint.buffer_bytes();
         endpoint.set_tx_timestamp_capacity(id, 0).unwrap();
@@ -11090,7 +11330,10 @@ mod memory_wait_tests {
     // The bytes beyond those queued that `id`'s allocated send ring and
     // ledger entries hold: what a write the budget refuses to grow takes.
     fn held(a: &Endpoint, id: ConnectionId) -> usize {
-        a.slot(id).unwrap().connection.allocated_send_room()
+        a.slot(id)
+            .unwrap()
+            .connection
+            .allocated_send_room_in(&a.tx_pool)
     }
 
     // Makes `a`'s end of `peer`'s connection hold `bytes` that `peer`, on
@@ -11177,8 +11420,10 @@ mod memory_wait_tests {
         let ledgers = |a: &Endpoint| a.slot(bulk).unwrap().connection.ledger_bytes();
         let data = long_data();
         assert_eq!(a.write(bulk, &data), Ok(data.len()));
-        let held = ledgers(&a);
-        assert!(held > crate::connection::LEDGER_RESERVE);
+        let held_ledgers = ledgers(&a);
+        let held_tx = a.tx_pool_bytes();
+        assert!(held_ledgers > crate::connection::LEDGER_RESERVE);
+        assert!(held_tx > 0);
         writable(&mut a, waiter);
         a.config.max_buffer_bytes = a.buffer_bytes();
         assert_eq!(a.write(waiter, &[1; 9]), Err(Error::WouldBlock.into()));
@@ -11196,7 +11441,10 @@ mod memory_wait_tests {
         }
         assert_eq!(read, data.len());
         assert_eq!(ledgers(&a), 0);
-        assert_eq!(a.buffer_bytes(), charged - held);
+        // Draining freed both the oversized ledgers and the TxPool chunks
+        // (and the idle tail chunk because a waiter was pending).
+        assert_eq!(a.tx_pool_bytes(), 0);
+        assert_eq!(a.buffer_bytes(), charged - held_ledgers - held_tx);
         assert!(writable(&mut a, waiter));
         assert_eq!(a.write(waiter, &[1; 9]), Ok(9));
         // A small write allocates ledgers within the reserve, which stay
@@ -11212,23 +11460,21 @@ mod memory_wait_tests {
         assert_eq!(ledgers(&a), small);
     }
 
-    // A connection whose queue drained frees a send ring grown past a
-    // page, as Linux frees an emptied write queue's skbs at ACK and
-    // sk_mem_reclaim returns what exceeds a page; the return wakes a writer
-    // waiting for memory. The send limit stays, and the next write grows
-    // the ring again from a page, which a small exchange keeps.
+    // A connection whose queue drains frees its TxPool chunks and oversized
+    // ledgers, waking a writer waiting for memory. Under an unbounded budget
+    // with no waiters, a small exchange reuses the warm shared tail chunk.
     #[test]
     fn drained_send_ring_above_a_page_is_freed_and_wakes_a_waiter() {
         let (mut a, mut b, listener) = endpoints();
         let (bulk, server) = connect(&mut a, &mut b, listener, 40000);
         let (waiter, _) = connect(&mut a, &mut b, listener, 40001);
-        let ring = |a: &Endpoint| a.slot(bulk).unwrap().connection.send_ring_bytes();
+        let entries = |a: &Endpoint| a.slot(bulk).unwrap().connection.send_ring_bytes();
         let ledgers = |a: &Endpoint| a.slot(bulk).unwrap().connection.ledger_bytes();
-        a.set_send_buffer(bulk, 8192).unwrap();
-        let data: Vec<u8> = (0..6000).map(|i| (i % 251) as u8).collect();
+        a.set_send_buffer(bulk, 40_000).unwrap();
+        let data: Vec<u8> = (0..36_000).map(|i| (i % 251) as u8).collect();
         assert_eq!(a.write(bulk, &data), Ok(data.len()));
-        assert_eq!(ring(&a), 2 * 8192);
-        let held = ring(&a) + ledgers(&a);
+        assert!(a.tx_pool_bytes() >= 3 * a.tx_pool.chunk_size());
+        let held = a.tx_pool_bytes() + ledgers(&a);
         assert!(ledgers(&a) > crate::connection::LEDGER_RESERVE);
         writable(&mut a, waiter);
         a.config.max_buffer_bytes = a.buffer_bytes();
@@ -11236,9 +11482,9 @@ mod memory_wait_tests {
         assert!(!writable(&mut a, waiter));
         let charged = a.buffer_bytes();
         let mut read = Vec::new();
-        for now in 1..256 {
+        for now in 1..512 {
             exchange(&mut a, &mut b, now);
-            let mut out = [0; 1024];
+            let mut out = [0; 2048];
             let len = b.read(server, &mut out).unwrap_or(0);
             read.extend_from_slice(&out[..len]);
             if a.slot(bulk).unwrap().connection.send_progress().queued_end
@@ -11246,65 +11492,63 @@ mod memory_wait_tests {
             {
                 break;
             }
-            // Nothing is freed while bytes are queued.
-            assert_eq!(ring(&a), 2 * 8192);
         }
         assert_eq!(read, data);
-        assert_eq!((ring(&a), ledgers(&a)), (0, 0));
+        // Chunks and oversized ledgers are freed and return to the budget.
+        assert_eq!((a.tx_pool_bytes(), ledgers(&a)), (0, 0));
         assert_eq!(a.buffer_bytes(), charged - held);
-        assert_eq!(a.buffer_capacities(bulk).unwrap().0, 8192);
+        assert_eq!(a.buffer_capacities(bulk).unwrap().0, 40_000);
         assert!(writable(&mut a, waiter));
         assert_eq!(a.write(waiter, &[1; 9]), Ok(9));
-        // A 600-byte write grows a page of ring, which stays once it is
-        // acknowledged.
+        // A small write shares the warm tail chunk without growing entries
+        // past the reserve, and keeps the tail warm when unpressured.
         a.config.max_buffer_bytes = usize::MAX;
+        let pool_before = a.tx_pool_bytes();
         assert_eq!(a.write(bulk, &[2; 600]), Ok(600));
-        assert_eq!(ring(&a), crate::connection::SEND_RING_RESERVE);
-        for now in 300..310 {
+        assert_eq!(a.tx_pool_bytes(), pool_before);
+        assert!(entries(&a) <= crate::connection::SEND_RING_RESERVE);
+        for now in 600..610 {
             exchange(&mut a, &mut b, now);
             let _ = b.read(server, &mut [0; 1024]);
         }
         let progress = a.slot(bulk).unwrap().connection.send_progress();
         assert_eq!(progress.queued_end, progress.acknowledged);
-        assert_eq!(ring(&a), crate::connection::SEND_RING_RESERVE);
+        assert!(entries(&a) <= crate::connection::SEND_RING_RESERVE);
     }
-    // A writer refused the growth of its own ring, whose queue the peer
-    // then acknowledges whole, freeing that ring, is woken by the return
-    // and is writable, as Linux's sk_stream_write_space finds
-    // sk_stream_is_writeable once the ACK emptied sk_wmem_queued; its next
-    // write grows a ring again from a page.
+    // A writer refused a second chunk, whose first chunk the peer then
+    // acknowledges, is woken by the returned chunk memory and becomes
+    // writable again.
     #[test]
     fn a_refused_writer_whose_ring_an_ack_frees_is_woken() {
         let (mut a, mut b, listener) = endpoints();
         let (client, server) = connect(&mut a, &mut b, listener, 40000);
-        let ring = |a: &Endpoint| a.slot(client).unwrap().connection.send_ring_bytes();
-        a.set_send_buffer(client, 8192).unwrap();
-        let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
-        assert_eq!(a.write(client, &data[..3000]), Ok(3000));
-        assert_eq!(ring(&a), 2 * 4096);
+        let chunk_size = a.tx_pool.chunk_size();
+        a.set_send_buffer(client, 3 * chunk_size).unwrap();
+        let data: Vec<u8> = (0..2 * chunk_size).map(|i| (i % 251) as u8).collect();
+        // Fill most of the first chunk.
+        assert_eq!(a.write(client, &data[..chunk_size - 1000]), Ok(chunk_size - 1000));
+        assert_eq!(a.tx_pool.live(), 1);
         writable(&mut a, client);
-        // The budget has no room for the ring to double.
+        // The budget has no room for a second chunk.
         a.config.max_buffer_bytes = a.buffer_bytes();
-        let mut sent = 3000 + a.write(client, &data[3000..]).unwrap();
+        let mut sent = (chunk_size - 1000) + a.write(client, &data[chunk_size - 1000..]).unwrap();
         assert!(sent < data.len());
         assert_eq!(a.memory_throttled_writes(), 1);
         assert_eq!(a.send_admission_room(client, None), Ok(0));
         let mut read = Vec::new();
-        for now in 1..256 {
+        for now in 1..512 {
             exchange(&mut a, &mut b, now);
-            let mut out = [0; 1024];
+            let mut out = [0; 2048];
             let len = b.read(server, &mut out).unwrap_or(0);
             read.extend_from_slice(&out[..len]);
             if read.len() == sent {
                 break;
             }
-            // Nothing is freed while bytes are queued.
-            assert_eq!(ring(&a), 2 * 4096);
         }
-        exchange(&mut a, &mut b, 300);
+        exchange(&mut a, &mut b, 600);
         assert_eq!(read, data[..sent]);
-        // The ring went back to the budget, and with it the writer's wait.
-        assert_eq!(ring(&a), 0);
+        // The chunk went back to the budget, and with it the writer's wait.
+        assert_eq!(a.tx_pool_bytes(), 0);
         assert!(a.memory_waiters.is_empty());
         assert!(writable(&mut a, client));
         sent += a.write(client, &data[sent..]).unwrap();
@@ -11381,15 +11625,20 @@ mod memory_wait_tests {
         let (client, _) = connect(&mut a, &mut b, listener, 40000);
         let (other, _) = connect(&mut a, &mut b, listener, 40001);
         let open = a.buffer_bytes();
-        // The first write allocates the send ring and ledgers.
+        // The first write allocates the shared TxPool tail chunk, send entries,
+        // and ledgers. A second connection's small write shares that tail chunk
+        // and adds only its own entries + ledgers.
         assert_eq!(a.write(client, &[1; 9]), Ok(9));
         let written = a.buffer_bytes();
-        let per_write = written - open;
+        let client_meta_growth = written - open - a.tx_pool_bytes();
+        assert!(client_meta_growth > 0);
         a.config.max_buffer_bytes = written * 4;
-        a.config.buffer_pressure_bytes = Some(written + per_write - 1);
-        a.config.buffer_low_bytes = Some(written / 2);
+        a.config.buffer_pressure_bytes = Some(written + client_meta_growth - 1);
+        a.config.buffer_low_bytes = Some(open / 2);
         assert!(!a.memory_pressure());
+        let tx_before = a.tx_pool_bytes();
         assert_eq!(a.write(other, &[1; 9]), Ok(9));
+        assert_eq!(a.tx_pool_bytes(), tx_before, "second write shares tail chunk");
         assert!(a.memory_pressure());
         // Reclaiming one connection does not reach low.
         a.abort(other).unwrap();
@@ -11496,7 +11745,7 @@ mod memory_wait_tests {
             .unwrap();
         exchange(&mut a, &mut b, 0);
         let peer = b.accept(listener).unwrap();
-        hold_unread(&mut a, &mut b, peer, 4096);
+        hold_unread(&mut a, &mut b, peer, 24_576);
         let (small, _) = connect(&mut a, &mut b, listener, 40001);
         assert_eq!(a.write(big, &[1; 200]), Ok(200));
         assert_eq!(a.write(small, &[2; 20]), Ok(20));
@@ -11505,7 +11754,8 @@ mod memory_wait_tests {
         let small_limit = a.buffer_capacities(small).unwrap().0;
         assert_eq!(small_limit, 1024);
         let charged = a.buffer_bytes();
-        let big_charge = a.slot(big).unwrap().connection.buffer_charge();
+        let big_conn = &a.slot(big).unwrap().connection;
+        let big_charge = big_conn.buffer_charge() + big_conn.send_chunk_bytes();
         // Two connections: the fair share is half the cap, which `big`
         // holds and `small` does not.
         a.config.max_buffer_bytes = 2 * big_charge;
@@ -11562,7 +11812,7 @@ mod memory_wait_tests {
             .unwrap();
         exchange(&mut a, &mut b, 0);
         let peer = b.accept(listener).unwrap();
-        hold_unread(&mut a, &mut b, peer, 4096);
+        hold_unread(&mut a, &mut b, peer, 24_576);
         let (first, _) = connect(&mut a, &mut b, listener, 40001);
         let (second, _) = connect(&mut a, &mut b, listener, 40002);
         let (_idle, _) = connect(&mut a, &mut b, listener, 40003);
@@ -11571,9 +11821,13 @@ mod memory_wait_tests {
         assert_eq!(a.write(second, &[3; 200]), Ok(200));
         drain(&mut a, 1);
         let charged = a.buffer_bytes();
-        let charge = |a: &Endpoint, id| a.slot(id).unwrap().connection.buffer_charge();
-        let (writer_charge, first_charge, second_charge) =
-            (charge(&a, writer), charge(&a, first), charge(&a, second));
+        let writer_conn = &a.slot(writer).unwrap().connection;
+        let writer_charge = writer_conn.buffer_charge() + writer_conn.send_chunk_bytes();
+        // `first` and `second` share the tail chunk with `writer`, so
+        // reclaiming them frees their own connection charges while `writer`
+        // keeps the shared chunk alive.
+        let first_charge = a.slot(first).unwrap().connection.buffer_charge();
+        let second_charge = a.slot(second).unwrap().connection.buffer_charge();
         // Two connections left still hold the writer to half the cap.
         a.config.max_buffer_bytes = 2 * writer_charge;
         assert!(charged < a.config.max_buffer_bytes);
@@ -14771,6 +15025,296 @@ mod deferred_timer_model_tests {
             // Verify brute-force timer oracle on BOTH endpoints after every single step!
             assert_timer_oracle(&client, &alloc::format!("step_{step}_client"));
             assert_timer_oracle(&server, &alloc::format!("step_{step}_server"));
+        }
+    }
+
+    // D3 randomized lifecycle test: interleave copying writes (small, medium,
+    // multi-chunk), shared-payload writes, ACKs, flush, local/remote abort
+    // (RST), graceful close into TIME-WAIT, TIME-WAIT reuse, reclaim, and
+    // mid-flight Endpoint::drop across multiple connections sharing one TxPool.
+    // Verifies exact Budget balance after every step, zero leaked ChunkRefs
+    // (`live() == 0`), and release of every shared Payload lease.
+    #[test]
+    fn tx_pool_d3_randomized_lifecycle_and_budget_balance() {
+        use alloc::sync::Arc;
+        use alloc::vec;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use ntcp_buffer::Payload;
+
+        let assert_budget_balance = |ep: &Endpoint, label: &str| {
+            let slot_sum: usize = ep
+                .slots
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .map(|s| s.connection.buffer_charge())
+                .sum();
+            assert_eq!(
+                ep.buffer_bytes(),
+                slot_sum + ep.tx_pool_bytes(),
+                "budget mismatch at {label}: buffer_bytes={}, slot_sum={slot_sum}, tx_pool_bytes={}",
+                ep.buffer_bytes(),
+                ep.tx_pool_bytes(),
+            );
+            assert_eq!(
+                ep.tx_pool_bytes(),
+                ep.tx_pool.storage_bytes(),
+                "tx_pool_charged drift at {label}"
+            );
+        };
+
+        let mut seed: u64 = 0xD3_5EED_1234_ABCD;
+        let mut rng = || -> u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let shared_leases_live = Arc::new(AtomicUsize::new(0));
+
+        // Phase 0: full lifecycle ending with drain + reclaim -> live() == 0, buffer_bytes() == 0.
+        // Phase 1: stop mid-flight with active chunks + shared payloads + TIME-WAIT and drop Endpoints.
+        for phase in 0..2 {
+            let mut cfg = EndpointConfig {
+                max_connections: 24,
+                max_listeners: 4,
+                max_time_wait: 24,
+                max_buffer_bytes: 512 * 1024,
+                ..EndpointConfig::default()
+            };
+            cfg.connection.mss = 536;
+            cfg.connection.send_capacity = 40 * 1024;
+            cfg.connection.receive_capacity = 40 * 1024;
+            cfg.connection.time_wait_us = 200_000;
+
+            let mut client = Endpoint::new(cfg.clone(), [0x11; 32], 0, |_| true).unwrap();
+            let mut server = Endpoint::new(cfg, [0x22; 32], 0, |_| true).unwrap();
+            let server_addr = addr(2, 7000);
+            let listener = server.listen(server_addr, 16).unwrap();
+
+            let mut now = 1_000u64;
+            let mut next_port = 20_000u16;
+            let mut pairs: Vec<(ConnectionId, ConnectionId, u16)> = Vec::new();
+
+            let try_open_pair = |client: &mut Endpoint,
+                                 server: &mut Endpoint,
+                                 port: u16,
+                                 now: &mut u64|
+             -> Option<(ConnectionId, ConnectionId, u16)> {
+                let cid = client.connect(*now, addr(1, port), server_addr).ok()?;
+                for _ in 0..4 {
+                    let p1 = drain_tx(client, *now);
+                    deliver(server, *now, &p1);
+                    let p2 = drain_tx(server, *now);
+                    deliver(client, *now, &p2);
+                    *now += 100;
+                }
+                let sid = server.accept(listener).ok()?;
+                Some((cid, sid, port))
+            };
+
+            for _ in 0..4 {
+                let p = try_open_pair(&mut client, &mut server, next_port, &mut now).unwrap();
+                next_port += 1;
+                pairs.push(p);
+            }
+
+            let steps = if phase == 0 { 400 } else { 150 };
+            let mut reused_ports: Vec<u16> = Vec::new();
+
+            for step in 0..steps {
+                now += 1_000 + (rng() % 50_000);
+                let _ = client.on_timeout(now, 64);
+                let _ = server.on_timeout(now, 64);
+
+                let op = rng() % 14;
+                match op {
+                    0..=2 => {
+                        // Copying write: small, medium, or multi-chunk (>16 KiB).
+                        if !pairs.is_empty() {
+                            let idx = (rng() >> 16) as usize % pairs.len();
+                            let (cid, sid, _) = pairs[idx];
+                            let len = match rng() % 3 {
+                                0 => 1 + (rng() as usize % 64),
+                                1 => 100 + (rng() as usize % 2000),
+                                _ => 17_000 + (rng() as usize % 8_000),
+                            };
+                            let data = vec![(step & 0xff) as u8; len];
+                            if (rng() & 1) == 0 {
+                                let _ = client.write(cid, &data);
+                            } else {
+                                let _ = server.write(sid, &data);
+                            }
+                        }
+                    }
+                    3..=4 => {
+                        // Shared-payload write with refcount tracking.
+                        if !pairs.is_empty() {
+                            let idx = (rng() >> 16) as usize % pairs.len();
+                            let (cid, sid, _) = pairs[idx];
+                            let len = 1 + (rng() as usize % 4096);
+                            let counter = shared_leases_live.clone();
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let payload = Payload::from_vec(vec![0x5a; len]).with_release(
+                                move || {
+                                    counter.fetch_sub(1, Ordering::SeqCst);
+                                },
+                            );
+                            if (rng() & 1) == 0 {
+                                let _ = client.write_shared(cid, payload, true, false, None);
+                            } else {
+                                let _ = server.write_shared(sid, payload, true, false, None);
+                            }
+                        }
+                    }
+                    5 => {
+                        // Flush unsent bytes on one side.
+                        if !pairs.is_empty() {
+                            let idx = (rng() >> 16) as usize % pairs.len();
+                            let (cid, sid, _) = pairs[idx];
+                            if (rng() & 1) == 0 {
+                                let _ = client.flush(cid);
+                            } else {
+                                let _ = server.flush(sid);
+                            }
+                        }
+                    }
+                    6..=8 => {
+                        // Exchange packets and read on both sides (delivering ACKs).
+                        let p1 = drain_tx(&mut client, now);
+                        // Occasionally drop one packet to exercise retransmit / partial ACK.
+                        let deliver_p1 = if p1.len() > 2 && (rng() % 5) == 0 {
+                            &p1[..p1.len() - 1]
+                        } else {
+                            &p1[..]
+                        };
+                        deliver(&mut server, now, deliver_p1);
+                        let p2 = drain_tx(&mut server, now);
+                        deliver(&mut client, now, &p2);
+                        let mut sink = [0u8; 4096];
+                        for &(cid, sid, _) in &pairs {
+                            while client.read(cid, &mut sink).unwrap_or(0) > 0 {}
+                            while server.read(sid, &mut sink).unwrap_or(0) > 0 {}
+                        }
+                        let p3 = drain_tx(&mut client, now);
+                        deliver(&mut server, now, &p3);
+                        let p4 = drain_tx(&mut server, now);
+                        deliver(&mut client, now, &p4);
+                    }
+                    9 => {
+                        // Local or peer abort (RST) + release.
+                        if pairs.len() > 2 {
+                            let idx = (rng() >> 16) as usize % pairs.len();
+                            let (cid, sid, port) = pairs.swap_remove(idx);
+                            if (rng() & 1) == 0 {
+                                let _ = client.abort(cid);
+                                let p1 = drain_tx(&mut client, now);
+                                deliver(&mut server, now, &p1);
+                            } else {
+                                let _ = server.abort(sid);
+                                let p2 = drain_tx(&mut server, now);
+                                deliver(&mut client, now, &p2);
+                            }
+                            let _ = client.release(cid);
+                            let _ = server.release(sid);
+                            reused_ports.push(port);
+                        }
+                    }
+                    10 => {
+                        // Graceful FIN exchange into TIME-WAIT + release.
+                        if pairs.len() > 2 {
+                            let idx = (rng() >> 16) as usize % pairs.len();
+                            let (cid, sid, port) = pairs.swap_remove(idx);
+                            let _ = client.close(cid);
+                            let _ = server.close(sid);
+                            for _ in 0..4 {
+                                let p1 = drain_tx(&mut client, now);
+                                deliver(&mut server, now, &p1);
+                                let p2 = drain_tx(&mut server, now);
+                                deliver(&mut client, now, &p2);
+                                now += 100;
+                            }
+                            let _ = client.release(cid);
+                            let _ = server.release(sid);
+                            reused_ports.push(port);
+                        }
+                    }
+                    11 => {
+                        // Advance past TIME-WAIT to reclaim expired records.
+                        now += 250_000;
+                        let _ = client.on_timeout(now, 64);
+                        let _ = server.on_timeout(now, 64);
+                    }
+                    _ => {
+                        // Open a new connection (reusing a TIME-WAIT/closed port when available).
+                        if pairs.len() < 8 {
+                            let port = reused_ports.pop().unwrap_or_else(|| {
+                                let p = next_port;
+                                next_port = next_port.wrapping_add(1).max(20_000);
+                                p
+                            });
+                            if let Some(pair) =
+                                try_open_pair(&mut client, &mut server, port, &mut now)
+                            {
+                                pairs.push(pair);
+                            }
+                        }
+                    }
+                }
+
+                assert_budget_balance(&client, &alloc::format!("p{phase}_step{step}_client"));
+                assert_budget_balance(&server, &alloc::format!("p{phase}_step{step}_server"));
+            }
+
+            if phase == 0 {
+                // Abort/release every remaining connection, expire TIME-WAIT, and assert zero live chunks and zero budget.
+                for (cid, sid, _) in pairs.drain(..) {
+                    let _ = client.abort(cid);
+                    let _ = server.abort(sid);
+                }
+                let p1 = drain_tx(&mut client, now);
+                deliver(&mut server, now, &p1);
+                let p2 = drain_tx(&mut server, now);
+                deliver(&mut client, now, &p2);
+                for slot in 0..client.slots.len() {
+                    if client.slots[slot].is_some() {
+                        let id = client.id(slot);
+                        let _ = client.release(id);
+                    }
+                }
+                for slot in 0..server.slots.len() {
+                    if server.slots[slot].is_some() {
+                        let id = server.id(slot);
+                        let _ = server.release(id);
+                    }
+                }
+                now += 1_000_000;
+                let _ = client.on_timeout(now, 64);
+                let _ = server.on_timeout(now, 64);
+                let _ = drain_tx(&mut client, now);
+                let _ = drain_tx(&mut server, now);
+                now += 1_000_000;
+                let _ = client.on_timeout(now, 64);
+                let _ = server.on_timeout(now, 64);
+
+                assert_eq!(client.tx_pool.live(), 0, "phase 0 client leaked TxPool chunks");
+                assert_eq!(server.tx_pool.live(), 0, "phase 0 server leaked TxPool chunks");
+                assert_eq!(client.tx_pool_bytes(), 0);
+                assert_eq!(server.tx_pool_bytes(), 0);
+                assert_eq!(client.buffer_bytes(), 0);
+                assert_eq!(server.buffer_bytes(), 0);
+                assert_eq!(shared_leases_live.load(Ordering::SeqCst), 0);
+            } else {
+                // Phase 1: deliberately drop both Endpoints mid-flight while chunks & shared payloads are queued.
+                // Endpoint::drop + TxPool::drop + Connection::drop assert live() == 0 and no leaked ChunkRefs.
+                drop(client);
+                drop(server);
+                assert_eq!(
+                    shared_leases_live.load(Ordering::SeqCst),
+                    0,
+                    "phase 1 Endpoint::drop leaked shared Payload leases"
+                );
+            }
         }
     }
 }
