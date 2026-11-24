@@ -36,4 +36,4 @@ pub use host::{Eal, Flow, HostedQueue, Port, PortConfig, QueueHandle, Rss, RssAl
 #[cfg(feature = "native")]
 mod native;
 #[cfg(feature = "native")]
-pub use native::{Dpdk, DpdkBuffer, MAX_PACKET_LEN, RxTimestampStatus};
+pub use native::{DEFAULT_TX_COPYBREAK, Dpdk, DpdkBuffer, MAX_PACKET_LEN, RxTimestampStatus};

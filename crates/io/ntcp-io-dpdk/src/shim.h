@@ -43,6 +43,7 @@ int ntcp_dpdk_receive_meta(void *packet, const void *pool, int timestamp_offset,
                            struct ntcp_rx_meta *out);
 void ntcp_dpdk_pool_geometry(const void *pool, uint32_t *element, uint32_t *cache,
                              uint32_t *size);
+uint16_t ntcp_dpdk_pool_room(const void *pool);
 int ntcp_dpdk_tx_checksum_check(uint16_t port, uint16_t queue);
 int ntcp_dpdk_transmit(uint16_t port, uint16_t queue, void *pool,
                        const uint8_t *packet, size_t length, int timestamp_offset,
@@ -69,6 +70,57 @@ int ntcp_dpdk_shared_transmit(uint16_t port, uint16_t queue, void *pool,
     const uint8_t *header, uint16_t header_length,
     const struct ntcp_shared_segment *segments, uint16_t count,
     ntcp_release_fn release);
+
+typedef void (*ntcp_chunk_free_fn)(void *chunk, void *recycler);
+void *ntcp_dpdk_chunk_alloc(size_t capacity, void *recycler,
+                            ntcp_chunk_free_fn recycle_cb, uint8_t **data_out);
+void ntcp_dpdk_chunk_reset(void *chunk, void *recycler, uint8_t **data_out);
+void ntcp_dpdk_chunk_release(void *chunk);
+void ntcp_dpdk_chunk_free(void *chunk);
+uint16_t ntcp_dpdk_chunk_refcnt(const void *chunk);
+
+struct ntcp_tx_offload {
+    int timestamp_offset;
+    uint64_t timestamp_flag;
+    uint64_t timestamp;
+    uint16_t l3;
+    uint16_t l4;
+    uint16_t mss;
+};
+
+enum {
+    NTCP_EXT_CHUNK = 0,
+    NTCP_EXT_SHARED = 1,
+};
+
+struct ntcp_ext_part {
+    uint8_t kind;
+    uint16_t length;
+    uint32_t offset;
+    void *handle;
+    const void *address;
+    uint64_t iova;
+};
+
+struct ntcp_copy_part {
+    const uint8_t *ptr;
+    size_t length;
+};
+
+// Takes every NTCP_EXT_SHARED lease, including on rejection or allocation
+// failure. NTCP_EXT_CHUNK entries bump the chunk's embedded extbuf refcnt
+// without per-packet heap allocation.
+int ntcp_dpdk_packet_transmit_ext(uint16_t port, uint16_t queue, void *pool,
+    const uint8_t *header, uint16_t header_length,
+    const struct ntcp_ext_part *parts, uint16_t count,
+    ntcp_release_fn shared_release,
+    const struct ntcp_tx_offload *offload);
+
+int ntcp_dpdk_packet_transmit_copy(uint16_t port, uint16_t queue, void *pool,
+    const uint8_t *header, size_t header_length,
+    const struct ntcp_copy_part *parts, size_t count,
+    const struct ntcp_tx_offload *offload,
+    uint16_t max_descriptors);
 
 // Host setup: owns EAL, ports, pools and flows (see host.rs for ordering).
 int ntcp_dpdk_eal_init(int argc, char **argv);

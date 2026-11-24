@@ -18,6 +18,37 @@ unsafe extern "C" {
     fn ntcp_test_inject(frame: *const u8, length: u32) -> i32;
     fn ntcp_test_l4_checksum(kind: u32);
     fn ntcp_test_checksummed() -> u32;
+    fn ntcp_test_tx_dequeue(
+        info: *mut TestTxInfo,
+        segs: *mut TestTxSeg,
+        seg_cap: u32,
+    ) -> *mut c_void;
+    fn ntcp_test_tx_read(mbuf: *const c_void, out: *mut u8, cap: u32) -> u32;
+    fn ntcp_test_tx_verify_tso(mbuf: *mut c_void, l3: u32, l4: u32, mss: u32, length: u32);
+    fn ntcp_test_tx_verify_checksum(mbuf: *const c_void, out: *mut u8, cap: u32);
+    fn ntcp_test_tx_free(mbuf: *mut c_void);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TestTxSeg {
+    data: *const c_void,
+    len: u16,
+    external: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TestTxInfo {
+    pkt_len: u32,
+    nb_segs: u16,
+    l2_len: u16,
+    l3_len: u16,
+    l4_len: u16,
+    tso_segsz: u16,
+    ol_flags: u64,
+    timestamp: u64,
+    has_timestamp: i32,
 }
 
 // The device's RX TCP checksum verdict: reported only once the queue opted
@@ -358,6 +389,7 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         assert_eq!(io.receive(&mut [0; 64]).unwrap(), Some(64));
         assert_eq!(ntcp_test_available(), 1023);
         io.tx_scheduling = None;
+        chunk_and_transmit_packet_ring_test(&mut io);
         segmented_network(io);
         assert_eq!(ntcp_test_available(), 1023);
         for offload in [true, false] {
@@ -831,4 +863,769 @@ unsafe fn pool_exhausted_network(io: Dpdk) {
         while unsafe { ntcp_test_take(frame.as_mut_ptr(), frame.len() as u32, &mut mss) } != 0 {}
     }
     drop(a);
+}
+
+fn build_tcp_header(v6: bool, l4: usize, payload_len: usize, for_tso: bool) -> Vec<u8> {
+    let l3 = if v6 { 40 } else { 20 };
+    let mut hdr = vec![0u8; 14 + l3 + l4];
+    hdr[12..14].copy_from_slice(&(if v6 { 0x86ddu16 } else { 0x0800 }).to_be_bytes());
+    if v6 {
+        hdr[14] = 0x60;
+        hdr[20] = 6;
+        hdr[18..20].copy_from_slice(&((l4 + payload_len) as u16).to_be_bytes());
+        hdr[22..38].copy_from_slice(&[0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        hdr[38..54].copy_from_slice(&[0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    } else {
+        hdr[14] = 0x45;
+        hdr[23] = 6;
+        hdr[16..18].copy_from_slice(&((20 + l4 + payload_len) as u16).to_be_bytes());
+        hdr[26..30].copy_from_slice(&[10, 0, 0, 1]);
+        hdr[30..34].copy_from_slice(&[10, 0, 0, 2]);
+    }
+    let tcp = 14 + l3;
+    hdr[tcp..tcp + 2].copy_from_slice(&12345u16.to_be_bytes());
+    hdr[tcp + 2..tcp + 4].copy_from_slice(&443u16.to_be_bytes());
+    hdr[tcp + 12] = ((l4 / 4) as u8) << 4;
+    hdr[tcp + 13] = 0x10; // ACK
+    if l4 > 20 {
+        hdr[tcp + 20..tcp + l4].fill(1); // NOP options
+    }
+    if !for_tso {
+        // Compute RFC 1071 pseudo-header sum (matching rte_ipv4/ipv6_phdr_cksum).
+        let mut sum: u32 = 0;
+        if v6 {
+            for &pair in hdr[22..54].as_chunks::<2>().0 {
+                sum += u32::from(u16::from_be_bytes(pair));
+            }
+            sum += (l4 + payload_len) as u32;
+            sum += 6;
+        } else {
+            for &pair in hdr[26..34].as_chunks::<2>().0 {
+                sum += u32::from(u16::from_be_bytes(pair));
+            }
+            sum += 6;
+            sum += (l4 + payload_len) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        hdr[tcp + 16..tcp + 18].copy_from_slice(&(sum as u16).to_be_bytes());
+    }
+    hdr
+}
+
+unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
+    use ntcp_io::{ChunkSlice, Payload, PayloadSlice};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    // 1. Default copybreak & tx_chunk_source fallback when shared_limit is None.
+    assert_eq!(io.tx_copybreak(), DEFAULT_TX_COPYBREAK);
+    assert!(io.shared_limit.is_none());
+    {
+        let mut heap_src = io.tx_chunk_source();
+        let heap_chunk = heap_src.allocate().unwrap();
+        assert!(!core::ptr::eq(
+            heap_chunk.vtable(),
+            &chunk::DPDK_CHUNK_VTABLE
+        ));
+    }
+
+    // 2. DpdkChunkSource lifecycle, alignment, bounded recycler, and drop with live chunks.
+    {
+        let mut src = chunk::DpdkChunkSource::new(chunk::DEFAULT_DPDK_CHUNK_SIZE);
+        assert_eq!(src.chunk_size(), 16 * 1024);
+        assert_eq!(src.cached_count(), 0);
+        let mut c1 = src.allocate().unwrap();
+        assert!(core::ptr::eq(c1.vtable(), &chunk::DPDK_CHUNK_VTABLE));
+        assert_eq!(c1.as_ptr() as usize % 64, 0);
+        assert_eq!(chunk::chunk_refcnt(&c1), 1);
+        assert_eq!(c1.append(b"hello dpdk chunk"), 16);
+        let s = ChunkSlice::new(&c1, 6..10).unwrap();
+        assert_eq!(s.bytes(), b"dpdk");
+        let first_ptr = c1.as_ptr();
+        drop(c1);
+        assert_eq!(src.cached_count(), 1);
+        // Reuses cached chunk without hitting rte_malloc again.
+        let c2 = src.allocate().unwrap();
+        assert_eq!(c2.as_ptr(), first_ptr);
+        assert_eq!(src.cached_count(), 0);
+        assert_eq!(chunk::chunk_refcnt(&c2), 1);
+        drop(c2);
+        assert_eq!(src.cached_count(), 1);
+
+        // Recycler is bounded at CHUNK_RECYCLER_CAP; extras are rte_free'd cleanly.
+        let mut batch = Vec::new();
+        for _ in 0..(chunk::CHUNK_RECYCLER_CAP + 4) {
+            batch.push(src.allocate().unwrap());
+        }
+        assert_eq!(src.cached_count(), 0);
+        drop(batch);
+        assert_eq!(src.cached_count(), chunk::CHUNK_RECYCLER_CAP);
+
+        // Dropping source while a chunk is still live keeps the chunk valid;
+        // dropping the chunk later (on another thread) frees it cleanly.
+        let mut survivor = src.allocate().unwrap();
+        survivor.append(&[0xab; 128]);
+        drop(src);
+        assert_eq!(survivor.bytes(0..128), &[0xab; 128]);
+        std::thread::spawn(move || {
+            assert_eq!(survivor.bytes(0..128), &[0xab; 128]);
+            drop(survivor);
+        })
+        .join()
+        .unwrap();
+    }
+
+    // Inject multi-seg limit in private fixture to exercise extbuf TX path.
+    io.shared_limit = Some(8);
+    {
+        let mut dpdk_src = io.tx_chunk_source();
+        let dpdk_chunk = dpdk_src.allocate().unwrap();
+        assert!(core::ptr::eq(
+            dpdk_chunk.vtable(),
+            &chunk::DPDK_CHUNK_VTABLE
+        ));
+        assert_eq!(dpdk_chunk.capacity(), 16 * 1024);
+    }
+
+    // 3. Two-level refcount test: drop TxChunk while NIC mbuf still holds extbuf!
+    {
+        let mut src = chunk::DpdkChunkSource::new(chunk::DEFAULT_DPDK_CHUNK_SIZE);
+        let mut c = src.allocate().unwrap();
+        let payload_bytes: Vec<u8> = (0..700).map(|i| ((i * 31) % 251) as u8).collect();
+        assert_eq!(c.append(&payload_bytes), 700);
+        let chunk_base = c.as_ptr();
+        let header = [0x42u8; 54];
+        let parts = [TxPart::Chunk(ChunkSlice::new(&c, 64..700).unwrap())];
+        let pkt = TxPacket {
+            header: &header,
+            payload: &parts,
+        };
+        assert_eq!(
+            io.transmit_packet(&pkt, TransmitRequest::default()).unwrap(),
+            TxOutcome::Submitted
+        );
+        // Owner ref (1) + attached extbuf mbuf (1) = 2.
+        assert_eq!(chunk::chunk_refcnt(&c), 2);
+        let mut info = TestTxInfo::default();
+        let mut segs = [TestTxSeg::default(); 8];
+        let mbuf = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert!(!mbuf.is_null());
+        assert_eq!(info.nb_segs, 2);
+        assert_eq!(info.pkt_len, 54 + 636);
+        assert_eq!(segs[0].len, 54);
+        assert_eq!(segs[0].external, 0);
+        assert_eq!(segs[1].len, 636);
+        assert_eq!(segs[1].external, 1);
+        assert_eq!(segs[1].data, unsafe { chunk_base.add(64) }.cast());
+
+        // Drop TxChunk while the mbuf is still held (simulating in-flight DMA).
+        drop(c);
+        assert_eq!(src.cached_count(), 0); // Must stay pinned until mbuf frees!
+        let mut wire = vec![0u8; info.pkt_len as usize];
+        assert_eq!(
+            unsafe { ntcp_test_tx_read(mbuf, wire.as_mut_ptr(), wire.len() as u32) },
+            info.pkt_len
+        );
+        assert_eq!(&wire[..54], &header);
+        assert_eq!(&wire[54..], &payload_bytes[64..700]);
+
+        // Freeing the mbuf drops refcnt 1 -> 0 and recycles the chunk!
+        unsafe { ntcp_test_tx_free(mbuf) };
+        assert_eq!(src.cached_count(), 1);
+        let reused = src.allocate().unwrap();
+        assert_eq!(reused.as_ptr(), chunk_base);
+        assert_eq!(chunk::chunk_refcnt(&reused), 1);
+
+        // Also drop BOTH source AND TxChunk while mbuf is held; freeing mbuf
+        // later must rte_free cleanly without UAF.
+        let mut c2 = reused;
+        c2.append(&payload_bytes);
+        let parts2 = [TxPart::Chunk(ChunkSlice::new(&c2, 0..600).unwrap())];
+        let pkt2 = TxPacket {
+            header: &header,
+            payload: &parts2,
+        };
+        assert_eq!(
+            io.transmit_packet(&pkt2, TransmitRequest::default()).unwrap(),
+            TxOutcome::Submitted
+        );
+        let mbuf2 = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert!(!mbuf2.is_null());
+        drop(c2);
+        drop(src);
+        let mut wire2 = vec![0u8; info.pkt_len as usize];
+        assert_eq!(
+            unsafe { ntcp_test_tx_read(mbuf2, wire2.as_mut_ptr(), wire2.len() as u32) },
+            info.pkt_len
+        );
+        assert_eq!(&wire2[54..], &payload_bytes[..600]);
+        unsafe { ntcp_test_tx_free(mbuf2) };
+        assert_eq!(unsafe { ntcp_test_available() }, 1023);
+    }
+
+    // 4. D1 configurable TX copybreak & I9 adjacent chunk merging.
+    {
+        let mut src = chunk::DpdkChunkSource::new(chunk::DEFAULT_DPDK_CHUNK_SIZE);
+        let mut c = src.allocate().unwrap();
+        let data: Vec<u8> = (0..1200).map(|i| (i % 239) as u8).collect();
+        c.append(&data);
+        let header = [0x11u8; 54];
+
+        // Small payload <= pool_room - 54 (64 bytes <= default copybreak 512):
+        // copies into 1 direct mbuf (no extbuf).
+        let small_parts = [TxPart::Chunk(ChunkSlice::new(&c, 0..64).unwrap())];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &header,
+                    payload: &small_parts,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(chunk::chunk_refcnt(&c), 1);
+        let mut info = TestTxInfo::default();
+        let mut segs = [TestTxSeg::default(); 8];
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.nb_segs, 1);
+        assert_eq!(segs[0].external, 0);
+        assert_eq!(info.pkt_len, 54 + 64);
+        let mut wire = vec![0u8; info.pkt_len as usize];
+        unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), wire.len() as u32) };
+        assert_eq!(&wire[..54], &header);
+        assert_eq!(&wire[54..], &data[..64]);
+        unsafe { ntcp_test_tx_free(m) };
+
+        // Exact boundary payload == DEFAULT_TX_COPYBREAK (512): still copy path!
+        let at_break = [TxPart::Chunk(ChunkSlice::new(&c, 0..512).unwrap())];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &header,
+                    payload: &at_break,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(chunk::chunk_refcnt(&c), 1);
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.pkt_len, 54 + 512);
+        for seg in &segs[..info.nb_segs as usize] {
+            assert_eq!(seg.external, 0);
+        }
+        unsafe { ntcp_test_tx_free(m) };
+
+        // Just above copybreak (513): extbuf zero-copy path!
+        let over_break = [TxPart::Chunk(ChunkSlice::new(&c, 0..513).unwrap())];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &header,
+                    payload: &over_break,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(chunk::chunk_refcnt(&c), 2);
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.nb_segs, 2);
+        assert_eq!(segs[1].external, 1);
+        assert_eq!(segs[1].data, c.as_ptr().cast());
+        unsafe { ntcp_test_tx_free(m) };
+        assert_eq!(chunk::chunk_refcnt(&c), 1);
+
+        // Raising copybreak to 1024 moves 600-byte payload back to copy path.
+        io.set_tx_copybreak(1024);
+        assert_eq!(io.tx_copybreak(), 1024);
+        let mid = [TxPart::Chunk(ChunkSlice::new(&c, 0..600).unwrap())];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &header,
+                    payload: &mid,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(chunk::chunk_refcnt(&c), 1);
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        for seg in &segs[..info.nb_segs as usize] {
+            assert_eq!(seg.external, 0);
+        }
+        unsafe { ntcp_test_tx_free(m) };
+
+        // Lowering copybreak to 0 sends even short (<60) frames via extbuf + pad mbuf.
+        io.set_tx_copybreak(0);
+        let short_hdr = [0x22u8; 34];
+        let short_part = [TxPart::Chunk(ChunkSlice::new(&c, 10..20).unwrap())];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &short_hdr,
+                    payload: &short_part,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.nb_segs, 3); // head (34) + ext (10) + zero pad (16) = 60
+        assert_eq!(info.pkt_len, 60);
+        assert_eq!(segs[1].external, 1);
+        assert_eq!(segs[1].len, 10);
+        assert_eq!(segs[2].external, 0);
+        assert_eq!(segs[2].len, 16);
+        let mut wire = vec![0u8; 60];
+        unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), 60) };
+        assert_eq!(&wire[..34], &short_hdr);
+        assert_eq!(&wire[34..44], &data[10..20]);
+        assert_eq!(&wire[44..60], &[0u8; 16]);
+        unsafe { ntcp_test_tx_free(m) };
+
+        // I9: adjacent ChunkSlices from the same chunk merge (skipping empty parts).
+        let merged_parts = [
+            TxPart::Chunk(ChunkSlice::new(&c, 0..300).unwrap()),
+            TxPart::Chunk(ChunkSlice::new(&c, 300..300).unwrap()),
+            TxPart::Chunk(ChunkSlice::new(&c, 300..700).unwrap()),
+            TxPart::Chunk(ChunkSlice::new(&c, 800..900).unwrap()),
+        ];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &header,
+                    payload: &merged_parts,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(chunk::chunk_refcnt(&c), 3); // owner + 2 extbufs (NOT 3!)
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.nb_segs, 3);
+        assert_eq!(segs[1].external, 1);
+        assert_eq!(segs[1].data, c.as_ptr().cast());
+        assert_eq!(segs[1].len, 700);
+        assert_eq!(segs[2].external, 1);
+        assert_eq!(segs[2].data, unsafe { c.as_ptr().add(800) }.cast());
+        assert_eq!(segs[2].len, 100);
+        unsafe { ntcp_test_tx_free(m) };
+        assert_eq!(chunk::chunk_refcnt(&c), 1);
+
+        // Mixed DPDK Chunk + DPDK Shared (with sub-slice & release callback).
+        let mut buf = unsafe { DpdkBuffer::allocate(2048) }.unwrap();
+        for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
+            *b = ((i * 7 + 3) % 251) as u8;
+        }
+        let buf_ptr = buf.as_ref().as_ptr();
+        let released = Arc::new(AtomicUsize::new(0));
+        let rel_clone = released.clone();
+        let sub_payload = buf
+            .freeze()
+            .slice(100..900)
+            .unwrap()
+            .with_release(move || {
+                rel_clone.fetch_add(1, Ordering::SeqCst);
+            });
+        let mixed = [
+            TxPart::Chunk(ChunkSlice::new(&c, 0..400).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&sub_payload, 50..350).unwrap()),
+        ];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &header,
+                    payload: &mixed,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        drop(sub_payload); // Lease still held by TX mbuf!
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.nb_segs, 3);
+        assert_eq!(segs[1].external, 1);
+        assert_eq!(segs[1].data, c.as_ptr().cast());
+        assert_eq!(segs[1].len, 400);
+        assert_eq!(segs[2].external, 1);
+        assert_eq!(segs[2].data, unsafe { buf_ptr.add(150) }.cast());
+        assert_eq!(segs[2].len, 300);
+        unsafe { ntcp_test_tx_free(m) };
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+
+        // Non-DPDK part falls back cleanly to copy-into-mbuf path.
+        let heap_payload = Payload::from_vec(vec![0x77; 200]);
+        let fallback_parts = [
+            TxPart::Chunk(ChunkSlice::new(&c, 0..100).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&heap_payload, 0..200).unwrap()),
+        ];
+        assert_eq!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &header,
+                    payload: &fallback_parts,
+                },
+                TransmitRequest::default()
+            )
+            .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(chunk::chunk_refcnt(&c), 1);
+        let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+        assert_eq!(info.pkt_len, 54 + 300);
+        for seg in &segs[..info.nb_segs as usize] {
+            assert_eq!(seg.external, 0);
+        }
+        let mut wire = vec![0u8; info.pkt_len as usize];
+        unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), wire.len() as u32) };
+        assert_eq!(&wire[54..154], &data[..100]);
+        assert_eq!(&wire[154..354], &[0x77; 200]);
+        unsafe { ntcp_test_tx_free(m) };
+
+        // NOMBUF on extbuf path: returns WouldBlock, bumps tx_nombuf, restores refcnt & releases leases.
+        let mut buf2 = unsafe { DpdkBuffer::allocate(1024) }.unwrap();
+        buf2.as_mut_slice().fill(0x5c);
+        let nombuf_rel = Arc::new(AtomicUsize::new(0));
+        let nombuf_rel_c = nombuf_rel.clone();
+        let p2 = buf2.freeze().with_release(move || {
+            nombuf_rel_c.fetch_add(1, Ordering::SeqCst);
+        });
+        let nombuf_parts = [
+            TxPart::Chunk(ChunkSlice::new(&c, 0..600).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&p2, 0..300).unwrap()),
+        ];
+        for leave in [0u32, 1, 2] {
+            let before = io.device_counters().tx_nombuf;
+            unsafe { ntcp_test_hold(leave) };
+            assert_eq!(
+                io.transmit_packet(
+                    &TxPacket {
+                        header: &header,
+                        payload: &nombuf_parts,
+                    },
+                    TransmitRequest::default()
+                )
+                .unwrap(),
+                TxOutcome::WouldBlock
+            );
+            assert_eq!(io.device_counters().tx_nombuf, before + 1);
+            assert_eq!(chunk::chunk_refcnt(&c), 1);
+            assert_eq!(unsafe { ntcp_test_available() }, leave);
+            unsafe { ntcp_test_release() };
+        }
+        drop(p2);
+        assert_eq!(nombuf_rel.load(Ordering::SeqCst), 1);
+
+        io.set_tx_copybreak(DEFAULT_TX_COPYBREAK);
+    }
+
+    // 5. I8 combination error matrix + TSO / TCP checksum offload / TX scheduling.
+    {
+        let mut src = chunk::DpdkChunkSource::new(chunk::DEFAULT_DPDK_CHUNK_SIZE);
+        let mut c = src.allocate().unwrap();
+        let body: Vec<u8> = (0..2048).map(|i| ((i * 13) % 251) as u8).collect();
+        c.append(&body);
+
+        let clock = ClockDescriptor {
+            domain: ClockDomain::Device(1),
+            unit: TimestampUnit::Nanoseconds,
+        };
+        let when = Some(TransmitTime { value: 999, clock });
+        let seg_req = Some(TcpSegmentationRequest {
+            segment_payload_len: 500,
+        });
+        let ts_req = Some(TxTimestampRequest {
+            cookie: 1,
+            software: true,
+            hardware: false,
+        });
+        let dummy_pkt = TxPacket {
+            header: &[0u8; 64],
+            payload: &[],
+        };
+        // Forbidden combinations (I8) all return Unsupported.
+        for req in [
+            TransmitRequest {
+                segmentation: seg_req,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation: seg_req,
+                timestamp: ts_req,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                timestamp: ts_req,
+                ..Default::default()
+            },
+            TransmitRequest {
+                timestamp: ts_req,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                io.transmit_packet(&dummy_pkt, req),
+                Err(TransmitError::Unsupported)
+            ));
+        }
+        // Empty and oversized packets return InvalidInput.
+        assert!(matches!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &[],
+                    payload: &[],
+                },
+                TransmitRequest::default()
+            ),
+            Err(TransmitError::InvalidInput)
+        ));
+        let huge = vec![0u8; MAX_PACKET_LEN + 1];
+        assert!(matches!(
+            io.transmit_packet(
+                &TxPacket {
+                    header: &huge,
+                    payload: &[],
+                },
+                TransmitRequest::default()
+            ),
+            Err(TransmitError::InvalidInput)
+        ));
+
+        // TSO over extbuf (> copybreak) and copy (<= copybreak), IPv4 and IPv6,
+        // both with and without tcp_checksum_offload: true.
+        assert!(matches!(
+            io.transmit_packet(
+                &dummy_pkt,
+                TransmitRequest {
+                    segmentation: seg_req,
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::Unsupported)
+        ));
+        io.tso = Some(TsoConfig {
+            mtu: 1500,
+            room: 128,
+            max_descriptors: 512,
+        });
+        for v6 in [false, true] {
+            let l3 = if v6 { 40u32 } else { 20 };
+            let l4 = 32usize;
+            for (payload_len, expect_ext, cksum_flag) in
+                [(1200usize, true, true), (400usize, false, false)]
+            {
+                let hdr = build_tcp_header(v6, l4, payload_len, true);
+                let parts = [
+                    TxPart::Chunk(ChunkSlice::new(&c, 0..payload_len / 2).unwrap()),
+                    TxPart::Chunk(ChunkSlice::new(&c, payload_len / 2..payload_len).unwrap()),
+                ];
+                let pkt = TxPacket {
+                    header: &hdr,
+                    payload: &parts,
+                };
+                assert_eq!(
+                    io.transmit_packet(
+                        &pkt,
+                        TransmitRequest {
+                            tcp_checksum_offload: cksum_flag,
+                            segmentation: Some(TcpSegmentationRequest {
+                                segment_payload_len: 300,
+                            }),
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap(),
+                    TxOutcome::Submitted
+                );
+                let mut info = TestTxInfo::default();
+                let mut segs = [TestTxSeg::default(); 8];
+                let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+                assert!(!m.is_null());
+                unsafe {
+                    ntcp_test_tx_verify_tso(
+                        m,
+                        l3,
+                        l4 as u32,
+                        300,
+                        (hdr.len() + payload_len) as u32,
+                    );
+                }
+                if expect_ext {
+                    // I9 merged the two adjacent halves into 1 extbuf!
+                    assert_eq!(info.nb_segs, 2);
+                    assert_eq!(segs[1].external, 1);
+                    assert_eq!(segs[1].data, c.as_ptr().cast());
+                    assert_eq!(segs[1].len, payload_len as u16);
+                } else {
+                    for seg in &segs[..info.nb_segs as usize] {
+                        assert_eq!(seg.external, 0);
+                    }
+                }
+                unsafe { ntcp_test_tx_free(m) };
+            }
+            // Truncated TSO header is rejected before submitting without copying payload.
+            let hdr = build_tcp_header(v6, l4, 1000, true);
+            let bad_parts = [TxPart::Chunk(ChunkSlice::new(&c, 0..1000).unwrap())];
+            assert!(matches!(
+                io.transmit_packet(
+                    &TxPacket {
+                        header: &hdr[..hdr.len() - 4],
+                        payload: &bad_parts,
+                    },
+                    TransmitRequest {
+                        segmentation: Some(TcpSegmentationRequest {
+                            segment_payload_len: 300,
+                        }),
+                        ..Default::default()
+                    }
+                ),
+                Err(TransmitError::InvalidInput)
+            ));
+        }
+        io.tso = None;
+
+        // TX TCP checksum offload on both extbuf (> copybreak) and copy (<= copybreak).
+        assert!(matches!(
+            io.transmit_packet(
+                &dummy_pkt,
+                TransmitRequest {
+                    tcp_checksum_offload: true,
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::Unsupported)
+        ));
+        io.tx_checksum = true;
+        for v6 in [false, true] {
+            for (payload_len, expect_ext) in [(700usize, true), (200usize, false)] {
+                let hdr = build_tcp_header(v6, 20, payload_len, false);
+                let parts = [TxPart::Chunk(ChunkSlice::new(&c, 0..payload_len).unwrap())];
+                assert_eq!(
+                    io.transmit_packet(
+                        &TxPacket {
+                            header: &hdr,
+                            payload: &parts,
+                        },
+                        TransmitRequest {
+                            tcp_checksum_offload: true,
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap(),
+                    TxOutcome::Submitted
+                );
+                let mut info = TestTxInfo::default();
+                let mut segs = [TestTxSeg::default(); 8];
+                let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+                assert!(!m.is_null());
+                if expect_ext {
+                    assert_eq!(info.nb_segs, 2);
+                    assert_eq!(segs[1].external, 1);
+                } else {
+                    for seg in &segs[..info.nb_segs as usize] {
+                        assert_eq!(seg.external, 0);
+                    }
+                }
+                let mut wire = vec![0u8; info.pkt_len as usize];
+                unsafe { ntcp_test_tx_verify_checksum(m, wire.as_mut_ptr(), wire.len() as u32) };
+                unsafe { ntcp_test_tx_free(m) };
+            }
+        }
+        io.tx_checksum = false;
+
+        // TX scheduling (`request.when`) on both extbuf and copy paths.
+        assert!(matches!(
+            io.transmit_packet(
+                &dummy_pkt,
+                TransmitRequest {
+                    when,
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::Unsupported)
+        ));
+        // TX timestamp dynfield/flag were already registered above.
+        let (mut ts_off, mut ts_flag) = (-1, 0);
+        assert_eq!(
+            unsafe { ntcp_dpdk_tx_timestamp_lookup(&mut ts_off, &mut ts_flag) },
+            0
+        );
+        io.tx_scheduling = Some(TimestampConfig {
+            clock,
+            offset: ts_off,
+            flag: ts_flag,
+        });
+        let wrong_clock = ClockDescriptor {
+            domain: ClockDomain::Device(99),
+            unit: TimestampUnit::Nanoseconds,
+        };
+        assert!(matches!(
+            io.transmit_packet(
+                &dummy_pkt,
+                TransmitRequest {
+                    when: Some(TransmitTime {
+                        value: 1,
+                        clock: wrong_clock,
+                    }),
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::InvalidInput)
+        ));
+        for (payload_len, expect_ext) in [(640usize, true), (64usize, false)] {
+            let hdr = [0x33u8; 54];
+            let parts = [TxPart::Chunk(ChunkSlice::new(&c, 0..payload_len).unwrap())];
+            assert_eq!(
+                io.transmit_packet(
+                    &TxPacket {
+                        header: &hdr,
+                        payload: &parts,
+                    },
+                    TransmitRequest {
+                        when: Some(TransmitTime {
+                            value: 0x1234_5678,
+                            clock,
+                        }),
+                        ..Default::default()
+                    }
+                )
+                .unwrap(),
+                TxOutcome::Submitted
+            );
+            let mut info = TestTxInfo::default();
+            let mut segs = [TestTxSeg::default(); 8];
+            let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
+            assert!(!m.is_null());
+            assert_eq!(info.has_timestamp, 1);
+            assert_eq!(info.timestamp, 0x1234_5678);
+            assert_eq!(info.nb_segs == 2 && segs[1].external == 1, expect_ext);
+            unsafe { ntcp_test_tx_free(m) };
+        }
+        io.tx_scheduling = None;
+    }
+
+    io.shared_limit = None;
+    assert_eq!(unsafe { ntcp_test_available() }, 1023);
 }

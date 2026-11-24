@@ -1,20 +1,29 @@
 use ntcp_io::{
-    ClockDescriptor, ClockDomain, DeviceCounters, PacketIo, PacketLayer, PacketTimestamp,
-    PacketTimestamps, ReceivedPacket, RxChecksum, RxFrame, RxFrameCount, RxFrameVtable,
-    TcpSegmentationCapabilities, TcpSegmentationError, TcpSegmentationRequest,
-    TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit, TransmitTime, TxOutcome,
-    TxSchedulingCapabilities, TxTimestampRequest,
+    ClockDescriptor, ClockDomain, DeviceCounters, HeapChunkSource, PacketIo, PacketLayer,
+    PacketTimestamp, PacketTimestamps, PayloadSlice, ReceivedPacket, RxChecksum, RxFrame,
+    RxFrameCount, RxFrameVtable, TcpSegmentationCapabilities, TcpSegmentationError,
+    TcpSegmentationRequest, TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit,
+    TransmitError, TransmitRequest, TransmitTime, TxChunk, TxChunkSource, TxOutcome, TxPacket,
+    TxPart, TxSchedulingCapabilities, TxTimestampRequest,
 };
 use std::{
     ffi::{CStr, c_char, c_void},
     io,
     marker::PhantomData,
+    mem::MaybeUninit,
     ptr::{self, NonNull},
     rc::Rc,
 };
 
 /// Maximum complete frame size accepted by the bounded copy shim.
 pub const MAX_PACKET_LEN: usize = 65_535;
+
+/// Default payload-length threshold at or below which `PacketIo::transmit_packet`
+/// copies payload bytes directly into the header mbuf instead of attaching
+/// external buffers (D1 copybreak).
+pub const DEFAULT_TX_COPYBREAK: usize = 512;
+
+const INLINE_PARTS: usize = 32;
 
 // rte_eth_rx_burst requires a count divisible by eight to support every PMD.
 // Use the smallest portable burst to bound prefetching for the one-packet API.
@@ -25,6 +34,8 @@ const NOMBUF: i32 = 2;
 // NTCP_DPDK_COPY: ntcp_dpdk_receive_meta leaves an mbuf to be copied.
 const COPY: i32 = 2;
 
+#[path = "chunk.rs"]
+mod chunk;
 #[path = "segmentation.rs"]
 mod segmentation;
 #[path = "shared.rs"]
@@ -54,6 +65,129 @@ struct RxMeta {
     timestamp_valid: i32,
     l4_status: i32,
     length: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TxOffload {
+    timestamp_offset: i32,
+    timestamp_flag: u64,
+    timestamp: u64,
+    l3: u16,
+    l4: u16,
+    mss: u16,
+}
+
+impl Default for TxOffload {
+    fn default() -> Self {
+        Self {
+            timestamp_offset: -1,
+            timestamp_flag: 0,
+            timestamp: 0,
+            l3: 0,
+            l4: 0,
+            mss: 0,
+        }
+    }
+}
+
+const EXT_CHUNK: u8 = 0;
+const EXT_SHARED: u8 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ExtPart {
+    kind: u8,
+    length: u16,
+    offset: u32,
+    handle: *mut c_void,
+    address: *const c_void,
+    iova: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CopyPart {
+    ptr: *const u8,
+    length: usize,
+}
+
+#[derive(Clone, Copy)]
+enum MergedPart<'a> {
+    Chunk {
+        chunk: &'a TxChunk,
+        offset: usize,
+        len: usize,
+    },
+    Shared(PayloadSlice<'a>),
+}
+
+impl<'a> MergedPart<'a> {
+    fn bytes(&self) -> &'a [u8] {
+        match *self {
+            Self::Chunk { chunk, offset, len } => chunk.bytes(offset..offset + len),
+            Self::Shared(slice) => slice.bytes(),
+        }
+    }
+}
+
+enum SmallBuf<T: Copy, const N: usize> {
+    Inline {
+        buf: [MaybeUninit<T>; N],
+        len: usize,
+    },
+    Heap(Vec<T>),
+}
+
+impl<T: Copy, const N: usize> SmallBuf<T, N> {
+    fn new() -> Self {
+        Self::Inline {
+            buf: [MaybeUninit::uninit(); N],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, value: T) {
+        match self {
+            Self::Inline { buf, len } if *len < N => {
+                buf[*len].write(value);
+                *len += 1;
+            }
+            Self::Inline { buf, len } => {
+                let mut vec = Vec::with_capacity((*len).saturating_mul(2).max(N + 1));
+                // SAFETY: `buf[..*len]` are initialized.
+                let slice = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<T>(), *len) };
+                vec.extend_from_slice(slice);
+                vec.push(value);
+                *self = Self::Heap(vec);
+            }
+            Self::Heap(vec) => vec.push(value),
+        }
+    }
+
+    fn as_slice(&self) -> &[T] {
+        match self {
+            Self::Inline { buf, len } => {
+                // SAFETY: `buf[..*len]` are initialized.
+                unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<T>(), *len) }
+            }
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        match self {
+            Self::Inline { buf, len } => {
+                // SAFETY: `buf[..*len]` are initialized.
+                unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<T>(), *len) }
+            }
+            Self::Heap(vec) => vec.as_mut_slice(),
+        }
+    }
+
+    fn last_mut(&mut self) -> Option<&mut T> {
+        self.as_mut_slice().last_mut()
+    }
 }
 
 unsafe extern "C" {
@@ -107,6 +241,29 @@ unsafe extern "C" {
         cache: *mut u32,
         size: *mut u32,
     );
+    fn ntcp_dpdk_pool_room(pool: *const c_void) -> u16;
+    fn ntcp_dpdk_packet_transmit_ext(
+        port: u16,
+        queue: u16,
+        pool: *mut c_void,
+        header: *const u8,
+        header_length: u16,
+        parts: *const ExtPart,
+        count: u16,
+        shared_release: unsafe extern "C" fn(*mut c_void),
+        offload: *const TxOffload,
+    ) -> i32;
+    fn ntcp_dpdk_packet_transmit_copy(
+        port: u16,
+        queue: u16,
+        pool: *mut c_void,
+        header: *const u8,
+        header_length: usize,
+        parts: *const CopyPart,
+        count: usize,
+        offload: *const TxOffload,
+        max_descriptors: u16,
+    ) -> i32;
     fn ntcp_dpdk_receive(
         packet: *mut c_void,
         out: *mut u8,
@@ -206,6 +363,11 @@ pub struct Dpdk {
     // What one mbuf keeps from the pool, a held frame's truesize: the
     // element with its mempool header and trailer.
     frame_truesize: u32,
+    // Tailroom of a freshly allocated direct mbuf from `self.pool`.
+    pool_room: u16,
+    // Payload-length threshold at or below which `transmit_packet` copies
+    // directly into the header mbuf instead of attaching extbufs (D1).
+    tx_copybreak: usize,
     // `set_rx_frame_budget`.
     rx_frame_budget: Option<usize>,
     _local: PhantomData<Rc<()>>,
@@ -250,18 +412,31 @@ pub(crate) unsafe fn tx_checksum_check(port: u16, queue: u16) -> io::Result<()> 
 
 // The network header length of an Ethernet frame of one TCP segment that
 // the device can checksum: IPv4 with any header length, or IPv6 whose
-// base header names TCP.
-fn tcp_frame_l3(packet: &[u8]) -> Option<u16> {
-    let ip = packet.get(14..)?;
+// base header names TCP. Validates against `header` and `total_len` without
+// copying payload bytes.
+fn tcp_frame_l3(header: &[u8], total_len: usize) -> Option<u16> {
+    let ip = header.get(14..)?;
     let l3 = match (
-        u16::from_be_bytes([packet[12], packet[13]]),
+        u16::from_be_bytes([header[12], header[13]]),
         ip.first()? >> 4,
     ) {
         (0x0800, 4) if *ip.get(9)? == 6 => u16::from(ip[0] & 15) * 4,
         (0x86dd, 6) if *ip.get(6)? == 6 => 40,
         _ => return None,
     };
-    (l3 >= 20 && ip.len() >= usize::from(l3) + 20).then_some(l3)
+    (l3 >= 20
+        && ip.len() >= usize::from(l3) + 20
+        && total_len >= 14 + usize::from(l3) + 20)
+        .then_some(l3)
+}
+
+fn map_transmit_shim_error(error: i32) -> TransmitError {
+    let error = io::Error::from_raw_os_error(-error);
+    match error.kind() {
+        io::ErrorKind::InvalidInput => TransmitError::InvalidInput,
+        io::ErrorKind::Unsupported => TransmitError::Unsupported,
+        _ => TransmitError::Other(error),
+    }
 }
 
 // The ethdev driver serving `port` (rte_eth_dev_info driver_name), or the
@@ -316,6 +491,8 @@ impl Dpdk {
         // SAFETY: the caller guarantees a live pktmbuf pool; outputs are
         // writable.
         let (element, _, _) = unsafe { pool_geometry(pool.as_ptr()) };
+        // SAFETY: the caller guarantees a live pktmbuf pool.
+        let pool_room = unsafe { ntcp_dpdk_pool_room(pool.as_ptr()) };
         Ok(Self {
             port,
             rx_queue,
@@ -336,9 +513,23 @@ impl Dpdk {
             frames_taken: 0,
             frames: NonNull::from(Box::leak(Box::new(RxFrameCount::new()))),
             frame_truesize: element,
+            pool_room,
+            tx_copybreak: DEFAULT_TX_COPYBREAK,
             rx_frame_budget: None,
             _local: PhantomData,
         })
+    }
+
+    /// Payload-length threshold at or below which `transmit_packet` copies
+    /// payload bytes into the header mbuf instead of attaching extbufs.
+    pub fn tx_copybreak(&self) -> usize {
+        self.tx_copybreak
+    }
+
+    /// Set the TX copybreak threshold in payload bytes (default:
+    /// [`DEFAULT_TX_COPYBREAK`]).
+    pub fn set_tx_copybreak(&mut self, bytes: usize) {
+        self.tx_copybreak = bytes;
     }
 
     /// The frame budget this adapter reports (`PacketIo::rx_frame_budget`):
@@ -918,10 +1109,233 @@ impl PacketIo for Dpdk {
                 "DPDK TX TCP checksum offload disabled",
             ));
         }
-        let l3 = tcp_frame_l3(packet).ok_or_else(|| {
+        let l3 = tcp_frame_l3(packet, packet.len()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "not an Ethernet TCP frame")
         })?;
         self.submit(packet, None, l3)
+    }
+
+    fn tx_chunk_source(&self) -> Box<dyn TxChunkSource> {
+        if self.shared_limit.is_some() {
+            Box::new(chunk::DpdkChunkSource::new(chunk::DEFAULT_DPDK_CHUNK_SIZE))
+        } else {
+            Box::new(HeapChunkSource::default())
+        }
+    }
+
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        let total_len = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+        let TransmitRequest {
+            tcp_checksum_offload,
+            segmentation,
+            timestamp,
+            when,
+        } = request;
+        if segmentation.is_some() && (timestamp.is_some() || when.is_some()) {
+            return Err(TransmitError::Unsupported);
+        }
+        if tcp_checksum_offload && (timestamp.is_some() || when.is_some()) {
+            return Err(TransmitError::Unsupported);
+        }
+        if timestamp.is_some() {
+            return Err(TransmitError::Unsupported);
+        }
+
+        let mut offload = TxOffload::default();
+        let mut max_descriptors = 0u16;
+
+        if let Some(seg) = segmentation {
+            let config = self.tso.ok_or(TransmitError::Unsupported)?;
+            if total_len == 0 || total_len > MAX_PACKET_LEN {
+                return Err(TransmitError::InvalidInput);
+            }
+            let caps = self.tcp_segmentation_capabilities().unwrap();
+            let (l3, l4) = segmentation::validate_header(
+                packet.header,
+                total_len,
+                seg.segment_payload_len,
+                caps,
+            )?;
+            if config.room < 14 + l3 + l4 {
+                return Err(TransmitError::Unsupported);
+            }
+            offload.l3 = l3;
+            offload.l4 = l4;
+            offload.mss = seg.segment_payload_len as u16;
+            max_descriptors = config.max_descriptors;
+        } else if let Some(when) = when {
+            let config = self.tx_scheduling.ok_or(TransmitError::Unsupported)?;
+            if when.clock != config.clock {
+                return Err(TransmitError::InvalidInput);
+            }
+            if total_len == 0 || total_len > MAX_PACKET_LEN {
+                return Err(TransmitError::InvalidInput);
+            }
+            offload.timestamp_offset = config.offset;
+            offload.timestamp_flag = config.flag;
+            offload.timestamp = when.value;
+        } else if tcp_checksum_offload {
+            if !self.tx_checksum {
+                return Err(TransmitError::Unsupported);
+            }
+            if total_len == 0 || total_len > MAX_PACKET_LEN {
+                return Err(TransmitError::InvalidInput);
+            }
+            let l3 =
+                tcp_frame_l3(packet.header, total_len).ok_or(TransmitError::InvalidInput)?;
+            offload.l3 = l3;
+        } else if total_len == 0 || total_len > MAX_PACKET_LEN {
+            return Err(TransmitError::InvalidInput);
+        }
+
+        // Skip zero-length parts and merge adjacent TxPart::Chunk slices from
+        // the same TxChunk with contiguous byte ranges (invariant I9).
+        let mut merged = SmallBuf::<MergedPart<'_>, INLINE_PARTS>::new();
+        for &part in packet.payload {
+            if part.is_empty() {
+                continue;
+            }
+            match part {
+                TxPart::Chunk(slice) => {
+                    if let Some(MergedPart::Chunk { chunk, offset, len }) = merged.last_mut()
+                        && core::ptr::eq(*chunk, slice.chunk())
+                        && *offset + *len == slice.offset()
+                    {
+                        *len += slice.len();
+                        continue;
+                    }
+                    merged.push(MergedPart::Chunk {
+                        chunk: slice.chunk(),
+                        offset: slice.offset(),
+                        len: slice.len(),
+                    });
+                }
+                TxPart::Shared(slice) => merged.push(MergedPart::Shared(slice)),
+            }
+        }
+
+        let payload_len = total_len - packet.header.len();
+        let merged_slice = merged.as_slice();
+        let payload_segs = merged_slice.len();
+        let pad_segs = usize::from(total_len < 60 && offload.mss == 0);
+        let total_segs = 1 + payload_segs + pad_segs;
+        let header_fits_head = !packet.header.is_empty()
+            && packet.header.len() <= usize::from(self.pool_room)
+            && (offload.l3 == 0 || packet.header.len() >= 14 + usize::from(offload.l3) + 20)
+            && (offload.mss == 0
+                || packet.header.len()
+                    >= 14 + usize::from(offload.l3) + usize::from(offload.l4));
+        let seg_limit_ok = self.shared_limit.is_some_and(|limit| {
+            total_segs <= usize::from(limit)
+                && (max_descriptors == 0 || total_segs <= usize::from(max_descriptors))
+        });
+        let all_dma_backed = payload_segs > 0
+            && merged_slice.iter().all(|part| match part {
+                MergedPart::Chunk { chunk, .. } => {
+                    core::ptr::eq(chunk.vtable(), &chunk::DPDK_CHUNK_VTABLE)
+                }
+                MergedPart::Shared(slice) => slice.payload().storage::<DpdkBuffer>().is_some(),
+            });
+
+        let result = if payload_len > self.tx_copybreak
+            && header_fits_head
+            && seg_limit_ok
+            && all_dma_backed
+        {
+            let mut ext_parts = SmallBuf::<ExtPart, INLINE_PARTS>::new();
+            for &part in merged_slice {
+                match part {
+                    MergedPart::Chunk { chunk, offset, len } => {
+                        ext_parts.push(ExtPart {
+                            kind: EXT_CHUNK,
+                            length: len as u16,
+                            offset: offset as u32,
+                            handle: chunk.context().cast(),
+                            address: ptr::null(),
+                            iova: 0,
+                        });
+                    }
+                    MergedPart::Shared(slice) => {
+                        let storage = slice.payload().storage::<DpdkBuffer>().unwrap();
+                        let base_offset = slice.payload().offset() + slice.range().start;
+                        debug_assert_eq!(
+                            slice.bytes().as_ptr(),
+                            storage.as_ref().as_ptr().wrapping_add(base_offset)
+                        );
+                        ext_parts.push(ExtPart {
+                            kind: EXT_SHARED,
+                            length: slice.len() as u16,
+                            offset: 0,
+                            handle: ptr::null_mut(),
+                            address: slice.bytes().as_ptr().cast(),
+                            iova: storage.iova + base_offset as u64,
+                        });
+                    }
+                }
+            }
+            // Populate Shared leases only after ext_parts storage is finalized,
+            // so C receives and owns every lease on all paths.
+            for (ext, part) in ext_parts.as_mut_slice().iter_mut().zip(merged_slice) {
+                if let MergedPart::Shared(slice) = part {
+                    ext.handle = Box::into_raw(Box::new(slice.to_payload())).cast();
+                }
+            }
+            let ext_slice = ext_parts.as_slice();
+            // SAFETY: live borrowed port/queue/pool; `ext_slice` entries point
+            // to live DPDK chunks (owner ref held across this call) or freshly
+            // boxed `Payload` leases over `DpdkBuffer` (all taken by C on every
+            // path).
+            unsafe {
+                ntcp_dpdk_packet_transmit_ext(
+                    self.port,
+                    self.tx_queue,
+                    self.pool.as_ptr(),
+                    packet.header.as_ptr(),
+                    packet.header.len() as u16,
+                    ext_slice.as_ptr(),
+                    ext_slice.len() as u16,
+                    shared::release,
+                    &offload,
+                )
+            }
+        } else {
+            let mut copy_parts = SmallBuf::<CopyPart, INLINE_PARTS>::new();
+            for part in merged_slice {
+                let bytes = part.bytes();
+                copy_parts.push(CopyPart {
+                    ptr: bytes.as_ptr(),
+                    length: bytes.len(),
+                });
+            }
+            let copy_slice = copy_parts.as_slice();
+            // SAFETY: live borrowed port/queue/pool; `packet.header` and every
+            // `copy_slice` entry are readable for the call and copied before
+            // return.
+            unsafe {
+                ntcp_dpdk_packet_transmit_copy(
+                    self.port,
+                    self.tx_queue,
+                    self.pool.as_ptr(),
+                    packet.header.as_ptr(),
+                    packet.header.len(),
+                    copy_slice.as_ptr(),
+                    copy_slice.len(),
+                    &offload,
+                    max_descriptors,
+                )
+            }
+        };
+
+        match result {
+            0 => Ok(TxOutcome::WouldBlock),
+            1 => Ok(TxOutcome::Submitted),
+            NOMBUF => Ok(self.pool_empty()),
+            error => Err(map_transmit_shim_error(error)),
+        }
     }
 }
 

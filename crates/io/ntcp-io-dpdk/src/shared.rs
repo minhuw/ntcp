@@ -30,7 +30,7 @@ unsafe extern "C" {
 pub struct DpdkBuffer {
     address: NonNull<u8>,
     length: usize,
-    iova: u64,
+    pub(super) iova: u64,
 }
 impl DpdkBuffer {
     /// # Safety
@@ -81,7 +81,7 @@ impl Drop for DpdkBuffer {
         unsafe { ntcp_dpdk_payload_free(self.address.as_ptr()) };
     }
 }
-unsafe extern "C" fn release(lease: *mut c_void) {
+pub(super) unsafe extern "C" fn release(lease: *mut c_void) {
     // SAFETY: shim takes each Box exactly once, either on failure or mbuf reclaim.
     // Payload release callbacks are required not to panic across this boundary.
     drop(unsafe { Box::from_raw(lease.cast::<Payload>()) });

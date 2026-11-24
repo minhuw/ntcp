@@ -12,9 +12,9 @@ use crate::native::{
 use ntcp_io::{
     ClockDescriptor, ClockDomain, DeviceCounters, OwnedPacket, PacketIo, PacketLayer, Payload,
     ReceivedPacket, RxFrame, TcpSegmentationCapabilities, TcpSegmentationError,
-    TcpSegmentationRequest, TimestampCapabilities, TimestampUnit, TransmitTime, TxOutcome,
-    TxSchedulingCapabilities, TxSchedulingError, TxTimestampCompletion, TxTimestampRequest,
-    ZeroCopyCapabilities,
+    TcpSegmentationRequest, TimestampCapabilities, TimestampUnit, TransmitError, TransmitRequest,
+    TransmitTime, TxChunkSource, TxOutcome, TxPacket, TxSchedulingCapabilities, TxSchedulingError,
+    TxTimestampCompletion, TxTimestampRequest, ZeroCopyCapabilities,
 };
 use std::{
     cell::Cell,
@@ -1203,6 +1203,7 @@ impl QueueHandle {
         // one mbuf (Port::start).
         let mut io =
             unsafe { Dpdk::from_borrowed(self.port.port, self.queue, self.queue, pool.as_ptr()) }?;
+        let _ = io.enable_zero_copy();
         if let Some(clock) = self.port.clock {
             io.enable_rx_timestamps(clock)?;
         }
@@ -1361,6 +1362,16 @@ impl HostedQueue {
     pub fn enable_zero_copy(&mut self) -> io::Result<()> {
         self.io.enable_zero_copy()
     }
+
+    /// See `Dpdk::tx_copybreak`.
+    pub fn tx_copybreak(&self) -> usize {
+        self.io.tx_copybreak()
+    }
+
+    /// See `Dpdk::set_tx_copybreak`.
+    pub fn set_tx_copybreak(&mut self, bytes: usize) {
+        self.io.set_tx_copybreak(bytes);
+    }
 }
 
 impl PacketIo for HostedQueue {
@@ -1464,6 +1475,16 @@ impl PacketIo for HostedQueue {
     }
     fn poll_tx_timestamp(&mut self) -> io::Result<Option<TxTimestampCompletion>> {
         self.io.poll_tx_timestamp()
+    }
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        self.io.transmit_packet(packet, request)
+    }
+    fn tx_chunk_source(&self) -> Box<dyn TxChunkSource> {
+        self.io.tx_chunk_source()
     }
 }
 

@@ -13,7 +13,24 @@ pub(crate) fn validate(
     mss: usize,
     caps: TcpSegmentationCapabilities,
 ) -> Result<(u16, u16), Error> {
-    if p.len() > caps.max_aggregate_len || p.len() < 54 || mss == 0 || mss > u16::MAX as usize {
+    validate_header(p, p.len(), mss, caps)
+}
+
+// Validate TSO against the contiguous L2+L3+L4 header prefix and total
+// aggregate length, without reading or gathering payload bytes.
+pub(crate) fn validate_header(
+    p: &[u8],
+    total_len: usize,
+    mss: usize,
+    caps: TcpSegmentationCapabilities,
+) -> Result<(u16, u16), Error> {
+    if total_len > caps.max_aggregate_len
+        || total_len < 54
+        || p.len() < 54
+        || p.len() > total_len
+        || mss == 0
+        || mss > u16::MAX as usize
+    {
         return Err(Error::InvalidInput);
     }
     let word = |i| u16::from_be_bytes([p[i], p[i + 1]]);
@@ -22,19 +39,19 @@ pub(crate) fn validate(
             if p[14] != 0x45 || p[23] != 6 || word(20) & !0x4000 != 0 || p[15] & 3 != 0 {
                 return Err(Error::Unsupported);
             }
-            if usize::from(word(16)) != p.len() - 14 || word(24) != 0 {
+            if usize::from(word(16)) != total_len - 14 || word(24) != 0 {
                 return Err(Error::InvalidInput);
             }
             20
         }
         0x86dd => {
-            if p.len() < 74 {
+            if total_len < 74 || p.len() < 74 {
                 return Err(Error::InvalidInput);
             }
             if p[14] >> 4 != 6 || p[20] != 6 || p[15] & 0x30 != 0 {
                 return Err(Error::Unsupported);
             }
-            if usize::from(word(18)) != p.len() - 54 {
+            if usize::from(word(18)) != total_len - 54 {
                 return Err(Error::InvalidInput);
             }
             40
@@ -43,7 +60,7 @@ pub(crate) fn validate(
     };
     let tcp = 14 + l3;
     let l4 = usize::from(p[tcp + 12] >> 4) * 4;
-    if l4 < 20 || tcp + l4 >= p.len() || word(tcp + 16) != 0 {
+    if l4 < 20 || tcp + l4 > p.len() || tcp + l4 >= total_len || word(tcp + 16) != 0 {
         return Err(Error::InvalidInput);
     }
     let flags = p[tcp + 13];
@@ -53,7 +70,7 @@ pub(crate) fn validate(
     }
     options(&p[tcp + 20..tcp + l4])?;
     let headers = tcp + l4;
-    let payload = p.len() - headers;
+    let payload = total_len - headers;
     let count = payload.div_ceil(mss);
     // Ethernet pads frames shorter than 60 bytes (excluding FCS). Account for
     // that too: especially small MSS must not evade the wire-work bound.
@@ -381,6 +398,42 @@ mod tests {
             for options in [[0, 19, 29, 1], [1, 4, 2, 0], [1, 1, 1, 1]] {
                 assert!(validate(&with_options(v6, &options, 30), 10, CAPS).is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn validate_header_checks_split_packet_without_payload_bytes() {
+        for v6 in [false, true] {
+            let l3 = if v6 { 40 } else { 20 };
+            let full = with_options(v6, &TIMESTAMPS, 4000);
+            let hdr_len = 14 + l3 + 20 + TIMESTAMPS.len();
+            let header_only = &full[..hdr_len];
+            // Validates purely against header + total_len (no payload copied).
+            assert_eq!(
+                validate_header(header_only, full.len(), 1400, CAPS).unwrap(),
+                (l3 as u16, (20 + TIMESTAMPS.len()) as u16)
+            );
+            // Truncated header (missing part of TCP options or base header) is rejected.
+            assert!(matches!(
+                validate_header(&header_only[..hdr_len - 1], full.len(), 1400, CAPS),
+                Err(Error::InvalidInput)
+            ));
+            // Header shorter than minimum IPv4/IPv6+TCP header is rejected.
+            assert!(matches!(
+                validate_header(&header_only[..53], full.len(), 1400, CAPS),
+                Err(Error::InvalidInput)
+            ));
+            // Header claiming zero payload (total_len == hdr_len) is rejected.
+            let empty_payload = with_options(v6, &TIMESTAMPS, 0);
+            assert!(matches!(
+                validate_header(&empty_payload, empty_payload.len(), 1400, CAPS),
+                Err(Error::InvalidInput)
+            ));
+            // Total length mismatch against IP length field is rejected.
+            assert!(matches!(
+                validate_header(header_only, full.len() + 1, 1400, CAPS),
+                Err(Error::InvalidInput)
+            ));
         }
     }
 }

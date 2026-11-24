@@ -384,7 +384,26 @@ fn mac_addresses(eal: &'static Eal) {
     assert_eq!(drawn[0] & 0b11, 0b10, "{drawn:02x?}");
     assert_eq!(port.mac_address().unwrap(), drawn);
 
-    let queue = port.take_queue(0).unwrap().attach().unwrap();
+    let mut queue = port.take_queue(0).unwrap().attach().unwrap();
+    assert_eq!(queue.tx_copybreak(), ntcp_io_dpdk::DEFAULT_TX_COPYBREAK);
+    queue.set_tx_copybreak(256);
+    assert_eq!(queue.tx_copybreak(), 256);
+    let mut chunk_source = queue.tx_chunk_source();
+    let mut chunk = chunk_source.allocate().unwrap();
+    assert_eq!(chunk.append(&[0x5a; 32]), 32);
+    let parts = [ntcp_io::TxPart::Chunk(
+        ntcp_io::ChunkSlice::new(&chunk, 0..32).unwrap(),
+    )];
+    let pkt = ntcp_io::TxPacket {
+        header: &[0x11; 34],
+        payload: &parts,
+    };
+    assert_eq!(
+        queue
+            .transmit_packet(&pkt, ntcp_io::TransmitRequest::default())
+            .unwrap(),
+        TxOutcome::Submitted
+    );
     assert_eq!(queue.mac_address().unwrap(), drawn);
     let chosen = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
     // SAFETY: EAL is initialized; the address has six octets.

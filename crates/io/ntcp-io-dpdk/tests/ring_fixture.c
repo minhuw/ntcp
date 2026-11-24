@@ -432,3 +432,106 @@ void ntcp_test_external(unsigned length) {
 unsigned ntcp_test_element(void) {
     return pool->header_size + pool->elt_size + pool->trailer_size;
 }
+
+// Stage 3b test helpers: inspect dequeued TX mbufs without freeing them
+// immediately so callers can drop TxChunk / DpdkChunkSource while the NIC's
+// mbuf still holds its extbuf refcount, verify bytes remain intact, then free.
+struct ntcp_test_tx_seg {
+    const void *data;
+    uint16_t len;
+    uint8_t external;
+};
+
+struct ntcp_test_tx_info {
+    uint32_t pkt_len;
+    uint16_t nb_segs;
+    uint16_t l2_len;
+    uint16_t l3_len;
+    uint16_t l4_len;
+    uint16_t tso_segsz;
+    uint64_t ol_flags;
+    uint64_t timestamp;
+    int has_timestamp;
+};
+
+void *ntcp_test_tx_dequeue(struct ntcp_test_tx_info *info,
+                           struct ntcp_test_tx_seg *segs,
+                           unsigned seg_cap) {
+    struct rte_mbuf *m;
+    if (rte_ring_dequeue(tx, (void **)&m) != 0) return NULL;
+    memset(info, 0, sizeof(*info));
+    info->pkt_len = m->pkt_len;
+    info->nb_segs = m->nb_segs;
+    info->l2_len = m->l2_len;
+    info->l3_len = m->l3_len;
+    info->l4_len = m->l4_len;
+    info->tso_segsz = m->tso_segsz;
+    info->ol_flags = m->ol_flags;
+    int ts_off = rte_mbuf_dynfield_lookup(RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, NULL);
+    int ts_bit = rte_mbuf_dynflag_lookup(RTE_MBUF_DYNFLAG_TX_TIMESTAMP_NAME, NULL);
+    if (ts_off >= 0 && ts_bit >= 0 && (m->ol_flags & (UINT64_C(1) << ts_bit))) {
+        info->has_timestamp = 1;
+        info->timestamp = *RTE_MBUF_DYNFIELD(m, ts_off, rte_mbuf_timestamp_t *);
+    }
+    unsigned idx = 0;
+    for (struct rte_mbuf *s = m; s; s = s->next) {
+        if (idx < seg_cap) {
+            segs[idx].data = rte_pktmbuf_mtod(s, const void *);
+            segs[idx].len = s->data_len;
+            segs[idx].external = (s->ol_flags & RTE_MBUF_F_EXTERNAL) ? 1 : 0;
+        }
+        ++idx;
+    }
+    assert(idx == m->nb_segs);
+    return m;
+}
+
+unsigned ntcp_test_tx_read(const void *mbuf, uint8_t *out, unsigned cap) {
+    const struct rte_mbuf *m = mbuf;
+    assert(m->pkt_len <= cap);
+    const void *bytes = rte_pktmbuf_read(m, 0, m->pkt_len, out);
+    if (bytes != out) memcpy(out, bytes, m->pkt_len);
+    return m->pkt_len;
+}
+
+void ntcp_test_tx_verify_tso(void *mbuf, unsigned l3, unsigned l4, unsigned mss,
+                             unsigned length) {
+    struct rte_mbuf *m = mbuf;
+    assert(m->pkt_len == length && m->l2_len == 14 && m->l3_len == l3);
+    assert(m->l4_len == l4 && m->tso_segsz == mss);
+    uint64_t expected = RTE_MBUF_F_TX_TCP_SEG | RTE_MBUF_F_TX_TCP_CKSUM |
+        (l3 == 20 ? RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM : RTE_MBUF_F_TX_IPV6);
+    assert(m->ol_flags == expected);
+    struct rte_tcp_hdr *tcp = rte_pktmbuf_mtod_offset(m, struct rte_tcp_hdr *, 14 + l3);
+    uint16_t seed;
+    if (l3 == 20) {
+        struct rte_ipv4_hdr ip = *rte_pktmbuf_mtod_offset(m, struct rte_ipv4_hdr *, 14);
+        assert(ip.hdr_checksum == 0);
+        ip.total_length = rte_cpu_to_be_16(20);
+        seed = rte_ipv4_phdr_cksum(&ip, 0);
+    } else {
+        struct rte_ipv6_hdr ip = *rte_pktmbuf_mtod_offset(m, struct rte_ipv6_hdr *, 14);
+        ip.payload_len = 0;
+        seed = rte_ipv6_phdr_cksum(&ip, 0);
+    }
+    assert(tcp->cksum == seed);
+    unsigned bytes = 0, segments = 0;
+    for (struct rte_mbuf *s = m; s; s = s->next) {
+        if (s != m) assert((s->ol_flags & ~RTE_MBUF_F_EXTERNAL) == 0);
+        bytes += s->data_len;
+        segments++;
+    }
+    assert(bytes == length && segments == m->nb_segs);
+}
+
+void ntcp_test_tx_verify_checksum(const void *mbuf, uint8_t *out, unsigned cap) {
+    const struct rte_mbuf *m = mbuf;
+    assert(m->pkt_len <= cap);
+    const void *bytes = rte_pktmbuf_read(m, 0, m->pkt_len, out);
+    if (bytes != out) memcpy(out, bytes, m->pkt_len);
+    complete_checksum(m, out);
+}
+
+void ntcp_test_tx_free(void *mbuf) {
+    rte_pktmbuf_free((struct rte_mbuf *)mbuf);
+}
