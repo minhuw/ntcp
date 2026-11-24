@@ -4,8 +4,8 @@ mod timestamp;
 mod vnet;
 use ntcp_io::linux::{received, transmitted};
 use ntcp_io::{
-    PacketIo, PacketLayer, ReceivedPacket, TimestampCapabilities, TxOutcome, TxTimestampCompletion,
-    TxTimestampRequest,
+    PacketIo, PacketLayer, ReceivedPacket, TimestampCapabilities, TransmitError, TransmitRequest,
+    TxOutcome, TxPacket, TxTimestampCompletion, TxTimestampRequest,
 };
 use std::{
     io,
@@ -236,7 +236,27 @@ impl AfPacket {
         packet: &[u8],
         request: Option<TxTimestampRequest>,
     ) -> io::Result<TxOutcome> {
-        let (mut control, length, prepared) = if let Some(request) = request {
+        self.send_controlled_packet(
+            &TxPacket {
+                header: packet,
+                payload: &[],
+            },
+            packet.len(),
+            request,
+        )
+    }
+
+    #[allow(clippy::unnecessary_cast)] // msghdr lengths differ on musl/glibc
+    fn send_controlled_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        total: usize,
+        request: Option<TxTimestampRequest>,
+    ) -> io::Result<TxOutcome> {
+        const STACK_IOVS: usize = 16;
+        // Linux UIO_MAXIOV / POSIX IOV_MAX (linux/uio.h).
+        const MAX_IOVS: usize = 1024;
+        let mut prepared = if let Some(request) = request {
             if !request.software && !request.hardware {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -251,28 +271,86 @@ impl AfPacket {
                 return Ok(TxOutcome::WouldBlock);
             };
             let (control, length) = Control::tx(request, id);
-            (control, length, Some((id, request)))
+            Some((control, length, id, request))
         } else {
-            (Control::new(), 0, None)
+            None
         };
-        let mut header = [0u8; vnet::LEN];
-        let prefix = if self.vnet_header { header.len() } else { 0 };
-        let mut vectors = [
-            libc::iovec {
-                iov_base: header.as_mut_ptr().cast(),
-                iov_len: prefix,
-            },
-            libc::iovec {
-                iov_base: packet.as_ptr().cast_mut().cast(),
-                iov_len: packet.len(),
-            },
-        ];
+        let mut vnet_header = [0u8; vnet::LEN];
+        let prefix = if self.vnet_header {
+            vnet_header.len()
+        } else {
+            0
+        };
+        let expected = total
+            .checked_add(prefix)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "packet length overflow"))?;
+
+        let mut stack = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; STACK_IOVS];
+        let mut len = 0usize;
+        let mut heap: Vec<libc::iovec> = Vec::new();
+        let mut push = |ptr: *mut libc::c_void, bytes_len: usize| {
+            if bytes_len == 0 {
+                return;
+            }
+            let iov = libc::iovec {
+                iov_base: ptr,
+                iov_len: bytes_len,
+            };
+            if !heap.is_empty() {
+                heap.push(iov);
+            } else if len < STACK_IOVS {
+                stack[len] = iov;
+                len += 1;
+            } else {
+                heap.reserve(STACK_IOVS + 1);
+                heap.extend_from_slice(&stack);
+                heap.push(iov);
+            }
+        };
+        if self.vnet_header {
+            push(vnet_header.as_mut_ptr().cast(), vnet_header.len());
+        }
+        push(
+            packet.header.as_ptr().cast_mut().cast(),
+            packet.header.len(),
+        );
+        for part in packet.payload {
+            let bytes = part.bytes();
+            push(bytes.as_ptr().cast_mut().cast(), bytes.len());
+        }
+
+        let mut fallback: Vec<u8> = Vec::new();
+        let iovs: &mut [libc::iovec] = if heap.len() > MAX_IOVS {
+            fallback.reserve_exact(expected);
+            if self.vnet_header {
+                fallback.extend_from_slice(&vnet_header);
+            }
+            fallback.extend_from_slice(packet.header);
+            for part in packet.payload {
+                fallback.extend_from_slice(part.bytes());
+            }
+            stack[0] = libc::iovec {
+                iov_base: fallback.as_mut_ptr().cast(),
+                iov_len: fallback.len(),
+            };
+            &mut stack[..1]
+        } else if heap.is_empty() {
+            &mut stack[..len]
+        } else {
+            &mut heap
+        };
+
         // SAFETY: pointers remain live through sendmsg; send does not mutate iov.
         let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        message.msg_iov = vectors.as_mut_ptr();
-        message.msg_iovlen = vectors.len() as _;
-        control.attach(&mut message);
-        message.msg_controllen = length as _;
+        message.msg_iov = iovs.as_mut_ptr();
+        message.msg_iovlen = iovs.len() as _;
+        if let Some((control, length, _, _)) = prepared.as_mut() {
+            control.attach(&mut message);
+            message.msg_controllen = *length as _;
+        }
         // SAFETY: message and its readable packet/control buffers are live.
         let count = unsafe {
             libc::sendmsg(
@@ -282,6 +360,7 @@ impl AfPacket {
             )
         };
         if count < 0
+            && prepared.is_some()
             && matches!(
                 io::Error::last_os_error().raw_os_error(),
                 Some(libc::EINVAL | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
@@ -289,9 +368,9 @@ impl AfPacket {
         {
             return Err(timestamp::unsupported());
         }
-        let outcome = transmitted(count, packet.len() + prefix)?;
+        let outcome = transmitted(count, expected)?;
         if outcome == TxOutcome::Submitted
-            && let Some((id, request)) = prepared
+            && let Some((_, _, id, request)) = prepared
         {
             self.timestamps.as_mut().unwrap().submitted(id, request);
         }
@@ -518,6 +597,38 @@ impl PacketIo for AfPacket {
             )
         };
         transmitted(count, packet.len())
+    }
+
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        let total = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+        let TransmitRequest {
+            tcp_checksum_offload,
+            segmentation,
+            timestamp,
+            when,
+        } = request;
+        if segmentation.is_some() || tcp_checksum_offload || when.is_some() {
+            return Err(TransmitError::Unsupported);
+        }
+        if self.vnet_header && total.checked_add(vnet::LEN).is_none() {
+            return Err(TransmitError::InvalidInput);
+        }
+        self.send_controlled_packet(packet, total, timestamp)
+            .map_err(|error| {
+                if timestamp.is_some() {
+                    match error.kind() {
+                        io::ErrorKind::Unsupported => TransmitError::Unsupported,
+                        io::ErrorKind::InvalidInput => TransmitError::InvalidInput,
+                        _ => TransmitError::Other(error),
+                    }
+                } else {
+                    TransmitError::Other(error)
+                }
+            })
     }
 }
 
@@ -761,5 +872,324 @@ pub(crate) mod tests {
         backpressure(&mut a, &mut b);
         drop(a);
         assert!(b.transmit(b"x").is_err()); // peer fd was closed
+    }
+
+    #[test]
+    fn transmit_packet_gathers_with_and_without_vnet_handles_backpressure_and_i8() {
+        use ntcp_io::{
+            ChunkSlice, ClockDescriptor, ClockDomain, Payload, PayloadSlice,
+            TcpSegmentationRequest, TimestampUnit, TransmitTime, TxChunk, TxPart,
+        };
+
+        let (a, b) = pair();
+        let mut a = AfPacket {
+            ifindex: 0,
+            fd: a,
+            timestamps: None,
+            packet_mark: 0,
+            vnet_header: false,
+        };
+        let mut b = AfPacket {
+            ifindex: 0,
+            fd: b,
+            timestamps: None,
+            packet_mark: 0,
+            vnet_header: false,
+        };
+
+        let mut chunk = TxChunk::heap(64);
+        chunk.append(b"XXchunk-bodyYY");
+        let shared = Payload::from_vec(b"ZZshared-tailWW".to_vec());
+        let parts = [
+            TxPart::Chunk(ChunkSlice::new(&chunk, 0..0).unwrap()),
+            TxPart::Chunk(ChunkSlice::new(&chunk, 2..12).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&shared, 4..4).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&shared, 2..13).unwrap()),
+        ];
+        let packet = TxPacket {
+            header: b"ETH:",
+            payload: &parts,
+        };
+
+        // Plain multi-part send (no vnet_header).
+        assert_eq!(
+            b.transmit_packet(&packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let mut out = [0u8; 64];
+        let n = a.receive(&mut out).unwrap().unwrap();
+        assert_eq!(&out[..n], b"ETH:chunk-bodyshared-tail");
+
+        // Zero-length packet without vnet_header.
+        let empty_packet = TxPacket {
+            header: &[],
+            payload: &[TxPart::Chunk(ChunkSlice::new(&chunk, 0..0).unwrap())],
+        };
+        assert_eq!(
+            b.transmit_packet(&empty_packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(a.receive(&mut out).unwrap(), Some(0));
+
+        // > 16 iovecs (heap spill path).
+        let many_storage = Payload::from_vec((0..20u8).collect());
+        let many_parts: Vec<TxPart<'_>> = (0..20)
+            .map(|i| TxPart::Shared(PayloadSlice::new(&many_storage, i..i + 1).unwrap()))
+            .collect();
+        let many_packet = TxPacket {
+            header: b"H",
+            payload: &many_parts,
+        };
+        assert_eq!(
+            b.transmit_packet(&many_packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let n = a.receive(&mut out).unwrap().unwrap();
+        let mut expected = vec![b'H'];
+        expected.extend(0..20u8);
+        assert_eq!(&out[..n], expected.as_slice());
+
+        // > UIO_MAXIOV (1024) iovecs (gather fallback path, with vnet_header).
+        b.vnet_header = true;
+        let huge_storage = Payload::from_vec((0..1025).map(|i| (i & 0xff) as u8).collect());
+        let huge_parts: Vec<TxPart<'_>> = (0..1025)
+            .map(|i| TxPart::Shared(PayloadSlice::new(&huge_storage, i..i + 1).unwrap()))
+            .collect();
+        let huge_packet = TxPacket {
+            header: b"!",
+            payload: &huge_parts,
+        };
+        assert_eq!(
+            b.transmit_packet(&huge_packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let mut huge_out = vec![0u8; vnet::LEN + 1026];
+        let n = a.receive(&mut huge_out).unwrap().unwrap();
+        assert_eq!(n, vnet::LEN + 1026);
+        assert_eq!(&huge_out[..vnet::LEN], &[0u8; vnet::LEN]);
+        assert_eq!(huge_out[vnet::LEN], b'!');
+        assert_eq!(&huge_out[vnet::LEN + 1..], huge_storage.as_slice());
+        b.vnet_header = false;
+
+        // With vnet_header enabled on sender: prepends zeroed vnet header in iov[0].
+        b.vnet_header = true;
+        assert_eq!(
+            b.transmit_packet(&packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let n = a.receive(&mut out).unwrap().unwrap();
+        assert_eq!(n, vnet::LEN + b"ETH:chunk-bodyshared-tail".len());
+        assert_eq!(&out[..vnet::LEN], &[0u8; vnet::LEN]);
+        assert_eq!(&out[vnet::LEN..n], b"ETH:chunk-bodyshared-tail");
+
+        // With vnet_header enabled on both sender and receiver: stripped cleanly.
+        a.vnet_header = true;
+        assert_eq!(
+            b.transmit_packet(&packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let n = a.receive(&mut out).unwrap().unwrap();
+        assert_eq!(&out[..n], b"ETH:chunk-bodyshared-tail");
+        a.vnet_header = false;
+        b.vnet_header = false;
+
+        // I8 unsupported combinations and timestamp validation submit nothing.
+        let when = Some(TransmitTime {
+            value: 100,
+            clock: ClockDescriptor {
+                domain: ClockDomain::Monotonic,
+                unit: TimestampUnit::Nanoseconds,
+            },
+        });
+        let segmentation = Some(TcpSegmentationRequest {
+            segment_payload_len: 10,
+        });
+        let timestamp = Some(TxTimestampRequest {
+            cookie: 7,
+            software: true,
+            hardware: false,
+        });
+        let empty_timestamp = Some(TxTimestampRequest {
+            cookie: 8,
+            software: false,
+            hardware: false,
+        });
+        for unsupported in [
+            TransmitRequest {
+                segmentation,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                timestamp: empty_timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                timestamp: empty_timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                when,
+                timestamp,
+                ..Default::default()
+            },
+            // Timestamp requested when timestamps not enabled on socket.
+            TransmitRequest {
+                timestamp,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                b.transmit_packet(&packet, unsupported),
+                Err(TransmitError::Unsupported)
+            ));
+        }
+        assert!(matches!(
+            b.transmit_packet(
+                &packet,
+                TransmitRequest {
+                    timestamp: empty_timestamp,
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::InvalidInput)
+        ));
+        assert_eq!(a.receive(&mut out).unwrap(), None);
+
+        // Timestamp capacity / unsupported source / duplicate cookie checks with State.
+        b.timestamps = Some(
+            State::new(TimestampConfig {
+                tx_software: true,
+                tx_completion_capacity: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        // Hardware timestamp requested on software-only config -> Unsupported.
+        assert!(matches!(
+            b.transmit_packet(
+                &packet,
+                TransmitRequest {
+                    timestamp: Some(TxTimestampRequest {
+                        cookie: 1,
+                        software: false,
+                        hardware: true,
+                    }),
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::Unsupported)
+        ));
+        // Reserve capacity with a pending entry -> duplicate cookie is InvalidInput,
+        // new cookie hits capacity WouldBlock without touching the socket.
+        let pending_req = TxTimestampRequest {
+            cookie: 10,
+            software: true,
+            hardware: false,
+        };
+        let id = b
+            .timestamps
+            .as_ref()
+            .unwrap()
+            .prepare(pending_req)
+            .unwrap()
+            .unwrap();
+        b.timestamps.as_mut().unwrap().submitted(id, pending_req);
+        assert!(matches!(
+            b.transmit_packet(
+                &packet,
+                TransmitRequest {
+                    timestamp: Some(pending_req),
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::InvalidInput)
+        ));
+        assert_eq!(
+            b.transmit_packet(
+                &packet,
+                TransmitRequest {
+                    timestamp: Some(TxTimestampRequest {
+                        cookie: 11,
+                        software: true,
+                        hardware: false,
+                    }),
+                    ..Default::default()
+                }
+            )
+            .unwrap(),
+            TxOutcome::WouldBlock
+        );
+        assert_eq!(a.receive(&mut out).unwrap(), None);
+        b.timestamps = None;
+
+        // Backpressure (WouldBlock) with multi-part TxPacket.
+        let mut rx_buf = [0u8; 1024];
+        let mut hit_would_block = false;
+        let fill_shared = Payload::from_vec(vec![0xA5u8; 768]);
+        let fill_parts = [TxPart::Shared(
+            PayloadSlice::new(&fill_shared, 0..768).unwrap(),
+        )];
+        for submitted in 0..10000usize {
+            let hdr = [submitted as u8; 256];
+            let pkt = TxPacket {
+                header: &hdr,
+                payload: &fill_parts,
+            };
+            if b.transmit_packet(&pkt, TransmitRequest::default()).unwrap() == TxOutcome::WouldBlock
+            {
+                hit_would_block = true;
+                for i in 0..submitted {
+                    assert_eq!(a.receive(&mut rx_buf).unwrap(), Some(1024));
+                    assert_eq!(&rx_buf[..256], &[i as u8; 256]);
+                    assert_eq!(&rx_buf[256..], &[0xA5u8; 768]);
+                }
+                assert_eq!(a.receive(&mut rx_buf).unwrap(), None);
+                assert_eq!(
+                    b.transmit_packet(&pkt, TransmitRequest::default()).unwrap(),
+                    TxOutcome::Submitted
+                );
+                assert_eq!(a.receive(&mut rx_buf).unwrap(), Some(1024));
+                assert_eq!(&rx_buf[..256], &[submitted as u8; 256]);
+                assert_eq!(&rx_buf[256..], &[0xA5u8; 768]);
+                break;
+            }
+        }
+        assert!(hit_would_block, "queue never filled");
     }
 }

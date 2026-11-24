@@ -11,7 +11,7 @@ pub use ethtool::{Rss, RssFields, RssFunction};
 
 use ntcp_io::{
     DeviceCounters, PacketIo, PacketLayer, ReceivedPacket, RxFrame, RxFrameCount, RxFrameVtable,
-    TxOutcome,
+    TransmitError, TransmitRequest, TxOutcome, TxPacket,
 };
 use std::{
     io,
@@ -779,10 +779,19 @@ impl AfXdp {
         }))
     }
     fn transmit_one(&mut self, packet: &[u8]) -> io::Result<TxOutcome> {
-        if packet.len() > self.max_packet_len().unwrap() {
+        self.transmit_parts(
+            &TxPacket {
+                header: packet,
+                payload: &[],
+            },
+            packet.len(),
+        )
+    }
+    fn transmit_parts(&mut self, packet: &TxPacket<'_>, total: usize) -> io::Result<TxOutcome> {
+        if total > self.max_packet_len().unwrap() {
             return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
         }
-        if packet.is_empty() {
+        if total == 0 {
             return Err(invalid("invalid transmit length"));
         }
         if !self.tx.has_space()? {
@@ -793,17 +802,27 @@ impl AfXdp {
         };
         let addr =
             u64::from(index) * u64::from(self.config.frame_size) + u64::from(self.data_offset());
-        // SAFETY: free frame is exclusively userspace-owned and packet fits the frame.
+        // SAFETY: free frame is exclusively userspace-owned and `total` fits the frame
+        // (Config::validate guarantees data_offset() + max_packet_len() <= frame_size).
         unsafe {
-            ptr::copy_nonoverlapping(
-                packet.as_ptr(),
-                self.umem.ptr().add(addr as usize),
-                packet.len(),
-            );
+            let mut offset = 0usize;
+            let base = self.umem.ptr().add(addr as usize);
+            if !packet.header.is_empty() {
+                ptr::copy_nonoverlapping(packet.header.as_ptr(), base, packet.header.len());
+                offset += packet.header.len();
+            }
+            for part in packet.payload {
+                let bytes = part.bytes();
+                if !bytes.is_empty() {
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(offset), bytes.len());
+                    offset += bytes.len();
+                }
+            }
+            debug_assert_eq!(offset, total);
         }
         if !self.tx.push(Descriptor {
             addr,
-            len: packet.len() as u32,
+            len: total as u32,
             options: 0,
         })? {
             return Ok(TxOutcome::WouldBlock);
@@ -927,6 +946,46 @@ impl PacketIo for AfXdp {
             self.poisoned = true;
         }
         result
+    }
+    // D7: AF_XDP without XDP_USE_SG copies once straight into the UMEM TX
+    // frame, avoiding the default transmit_packet's extra Vec gather copy.
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        let total = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+        let TransmitRequest {
+            tcp_checksum_offload,
+            segmentation,
+            timestamp,
+            when,
+        } = request;
+        if segmentation.is_some() || tcp_checksum_offload || when.is_some() {
+            return Err(TransmitError::Unsupported);
+        }
+        if let Some(ts) = timestamp {
+            return Err(if !ts.software && !ts.hardware {
+                TransmitError::InvalidInput
+            } else {
+                TransmitError::Unsupported
+            });
+        }
+        // Reject before service/kick or any descriptor publication.
+        if total > self.max_packet_len().unwrap() {
+            return Err(TransmitError::Other(io::Error::from_raw_os_error(
+                libc::EMSGSIZE,
+            )));
+        }
+        self.service().map_err(TransmitError::Other)?;
+        let result = self.transmit_parts(packet, total);
+        if result
+            .as_ref()
+            .is_err_and(|e| e.kind() == io::ErrorKind::InvalidData)
+        {
+            self.poisoned = true;
+        }
+        result.map_err(TransmitError::Other)
     }
 }
 
@@ -1631,5 +1690,220 @@ mod tests {
             },
             0
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn transmit_packet_copies_parts_directly_into_umem_and_enforces_i8() {
+        use ntcp_io::{
+            ChunkSlice, ClockDescriptor, ClockDomain, Payload, PayloadSlice,
+            TcpSegmentationRequest, TimestampUnit, TransmitTime, TxChunk, TxPart,
+            TxTimestampRequest,
+        };
+
+        let mut a = adapter();
+        let _peer = wakeup_peer(&mut a);
+
+        let mut chunk = TxChunk::heap(64);
+        chunk.append(b"XXchunk-bodyYY");
+        let shared = Payload::from_vec(b"ZZshared-tailWW".to_vec());
+        let parts = [
+            TxPart::Chunk(ChunkSlice::new(&chunk, 0..0).unwrap()),
+            TxPart::Chunk(ChunkSlice::new(&chunk, 2..12).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&shared, 4..4).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&shared, 2..13).unwrap()),
+        ];
+        let packet = TxPacket {
+            header: b"ETH:",
+            payload: &parts,
+        };
+        let expected = b"ETH:chunk-bodyshared-tail";
+        let free_before = a.free.len();
+        assert_eq!(
+            a.transmit_packet(&packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(a.free.len(), free_before - 1);
+        let desc = a.tx.peek().unwrap().unwrap();
+        assert_eq!(desc.len as usize, expected.len());
+        assert_eq!(desc.options, 0);
+        assert_eq!(
+            desc.addr % u64::from(a.config.frame_size),
+            u64::from(a.data_offset())
+        );
+        let index = (desc.addr / u64::from(a.config.frame_size)) as usize;
+        assert!(a.frames[index] == Frame::Tx);
+        let written = unsafe {
+            std::slice::from_raw_parts(a.umem.ptr().add(desc.addr as usize), desc.len as usize)
+        };
+        assert_eq!(written, expected);
+
+        // Complete the TX frame and verify reuse.
+        a.tx.consume();
+        a.completion.push(desc.addr).unwrap();
+        a.service().unwrap();
+        assert!(a.frames[index] == Frame::Free);
+        assert_eq!(a.free.len(), free_before);
+
+        // Payload-only packet (empty header).
+        let payload_only = TxPacket {
+            header: &[],
+            payload: &[TxPart::Shared(PayloadSlice::new(&shared, 2..8).unwrap())],
+        };
+        assert_eq!(
+            a.transmit_packet(&payload_only, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let desc = a.tx.peek().unwrap().unwrap();
+        let written = unsafe {
+            std::slice::from_raw_parts(a.umem.ptr().add(desc.addr as usize), desc.len as usize)
+        };
+        assert_eq!(written, b"shared");
+        a.tx.consume();
+        a.completion.push(desc.addr).unwrap();
+        a.service().unwrap();
+
+        // Empty packet rejected with InvalidInput (wrapped in Other, matching transmit()).
+        let empty = TxPacket {
+            header: &[],
+            payload: &[TxPart::Chunk(ChunkSlice::new(&chunk, 0..0).unwrap())],
+        };
+        match a.transmit_packet(&empty, TransmitRequest::default()) {
+            Err(TransmitError::Other(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+            other => panic!("unexpected result for empty packet: {other:?}"),
+        }
+        assert!(a.tx.peek().unwrap().is_none());
+        assert_eq!(a.free.len(), free_before);
+
+        // Oversize packet rejected with EMSGSIZE before service or publication.
+        let big = Payload::from_vec(vec![0xAB; 1500]);
+        let oversize = TxPacket {
+            header: &[0u8; 15],
+            payload: &[TxPart::Shared(PayloadSlice::new(&big, 0..1500).unwrap())],
+        };
+        let tx_before = a.tx.indices().unwrap();
+        let free_snapshot = a.free.clone();
+        match a.transmit_packet(&oversize, TransmitRequest::default()) {
+            Err(TransmitError::Other(e)) => assert_eq!(e.raw_os_error(), Some(libc::EMSGSIZE)),
+            other => panic!("unexpected result for oversize packet: {other:?}"),
+        }
+        assert_eq!(a.tx.indices().unwrap(), tx_before);
+        assert_eq!(a.free, free_snapshot);
+        assert!(!a.poisoned);
+
+        // I8 unsupported features & combinations reject without submitting.
+        let when = Some(TransmitTime {
+            value: 100,
+            clock: ClockDescriptor {
+                domain: ClockDomain::Monotonic,
+                unit: TimestampUnit::Nanoseconds,
+            },
+        });
+        let segmentation = Some(TcpSegmentationRequest {
+            segment_payload_len: 10,
+        });
+        let timestamp = Some(TxTimestampRequest {
+            cookie: 7,
+            software: true,
+            hardware: false,
+        });
+        let empty_timestamp = Some(TxTimestampRequest {
+            cookie: 8,
+            software: false,
+            hardware: false,
+        });
+        for unsupported in [
+            TransmitRequest {
+                segmentation,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                timestamp: empty_timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                timestamp: empty_timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                when,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                timestamp,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                a.transmit_packet(&packet, unsupported),
+                Err(TransmitError::Unsupported)
+            ));
+        }
+        assert!(matches!(
+            a.transmit_packet(
+                &packet,
+                TransmitRequest {
+                    timestamp: empty_timestamp,
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::InvalidInput)
+        ));
+        assert!(a.tx.peek().unwrap().is_none());
+        assert_eq!(a.free.len(), free_before);
+
+        // Exhausting free frames yields WouldBlock.
+        for _ in 0..free_before {
+            assert_eq!(
+                a.transmit_packet(&packet, TransmitRequest::default())
+                    .unwrap(),
+                TxOutcome::Submitted
+            );
+        }
+        assert_eq!(
+            a.transmit_packet(&packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::WouldBlock
+        );
+
+        // Poisoned adapter returns Other(InvalidData) on plain transmit_packet.
+        a.poisoned = true;
+        match a.transmit_packet(&packet, TransmitRequest::default()) {
+            Err(TransmitError::Other(e)) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("unexpected result on poisoned adapter: {other:?}"),
+        }
     }
 }

@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use ntcp_io::linux::{attribute, received, transmitted};
-use ntcp_io::{PacketIo, PacketLayer, TxOutcome};
+use ntcp_io::{PacketIo, PacketLayer, TransmitError, TransmitRequest, TxOutcome, TxPacket};
 use std::{
     fs::OpenOptions,
     io,
@@ -152,6 +152,85 @@ impl PacketIo for Tun {
         // SAFETY: packet is readable for its length; write retains no pointer.
         let count = unsafe { libc::write(self.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
         transmitted(count, packet.len())
+    }
+
+    fn transmit_packet(
+        &mut self,
+        packet: &TxPacket<'_>,
+        request: TransmitRequest,
+    ) -> Result<TxOutcome, TransmitError> {
+        const STACK_IOVS: usize = 16;
+        // Linux UIO_MAXIOV / POSIX IOV_MAX (linux/uio.h).
+        const MAX_IOVS: usize = 1024;
+        let total = packet.checked_len().ok_or(TransmitError::InvalidInput)?;
+        let TransmitRequest {
+            tcp_checksum_offload,
+            segmentation,
+            timestamp,
+            when,
+        } = request;
+        if segmentation.is_some() || tcp_checksum_offload || when.is_some() {
+            return Err(TransmitError::Unsupported);
+        }
+        if let Some(ts) = timestamp {
+            return Err(if !ts.software && !ts.hardware {
+                TransmitError::InvalidInput
+            } else {
+                TransmitError::Unsupported
+            });
+        }
+        if total == 0 {
+            return self.transmit(&[]).map_err(TransmitError::Other);
+        }
+
+        let mut stack = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; STACK_IOVS];
+        let mut len = 0usize;
+        let mut heap: Vec<libc::iovec> = Vec::new();
+        let mut push = |bytes: &[u8]| {
+            if bytes.is_empty() {
+                return;
+            }
+            let iov = libc::iovec {
+                iov_base: bytes.as_ptr().cast_mut().cast(),
+                iov_len: bytes.len(),
+            };
+            if !heap.is_empty() {
+                heap.push(iov);
+            } else if len < STACK_IOVS {
+                stack[len] = iov;
+                len += 1;
+            } else {
+                heap.reserve(STACK_IOVS + 1);
+                heap.extend_from_slice(&stack);
+                heap.push(iov);
+            }
+        };
+        push(packet.header);
+        for part in packet.payload {
+            push(part.bytes());
+        }
+
+        let iovs: &[libc::iovec] = if heap.is_empty() {
+            &stack[..len]
+        } else {
+            &heap
+        };
+        if iovs.len() > MAX_IOVS {
+            let mut contiguous = Vec::with_capacity(total);
+            contiguous.extend_from_slice(packet.header);
+            for part in packet.payload {
+                contiguous.extend_from_slice(part.bytes());
+            }
+            return self.transmit(&contiguous).map_err(TransmitError::Other);
+        }
+        // SAFETY: every iovec points to readable bytes of `packet` that remain
+        // live through writev; iovs.len() is within 1..=MAX_IOVS.
+        let count =
+            unsafe { libc::writev(self.as_raw_fd(), iovs.as_ptr(), iovs.len() as libc::c_int) };
+        transmitted(count, total).map_err(TransmitError::Other)
     }
 }
 
@@ -332,5 +411,237 @@ mod tests {
         backpressure(&mut a, &mut b);
         drop(a);
         assert!(b.transmit(b"x").is_err());
+    }
+
+    #[test]
+    fn transmit_packet_gathers_parts_handles_backpressure_and_enforces_i8() {
+        use ntcp_io::{
+            ChunkSlice, ClockDescriptor, ClockDomain, Payload, PayloadSlice,
+            TcpSegmentationRequest, TimestampUnit, TransmitTime, TxChunk, TxPart,
+            TxTimestampRequest,
+        };
+
+        let (a, b) = pair();
+        let mut a = Tun {
+            fd: a,
+            name: "test-a".into(),
+            ifindex: 0,
+        };
+        let mut b = Tun {
+            fd: b,
+            name: "test-b".into(),
+            ifindex: 0,
+        };
+
+        // Multi-part TxPacket: header + Chunk + empty parts + Shared.
+        let mut chunk = TxChunk::heap(64);
+        chunk.append(b"XXchunk-bodyYY");
+        let shared = Payload::from_vec(b"ZZshared-tailWW".to_vec());
+        let parts = [
+            TxPart::Chunk(ChunkSlice::new(&chunk, 0..0).unwrap()),
+            TxPart::Chunk(ChunkSlice::new(&chunk, 2..12).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&shared, 5..5).unwrap()),
+            TxPart::Shared(PayloadSlice::new(&shared, 2..13).unwrap()),
+        ];
+        let packet = TxPacket {
+            header: b"HDR:",
+            payload: &parts,
+        };
+        assert_eq!(
+            b.transmit_packet(&packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let mut out = [0u8; 64];
+        let n = a.receive(&mut out).unwrap().unwrap();
+        assert_eq!(&out[..n], b"HDR:chunk-bodyshared-tail");
+
+        // Empty header with payload only, and zero-length packet.
+        let payload_only = TxPacket {
+            header: &[],
+            payload: &[TxPart::Shared(PayloadSlice::new(&shared, 2..8).unwrap())],
+        };
+        assert_eq!(
+            b.transmit_packet(&payload_only, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let n = a.receive(&mut out).unwrap().unwrap();
+        assert_eq!(&out[..n], b"shared");
+
+        let empty_packet = TxPacket {
+            header: &[],
+            payload: &[TxPart::Chunk(ChunkSlice::new(&chunk, 0..0).unwrap())],
+        };
+        assert_eq!(
+            b.transmit_packet(&empty_packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        assert_eq!(a.receive(&mut out).unwrap(), Some(0));
+
+        // > 16 iovecs (heap spill path).
+        let many_storage = Payload::from_vec((0..24u8).collect());
+        let many_parts: Vec<TxPart<'_>> = (0..24)
+            .map(|i| TxPart::Shared(PayloadSlice::new(&many_storage, i..i + 1).unwrap()))
+            .collect();
+        let many_packet = TxPacket {
+            header: b"H",
+            payload: &many_parts,
+        };
+        assert_eq!(
+            b.transmit_packet(&many_packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let n = a.receive(&mut out).unwrap().unwrap();
+        let mut expected = vec![b'H'];
+        expected.extend(0..24u8);
+        assert_eq!(&out[..n], expected.as_slice());
+
+        // > UIO_MAXIOV (1024) iovecs (gather fallback path).
+        let huge_storage = Payload::from_vec((0..1025).map(|i| (i & 0xff) as u8).collect());
+        let huge_parts: Vec<TxPart<'_>> = (0..1025)
+            .map(|i| TxPart::Shared(PayloadSlice::new(&huge_storage, i..i + 1).unwrap()))
+            .collect();
+        let huge_packet = TxPacket {
+            header: b"!",
+            payload: &huge_parts,
+        };
+        assert_eq!(
+            b.transmit_packet(&huge_packet, TransmitRequest::default())
+                .unwrap(),
+            TxOutcome::Submitted
+        );
+        let mut huge_out = vec![0u8; 1026];
+        let n = a.receive(&mut huge_out).unwrap().unwrap();
+        assert_eq!(n, 1026);
+        assert_eq!(huge_out[0], b'!');
+        assert_eq!(&huge_out[1..], huge_storage.as_slice());
+
+        // I8 unsupported features & combinations submit nothing.
+        let when = Some(TransmitTime {
+            value: 100,
+            clock: ClockDescriptor {
+                domain: ClockDomain::Monotonic,
+                unit: TimestampUnit::Nanoseconds,
+            },
+        });
+        let segmentation = Some(TcpSegmentationRequest {
+            segment_payload_len: 10,
+        });
+        let timestamp = Some(TxTimestampRequest {
+            cookie: 7,
+            software: true,
+            hardware: false,
+        });
+        let empty_timestamp = Some(TxTimestampRequest {
+            cookie: 8,
+            software: false,
+            hardware: false,
+        });
+        for unsupported in [
+            TransmitRequest {
+                segmentation,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                segmentation,
+                timestamp: empty_timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                tcp_checksum_offload: true,
+                timestamp: empty_timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                when,
+                ..Default::default()
+            },
+            TransmitRequest {
+                when,
+                timestamp,
+                ..Default::default()
+            },
+            TransmitRequest {
+                timestamp,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                b.transmit_packet(&packet, unsupported),
+                Err(TransmitError::Unsupported)
+            ));
+        }
+        assert!(matches!(
+            b.transmit_packet(
+                &packet,
+                TransmitRequest {
+                    timestamp: empty_timestamp,
+                    ..Default::default()
+                }
+            ),
+            Err(TransmitError::InvalidInput)
+        ));
+        assert_eq!(a.receive(&mut out).unwrap(), None);
+
+        // Backpressure (WouldBlock) with multi-part TxPacket.
+        let mut rx_buf = [0u8; 1024];
+        let mut hit_would_block = false;
+        let fill_shared = Payload::from_vec(vec![0x5Au8; 768]);
+        let fill_parts = [TxPart::Shared(
+            PayloadSlice::new(&fill_shared, 0..768).unwrap(),
+        )];
+        for submitted in 0..10000usize {
+            let hdr = [submitted as u8; 256];
+            let pkt = TxPacket {
+                header: &hdr,
+                payload: &fill_parts,
+            };
+            if b.transmit_packet(&pkt, TransmitRequest::default()).unwrap() == TxOutcome::WouldBlock
+            {
+                hit_would_block = true;
+                for i in 0..submitted {
+                    assert_eq!(a.receive(&mut rx_buf).unwrap(), Some(1024));
+                    assert_eq!(&rx_buf[..256], &[i as u8; 256]);
+                    assert_eq!(&rx_buf[256..], &[0x5Au8; 768]);
+                }
+                assert_eq!(a.receive(&mut rx_buf).unwrap(), None);
+                assert_eq!(
+                    b.transmit_packet(&pkt, TransmitRequest::default()).unwrap(),
+                    TxOutcome::Submitted
+                );
+                assert_eq!(a.receive(&mut rx_buf).unwrap(), Some(1024));
+                assert_eq!(&rx_buf[..256], &[submitted as u8; 256]);
+                assert_eq!(&rx_buf[256..], &[0x5Au8; 768]);
+                break;
+            }
+        }
+        assert!(hit_would_block, "queue never filled");
     }
 }
