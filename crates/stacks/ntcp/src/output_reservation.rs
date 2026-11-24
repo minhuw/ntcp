@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use crate::{EndpointError, Error, Instant, Transmit, seq::Seq, wire};
 
 // Only physical-departure work; sequence, recovery and PRR charges stay selected.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Departure {
     pub data_ack: bool,
     pub defer_push: bool,
@@ -132,7 +132,7 @@ pub(crate) struct GsoBuffer<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransmitAttempt {
-    pub(crate) ordinal: u64,
+    pub(crate) ordinal: core::num::NonZeroU64,
     pub(crate) reservation: usize,
 }
 
@@ -171,7 +171,8 @@ pub(crate) struct ReservedOutput {
     pub departure: Option<Departure>,
     // A PLPMTUD probe's intent, kept beside its departure: copied only
     // for a probe, while every output copies its departure.
-    pub discovery: Option<crate::DiscoveryIntent>,
+    // The held owner keeps its selection and probe intent until release.
+    pub probe: bool,
     // The link scoping the packet (`Endpoint::transmit_attempt_zone`).
     pub zone: Option<ntcp_path::LinkId>,
     // A stateless reply already counted as undeliverable.
@@ -201,9 +202,14 @@ impl OutputReservation {
     }
 
     pub fn token(&mut self) -> Result<TransmitAttempt, Error> {
-        self.ordinal = self.ordinal.checked_add(1).ok_or(Error::InvalidArgument)?;
+        let next = self
+            .ordinal
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new)
+            .ok_or(Error::InvalidArgument)?;
+        self.ordinal = next.get();
         Ok(TransmitAttempt {
-            ordinal: self.ordinal,
+            ordinal: next,
             reservation: self.index,
         })
     }
@@ -265,7 +271,7 @@ impl OutputReservation {
             repaired: false,
             restamped: false,
             departure: None,
-            discovery: None,
+            probe: false,
             zone: None,
             undeliverable: false,
         });
@@ -368,7 +374,7 @@ impl OutputReservation {
             repaired: false,
             restamped: false,
             departure: None,
-            discovery: None,
+            probe: false,
             zone: None,
             undeliverable: false,
         });

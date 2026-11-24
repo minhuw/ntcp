@@ -48,7 +48,6 @@ impl ReadyQueue {
         (self.first != END).then_some(self.first)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sole(&self, index: usize) -> bool {
         self.first == index && self.last == index
     }
@@ -98,7 +97,6 @@ impl ReadyQueue {
         };
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn move_to_back(&mut self, index: usize) {
         if self.last != index {
             self.remove(index);

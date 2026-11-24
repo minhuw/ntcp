@@ -4,6 +4,20 @@
 // never cloned. Unsupported outputs keep their existing immutable reservation.
 use super::*;
 
+pub(super) enum ReservationUndo {
+    Data(RepairUndo),
+    Control(ControlUndo),
+}
+
+impl ReservationUndo {
+    pub(super) fn data(&self) -> Option<&RepairUndo> {
+        match self {
+            Self::Data(undo) => Some(undo),
+            _ => None,
+        }
+    }
+}
+
 pub(super) struct RepairUndo {
     rack: Option<crate::rack::RetryUndo>,
     fresh: Option<FreshState>,
@@ -125,7 +139,11 @@ impl RepairUndo {
     // the common output without an undo copies nothing.
     pub(super) fn capture(a: &mut Connection, start: Seq, count: usize) {
         if let Some(rack) = a.rack.retry_undo(start, start.wrapping_add(count as u32)) {
-            a.repair_undo = Some(Self::capture_state(a, Some(rack), None));
+            a.repair_undo = Some(ReservationUndo::Data(Self::capture_state(
+                a,
+                Some(rack),
+                None,
+            )));
         }
     }
 
@@ -146,7 +164,12 @@ impl RepairUndo {
         {
             return;
         }
-        a.repair_undo = Some(Self::capture_state(a, None, Some(FreshState::capture(a))));
+        let fresh = FreshState::capture(a);
+        a.repair_undo = Some(ReservationUndo::Data(Self::capture_state(
+            a,
+            None,
+            Some(fresh),
+        )));
     }
 
     fn capture_state(
@@ -197,17 +220,21 @@ impl Connection {
     // longer be restored, only released or kept.
     pub(crate) fn forget_reserved_undo(&mut self) {
         self.repair_undo = None;
-        self.control_undo = None;
     }
 
     pub(crate) fn cancel_reserved_repair(&mut self) -> bool {
-        self.repair_undo.as_ref().is_some_and(|u| u.fresh.is_none()) && self.cancel_reserved_local()
+        matches!(self.repair_undo.as_ref().and_then(ReservationUndo::data), Some(u) if !u.is_fresh())
+            && self.cancel_reserved_local()
     }
 
     pub(crate) fn cancel_reserved_resource(&mut self, now: Instant) -> Result<bool, Error> {
         self.check_time(now)?;
         let expired = due(self.application_deadline(), now);
-        if self.repair_undo.as_ref().is_none_or(|u| u.fresh.is_none())
+        if !self
+            .repair_undo
+            .as_ref()
+            .and_then(ReservationUndo::data)
+            .is_some_and(RepairUndo::is_fresh)
             || !self.cancel_reserved_local()
         {
             return Ok(false);
@@ -286,7 +313,6 @@ impl Connection {
         self.update_time(now)?;
         self.reject_reserved_output();
         self.repair_undo = None;
-        self.control_undo = None;
         self.reserved_retransmit_counts = None;
         self.last_departure = None;
         self.last_discovery = None;
@@ -338,14 +364,16 @@ impl Connection {
     }
 
     fn cancel_reserved_control(&mut self) -> bool {
-        let Some(undo) = &self.control_undo else {
+        let Some(ReservationUndo::Control(undo)) = &self.repair_undo else {
             return false;
         };
         // A concurrent path-MSS update must not be undone with old units.
         if self.mss != undo.state.mss {
             return false;
         }
-        let undo = self.control_undo.take().unwrap();
+        let Some(ReservationUndo::Control(undo)) = self.repair_undo.take() else {
+            return false;
+        };
         self.reject_reserved_output();
         self.restore_selection(undo.state);
         self.state = undo.connection_state;
@@ -371,7 +399,7 @@ impl Connection {
     }
 
     fn cancel_reserved_local(&mut self) -> bool {
-        let Some(undo) = &self.repair_undo else {
+        let Some(ReservationUndo::Data(undo)) = &self.repair_undo else {
             return false;
         };
         let Some(selection) = self.reserved_ledger else {
@@ -389,7 +417,9 @@ impl Connection {
             return false;
         }
         self.reject_reserved_output();
-        let undo = self.repair_undo.take().unwrap();
+        let Some(ReservationUndo::Data(undo)) = self.repair_undo.take() else {
+            return false;
+        };
         self.restore_selection(undo);
         self.reserved_retransmit_counts = None;
         self.last_departure = None;
@@ -411,6 +441,9 @@ impl Connection {
         self.congestion = undo.congestion;
         self.prr = undo.prr;
         self.sack_recovery = undo.sack_recovery;
+        // An older selection-time sample can precede the last time the
+        // live samples were reviewed. Recheck it at the next clock advance.
+        self.sample_review = 0;
         self.sample = undo.sample;
         self.sample_departure = undo.sample_departure;
         self.rto_deadline = undo.rto_deadline;

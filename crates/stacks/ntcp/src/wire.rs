@@ -591,8 +591,6 @@ pub(crate) fn encode_with(
 
 /// Encode established stream output with the already negotiated options.
 /// The aligned timestamp can be written directly into the TCP header.
-// Non-test callers land with the stream-output commit.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_stream(
     pseudo_header: PseudoHeader,
     ports: u32,

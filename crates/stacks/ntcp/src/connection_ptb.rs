@@ -640,7 +640,11 @@ impl Connection {
     pub(super) fn ptb_acknowledged(&mut self, ack: Seq, bytes: usize) {
         self.ptb_progress();
         if bytes != 0 {
-            self.ptb_release(self.send_base, self.send_base.wrapping_add(bytes as u32));
+            if self.ptb.span.is_some() {
+                self.ptb_release(self.send_base, self.send_base.wrapping_add(bytes as u32));
+            } else {
+                self.ptb_settle();
+            }
         }
         if self.fin_sequence.is_some_and(|fin| ack.after(fin)) {
             self.ptb.fin_pending = false;

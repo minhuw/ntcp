@@ -495,6 +495,41 @@ impl EgressContext {
     }
 }
 
+/// A scalar connection frame whose route, link-layer address (if requested)
+/// and transport departure have been checked together. The exclusive borrows
+/// of the host and endpoint keep the grant valid through the device call.
+pub struct ConnectedSubmission<'a> {
+    permit: ntcp::PreparedTransmit<'a>,
+    receipt: ntcp::PhysicalReceipt,
+    context: EgressContext,
+    address: Option<[u8; 6]>,
+}
+impl ConnectedSubmission<'_> {
+    pub fn context(&self) -> EgressContext {
+        self.context
+    }
+
+    pub fn address(&self) -> Option<[u8; 6]> {
+        self.address
+    }
+
+    pub fn submitted(self) {
+        self.permit.submitted(self.receipt);
+    }
+}
+
+/// The result of offering a scalar segment on its live route. Only a
+/// retained segment needs a path grant to validate its next attempt.
+#[allow(clippy::large_enum_variant)] // EgressContext carries a debug-only PathSnapshot cross-check.
+pub enum FreshSubmission {
+    Submitted(ntcp::PhysicalReceipt),
+    Retained {
+        context: EgressContext,
+        outcome: BackendOutcome,
+        receipt: ntcp::PhysicalReceipt,
+    },
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IngressPacket<'a> {
     pub ip: IpMetadata,
@@ -514,6 +549,14 @@ pub struct IngressPacket<'a> {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SubmissionTicket {
     ticket: Option<u64>,
+}
+
+impl SubmissionTicket {
+    /// A TCP connection uses its sequence space as transmission evidence.
+    /// Submission still checks that the attempt belongs to a live connection.
+    pub const fn connection() -> Self {
+        Self { ticket: None }
+    }
 }
 
 /// The backend's own statement about one synchronous physical call.
@@ -3017,6 +3060,195 @@ impl Host {
         }
     }
 
+    /// Prepare an immediate, scalar submission using a connection's live
+    /// destination. A miss leaves resolution, rebind, stateless evidence and
+    /// option registration to the ordinary egress path.
+    pub fn prepare_connected_submission<'a>(
+        &'a mut self,
+        endpoint: &'a mut Endpoint,
+        attempt: TransmitAttempt,
+        now: Instant,
+        frame: &[u8],
+        resolve: bool,
+    ) -> Result<Option<ConnectedSubmission<'a>>, EndpointError> {
+        if self.check_endpoint(endpoint).is_err() {
+            return Ok(None);
+        }
+        let Some(packet) = endpoint.transmit_attempt_packet_ref(attempt) else {
+            return Ok(None);
+        };
+        let Some(owner) = packet.connection else {
+            return Ok(None);
+        };
+        if !packet.ipv4_options.is_empty() {
+            return Ok(None);
+        }
+        let Some((binding, address)) = self.connected_frame::<false>(
+            owner,
+            &packet.ip,
+            packet.dscp,
+            resolve,
+            now,
+            |route| endpoint.managed_route_matches(owner, route),
+            |snapshot| frame_fits(snapshot, packet.ip.source.is_ipv4(), frame, frame.len()),
+        ) else {
+            return Ok(None);
+        };
+        debug_assert_eq!(
+            self.attempt_frame(
+                self.bindings[binding]
+                    .as_ref()
+                    .unwrap()
+                    .prepared
+                    .snapshot
+                    .key(),
+                packet,
+                frame,
+                0,
+                false,
+            ),
+            Ok(())
+        );
+        let context =
+            EgressContext::for_path(attempt, &self.bindings[binding].as_ref().unwrap().prepared);
+        let Some(permit) = endpoint.prepare_transmit_submission(now, attempt)? else {
+            return Ok(None);
+        };
+        self.now = self.now.max(now);
+        Ok(Some(ConnectedSubmission {
+            permit,
+            context,
+            address,
+            receipt: ntcp::PhysicalReceipt {
+                ip_packet_len: frame.len() as u32,
+                dont_fragment: unfragmentable(frame),
+            },
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connected_frame<const LIVE: bool>(
+        &self,
+        owner: ConnectionId,
+        ip: &IpMetadata,
+        dscp: u8,
+        resolve: bool,
+        now: Instant,
+        matches: impl FnOnce(&ManagedRoute) -> bool,
+        fits: impl FnOnce(&PathSnapshot) -> bool,
+    ) -> Option<(usize, Option<[u8; 6]>)> {
+        let index = self.binding_index(owner)?;
+        let binding = self.bindings[index].as_ref().unwrap();
+        let dst = self.held_matching_dst(binding, matches)?;
+        let prepared = &binding.prepared;
+        let snapshot = &prepared.snapshot;
+        // Path admission binds source and destination to the socket tuple,
+        // and rebinding preserves them. The live option-free selection
+        // takes DSCP and forwarding destination from that same held socket.
+        // A retained packet has its own earlier snapshot of those fields.
+        let on_route = || {
+            ip.destination == dst.route.forwarding_destination
+                && packet_on_path(snapshot, *ip, dscp)
+        };
+        debug_assert!(!LIVE || on_route());
+        if (!LIVE && !on_route()) || !fits(snapshot) {
+            return None;
+        }
+        let address = if resolve {
+            let (link, via) = snapshot.neighbor()?;
+            Some(self.egress_address(link, via, snapshot.stamp(), binding.neighbor, now)?)
+        } else {
+            None
+        };
+        Some((index, address))
+    }
+
+    /// Encapsulate and offer a preflighted TCP segment on a live connected
+    /// route. The prefix contains the caller's link header followed by the
+    /// space for the IP header. With resolution this also sets Ethernet's
+    /// destination from the route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_fresh_tcp(
+        &mut self,
+        selected: &mut ntcp::FreshTransmit<'_>,
+        now: Instant,
+        link_header: usize,
+        minimum: usize,
+        resolve: bool,
+        submit: impl FnOnce(&[u8]) -> BackendOutcome,
+    ) -> Option<FreshSubmission> {
+        if selected.managed_context() != Some(self.paths.context()) || resolve && link_header < 14 {
+            return None;
+        }
+        let owner = selected.owner();
+        let (header, prefix) = selected.plain_encapsulation()?;
+        let space = prefix.get_mut(link_header..)?;
+        let ipv4 = header.ip().source.is_ipv4();
+        let encoded = if ipv4 {
+            ntcp_ip::write_connected_header(space, header).ok()?
+        } else {
+            ntcp_ip6::write_plain_tcp_header(space, header.fields(), header.tcp_len()).ok()?
+        };
+        if encoded != space.len() {
+            return None;
+        }
+        let len = encoded + header.tcp_len();
+        let (index, address) = self.connected_frame::<true>(
+            owner,
+            header.ip(),
+            header.dscp(),
+            resolve,
+            now,
+            |route| header.matches_route(route),
+            // The plain IPv4 encoder sets DF. Both encoders emit a whole,
+            // unfragmented IP packet.
+            |snapshot| {
+                len <= snapshot.first_hop_mtu() as usize
+                    && (!ipv4 || !snapshot.clears_dont_fragment())
+            },
+        )?;
+        #[cfg(debug_assertions)]
+        {
+            let frame = &selected.frame()[link_header..];
+            debug_assert!(unfragmentable(frame) && len == frame.len());
+            debug_assert_eq!(
+                self.attempt_frame(
+                    self.bindings[index]
+                        .as_ref()
+                        .unwrap()
+                        .prepared
+                        .snapshot
+                        .key(),
+                    selected.packet(),
+                    frame,
+                    0,
+                    false,
+                ),
+                Ok(())
+            );
+        }
+        let receipt = ntcp::PhysicalReceipt {
+            ip_packet_len: len as u32,
+            dont_fragment: true,
+        };
+        if let Some(mac) = address {
+            selected.headroom().get_mut(..6)?.copy_from_slice(&mac);
+        }
+        let wire = selected.padded_frame(minimum)?;
+        self.now = self.now.max(now);
+        Some(match submit(wire) {
+            BackendOutcome::Submitted => FreshSubmission::Submitted(receipt),
+            outcome => FreshSubmission::Retained {
+                context: EgressContext::for_path(
+                    selected.attempt(),
+                    &self.bindings[index].as_ref().unwrap().prepared,
+                ),
+                receipt,
+                outcome,
+            },
+        })
+    }
+
     /// Obtain authority for a selected reservation: the build-time
     /// validation of its packet against the connection's checked egress
     /// decision (see "Egress validation" in the crate documentation). Keep
@@ -3031,8 +3263,22 @@ impl Host {
             .map(|(context, _)| context)
     }
 
-    // Non-test callers land with the host submission fast-path commit.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Grant the path and look up its connected link-layer address while the
+    /// socket binding is in hand. A missing address needs neighbor resolution.
+    pub fn ethernet_egress_context(
+        &mut self,
+        endpoint: &mut Endpoint,
+        attempt: TransmitAttempt,
+        now: Instant,
+    ) -> Result<(EgressContext, Option<[u8; 6]>), Error> {
+        let (context, binding) = self.grant_egress(endpoint, attempt)?;
+        let neighbor = binding.and_then(|i| self.bindings[i].as_ref().unwrap().neighbor);
+        let address = context
+            .neighbor_address()
+            .and_then(|via| self.egress_address(context.link, via, context.stamp, neighbor, now));
+        Ok((context, address))
+    }
+
     fn egress_address(
         &self,
         link: LinkId,
@@ -3498,7 +3744,7 @@ impl Host {
             .transmit_attempt_packet_ref(context.attempt)
             .ok_or(Error::Obsolete)?;
         if packet.connection.is_some() {
-            return Ok(SubmissionTicket { ticket: None });
+            return Ok(SubmissionTicket::connection());
         }
         let index = self.reserve_attempt(endpoint, Owner::Stateless, context.attempt)?;
         Ok(SubmissionTicket {
@@ -3556,16 +3802,24 @@ impl Host {
                 ticket,
             });
         }
-        let prepared = (|| {
-            let live = self.validate_egress(endpoint, context, frame, shared_payload_len)?;
-            if !endpoint.preflight_accept_transmit(now, context.attempt)? {
-                return Err(Error::Obsolete);
-            }
-            Ok(live)
-        })();
-        let live = match prepared {
+        let live = match self.validate_egress(endpoint, context, frame, shared_payload_len) {
             Ok(live) => live,
             Err(error) => return Err(Refused { error, ticket }),
+        };
+        let permit = match endpoint.prepare_transmit_submission(now, context.attempt) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                return Err(Refused {
+                    error: Error::Obsolete,
+                    ticket,
+                });
+            }
+            Err(error) => {
+                return Err(Refused {
+                    error: error.into(),
+                    ticket,
+                });
+            }
         };
         debug_assert!(ticket.ticket.is_none_or(|ticket| {
             self.ledger
@@ -3584,8 +3838,7 @@ impl Host {
                     ip_packet_len: (frame.len() + shared_payload_len) as u32,
                     dont_fragment: unfragmentable(frame),
                 };
-                let accepted = endpoint.accept_transmit_submitted(now, context.attempt, receipt);
-                assert!(matches!(accepted, Ok(true)), "preflighted acceptance");
+                permit.submitted(receipt);
                 Ok(Submission::Submitted)
             }
             BackendOutcome::WouldBlock => Ok(Submission::Blocked(ticket)),
@@ -4603,5 +4856,634 @@ mod commit7_cache_tests {
             host.egress_address(link, IpAddr::V4(GW_IP), stamp, stale, 5_000),
             None
         );
+    }
+
+    #[test]
+    fn submission_fast_paths_match_general_path_ipv4_and_ipv6() {
+        use core::net::Ipv6Addr;
+
+        // --- Part A: IPv4 with ARP resolution, submit_fresh_tcp, ethernet_egress_context,
+        // and prepare_connected_submission vs general egress_context + encode_atomic + submit ---
+        let mac = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let make_v4_onlink = |local: Ipv4Addr, peer: Ipv4Addr, id: u64, pmtud: Option<PmtudConfig>| {
+            let cfg = EndpointConfig {
+                max_connections: 4,
+                max_listeners: 2,
+                connection: ConnectionConfig {
+                    mss: 1460,
+                    send_capacity: 65536,
+                    receive_capacity: 65536,
+                    initial_window: InitialWindow::Iw10,
+                    nagle: false,
+                    delayed_ack_us: 0,
+                    timestamps: true,
+                    pmtud,
+                    ..ConnectionConfig::default()
+                },
+                ..EndpointConfig::default()
+            };
+            let (mut path_limits, limits) = managed_limits(&cfg, 2, 3, 2, 8, 2).unwrap();
+            path_limits.routes = 8;
+            path_limits.paths = 16;
+            let mut host = Host::new(
+                ContextId::new(id),
+                path_limits,
+                limits,
+                cfg.connection.timebase,
+                [id as u8; 16],
+            )
+            .unwrap();
+            let link = host
+                .register_link(
+                    path::InterfaceKey(id),
+                    1500,
+                    plain_recv_caps(),
+                    Forwarding::IpNextHop,
+                )
+                .unwrap();
+            host.register_source(ScopedAddress::new(IpAddr::V4(local), None).unwrap(), link.link())
+                .unwrap();
+            host.add_route(path::Route {
+                destination: path::IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+                source: None,
+                dscp: None,
+                link: link.link(),
+                next_hop: path::NextHop::OnLink,
+                metric: 0,
+            })
+            .unwrap();
+            host.ipv4_neighbors.install(Box::new(ExpiringArp {
+                link: link.link(),
+                target: peer,
+                mac,
+                expires_at: 10_000,
+                generation: 1,
+            }));
+            let mut ep = Endpoint::new(cfg, [id as u8; 32], 0, move |req| match req {
+                ntcp::AddressValidation::Bind { local: a }
+                | ntcp::AddressValidation::Open { local: a, .. }
+                | ntcp::AddressValidation::Incoming { destination: a, .. }
+                | ntcp::AddressValidation::Route { source: a, .. } => a == IpAddr::V4(local),
+            })
+            .unwrap();
+            host.attach(&mut ep).unwrap();
+            ep.enable_output_reservations_with_capacity(2).unwrap();
+            (host, ep, link)
+        };
+
+        let connect_v4_pair = |pmtud: Option<PmtudConfig>| {
+            let mut a = make_v4_onlink(A_IP, B_IP, 11, pmtud);
+            let mut b = make_v4_onlink(B_IP, A_IP, 12, pmtud);
+            let l = b
+                .1
+                .listen(SocketAddr::new(IpAddr::V4(B_IP), 80), 4)
+                .unwrap();
+            let c = a
+                .1
+                .connect_with_path_provider(
+                    1,
+                    SocketAddr::new(IpAddr::V4(A_IP), 50000),
+                    SocketAddr::new(IpAddr::V4(B_IP), 80),
+                    ManagedOpenOptions {
+                        transport: ActiveOpenOptions::from(&EndpointConfig::default().connection),
+                        dscp: 0,
+                        ipv4_options: OutgoingIpv4Options::default(),
+                        registration: None,
+                        receive_authority: None,
+                    },
+                    &mut a.0,
+                )
+                .unwrap();
+            let mut now = 1;
+            for _ in 0..8 {
+                now += 1;
+                if let Some(pkt) = emit_ipv4(&mut a.0, &mut a.1, now) {
+                    let mut frame = None;
+                    b.0.receive_tcp_frame(&mut b.1, b.2, now, &pkt, &mut frame, Default::default(), 0)
+                        .unwrap();
+                }
+                now += 1;
+                if let Some(pkt) = emit_ipv4(&mut b.0, &mut b.1, now) {
+                    let mut frame = None;
+                    a.0.receive_tcp_frame(&mut a.1, a.2, now, &pkt, &mut frame, Default::default(), 0)
+                        .unwrap();
+                }
+            }
+            let s = b.1.accept(l).unwrap();
+            a.0.refresh(&mut a.1, c).unwrap();
+            (a, b, c, s)
+        };
+
+        // 1) IPv4 byte-identical comparison: submit_fresh_tcp vs general encode_atomic + submit
+        let (mut fast_a, _, fast_c, _) = connect_v4_pair(None);
+        let (mut gen_a, _, gen_c, _) = connect_v4_pair(None);
+        let payload = b"ipv4-fast-path-payload";
+        fast_a.1.write(fast_c, payload).unwrap();
+        gen_a.1.write(gen_c, payload).unwrap();
+
+        // General path emits IPv4 header (DF, atomic ID=0) + TCP.
+        let mut gen_tcp = [0u8; 2048];
+        let (gen_poll, gen_att) = gen_a.1.poll_reserved_transmit_for(50, gen_c, &mut gen_tcp, 1).unwrap();
+        let gen_pkt = gen_poll.packet.unwrap();
+        let gen_att = gen_att.unwrap();
+        let (gen_ctx, gen_mac) = gen_a.0.ethernet_egress_context(&mut gen_a.1, gen_att, 50).unwrap();
+        assert_eq!(gen_mac, Some(mac));
+        let mut gen_ip = vec![0u8; 20 + gen_pkt.len];
+        gen_ip[20..].copy_from_slice(&gen_tcp[..gen_pkt.len]);
+        let gen_len = ntcp_ip::encode(&mut gen_ip, gen_pkt, 0).unwrap();
+        gen_ip.truncate(gen_len);
+        let gen_ticket = gen_a.0.submission_ticket(&mut gen_a.1, gen_ctx).unwrap();
+        assert_eq!(
+            gen_a
+                .0
+                .submit(&mut gen_a.1, 50, gen_ticket, gen_ctx, &gen_ip, 0, |_| {
+                    BackendOutcome::Submitted
+                })
+                .unwrap(),
+            Submission::Submitted
+        );
+
+        // Fast path: offer_fresh_transmit + submit_fresh_tcp with 14B Ethernet + 20B IPv4 headroom.
+        let mut fast_buf = [0xeeu8; 2048];
+        let mut fast_wire = Vec::new();
+        let offered = fast_a
+            .1
+            .offer_fresh_transmit(50, fast_c, &mut fast_buf, 34, false, |selected| {
+                match fast_a
+                    .0
+                    .submit_fresh_tcp(selected, 50, 14, 60, true, |wire| {
+                        fast_wire = wire.to_vec();
+                        BackendOutcome::Submitted
+                    })
+                    .expect("submit_fresh_tcp should hit connected IPv4 route")
+                {
+                    FreshSubmission::Submitted(receipt) => Some(receipt),
+                    FreshSubmission::Retained { .. } => None,
+                }
+            })
+            .unwrap();
+        assert!(matches!(offered, ntcp::FreshPoll::Submitted { .. }));
+        assert_eq!(&fast_wire[..6], &mac, "Ethernet destination MAC must match ARP");
+        assert_eq!(
+            &fast_wire[14..14 + gen_ip.len()],
+            &gen_ip[..],
+            "IPv4+TCP bytes from submit_fresh_tcp must be byte-identical to general path"
+        );
+        if fast_wire.len() > 14 + gen_ip.len() {
+            assert!(fast_wire[14 + gen_ip.len()..].iter().all(|&b| b == 0));
+        }
+        assert_eq!(fast_a.1.next_deadline(), gen_a.1.next_deadline());
+        assert_eq!(
+            fast_a.1.transport_info(fast_c).unwrap(),
+            gen_a.1.transport_info(gen_c).unwrap()
+        );
+
+        // 2) IPv4 blocked submit_fresh_tcp -> FreshSubmission::Retained -> prepare_connected_submission
+        let (mut blk_a, _, blk_c, _) = connect_v4_pair(Some(PmtudConfig::new(1500)));
+        blk_a.1.write(blk_c, b"blocked-then-prepared").unwrap();
+        let mut blk_buf = [0u8; 2048];
+        let mut saved_ip = Vec::new();
+        let reserved = blk_a
+            .1
+            .offer_fresh_transmit(60, blk_c, &mut blk_buf, 34, false, |selected| {
+                match blk_a
+                    .0
+                    .submit_fresh_tcp(selected, 60, 14, 0, true, |wire| {
+                        saved_ip = wire[14..].to_vec();
+                        BackendOutcome::WouldBlock
+                    })
+                    .expect("submit_fresh_tcp should run on live route")
+                {
+                    FreshSubmission::Retained {
+                        outcome: BackendOutcome::WouldBlock,
+                        ..
+                    } => None,
+                    _ => panic!("expected Retained(WouldBlock)"),
+                }
+            })
+            .unwrap();
+        let ntcp::FreshPoll::Reserved { attempt, .. } = reserved else {
+            panic!("blocked offer must capture reservation");
+        };
+        let prepared = blk_a
+            .0
+            .prepare_connected_submission(&mut blk_a.1, attempt, 65, &saved_ip, true)
+            .unwrap()
+            .expect("prepare_connected_submission must succeed on live IPv4 route");
+        assert_eq!(prepared.address(), Some(mac));
+        assert_eq!(prepared.context().attempt, attempt);
+        prepared.submitted();
+        assert!(!blk_a.1.is_output_reserved(blk_c));
+
+        // --- Part B: IPv6 byte-identical comparison: submit_fresh_tcp + prepare_connected_submission ---
+        let a_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let b_v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let make_v6 = |local: Ipv6Addr, id: u64| {
+            let cfg = EndpointConfig {
+                max_connections: 4,
+                max_listeners: 2,
+                connection: ConnectionConfig {
+                    mss: 1440,
+                    send_capacity: 65536,
+                    receive_capacity: 65536,
+                    initial_window: InitialWindow::Iw10,
+                    nagle: false,
+                    delayed_ack_us: 0,
+                    timestamps: true,
+                    pmtud: None,
+                    ..ConnectionConfig::default()
+                },
+                ..EndpointConfig::default()
+            };
+            let (mut path_limits, limits) = managed_limits(&cfg, 2, 3, 2, 8, 2).unwrap();
+            path_limits.routes = 8;
+            path_limits.paths = 16;
+            let mut host = Host::new(
+                ContextId::new(id),
+                path_limits,
+                limits,
+                cfg.connection.timebase,
+                [id as u8; 16],
+            )
+            .unwrap();
+            let caps = ReceiveCapabilities {
+                max_ip_packet: 1500,
+                ipv4: Ipv4Receive::Disabled,
+                ipv6: Ipv6Receive::BaseHeader,
+                gro: false,
+            };
+            let link = host
+                .register_link(
+                    path::InterfaceKey(id),
+                    1500,
+                    caps,
+                    Forwarding::Forwarder(ForwarderId(9)),
+                )
+                .unwrap();
+            host.register_source(ScopedAddress::new(IpAddr::V6(local), None).unwrap(), link.link())
+                .unwrap();
+            host.add_route(path::Route {
+                destination: path::IpPrefix::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).unwrap(),
+                source: None,
+                dscp: None,
+                link: link.link(),
+                next_hop: path::NextHop::Forwarder(ForwarderId(9)),
+                metric: 0,
+            })
+            .unwrap();
+            let mut ep = Endpoint::new(cfg, [id as u8; 32], 0, move |req| match req {
+                ntcp::AddressValidation::Bind { local: a }
+                | ntcp::AddressValidation::Open { local: a, .. }
+                | ntcp::AddressValidation::Incoming { destination: a, .. }
+                | ntcp::AddressValidation::Route { source: a, .. } => a == IpAddr::V6(local),
+            })
+            .unwrap();
+            host.attach(&mut ep).unwrap();
+            ep.enable_output_reservations_with_capacity(2).unwrap();
+            (host, ep, link)
+        };
+
+        let emit_v6 = |host: &mut Host, ep: &mut Endpoint, now: Instant| -> Option<Vec<u8>> {
+            let mut tcp = [0u8; 2048];
+            let (poll, attempt) = ep.poll_reserved_transmit(now, &mut tcp, 32).unwrap();
+            let pkt = poll.packet?;
+            let attempt = attempt.unwrap();
+            let ctx = host.egress_context(ep, attempt).unwrap();
+            let mut ip_buf = vec![0u8; 40 + pkt.len];
+            ip_buf[40..40 + pkt.len].copy_from_slice(&tcp[..pkt.len]);
+            let n = ntcp_ip6::encode(&mut ip_buf, pkt).unwrap();
+            ip_buf.truncate(n);
+            let ticket = host.submission_ticket(ep, ctx).unwrap();
+            assert_eq!(
+                host.submit(ep, now, ticket, ctx, &ip_buf, 0, |_| BackendOutcome::Submitted)
+                    .unwrap(),
+                Submission::Submitted
+            );
+            Some(ip_buf)
+        };
+
+        let connect_v6_pair = || {
+            let mut a = make_v6(a_v6, 21);
+            let mut b = make_v6(b_v6, 22);
+            let l = b
+                .1
+                .listen(SocketAddr::new(IpAddr::V6(b_v6), 80), 4)
+                .unwrap();
+            let c = a
+                .1
+                .connect_with_path_provider(
+                    1,
+                    SocketAddr::new(IpAddr::V6(a_v6), 50001),
+                    SocketAddr::new(IpAddr::V6(b_v6), 80),
+                    ManagedOpenOptions {
+                        transport: ActiveOpenOptions::from(&EndpointConfig::default().connection),
+                        dscp: 0,
+                        ipv4_options: OutgoingIpv4Options::default(),
+                        registration: None,
+                        receive_authority: None,
+                    },
+                    &mut a.0,
+                )
+                .unwrap();
+            let mut now = 1;
+            for _ in 0..8 {
+                now += 1;
+                if let Some(pkt) = emit_v6(&mut a.0, &mut a.1, now) {
+                    b.0.input_ip(&mut b.1, b.2, now, &pkt, Default::default(), 0, None)
+                        .unwrap();
+                }
+                now += 1;
+                if let Some(pkt) = emit_v6(&mut b.0, &mut b.1, now) {
+                    a.0.input_ip(&mut a.1, a.2, now, &pkt, Default::default(), 0, None)
+                        .unwrap();
+                }
+            }
+            let s = b.1.accept(l).unwrap();
+            a.0.refresh(&mut a.1, c).unwrap();
+            (a, b, c, s)
+        };
+
+        let (mut v6_fast, _, v6_fc, _) = connect_v6_pair();
+        let (mut v6_gen, _, v6_gc, _) = connect_v6_pair();
+        v6_fast.1.write(v6_fc, b"ipv6-fast-path-payload").unwrap();
+        v6_gen.1.write(v6_gc, b"ipv6-fast-path-payload").unwrap();
+
+        let gen_v6_pkt = emit_v6(&mut v6_gen.0, &mut v6_gen.1, 70).unwrap();
+
+        let mut v6_buf = [0u8; 2048];
+        let mut v6_wire = Vec::new();
+        let v6_offered = v6_fast
+            .1
+            .offer_fresh_transmit(70, v6_fc, &mut v6_buf, 54, false, |selected| {
+                match v6_fast
+                    .0
+                    .submit_fresh_tcp(selected, 70, 14, 0, false, |wire| {
+                        v6_wire = wire.to_vec();
+                        BackendOutcome::Submitted
+                    })
+                    .expect("submit_fresh_tcp should hit connected IPv6 route")
+                {
+                    FreshSubmission::Submitted(receipt) => Some(receipt),
+                    FreshSubmission::Retained { .. } => None,
+                }
+            })
+            .unwrap();
+        assert!(matches!(v6_offered, ntcp::FreshPoll::Submitted { .. }));
+        assert_eq!(
+            &v6_wire[14..],
+            &gen_v6_pkt[..],
+            "IPv6+TCP bytes from submit_fresh_tcp must be byte-identical to general path"
+        );
+        assert_eq!(v6_fast.1.next_deadline(), v6_gen.1.next_deadline());
+        assert_eq!(
+            v6_fast.1.transport_info(v6_fc).unwrap(),
+            v6_gen.1.transport_info(v6_gc).unwrap()
+        );
+
+        // IPv6 prepare_connected_submission on a reserved attempt.
+        v6_fast.1.write(v6_fc, b"ipv6-prepared-submission").unwrap();
+        let mut v6_tcp = [0u8; 2048];
+        let (poll, att) = v6_fast.1.poll_reserved_transmit_for(80, v6_fc, &mut v6_tcp, 1).unwrap();
+        let pkt = poll.packet.unwrap();
+        let att = att.unwrap();
+        let mut v6_frame = vec![0u8; 40 + pkt.len];
+        v6_frame[40..].copy_from_slice(&v6_tcp[..pkt.len]);
+        let n = ntcp_ip6::encode(&mut v6_frame, pkt).unwrap();
+        v6_frame.truncate(n);
+        let prepared = v6_fast
+            .0
+            .prepare_connected_submission(&mut v6_fast.1, att, 80, &v6_frame, false)
+            .unwrap()
+            .expect("prepare_connected_submission must succeed on live IPv6 route");
+        assert_eq!(prepared.address(), None);
+        prepared.submitted();
+        assert!(!v6_fast.1.is_output_reserved(v6_fc));
+    }
+
+    #[test]
+    fn submission_fast_paths_fallback_cleanly_on_route_mtu_and_arp_invalidation() {
+        let (mut a, _b, c, _s) = connect_pair();
+        a.0.refresh(&mut a.1, c).unwrap();
+        assert!(a.0.dst_held(&a.1, c));
+
+        // 1) Route invalidation: adding a more-specific route invalidates dst ->
+        // both submit_fresh_tcp and prepare_connected_submission return None (clean fallback).
+        let specific = path::Route {
+            destination: path::IpPrefix::new(IpAddr::V4(B_IP), 32).unwrap(),
+            source: None,
+            dscp: None,
+            link: a.2.link(),
+            next_hop: path::NextHop::Forwarder(ForwarderId(9)),
+            metric: 0,
+        };
+        a.0.add_route(specific).unwrap();
+        assert!(!a.0.dst_held(&a.1, c));
+
+        a.1.write(c, b"after-route-change").unwrap();
+        let mut buf = [0u8; 2048];
+        let mut ran_fallback = false;
+        let reserved = a
+            .1
+            .offer_fresh_transmit(100, c, &mut buf, 34, false, |selected| {
+                let res = a.0.submit_fresh_tcp(selected, 100, 14, 0, false, |_| {
+                    panic!("stale route must not submit")
+                });
+                assert!(res.is_none());
+                ran_fallback = true;
+                None
+            })
+            .unwrap();
+        assert!(ran_fallback);
+        let ntcp::FreshPoll::Reserved { attempt, .. } = reserved else {
+            panic!("stale route offer must fall back to captured reservation");
+        };
+        let pkt = a.1.transmit_attempt_packet(attempt).unwrap();
+        let mut ip_frame = vec![0u8; 20 + pkt.len];
+        ip_frame[20..].copy_from_slice(&buf[34..34 + pkt.len]);
+        let n = ntcp_ip::encode(&mut ip_frame, pkt, 0).unwrap();
+        ip_frame.truncate(n);
+        assert!(
+            a.0.prepare_connected_submission(&mut a.1, attempt, 100, &ip_frame, false)
+                .unwrap()
+                .is_none(),
+            "stale route must cause prepare_connected_submission to return Ok(None)"
+        );
+        // General egress_context + submit still refreshes and succeeds cleanly!
+        let ctx = a.0.egress_context(&mut a.1, attempt).unwrap();
+        let ticket = a.0.submission_ticket(&mut a.1, ctx).unwrap();
+        assert_eq!(
+            a.0.submit(&mut a.1, 100, ticket, ctx, &ip_frame, 0, |_| {
+                BackendOutcome::Submitted
+            })
+            .unwrap(),
+            Submission::Submitted
+        );
+
+        // 2) MTU invalidation: lower link MTU below packet size -> fast paths return None cleanly.
+        a.0.refresh(&mut a.1, c).unwrap();
+        a.0.refresh(&mut a.1, c).unwrap();
+        assert!(a.0.dst_held(&a.1, c));
+        a.1.write(c, &[0x5a; 1000]).unwrap();
+        let mut tcp = [0u8; 2048];
+        let (poll, att) = a.1.poll_reserved_transmit_for(110, c, &mut tcp, 1).unwrap();
+        let pkt = poll.packet.unwrap();
+        let att = att.unwrap();
+        let mut big_ip = vec![0u8; 20 + pkt.len];
+        big_ip[20..].copy_from_slice(&tcp[..pkt.len]);
+        let n = ntcp_ip::encode(&mut big_ip, pkt, 0).unwrap();
+        big_ip.truncate(n);
+        a.0.set_link_mtu(a.2.link(), 576).unwrap();
+        assert!(
+            a.0.prepare_connected_submission(&mut a.1, att, 110, &big_ip, false)
+                .unwrap()
+                .is_none(),
+            "MTU decrease must cause prepare_connected_submission to return Ok(None)"
+        );
+        assert!(a.1.reject_unsubmitted(att).unwrap());
+        assert!(a.1.abandon_transmit(att).unwrap());
+
+        // 3) ARP expiry invalidation: on-link route with expired ARP returns None when resolve=true,
+        // and ethernet_egress_context returns (ctx, None), while resolve=false still succeeds.
+        let (mut arp_host, mut arp_ep, arp_link) = {
+            let cfg = EndpointConfig {
+                max_connections: 4,
+                max_listeners: 2,
+                connection: ConnectionConfig {
+                    mss: 1460,
+                    send_capacity: 65536,
+                    receive_capacity: 65536,
+                    initial_window: InitialWindow::Iw10,
+                    nagle: false,
+                    delayed_ack_us: 0,
+                    timestamps: true,
+                    pmtud: None,
+                    ..ConnectionConfig::default()
+                },
+                ..EndpointConfig::default()
+            };
+            let (mut path_limits, limits) = managed_limits(&cfg, 2, 3, 2, 8, 2).unwrap();
+            path_limits.routes = 8;
+            path_limits.paths = 16;
+            let mut host = Host::new(
+                ContextId::new(31),
+                path_limits,
+                limits,
+                cfg.connection.timebase,
+                [31; 16],
+            )
+            .unwrap();
+            let link = host
+                .register_link(
+                    path::InterfaceKey(31),
+                    1500,
+                    plain_recv_caps(),
+                    Forwarding::IpNextHop,
+                )
+                .unwrap();
+            host.register_source(ScopedAddress::new(IpAddr::V4(A_IP), None).unwrap(), link.link())
+                .unwrap();
+            host.add_route(path::Route {
+                destination: path::IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+                source: None,
+                dscp: None,
+                link: link.link(),
+                next_hop: path::NextHop::OnLink,
+                metric: 0,
+            })
+            .unwrap();
+            host.ipv4_neighbors.install(Box::new(ExpiringArp {
+                link: link.link(),
+                target: B_IP,
+                mac: [0x02, 0xde, 0xad, 0xbe, 0xef, 0x01],
+                expires_at: 500,
+                generation: 1,
+            }));
+            let mut ep = Endpoint::new(cfg, [31; 32], 0, |_| true).unwrap();
+            host.attach(&mut ep).unwrap();
+            ep.enable_output_reservations_with_capacity(2).unwrap();
+            (host, ep, link)
+        };
+        let mut peer = make_host(B_IP, 32);
+        let l = peer
+            .1
+            .listen(SocketAddr::new(IpAddr::V4(B_IP), 80), 4)
+            .unwrap();
+        let conn = arp_ep
+            .connect_with_path_provider(
+                1,
+                SocketAddr::new(IpAddr::V4(A_IP), 51000),
+                SocketAddr::new(IpAddr::V4(B_IP), 80),
+                ManagedOpenOptions {
+                    transport: ActiveOpenOptions::from(&EndpointConfig::default().connection),
+                    dscp: 0,
+                    ipv4_options: OutgoingIpv4Options::default(),
+                    registration: None,
+                    receive_authority: None,
+                },
+                &mut arp_host,
+            )
+            .unwrap();
+        let mut now = 1;
+        for _ in 0..8 {
+            now += 1;
+            if let Some(pkt) = emit_ipv4(&mut arp_host, &mut arp_ep, now) {
+                let mut frame = None;
+                peer.0
+                    .receive_tcp_frame(&mut peer.1, peer.2, now, &pkt, &mut frame, Default::default(), 0)
+                    .unwrap();
+            }
+            now += 1;
+            if let Some(pkt) = emit_ipv4(&mut peer.0, &mut peer.1, now) {
+                let mut frame = None;
+                arp_host
+                    .receive_tcp_frame(&mut arp_ep, arp_link, now, &pkt, &mut frame, Default::default(), 0)
+                    .unwrap();
+            }
+        }
+        let _ = peer.1.accept(l).unwrap();
+        arp_host.refresh(&mut arp_ep, conn).unwrap();
+        arp_ep.write(conn, b"after-arp-expiry").unwrap();
+
+        // Advance past ARP expiry (500): submit_fresh_tcp(resolve=true) returns None.
+        let mut arp_buf = [0u8; 2048];
+        let reserved = arp_ep
+            .offer_fresh_transmit(600, conn, &mut arp_buf, 34, false, |selected| {
+                assert!(
+                    arp_host
+                        .submit_fresh_tcp(selected, 600, 14, 0, true, |_| {
+                            panic!("expired ARP must not submit with resolve=true")
+                        })
+                        .is_none()
+                );
+                None
+            })
+            .unwrap();
+        let ntcp::FreshPoll::Reserved { attempt, .. } = reserved else {
+            panic!("expired ARP must fall back to captured reservation");
+        };
+        let pkt = arp_ep.transmit_attempt_packet(attempt).unwrap();
+        let mut arp_ip = vec![0u8; 20 + pkt.len];
+        arp_ip[20..].copy_from_slice(&arp_buf[34..34 + pkt.len]);
+        let n = ntcp_ip::encode(&mut arp_ip, pkt, 0).unwrap();
+        arp_ip.truncate(n);
+
+        assert!(
+            arp_host
+                .prepare_connected_submission(&mut arp_ep, attempt, 600, &arp_ip, true)
+                .unwrap()
+                .is_none(),
+            "expired ARP must cause prepare_connected_submission(resolve=true) to return Ok(None)"
+        );
+        let (_ctx, resolved_mac) = arp_host
+            .ethernet_egress_context(&mut arp_ep, attempt, 600)
+            .unwrap();
+        assert_eq!(resolved_mac, None, "expired ARP must yield None MAC");
+        // With resolve=false, prepare_connected_submission still hits the held route and commits cleanly.
+        let prepared = arp_host
+            .prepare_connected_submission(&mut arp_ep, attempt, 600, &arp_ip, false)
+            .unwrap()
+            .expect("resolve=false should succeed even with expired ARP");
+        prepared.submitted();
+        assert!(!arp_ep.is_output_reserved(conn));
     }
 }

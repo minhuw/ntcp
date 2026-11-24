@@ -504,6 +504,7 @@ impl Rack {
 
     // These two commits are called only after successful wire encoding. Window
     // validity belongs to the complete original, not its surviving ACK suffix.
+    #[cfg(test)]
     pub(crate) fn commit_original_window(&mut self, start: Seq, end: Seq, in_window: bool) {
         // Pieces of an original never leave its own sequence range.
         let (first, last) = self.overlapping(start, end);
@@ -1596,8 +1597,6 @@ impl Rack {
     // An original submitted at the instant of selection. It can be
     // appended with its final wire bounds, timestamp and delivery-unit
     // boundary in one write.
-    // Callers in `connection.rs` land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn record_submitted_original(
         &mut self,
         start: Seq,
@@ -2785,6 +2784,18 @@ impl Rack {
                 .count() as u32;
         }
         self.tally.short != 0
+    }
+
+    // Pure `&self` view of `has_short_transmission` for debug invariant checks.
+    #[cfg(debug_assertions)]
+    pub(crate) fn has_short_transmission_ref(&self, mss: u32) -> bool {
+        if mss == self.short_mss {
+            self.tally.short != 0
+        } else {
+            self.intervals
+                .iter()
+                .any(|r| r.transmission_end.distance_from(r.transmission_start) < mss)
+        }
     }
 
     // Diagnostic/accounting identity remains the logical selection, not local

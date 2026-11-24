@@ -180,6 +180,7 @@ impl SendBuffer {
         self.marks.extend_to(self.data.len());
     }
 
+    #[cfg(test)]
     pub(crate) fn write(&mut self, input: &[u8]) -> usize {
         let count = input.len().min(self.remaining());
         self.append(&input[..count]);
@@ -235,8 +236,6 @@ impl SendBuffer {
         self.push_end.checked_sub(1)
     }
 
-    // Production callers land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn push_after(&self, offset: usize) -> bool {
         self.push_end > offset
     }
@@ -356,8 +355,6 @@ impl SendBuffer {
     }
 
     // A nonempty append puts its last byte strictly past all old marks.
-    // Production callers land in a later commit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn finish_append(&mut self, push: bool, end_of_record: bool) {
         if push || end_of_record {
             let end = self.len();
@@ -376,6 +373,7 @@ impl SendBuffer {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_end_of_record(&mut self) {
         if self.marks.or_back(2) {
             self.eor_end = self.marks.len();

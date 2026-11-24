@@ -24,7 +24,7 @@ use crate::{
 
 #[path = "connection_local_repair.rs"]
 mod local_repair;
-use local_repair::{ControlUndo, RepairUndo};
+use local_repair::{ControlUndo, RepairUndo, ReservationUndo};
 #[path = "connection_ptb.rs"]
 mod ptb;
 use ptb::PtbRepair;
@@ -867,6 +867,9 @@ pub(crate) const LEDGER_RESERVE: usize = 4096;
 // request/response connection's 600-byte responses reallocate nothing.
 pub(crate) const SEND_RING_RESERVE: usize = 4096;
 
+// Minimum number of segments used when sizing a send ledger.
+const LEDGER_INITIAL_SEGMENTS: usize = 10;
+
 fn rounded_send_space(capacity: usize, quantum: usize) -> usize {
     if capacity < quantum {
         capacity
@@ -913,6 +916,47 @@ struct DeferredSyn {
 // capacities are bounded by `65535 << 14`, so `usize::MAX` never matches.
 const RCV_MEMORY_LIMIT_UNSET: (usize, usize) = (usize::MAX, 0);
 
+// A fresh scalar packet offered with its owner exclusively borrowed. RACK
+// and the PTO timer learn of the selection together when the device returns.
+pub(crate) struct StreamRecord {
+    start: Seq,
+    end: Seq,
+    data_ack: bool,
+    window: u16,
+    received_syn_data_acked: bool,
+}
+
+impl StreamRecord {
+    pub(crate) fn has_data(&self) -> bool {
+        self.start != self.end
+    }
+
+    // A device refusal needs the complete selected departure for the usual
+    // reservation and retry. An original has no retransmission, probe,
+    // partial GSO, or control-packet state to save before the offer.
+    // Each consumer uses the departure fields its kind of submission needs.
+    #[inline(always)]
+    fn departure(&self, owner: &Connection, now: Instant) -> Departure {
+        let data = self.has_data();
+        Departure {
+            fresh_data: data,
+            stream: data,
+            tlp: data,
+            start: self.start.0,
+            payload: self.end.distance_from(self.start) as usize,
+            selected_at: now,
+            data_ack: self.data_ack,
+            received_syn_data_acked: self.received_syn_data_acked,
+            syn_timestamp: owner.timestamps.then(|| owner.timestamp_value(now)),
+            rto: data && owner.rto_deadline.is_none(),
+            rto_head: self.start == owner.snd_una,
+            prior_rto_deadline: owner.prior_rto_deadline(self.start),
+            timeout_recovery: owner.sack_post_rto.is_some() || owner.consecutive_timeouts != 0,
+            ..Departure::default()
+        }
+    }
+}
+
 // Window information from before the ACK changed flight or sender state.
 struct AckWindow {
     prior: u32,
@@ -941,6 +985,9 @@ pub(crate) struct Connection {
     reason: Option<CloseReason>,
     events: PendingEvents,
     now: Instant,
+    // First clock instant at which an RTT or timestamp sample can have
+    // aged by a serial half-range. New samples can only move it later.
+    sample_review: Instant,
     send: SendBuffer,
     receive: RxQueue,
     // The receive queue's storage as last settled with the Endpoint's
@@ -1074,8 +1121,7 @@ pub(crate) struct Connection {
     pub(crate) last_discovery: Option<crate::DiscoveryIntent>,
     // Optional timing evidence, separate from the retained output obligation.
     reserved_ledger: Option<crate::rack::DepartureSelection>,
-    repair_undo: Option<RepairUndo>,
-    control_undo: Option<ControlUndo>,
+    repair_undo: Option<ReservationUndo>,
     ptb: PtbRepair,
     local_resource: Option<LocalResource>,
     resource_probes: u32,
@@ -1441,6 +1487,7 @@ impl Connection {
             send_mss_limit: config.mss,
             ip_header_len,
             pmtud,
+            sample_review: Self::sample_expiration(&config, now),
             config,
             state: State::SynSent,
             reason: None,
@@ -1538,7 +1585,6 @@ impl Connection {
             last_discovery: None,
             reserved_ledger: None,
             repair_undo: None,
-            control_undo: None,
             ptb: PtbRepair::default(),
             local_resource: None,
             resource_probes: 0,
@@ -2420,24 +2466,23 @@ impl Connection {
             && self.rack.valid()
     }
 
-    fn tlp_arm_packets(&self) -> Option<u32> {
+    fn tlp_arm_packets<const STREAM: bool>(&self) -> Option<u32> {
         // Plain state tests first, the flight before all (an ACK of every
         // byte arms nothing, as tcp_set_xmit_timer tests packets_out
         // first); the composite rack_enabled and synchronized last.
         if !(self.config.tlp
-            && self.flight() != 0
-            && self.snd_wnd != 0
+            && (STREAM || self.flight() != 0 && self.snd_wnd != 0)
             && self.consecutive_timeouts == 0
-            && !self.retx_pending
+            && (STREAM || !self.retx_pending)
             && self.rack.deadline.is_none()
-            && self.sack_post_rto.is_none()
+            && (STREAM || self.sack_post_rto.is_none())
             && !self.congestion.in_recovery()
             && self.ecn_pause.is_none_or(|deadline| self.now >= deadline)
             // A loss probe must not bypass the PTB Restart allowance or
             // ordinary admission of known-dropped ranges.
-            && self.ptb_idle()
+            && (STREAM || self.ptb_idle())
             && self.rack_enabled()
-            && self.synchronized())
+            && (STREAM || self.synchronized()))
         {
             return None;
         }
@@ -2447,7 +2492,7 @@ impl Connection {
     }
 
     fn tlp_eligible(&self) -> bool {
-        self.tlp_arm_packets().is_some()
+        self.tlp_arm_packets::<false>().is_some()
     }
 
     // Only this value is armed. The protocol-specific deadlines are candidate
@@ -2526,8 +2571,61 @@ impl Connection {
     //# any delayed ACKs that it is withholding.
     #[cfg(test)]
     fn schedule_tlp(&mut self) {
-        self.arm_tlp(self.tlp_arm_packets());
+        self.arm_tlp(self.tlp_arm_packets::<false>());
         self.select_loss_timer();
+    }
+
+    fn tlp_deadline_from_short(
+        &self,
+        unacked_packets: u32,
+        has_short: bool,
+    ) -> Option<Instant> {
+        // Preserve a short flight's peer ACK budget without imposing that
+        // delay on full-sized flights. A separate scheduling margin covers
+        // local timing variance for sampled multi-packet flights.
+        let pto = self.rtt.srtt().map_or_else(
+            || self.config.timebase.ticks_from_us(1_000_000),
+            |srtt| {
+                let peer_delay = self
+                    .config
+                    .timebase
+                    .ticks_from_us(self.config.peer_max_ack_delay_us);
+                let fin_packet = u32::from(self.fin_sequence.is_some_and(|fin| {
+                    fin.at_or_after(self.snd_una)
+                        && (self.fin_standalone || fin == self.snd_una)
+                }));
+                let packets = unacked_packets + fin_packet;
+                let delay = if packets == 1 {
+                    peer_delay
+                } else if packets > 1 {
+                    // Conservative scheduling allowance, not delivery or
+                    // congestion credit. Preserve RTO as the outer cap.
+                    self.config
+                        .timebase
+                        .ticks_from_us(self.config.tlp_timer_margin_us)
+                } else {
+                    0
+                };
+                let pto = srtt.saturating_mul(2).saturating_add(delay);
+                // A singleton's PTO already includes the peer delay in
+                // full. A short original can only raise a larger flight's
+                // timeout (or one whose originals were split).
+                if packets != 1 && has_short {
+                    pto.max(srtt.saturating_add(peer_delay))
+                } else {
+                    pto
+                }
+                .max(1)
+            },
+        );
+        self.rto_deadline
+            .map(|rto| self.now.saturating_add(pto).min(rto))
+    }
+
+    #[cfg(debug_assertions)]
+    fn expected_tlp_deadline(&self, unacked_packets: u32) -> Option<Instant> {
+        let has_short = self.rack.has_short_transmission_ref(self.mss as u32);
+        self.tlp_deadline_from_short(unacked_packets, has_short)
     }
 
     // The PTO deadline for `packets`, tlp_arm_packets() as the caller has
@@ -2535,46 +2633,17 @@ impl Connection {
     // recomputes the probe timeout on each arm and only resets its timer
     // (tcp_schedule_loss_probe).
     fn arm_tlp(&mut self, packets: Option<u32>) {
-        debug_assert_eq!(packets, self.tlp_arm_packets());
+        debug_assert_eq!(packets, self.tlp_arm_packets::<false>());
         if let Some(unacked_packets) = packets {
-            // Preserve a short flight's peer ACK budget without imposing that
-            // delay on full-sized flights. A separate scheduling margin covers
-            // local timing variance for sampled multi-packet flights.
-            let pto = self.rtt.srtt().map_or_else(
-                || self.config.timebase.ticks_from_us(1_000_000),
-                |srtt| {
-                    let peer_delay = self
-                        .config
-                        .timebase
-                        .ticks_from_us(self.config.peer_max_ack_delay_us);
-                    let fin_packet = u32::from(self.fin_sequence.is_some_and(|fin| {
+            let has_short = self.rtt.srtt().is_some()
+                && unacked_packets
+                    + u32::from(self.fin_sequence.is_some_and(|fin| {
                         fin.at_or_after(self.snd_una)
                             && (self.fin_standalone || fin == self.snd_una)
-                    }));
-                    let packets = unacked_packets + fin_packet;
-                    let delay = if packets == 1 {
-                        peer_delay
-                    } else if packets > 1 {
-                        // Conservative scheduling allowance, not delivery or
-                        // congestion credit. Preserve RTO as the outer cap.
-                        self.config
-                            .timebase
-                            .ticks_from_us(self.config.tlp_timer_margin_us)
-                    } else {
-                        0
-                    };
-                    let pto = srtt.saturating_mul(2).saturating_add(delay);
-                    if self.rack.has_short_transmission(self.mss as u32) {
-                        pto.max(srtt.saturating_add(peer_delay))
-                    } else {
-                        pto
-                    }
-                    .max(1)
-                },
-            );
-            self.tlp_deadline = self
-                .rto_deadline
-                .map(|rto| self.now.saturating_add(pto).min(rto));
+                    }))
+                    != 1
+                && self.rack.has_short_transmission(self.mss as u32);
+            self.tlp_deadline = self.tlp_deadline_from_short(unacked_packets, has_short);
         }
     }
 
@@ -3498,6 +3567,7 @@ impl Connection {
     /// Returns whether the reservation ends at this fragment although its
     /// suffix was not emitted: a PTB repair split during Restart, whose
     /// never-charged suffix stays pending repair work.
+    #[cfg(test)]
     pub(crate) fn accept_reserved_output(
         &mut self,
         now: Instant,
@@ -3507,12 +3577,12 @@ impl Connection {
         finished: bool,
     ) -> Result<bool, Error> {
         self.validate_reserved_output(now, d, offset, count)?;
-        self.accept_validated_output(now, d, offset, count, finished)
+        Ok(self.accept_validated_output(now, d, offset, count, finished))
     }
 
     /// `accept_reserved_output` once `validate_reserved_output` held for
     /// the same arguments, with the connection unchanged since (a held
-    /// reservation freezes it).
+    /// reservation freezes it). Structurally infallible after validation.
     pub(crate) fn accept_validated_output(
         &mut self,
         now: Instant,
@@ -3520,22 +3590,107 @@ impl Connection {
         offset: usize,
         count: usize,
         finished: bool,
-    ) -> Result<bool, Error> {
+    ) -> bool {
+        self.commit_selected_checked(now, d, offset, count, finished, false)
+    }
+
+    // Called immediately after selecting this scalar packet, before releasing
+    // the owner. A new data packet with a ledger selection just appended
+    // exactly one interval. A control-only packet has no interval to check.
+    pub(crate) fn can_submit_immediate(&self, now: Instant) -> Option<Departure> {
+        let d = self.last_departure?;
+        if d.segmentation.is_some() {
+            return None;
+        }
+        if d.fresh_data || !d.stream {
+            debug_assert!(self.validate_reserved_output(now, &d, 0, d.payload).is_ok());
+            Some(d)
+        } else {
+            self.validate_reserved_output(now, &d, 0, d.payload)
+                .is_ok()
+                .then_some(d)
+        }
+    }
+
+    // Structurally infallible synchronous departure commit for a stream record
+    // selected at `now` with the owner held exclusively.
+    pub(crate) fn submit_immediate_stream(&mut self, now: Instant, r: StreamRecord) {
+        if !r.has_data() {
+            // Selection settled the advertised window and idle timers.
+            // This ACK consumes no send sequence space or RACK entry.
+            debug_assert!(self.now == now && self.pmtud.is_none());
+            self.ack_departed(r.data_ack, false, r.received_syn_data_acked);
+            return;
+        }
+        // Selection held the owner exclusively and left the RTO and head
+        // untouched. Read their prior state before settling that selection.
+        let mut d = r.departure(self, now);
+        self.settle_offered_stream(&r);
+        let count = d.payload;
+        debug_assert!(d.fresh_data && !d.fin && !d.ptb_repair && self.now == now);
+        self.rack
+            .record_submitted_original(r.start, r.end, now, true);
+        // The backend already owns this packet. No reservation can
+        // present its token to validate or commit it a second time.
+        debug_assert!(self.reserved_ledger.is_none());
+        debug_assert!(self.pmtud.is_none());
+        let withdrawn =
+            self.accept_departed_output_checked::<true>(now, &mut d, 0, count, true, false);
+        debug_assert!(!withdrawn);
+    }
+
+    // Structurally infallible synchronous departure commit for a preflighted
+    // scalar selection at `now` (proven by `can_submit_immediate(now)`).
+    pub(crate) fn submit_immediate_departure(
+        &mut self,
+        now: Instant,
+        mut d: Departure,
+        receipt: crate::PhysicalReceipt,
+    ) {
+        let count = d.payload;
+        debug_assert_eq!(d.selected_at, now);
+        let withdrawn = self.commit_selected_checked(now, &mut d, 0, count, true, true);
+        debug_assert!(!withdrawn);
+        self.certify_submission(&d, 0, count, receipt);
+    }
+
+    fn commit_selected_checked(
+        &mut self,
+        now: Instant,
+        d: &mut Departure,
+        offset: usize,
+        count: usize,
+        finished: bool,
+        immediate: bool,
+    ) -> bool {
         debug_assert!(self.validate_reserved_output(now, d, offset, count).is_ok());
-        if d.stream
+        let whole_packet = if d.stream
             && count != 0
             && let Some(selection) = self.reserved_ledger
         {
             let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
             // Validated; nothing since changed the intervals.
-            self.rack.commit_validated_departure(
-                selection,
-                start,
-                start.wrapping_add(count as u32),
-                now,
-            );
-        }
-        self.accept_departed_output(now, d, offset, count, finished)
+            if immediate && d.fresh_data {
+                self.rack.commit_new_packet(selection)
+            } else {
+                self.rack.commit_validated_departure(
+                    selection,
+                    start,
+                    start.wrapping_add(count as u32),
+                    now,
+                )
+            }
+        } else {
+            false
+        };
+        self.accept_departed_output_checked::<false>(
+            now,
+            d,
+            offset,
+            count,
+            finished,
+            whole_packet && now == d.selected_at && d.tlp && !d.syn && !d.fin,
+        )
     }
 
     /// `accept_reserved_output` of each segment of a GSO reservation that
@@ -3576,31 +3731,59 @@ impl Connection {
             // The group preflight covers every segment, and nothing else
             // runs between these acceptances.
             let withdrawn = if whole {
-                self.accept_departed_output(now, d, at, count, last)
+                self.accept_departed_output_checked::<false>(now, d, at, count, last, false)
             } else {
-                self.accept_reserved_output(now, d, at, count, last)
-            }
-            .expect("preflighted group departure");
+                self.accept_validated_output(now, d, at, count, last)
+            };
             // Only PTB repairs withdraw a suffix; GSO selects fresh data.
             debug_assert!(!withdrawn);
         }
     }
 
-    // The rest of `accept_reserved_output`, once RACK has the departure.
-    fn accept_departed_output(
+    // The rest of `accept_reserved_output`, once RACK has the departure and
+    // `check_time(now)` has already been proven. Structurally infallible.
+    fn accept_departed_output_checked<const ORIGINAL: bool>(
         &mut self,
         now: Instant,
         d: &mut Departure,
         offset: usize,
         count: usize,
         finished: bool,
-    ) -> Result<bool, Error> {
-        self.control_undo = None;
-        if count != 0 {
+        same_probe: bool,
+    ) -> bool {
+        // The direct submission owns the same selected stream and clock as
+        // the encoder. Such an original has no control or loss-repair work.
+        debug_assert!(
+            !ORIGINAL
+                || (d.fresh_data
+                    && d.stream
+                    && count == d.payload
+                    && count != 0
+                    && offset == 0
+                    && finished
+                    && now == self.now
+                    && !d.syn
+                    && !d.fin
+                    && !d.ptb_repair
+                    && !d.retransmission
+                    && !d.loss_probe
+                    && !d.shrink
+                    && !d.persist
+                    && !d.keepalive
+                    && self.prr.is_none()
+                    && self.pmtud.is_none())
+        );
+        let data = ORIGINAL || count != 0;
+        let syn = !ORIGINAL && d.syn;
+        let fin = !ORIGINAL && d.fin;
+        let selected_rto = self.rto_deadline;
+        if data || matches!(self.repair_undo, Some(ReservationUndo::Control(_))) {
+            self.repair_undo = None;
+        }
+        if data {
             if let Some(resource) = self.local_resource.take() {
                 self.application_progress_at = resource.epoch.unwrap_or(now);
             }
-            self.repair_undo = None; // Accepted prefixes can never be cancelled.
             self.reserved_retransmit_counts = None;
         }
         if finished && d.defer_push {
@@ -3610,13 +3793,14 @@ impl Connection {
             );
             d.defer_push = false;
         }
-        if count != 0
+        if !ORIGINAL
+            && data
             && (d.segmentation.is_some() || d.deferred_fresh)
             && let Some(p) = &mut self.pmtud
         {
             // An aggregate is not a physical packet or PMTU observation. Record
             // only the actual accepted segment, including any reduced-MTU split.
-            let start = Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32);
+            let start = Seq(d.start).wrapping_add(u32::from(syn) + offset as u32);
             p.sent(
                 start,
                 start.wrapping_add(count as u32),
@@ -3632,37 +3816,43 @@ impl Connection {
                 p.defer_proof_latest();
             }
         }
-        if d.deferred_fresh && count != 0 && !finished {
+        if !ORIGINAL && d.deferred_fresh && data && !finished {
             // The unsubmitted suffix is reserved sequence space, not another
             // physical packet. Keep partial-acceptance diagnostics truthful.
             self.reserved_retransmit_counts = Some(self.rack.diagnostic_packet_counts());
         }
-        self.update_time(now)?;
-        if d.stream
+        if !ORIGINAL {
+            debug_assert!(self.check_time(now).is_ok());
+            self.commit_checked_time(now);
+        }
+        if !ORIGINAL
+            && d.stream
             && !d.ptb_repair
             && let Some(prr) = &mut self.prr
             && prr.timer_repair()
         {
-            prr.sent(u32::from(count != 0)); // One accepted fragment.
+            prr.sent(u32::from(data)); // One accepted fragment.
             if finished {
                 prr.finish_timer_repair();
             }
         }
-        self.adaptive_departure(d.data_ack, d.fresh_data && count != 0 && !d.syn);
+        self.ack_departed(
+            d.data_ack,
+            ORIGINAL || (d.fresh_data && data && !syn),
+            d.received_syn_data_acked,
+        );
         d.data_ack = false; // One logical ACK, including SACK-only repair fragments.
-        self.syn_data_acked |= d.received_syn_data_acked;
-        self.syn_data_fully_acked |= d.received_syn_data_acked;
         // Payload has accepted-departure evidence in RACK. SYN (including
         // SYN+data) and standalone FIN retain their Karn-eligible sample, but
         // measure from acceptance, never from the encoded TSval's selection.
         // A retransmission already invalidated sample during selection; an
         // earlier flight's sample must not acquire this output's departure.
-        let end = Seq(d.start).wrapping_add(if d.syn {
+        let end = Seq(d.start).wrapping_add(if syn {
             1
         } else {
-            d.payload as u32 + u32::from(d.fin)
+            d.payload as u32 + u32::from(fin)
         });
-        if d.syn {
+        if syn {
             if finished {
                 self.fast_open_option_sent |= d.fast_open_option;
                 self.fast_open_response_committed |= d.simultaneous_response;
@@ -3675,15 +3865,17 @@ impl Connection {
                 Seq(d.start).wrapping_add(1 + count as u32),
             );
         }
-        if (d.payload != 0 || d.syn || d.fin) && self.sample.is_some_and(|(edge, _)| edge == end) {
-            if d.payload != 0 && !d.syn {
+        if (ORIGINAL || d.payload != 0 || syn || fin)
+            && self.sample.is_some_and(|(edge, _)| edge == end)
+        {
+            if ORIGINAL || (d.payload != 0 && !syn) {
                 self.sample = None;
-            } else if d.syn || (d.fin && finished) {
+            } else if syn || (fin && finished) {
                 self.sample_departure = Some(now);
             }
         }
-        let sequence = count != 0 || d.syn || (d.fin && finished);
-        if d.stream && count != 0 {
+        let sequence = data || syn || (fin && finished);
+        if ORIGINAL || (d.stream && data) {
             self.last_sent = now;
             if let Some(interval) = d.interval {
                 if d.initial_burst {
@@ -3706,23 +3898,23 @@ impl Connection {
                 );
             }
         }
-        if d.fin && finished {
+        if fin && finished {
             self.record_fin_departure(Seq(d.start).wrapping_add(offset as u32), count);
             self.fin_sent_at = Some(now);
         }
         // Accepted PTB repair coverage consumes the Restart allowance. In
         // Restart a split repair ends at its first accepted fragment.
         let mut withdrawn = false;
-        if d.ptb_repair && (count != 0 || d.fin && finished) {
+        if !ORIGINAL && d.ptb_repair && (data || fin && finished) {
             withdrawn = !finished && self.ptb_in_restart();
             self.ptb_repair_committed();
         }
         // Only this accepted coverage became a (possibly) submitted copy.
-        if d.retransmission {
+        if !ORIGINAL && d.retransmission {
             self.record_retransmission(
-                Seq(d.start).wrapping_add(u32::from(d.syn) + offset as u32),
+                Seq(d.start).wrapping_add(u32::from(syn) + offset as u32),
                 if d.stream { count } else { 0 },
-                d.fin && finished && d.fin_retransmission,
+                fin && finished && d.fin_retransmission,
                 d.ptb_repair,
             );
             if sequence {
@@ -3730,22 +3922,22 @@ impl Connection {
             }
         }
         // The probe's first accepted sequence-bearing segment sends it.
-        if sequence && d.loss_probe {
+        if !ORIGINAL && sequence && d.loss_probe {
             self.loss_events.loss_probes += 1;
             self.refresh_work = true;
             d.loss_probe = false;
         }
-        if d.ptb_repair {
+        if !ORIGINAL && d.ptb_repair {
             self.commit_ptb_copy(
                 now,
                 d.selected_at,
                 Seq(d.start).wrapping_add(offset as u32),
                 count,
-                d.fin && finished,
+                fin && finished,
                 finished || withdrawn,
             );
         }
-        if sequence && d.rto {
+        if sequence && d.rto && !(ORIGINAL && d.rto_head) {
             // A non-head retry cannot replace an ACK-restarted timer with
             // head.sent + RTO (nor defer an already overdue older flight).
             self.rto_deadline = if d.rto_head {
@@ -3760,11 +3952,11 @@ impl Connection {
             // later siblings must not defer that prefix's RTO.
             d.rto = false;
         }
-        if sequence && d.shrink {
+        if !ORIGINAL && sequence && d.shrink {
             self.shrink_unanswered_since = Some(now);
             d.shrink = false;
         }
-        if d.persist && (sequence || finished) {
+        if !ORIGINAL && d.persist && (sequence || finished) {
             if self.snd_wnd == 0 {
                 if d.unanswered {
                     self.persist_unanswered_since = Some(now);
@@ -3782,28 +3974,40 @@ impl Connection {
             d.unanswered = false;
             d.persist = false;
         }
-        if d.keepalive {
+        if !ORIGINAL && d.keepalive {
             self.keepalive_deadline = self
                 .config
                 .keepalive
                 .map(|k| now.saturating_add(self.config.timebase.ticks_from_us(k.interval_us)));
             d.keepalive = false;
         }
+        if ORIGINAL {
+            self.arm_submitted_stream();
+            return false;
+        }
         if sequence && d.tlp {
             if self.rto_deadline.is_some_and(|deadline| deadline <= now) {
                 // Local waiting cannot insert a new PTO ahead of an already
                 // expired older flight's RTO (PTO wins capped ties otherwise).
                 self.tlp_deadline = None;
+            } else if !same_probe || self.rto_deadline != selected_rto {
+                self.arm_tlp(self.tlp_arm_packets::<false>());
             } else {
-                self.arm_tlp(self.tlp_arm_packets());
+                #[cfg(debug_assertions)]
+                if let Some(unacked_packets) = self.tlp_arm_packets::<false>() {
+                    debug_assert_eq!(
+                        self.tlp_deadline,
+                        self.expected_tlp_deadline(unacked_packets)
+                    );
+                }
             }
         }
-        if withdrawn || d.syn && finished && self.early_response_eligible() {
+        if withdrawn || syn && finished && self.early_response_eligible() {
             self.arm_work();
         } else {
             self.select_loss_timer();
         }
-        Ok(withdrawn)
+        withdrawn
     }
 
     // One accepted segment carried retransmitted sequence space.
@@ -3820,7 +4024,6 @@ impl Connection {
         self.reset_echo = None;
         self.reset_reply = false;
         self.repair_undo = None;
-        self.control_undo = None;
         self.reserved_retransmit_counts = None;
         self.terminal(CloseReason::Aborted);
     }
@@ -4026,19 +4229,11 @@ impl Connection {
         count: usize,
         receipt: crate::PhysicalReceipt,
     ) {
-        self.certify_range(departure.submitted_range(offset, count), receipt);
-    }
-
-    pub(crate) fn certify_range(
-        &mut self,
-        (start, end): (Seq, Seq),
-        receipt: crate::PhysicalReceipt,
-    ) {
-        let unfragmented = receipt.dont_fragment || !self.tuple.local.is_ipv4();
-        let Some(p) = &mut self.pmtud else {
-            return;
-        };
-        p.certify(start, end, receipt.ip_packet_len, unfragmented);
+        if let Some(p) = &mut self.pmtud {
+            let (start, end) = departure.submitted_range(offset, count);
+            let unfragmented = receipt.dont_fragment || !self.tuple.local.is_ipv4();
+            p.certify(start, end, receipt.ip_packet_len, unfragmented);
+        }
     }
 
     /// Retain a definitely-submitted receipt with the active probe it proves.
@@ -4577,16 +4772,21 @@ impl Connection {
     #[inline]
     pub(crate) fn update_time(&mut self, now: Instant) -> Result<(), Error> {
         self.check_time(now)?;
+        self.commit_checked_time(now);
+        Ok(())
+    }
+
+    #[inline]
+    fn commit_checked_time(&mut self, now: Instant) {
         // The instant is processed once, as tcp_mstamp_refresh takes the
         // clock once: at the same instant no chronograph advances, and
         // nothing has been sampled since that predates it, so the stale
         // rule below has nothing new to find.
         if now == self.now {
             debug_assert!(!self.timestamps_stale(now));
-            return Ok(());
+        } else {
+            self.advance_checked_time(now);
         }
-        self.advance_checked_time(now);
-        Ok(())
     }
 
     fn advance_checked_time(&mut self, now: Instant) {
@@ -4599,6 +4799,33 @@ impl Connection {
                 self.transport_ticks[index] = self.transport_ticks[index].saturating_add(elapsed);
             }
         }
+        if now >= self.sample_review {
+            self.review_timestamp_samples(now);
+        } else {
+            debug_assert!(!self.timestamps_stale(now));
+        }
+        self.now = now;
+    }
+
+    fn sample_granularity(config: &ConnectionConfig) -> TimestampGranularity {
+        if config.timestamps {
+            config.timestamp_granularity
+        } else {
+            TimestampGranularity::Milliseconds
+        }
+    }
+
+    // First instant in the tick half a sequence space after `sample`.
+    fn sample_expiration(config: &ConnectionConfig, sample: Instant) -> Instant {
+        let granularity = Self::sample_granularity(config);
+        granularity
+            .tick_in(sample, config.timebase)
+            .saturating_add(1 << 31)
+            .saturating_mul(config.timebase.ticks_from_us(granularity.tick_us()))
+    }
+
+    #[cold]
+    fn review_timestamp_samples(&mut self, now: Instant) {
         if self.timestamps_stale(now) {
             self.sample = None;
             self.last_timestamp_sent_at = None;
@@ -4614,7 +4841,11 @@ impl Connection {
                 self.prr = None;
             }
         }
-        self.now = now;
+        let oldest = self
+            .sample
+            .map_or(now, |(_, sent)| sent)
+            .min(self.last_timestamp_sent_at.unwrap_or(now));
+        self.sample_review = Self::sample_expiration(&self.config, oldest);
     }
 
     // Whether the RTT sample or the last timestamp sent is too old at `now`
@@ -4622,11 +4853,7 @@ impl Connection {
     fn timestamps_stale(&self, now: Instant) -> bool {
         // Endpoint validates caller clock gaps. A dormant connection may lag
         // that serviced clock by more than the timestamp serial half-range.
-        let granularity = if self.config.timestamps {
-            self.config.timestamp_granularity
-        } else {
-            TimestampGranularity::Milliseconds
-        };
+        let granularity = Self::sample_granularity(&self.config);
         // Ticks of one period differ by less than 2^31 while fewer than
         // 2^31 - 1 periods separate the samples, so only an older sample
         // needs its ticks divided out.
@@ -5014,6 +5241,19 @@ impl Connection {
             })
     }
 
+    // A non-head departure preserves the oldest outstanding packet's timer.
+    fn prior_rto_deadline(&self, start: Seq) -> Option<Instant> {
+        self.rto_deadline.or_else(|| {
+            if start == self.snd_una {
+                None
+            } else {
+                self.rack
+                    .head_transmission(self.snd_una)
+                    .map(|(_, sent)| sent.saturating_add(self.rto()))
+            }
+        })
+    }
+
     // FlightSize counts payload, not SYN/FIN sequence-space consumption.
     //= https://www.rfc-editor.org/rfc/rfc5681#section-2
     //= reason=Separate payload FlightSize from transport sequence-space flight: SYN0/FIN0 payload accounting, SACK-only preservation, divided cumulative release and unchanged cwnd on FIN-only ACK are directly asserted through wrap. RFC9937 PRR snapshots unsacked payload and includes the triggering ACK delivery.
@@ -5248,7 +5488,6 @@ impl Connection {
         self.state = State::Closed;
         self.local_resource = None;
         self.repair_undo = None;
-        self.control_undo = None;
         self.abandon_ptb();
         self.congestion.commit_probe_response();
         if let Some(p) = &mut self.pmtud {
@@ -5457,7 +5696,7 @@ impl Connection {
         // With no probe armed or pending and no request to start one,
         // eligibility cannot change this pass's timers.
         let probe_packets = if restart_probe || self.tlp_deadline.is_some() || self.tlp_pending {
-            self.tlp_arm_packets()
+            self.tlp_arm_packets::<false>()
         } else {
             None
         };
@@ -5560,6 +5799,53 @@ impl Connection {
         }
     }
 
+    // Selection advanced SND.NXT into an open window and installed the
+    // RTO. With the device and socket held together, no timer can fire
+    // between selection and submission. Arm the PTO against the final RTO
+    // and the actual wire packet count, once, after the physical departure.
+    fn arm_submitted_stream(&mut self) {
+        debug_assert_eq!(self.state, State::Established);
+        debug_assert!(self.flight() != 0 && self.snd_wnd != 0 && self.rto_deadline.is_some());
+        debug_assert!(self.stream_output_only() && self.pmtud.is_none());
+        self.clear_persist();
+        self.arm_send_queue(self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize);
+        self.keepalive_deadline = None;
+        let overdue = self.rto_deadline.is_some_and(|at| at <= self.now);
+        let packets = self.tlp_arm_packets::<true>();
+        if overdue || packets.is_none() {
+            self.tlp_deadline = None;
+        } else {
+            self.arm_tlp(packets);
+        }
+        self.select_loss_timer();
+        #[cfg(debug_assertions)]
+        self.assert_arm_submitted_stream_invariants(overdue);
+    }
+
+    // Pure `&self` verification that `arm_work_with_probe(true)` (followed by
+    // clearing TLP when RTO is already overdue) leaves the exact same timer state.
+    #[cfg(debug_assertions)]
+    fn assert_arm_submitted_stream_invariants(&self, overdue: bool) {
+        debug_assert!(!self.early_response_eligible() && self.synchronized());
+        debug_assert!(!self.keepalive_pending && self.keepalive_deadline.is_none());
+        debug_assert!(!self.tlp_pending);
+        debug_assert!(
+            !self.probe_pending
+                && self.persist_interval == 0
+                && self.persist_unanswered_since.is_none()
+                && self.persist_deadline.is_none(),
+            "submitted stream left stale persist state"
+        );
+        let expected_packets = self.tlp_arm_packets::<false>();
+        let expected_tlp = if overdue || self.rack.deadline.is_some() {
+            None
+        } else {
+            expected_packets.and_then(|packets| self.expected_tlp_deadline(packets))
+        };
+        debug_assert_eq!(self.tlp_deadline, expected_tlp);
+        debug_assert_eq!(self.loss_timer, self.selected_loss_timer());
+    }
+
     // Appending bytes changes the unsent queue and ends keepalive idleness.
     // In an established socket with an open window, it does not change
     // flight, RACK delivery, PTO eligibility or an armed retransmission.
@@ -5590,7 +5876,7 @@ impl Connection {
         debug_assert!(!self.early_response_eligible() && self.synchronized());
         debug_assert!(
             !(self.tlp_deadline.is_some() || self.tlp_pending)
-                || self.tlp_arm_packets().is_some(),
+                || self.tlp_arm_packets::<false>().is_some(),
             "write invalidated active TLP state"
         );
         debug_assert!(
@@ -5766,10 +6052,15 @@ impl Connection {
         // Keep the u64 TCP-stream position representable, including output's
         // exclusive end. Never wrap offsets or admit bytes we cannot identify.
         let cursor_room = u64::MAX - self.acknowledged - self.send.len() as u64;
-        self.send
-            .admission_room(self.notsent_bytes(), lowat)
-            .min(space)
-            .min(usize::try_from(cursor_room).unwrap_or(usize::MAX))
+        // Send space includes the queued bytes and their excess ledger
+        // charge; it already fits within the logical ring capacity.
+        debug_assert!(space <= self.send.remaining());
+        let room = space.min(usize::try_from(cursor_room).unwrap_or(usize::MAX));
+        if lowat.is_some() {
+            room.min(self.send.admission_room(self.notsent_bytes(), lowat))
+        } else {
+            room
+        }
     }
 
     // Whether the ledgers hold more than LEDGER_RESERVE while nothing is
@@ -6204,11 +6495,17 @@ impl Connection {
     // (`check_write_admission`) and the connection is writable
     // (`stream_writable`), the send usage and space computed once.
     pub(crate) fn writable(&self, lowat: Option<u32>, request: TxTimestampRequest) -> bool {
-        let usage = self.send_usage();
-        let space = self.send_space();
-        self.check_admission(lowat, request, space.saturating_sub(usage))
-            .is_ok_and(|room| room != 0)
-            && self.writable_with(lowat, usage, space)
+        // The poll thresholds imply positive send room and satisfy the
+        // write's NOTSENT_LOWAT test. Check the other admission bounds
+        // directly, without computing the size of a possible write.
+        !self.shutdown
+            && matches!(
+                self.state,
+                State::SynSent | State::SynReceived | State::Established | State::CloseWait
+            )
+            && self.stream_writable(lowat)
+            && self.acknowledged < u64::MAX - self.send.len() as u64
+            && self.tx_timestamps.admit(request).is_ok()
     }
 
     // Fresh payload a managed connection may newly transmit: C less the
@@ -6301,8 +6598,26 @@ impl Connection {
 
     pub(crate) fn send_storage_fits(&self, accepted: usize) -> bool {
         let live = self.send.len() + accepted;
-        live <= self.send.allocation_capacity()
-            && self.ledger_growth(live).0 <= self.ledger_capacity()
+        if live > self.send.allocation_capacity() {
+            return false;
+        }
+        // Growth asks for twice the needed entries plus the split reserve,
+        // bounded by the configured ceiling. Work backwards from the held
+        // entries. If even all live bytes fit, no send cursor is needed.
+        let capacity = self.ledger_capacity();
+        let entries = capacity.saturating_sub(SPARE) / 2;
+        let held = self.rack.len();
+        let fits = entries >= LEDGER_INITIAL_SEGMENTS && entries >= held && {
+            let free = entries - held;
+            // One free entry takes a full MSS without counting a send cursor
+            // or converting the whole ledger's capacity to bytes.
+            free != 0 && live <= self.mss || {
+                let bytes = free.saturating_mul(self.mss.max(1));
+                live <= bytes || self.notsent_bytes().saturating_add(accepted) <= bytes
+            }
+        } || capacity >= SplitBound::entries(self.config.send_capacity).saturating_add(SPARE);
+        debug_assert_eq!(fits, self.ledger_growth(live).0 <= capacity);
+        fits
     }
 
     pub(crate) fn grow_send_prefix(&mut self, accepted: usize, max_charge: usize) -> Option<usize> {
@@ -6595,17 +6910,11 @@ impl Connection {
             let accepted = self.send.write_shared(payload.slice(0..count).unwrap());
             debug_assert_eq!(count, accepted);
         } else {
-            let accepted = self.send.write(&data[..count]);
-            debug_assert_eq!(count, accepted);
+            self.send.append(&data[..count]);
         }
         self.send_issued = true;
         self.more = more;
-        if end_of_record {
-            self.send.mark_end_of_record();
-        }
-        if push {
-            self.send.mark_push();
-        }
+        self.send.finish_append(push, end_of_record);
         if application_idle {
             self.progress_at = self.now;
             self.application_progress_at = self.now;
@@ -6768,6 +7077,13 @@ impl Connection {
 
     pub(crate) fn at_time(&self, now: Instant) -> bool {
         self.now == now
+    }
+
+    pub(crate) fn awaiting_stream_data(&self, available: usize) -> bool {
+        available == 0
+            && self.state == State::Established
+            && !self.read_closed
+            && !self.receive.eof()
     }
 
     // The second result records a new immediate window update. Draining
@@ -10075,6 +10391,13 @@ impl Connection {
         }
     }
 
+    #[inline]
+    fn ack_departed(&mut self, data_ack: bool, fresh_data: bool, syn_data: bool) {
+        self.adaptive_departure(data_ack, fresh_data);
+        self.syn_data_acked |= syn_data;
+        self.syn_data_fully_acked |= syn_data;
+    }
+
     fn adaptive_quick_budget(&self) -> u8 {
         // Use the remaining local advertised byte window, not the peer's send credit.
         let budget = self.receive_window() / (2 * u32::from(self.receive_mss()));
@@ -10608,6 +10931,62 @@ impl Connection {
         self.transmit_selected_payload(now, out, reserve, gso, None)
     }
 
+    pub(crate) fn transmit_offered(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        record: &mut Option<StreamRecord>,
+    ) -> Result<Option<usize>, Error> {
+        // A directly offered packet has a scalar backend buffer. Keep its
+        // selection and accounting together while the owner is borrowed.
+        if self.selects_stream()
+            && !self.pacing_enabled()
+            && !self.local_refusals
+            // A clock review can discard the RACK head during selection.
+            && now < self.sample_review
+            && self.rack.valid()
+        {
+            if self.stream_queue_drained() {
+                debug_assert!(self.output_idle());
+                return self.check_time(now).map(|()| None);
+            }
+            if self.send.len() == 0 && self.flight() == 0 {
+                self.select_output::<true, true, true>(now, out, true, None, None, Some(record))
+            } else {
+                self.select_output::<true, true, false>(now, out, true, None, None, Some(record))
+            }
+        } else {
+            self.transmit_selected(now, out, true)
+        }
+    }
+
+    fn selects_stream(&self) -> bool {
+        self.state == State::Established
+            && self.stream_output_only()
+            && !self.shutdown
+            && !self.limited_pending
+            && self.pmtud.is_none()
+            && !self.receive.has_sack_blocks()
+    }
+
+    pub(crate) fn finish_offered_record(&mut self, record: StreamRecord) {
+        let departure = record.departure(self, self.now);
+        if !record.has_data() {
+            self.last_departure = Some(departure);
+            return;
+        }
+        if self.sample.is_none() {
+            self.sample = Some((record.end, self.now));
+        }
+        self.settle_offered_stream(&record);
+        self.last_sent = self.now;
+        self.last_departure = Some(departure);
+        self.rack
+            .record_transmission(record.start, record.end, self.now, false, true);
+        self.reserved_ledger = self.rack.departure_selection();
+        self.arm_work_with_probe(true);
+    }
+
     fn transmit_selected_payload(
         &mut self,
         now: Instant,
@@ -10627,13 +11006,17 @@ impl Connection {
             // so.
             #[cfg(debug_assertions)]
             debug_assert_eq!(
-                self.select_output(now, out, reserve, gso, shared),
+                self.select_output::<false, false, false>(now, out, reserve, gso, shared, None),
                 idle,
                 "an idle connection selected output"
             );
             return idle;
         }
-        self.select_output(now, out, reserve, gso, shared)
+        if gso.is_none() && shared.is_none() && self.selects_stream() {
+            self.select_output::<true, false, false>(now, out, reserve, None, None, None)
+        } else {
+            self.select_output::<false, false, false>(now, out, reserve, gso, shared, None)
+        }
     }
 
     // Whether this connection certainly has nothing to send: no reset,
@@ -10642,20 +11025,8 @@ impl Connection {
     // whose deferral a selection would record. Each of these is set by a
     // change, never by time alone.
     pub(crate) fn output_idle(&self) -> bool {
-        !self.ack_pending
-            && self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize
-            && self.pending_rst.is_none()
-            && !self.challenge_ack_pending
-            && !self.syn_pending
-            && !self.probe_pending
-            && !self.keepalive_pending
-            && !self.tlp_pending
-            && !self.retx_pending
-            && self.fast_open_retry.is_none()
-            && self.sack_recovery.is_none()
-            && self.prr.is_none()
-            && self.sack_post_rto.is_none()
-            && self.ptb_idle()
+        self.stream_queue_drained()
+            && self.stream_output_only()
             && !(self.shutdown && self.fin_sequence.is_none())
             && self
                 .pmtud
@@ -10663,13 +11034,34 @@ impl Connection {
                 .is_none_or(|p| p.administrative_target().is_none())
     }
 
-    fn select_output(
+    pub(crate) fn stream_queue_drained(&self) -> bool {
+        !self.ack_pending && self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize
+    }
+
+    // Control packets, probes and repairs all precede ordinary stream output.
+    fn stream_output_only(&self) -> bool {
+        !(self.syn_pending
+            | self.challenge_ack_pending
+            | self.retx_pending
+            | self.probe_pending
+            | self.keepalive_pending
+            | self.tlp_pending)
+            && self.pending_rst.is_none()
+            && self.fast_open_retry.is_none()
+            && self.sack_recovery.is_none()
+            && self.prr.is_none()
+            && self.sack_post_rto.is_none()
+            && self.ptb_idle()
+    }
+
+    fn select_output<const STREAM: bool, const OFFERED: bool, const ACK_ONLY: bool>(
         &mut self,
         now: Instant,
         out: &mut [u8],
         reserve: bool,
         mut gso: Option<crate::output_reservation::GsoBuffer<'_>>,
         mut shared: Option<&mut Vec<crate::Payload>>,
+        offered: Option<&mut Option<StreamRecord>>,
     ) -> Result<Option<usize>, Error> {
         self.check_time(now)?;
         if self.local_resource.is_some_and(|r| r.retry_at.is_some()) || self.timestamp_ambiguous {
@@ -10677,32 +11069,38 @@ impl Connection {
         }
         let mut segmentation = None;
         let mut direct_payload = None;
+        let mut idle_before_send = false;
+        let mut startup_room = 0;
         // Plan entirely before encode. Even timer/clock/accounting changes
         // are committed only once the adapter has sufficient output space.
-        let reset = self.pending_rst;
-        let challenge = reset.is_none() && self.challenge_ack_pending;
-        let syn = reset.is_none() && !challenge && self.syn_pending;
-        let live = self.synchronized() && !challenge;
-        let early_response = self.early_response_eligible() && !challenge;
+        let reset = if STREAM { None } else { self.pending_rst };
+        let challenge = !STREAM && reset.is_none() && self.challenge_ack_pending;
+        let syn = !STREAM && reset.is_none() && !challenge && self.syn_pending;
+        let live = STREAM || self.synchronized() && !challenge;
+        let early_response = !STREAM && self.early_response_eligible() && !challenge;
         // Control and due protocol probes bypass pacing: SYN/RST/challenge,
         // pure ACK/FIN, RTO head retry outside PRR, TLP, persist and keepalive.
         // Actual stream data on bypasses still schedules spacing (keepalive's
         // garbage octet is not stream data). Fast recovery retries do not
         // bypass. Selection/admission below remains the sole authority to send.
-        let pacing_blocked = if self.config.pacing.is_some() {
+        let pacing_blocked = if OFFERED {
+            debug_assert!(!self.pacing_enabled());
+            false
+        } else if self.config.pacing.is_some() {
             // A saturated deadline still blocks at Instant::MAX.
             self.general_pacing_deadline(now).is_some()
         } else {
             self.pacing_enabled() && self.pacing_deadline.is_some_and(|deadline| now < deadline)
         };
         let data_live = live && !pacing_blocked;
-        let retransmit = reset.is_none()
+        let retransmit = !STREAM
+            && reset.is_none()
             && !syn
             && live
             && (!pacing_blocked || self.consecutive_timeouts != 0 && self.prr.is_none())
             && self.retx_pending
             && self.flight() != 0;
-        let probe = reset.is_none() && !syn && live && self.probe_pending;
+        let probe = !STREAM && reset.is_none() && !syn && live && self.probe_pending;
         // An old-sequence control elicits a window reply, but cannot deliver
         // a new urgent pointer. First notify URG at the acceptable sequence;
         // the unchanged probe obligation then emits the old-sequence control.
@@ -10716,7 +11114,8 @@ impl Connection {
                     && distance < 1 << 31
                     && self.advertised_snd_up.is_none_or(|old| edge.after(old))
             });
-        let tlp = reset.is_none()
+        let tlp = !STREAM
+            && reset.is_none()
             && !syn
             && live
             && self.tlp_pending
@@ -10724,7 +11123,7 @@ impl Connection {
             && self.tlp_end.is_none()
             && self.tlp_flight.is_none()
             && self.tlp_fresh_rtt;
-        let keepalive = reset.is_none() && !syn && live && self.keepalive_pending;
+        let keepalive = !STREAM && reset.is_none() && !syn && live && self.keepalive_pending;
         //= https://www.rfc-editor.org/rfc/rfc9293#section-3.7.1
         //= reason=Transmit supplies MSS on SYN; learn_syn consumes the decoded peer MSS.
         //# TCP endpoints MUST implement both sending and receiving the MSS Option
@@ -10949,7 +11348,8 @@ impl Connection {
         // With no out-of-order data and no duplicate to report every budget
         // yields no block, so the option is neither sized nor built, as
         // Linux tcp_established_options adds SACK only for eff_sacks != 0.
-        if reset.is_none()
+        if !STREAM
+            && reset.is_none()
             && !syn
             && live
             && self.sack_send
@@ -11048,7 +11448,17 @@ impl Connection {
         } else {
             self.mss
         };
-        let wire_mss = payload_mss(ordinary_mss);
+        // A managed socket intersects its negotiated MSS with the complete
+        // path budget at SYN and on every change. The option-free or
+        // timestamp-only stream header is the one used for that calculation.
+        // A one-byte MSS can also represent a path whose residual budget
+        // rounded up to the minimum, so compute its actual available space.
+        let wire_mss = if STREAM && self.managed_path.is_some() && self.mss > 1 {
+            debug_assert_eq!(self.mss, payload_mss(ordinary_mss));
+            self.mss
+        } else {
+            payload_mss(ordinary_mss)
+        };
         // With zero credit, retain a plan so the transactional gate reports
         // exhaustion instead of consuming the pending output obligation.
         let timestamp_limit = if timestamp_credit == 0 {
@@ -11065,7 +11475,8 @@ impl Connection {
         // Partial evidence: byte credit and packet clipping at recovery admission;
         // the existing wire witness demonstrates the literal packet-count gap.
         let mut sack_segment = None;
-        if reset.is_none()
+        if !STREAM
+            && reset.is_none()
             && !syn
             && data_live
             && !retransmit
@@ -11147,7 +11558,8 @@ impl Connection {
         }
         // No-SACK PRR uses the same byte loss ledger for short-retry suffixes,
         // without enabling SACK's speculative/rescue selection.
-        if reset.is_none()
+        if !STREAM
+            && reset.is_none()
             && !syn
             && data_live
             && !retransmit
@@ -11165,7 +11577,8 @@ impl Connection {
         // RFC 6675 §5.1 recommends filling the newly reported holes after an
         // RTO, but forbids starting another recovery phase before its boundary
         // is covered. The initial RTO retransmission still ignores all SACKs.
-        let post_rto_segment = if reset.is_none()
+        let post_rto_segment = if !STREAM
+            && reset.is_none()
             && !syn
             && data_live
             && !retransmit
@@ -11215,7 +11628,8 @@ impl Connection {
         };
         // Exact-range PTB repair: ahead of fresh data, behind control work and
         // due ordinary recovery (RTO/NewReno head, SACK/RACK, post-RTO, TFO).
-        let ptb_segment = if reset.is_none()
+        let ptb_segment = if !STREAM
+            && reset.is_none()
             && !syn
             && !challenge
             && data_live
@@ -11344,7 +11758,7 @@ impl Connection {
                     flags |= FIN;
                 }
             }
-        } else if data_live && self.fast_open_retry.is_some() && !retransmit && !probe {
+        } else if !STREAM && data_live && self.fast_open_retry.is_some() && !retransmit && !probe {
             let (start, end) = self.fast_open_retry.unwrap();
             seq = start;
             let limit = end.distance_from(start) as usize;
@@ -11461,7 +11875,8 @@ impl Connection {
         //# If no SENDs have been issued and there is no pending data to send, then form a
         //# FIN segment and send it, and enter FIN-WAIT-1 state; otherwise, queue for
         //# processing after entering ESTABLISHED state.
-        } else if self.state == State::SynReceived
+        } else if !STREAM
+            && self.state == State::SynReceived
             && self.shutdown
             && !self.send_issued
             && self.send.len() == 0
@@ -11471,7 +11886,9 @@ impl Connection {
             seq = self.iss.wrapping_add(1);
             flags |= FIN;
             new_fin = true;
-        } else if (live || early_response)
+        } else if !ACK_ONLY
+            && (live || early_response)
+            && (!STREAM || self.send.len() > self.snd_nxt.distance_from(self.send_base) as usize)
             && (!pacing_blocked
                 || self.send.len() <= self.snd_nxt.distance_from(self.send_base) as usize)
             && !(pacing_blocked && self.retx_pending)
@@ -11482,9 +11899,9 @@ impl Connection {
             //# to send the largest possible segment (SHLD-27).
             let offset = self.snd_nxt.distance_from(self.send_base) as usize;
             let unsent = self.send.len().saturating_sub(offset);
-            let idle_restart =
+            idle_before_send =
                 self.flight() == 0 && now.saturating_sub(self.last_sent) >= self.rto();
-            let cwnd = if idle_restart {
+            let cwnd = if idle_before_send {
                 self.congestion.cwnd().min(self.restart_window())
             } else {
                 self.congestion.cwnd()
@@ -11517,7 +11934,9 @@ impl Connection {
             //# send data with a sequence number higher than the sum of the
             //# highest acknowledged sequence number and the minimum of the cwnd
             //# and rwnd.
-            let usable = if early_response {
+            let usable = if STREAM {
+                self.snd_wnd.min(cwnd).saturating_sub(self.flight()) as usize
+            } else if early_response {
                 // RFC6928 section2 explicitly covers data during the handshake.
                 // Honor the endpoint-selected IW policy, including path fallback;
                 // current cwnd still bounds loss/retry reductions independently.
@@ -11564,9 +11983,13 @@ impl Connection {
             } else {
                 self.snd_wnd.min(cwnd_limit).saturating_sub(self.flight()) as usize
             };
-            let initial_room = self.initial_pacing_room();
-            let usable = if initial_room != 0 {
-                usable.min(initial_room as usize)
+            startup_room = if OFFERED {
+                0
+            } else {
+                self.initial_pacing_room()
+            };
+            let usable = if startup_room != 0 {
+                usable.min(startup_room as usize)
             } else {
                 usable
             };
@@ -11580,15 +12003,22 @@ impl Connection {
             // section 3.4). RFC 5681 section 2 and RFC 9937 section 3
             // constrain data: a standalone FIN need not wait for cwnd.
             // Keep peer-window admission and the existing PRR gate.
-            let fin_admissible = self.shutdown
+            let fin_admissible = !STREAM
+                && self.shutdown
                 && self.fin_sequence.is_none()
                 && self.snd_wnd.saturating_sub(self.flight()) as usize > unsent
                 && (usable > unsent || unsent == 0 && self.prr.is_none())
                 && matches!(self.state, State::Established | State::CloseWait);
             // FIN consumes no send space; payload, probes and GSO totals do.
-            let usable = usable
-                .min(self.fresh_send_allowance())
-                .min(self.fresh_entry_room());
+            let allowance = if STREAM && self.managed_path.is_some() {
+                // All selected sequence space is stream payload. The send
+                // head's offset already counts exactly the outstanding bytes.
+                debug_assert_eq!(self.data_flight() as usize, offset);
+                self.send_space().saturating_sub(offset)
+            } else {
+                self.fresh_send_allowance()
+            };
+            let usable = usable.min(allowance).min(self.fresh_entry_room());
             //= https://www.rfc-editor.org/rfc/rfc4821#section-7.4
             //# It has no outstanding probes or losses.
             // Leading/trailing retransmissions are tracked through cumulative
@@ -11600,17 +12030,15 @@ impl Connection {
             // The administrative target (armed once per administrative value)
             // passes every existing admission condition; when it does not
             // leave, the blocking precondition is recorded.
-            let admin_target = self.pmtud.as_ref().and_then(|p| p.administrative_target());
+            let discovery = if STREAM { None } else { self.pmtud.as_ref() };
+            let admin_target = discovery.and_then(|p| p.administrative_target());
             let mut admin_deferral = None;
             // A probe needs its payload and three trailing segments. When
             // the queue or window cannot hold the trailing data, only an
             // administrative search has a deferral reason to record.
             let trailing = self.mss.checked_mul(3);
             let probe_room = trailing.is_some_and(|n| usable.min(unsent) > n);
-            let discovery = self
-                .pmtud
-                .as_ref()
-                .filter(|_| admin_target.is_some() || probe_room);
+            let discovery = discovery.filter(|_| admin_target.is_some() || probe_room);
             let candidate = discovery.and_then(|p| {
                 let target = if let Some(path) = &self.managed_path {
                     if p.discovery_disabled() {
@@ -11743,14 +12171,18 @@ impl Connection {
                     && unsent >= needed
                     && timestamp_credit as usize >= payload
                     && self.send.selection_len(offset, payload) == payload
-                    && self.send.record_len(offset, payload) == payload)
+                    && self.send.record_len_within(offset, payload) == payload)
                     .then_some((size, payload, trailing))
             });
             let wire_mss = candidate.map_or(wire_mss, |(_, payload, _)| payload);
             let packet_mss = candidate.map_or(packet_mss, |(_, payload, _)| payload);
-            let record = self.send.record_len(offset, unsent.min(wire_mss));
+            let record = self.send.record_len_within(offset, unsent.min(wire_mss));
             count = record.min(packet_mss).min(usable);
-            let selected = self.send.selection_len(offset, count);
+            let selected = if STREAM {
+                count
+            } else {
+                self.send.selection_len(offset, count)
+            };
             let descriptor_limited = selected < count;
             count = selected;
             pmtu_probe = candidate.filter(|(_, payload, _)| count == *payload);
@@ -11792,11 +12224,6 @@ impl Connection {
                 // A managed C below one segment is the largest payload this
                 // connection can ever send: a segment it alone shortens is
                 // not held, since waiting cannot enlarge it.
-                let largest = if self.managed_path.is_some() {
-                    record.min(self.send_space())
-                } else {
-                    record
-                };
                 // A push (flush credit) does not lift it: RFC 9293 sends a
                 // pushed short segment early only when it takes all queued
                 // data (count == largest) or on the override timeout, and
@@ -11805,7 +12232,8 @@ impl Connection {
                 // Nagle). A blocked write pushes on every wait.
                 let sws = !descriptor_limited
                     && !self.sws_override
-                    && count < largest
+                    && count < record
+                    && (self.managed_path.is_none() || count < self.send_space())
                     && count < (self.max_snd_wnd / 2) as usize;
                 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
                 //# When an application issues a series of SEND calls without setting
@@ -11814,7 +12242,7 @@ impl Connection {
                 let aggregate = !flushing
                     && !self.shutdown
                     && !self.sws_override
-                    && !self.send.pushed(offset, unsent);
+                    && !self.send.push_after(offset);
                 if nagle || sws || aggregate {
                     count = 0;
                 }
@@ -11865,7 +12293,8 @@ impl Connection {
                 }
                 None => usize::MAX,
             };
-            let group_eligible = count == wire_mss
+            let group_eligible = !STREAM
+                && count == wire_mss
                 && count != 0
                 && packet_mss == wire_mss
                 && reserve
@@ -11919,7 +12348,7 @@ impl Connection {
                 } else {
                     buffer.limits.max_segments
                 };
-                let record = self.send.record_len(offset, bounded);
+                let record = self.send.record_len_within(offset, bounded);
                 // Each segment of the group becomes its own ledger entry.
                 // PRR's credit is packets: one per segment, whatever SMSS
                 // its byte form allows past option space.
@@ -12009,9 +12438,13 @@ impl Connection {
             burst_push = (!self.config.output_group_flush || !group_eligible || startup_flush)
                 && count != 0
                 && self.flight().saturating_add(count as u32) == self.snd_wnd.min(cwnd)
-                && self.send.pushed(offset, unsent);
+                && self.send.push_after(offset);
             if segmentation.is_none() {
-                direct_payload = self.send.contiguous(offset, count);
+                direct_payload = if STREAM {
+                    self.send.selected_slice(offset, count)
+                } else {
+                    self.send.contiguous(offset, count)
+                };
                 count = match direct_payload {
                     Some(bytes) => bytes.len(),
                     None => self.send.copy(offset, &mut self.scratch[..count]),
@@ -12068,19 +12501,17 @@ impl Connection {
             // Flush the final multi-segment recovery burst, analogous to Linux's
             // GSO PUSH policy. Single-segment repairs retain their original marks.
             burst_push = self.scoreboard.unsacked_bytes(end, queued_end) == 0
-                && self
-                    .send
-                    .pushed(offset, self.send.len().saturating_sub(offset));
+                && self.send.push_after(offset);
         }
         let offset = seq
             .wrapping_add(u32::from(syn))
             .distance_from(self.send_base) as usize;
-        let application_push = count != 0 && !keepalive && self.send.pushed(offset, count);
+        let push_at_end = !keepalive && self.send.push_at_end(offset, count);
+        let application_push =
+            push_at_end || count != 0 && !keepalive && self.send.pushed(offset, count);
         let group_push = self.config.output_group_flush
             && segmentation.is_some()
-            && self
-                .send
-                .pushed(offset, self.send.len().saturating_sub(offset));
+            && self.send.push_after(offset);
         if count != 0 && !keepalive && (burst_push || application_push || group_push) {
             //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.2
             // Scope: write supplies automatic PUSH; explicit no-PUSH SENDs are
@@ -12140,8 +12571,11 @@ impl Connection {
         // empty window probe preserves idle age and deferred ECN feedback.
         let idle_restart = !keepalive
             && count != 0
-            && self.flight() == 0
-            && now.saturating_sub(self.last_sent) >= self.rto();
+            && if STREAM {
+                idle_before_send
+            } else {
+                self.flight() == 0 && now.saturating_sub(self.last_sent) >= self.rto()
+            };
         let idle_reduction = idle_restart && self.congestion.cwnd() > self.restart_window();
         //= https://www.rfc-editor.org/rfc/rfc3168#section-5.2
         //= reason=Shared fresh-data output predicate excludes setup, pure ACK, reset, FIN-only, keepalive, persist and retransmitted packets. Fresh FIFO bytes (including Limited Transmit, recovery new data, data/FIN and original TLP) advance tracked sequence space and remain subject to loss recovery. Assertions cover special ECT/Not-ECT outputs, original TLP loss RTO and corrupted CE loss congestion response; no router marking claim.
@@ -12305,7 +12739,6 @@ impl Connection {
             window,
             urgent_pointer,
         };
-        let ip = self.ip;
         // Include TCP options on every output path, before committing any state.
         //= https://www.rfc-editor.org/rfc/rfc4821#section-10.1
         //= reason=Selected non-overlapping real-data probes; actual receiver-generated ACKs exercise multiple smaller gap repairs and prevent crossing the probe boundary.
@@ -12369,10 +12802,6 @@ impl Connection {
         if timestamp_cost > timestamp_credit {
             return Err(Error::TimestampBudgetExceeded);
         }
-        let mut encoded_options = [0; 40];
-        let written = wire::write_options(&options, &mut encoded_options);
-        debug_assert_eq!(written, option_len);
-        let options = &encoded_options[..written];
         let mut wire_header = header;
         if let Some(s) = &mut segmentation {
             s.terminal_flags = flags;
@@ -12390,28 +12819,41 @@ impl Connection {
             false
         };
         let partial = self.config.tcp_checksum_offload;
-        let encoded = if shared_payload {
-            wire::encode_shared_with(
-                ip,
+        let payload = || match &gso {
+            Some(buffer) if segmentation.is_some() => &buffer.payload[..wire_count],
+            _ => &direct_payload.unwrap_or(&self.scratch)[..wire_count],
+        };
+        let encoded = if STREAM {
+            debug_assert!(!shared_payload && segmentation.is_none());
+            debug_assert_eq!(option_len, 12 * usize::from(options.timestamps.is_some()));
+            wire::encode_stream(
+                self.pseudo_header,
+                self.wire_ports,
                 wire_header,
-                options,
-                shared.as_deref().unwrap(),
+                options.timestamps,
+                payload(),
                 out,
                 partial,
             )
-            .map(|n| n + wire_count)
         } else {
-            wire::encode_with(
-                ip,
-                wire_header,
-                options,
-                match &gso {
-                    Some(buffer) if segmentation.is_some() => &buffer.payload[..wire_count],
-                    _ => &direct_payload.unwrap_or(&self.scratch)[..wire_count],
-                },
-                out,
-                partial,
-            )
+            let ip = self.ip;
+            let mut encoded_options = [0; 40];
+            let written = wire::write_options(&options, &mut encoded_options);
+            debug_assert_eq!(written, option_len);
+            let options = &encoded_options[..written];
+            if shared_payload {
+                wire::encode_shared_with(
+                    ip,
+                    wire_header,
+                    options,
+                    shared.as_deref().unwrap(),
+                    out,
+                    partial,
+                )
+                .map(|n| n + wire_count)
+            } else {
+                wire::encode_with(ip, wire_header, options, payload(), out, partial)
+            }
         };
         let size = encoded.map_err(|error| {
             if error == wire::WireError::OutputTooSmall {
@@ -12438,7 +12880,8 @@ impl Connection {
             && self.prr.is_some_and(|p| p.timer_repair())
         {
             RepairUndo::capture(self, seq, count);
-        } else if self.local_refusals
+        } else if !OFFERED
+            && self.local_refusals
             && reserve
             && fresh_data
             && !syn
@@ -12457,7 +12900,6 @@ impl Connection {
         // never resolves can be withdrawn without a departure.
         // Cleared in place: most outputs keep none, and an empty one built
         // aside would still be copied in whole.
-        self.control_undo = None;
         if reserve
             && self.repair_undo.is_none()
             && count == 0
@@ -12470,9 +12912,13 @@ impl Connection {
             && !keepalive
             && pmtu_probe.is_none()
         {
-            self.control_undo = Some(ControlUndo::capture(self));
+            self.repair_undo = Some(ReservationUndo::Control(ControlUndo::capture(self)));
         }
-        let deferred_fresh = self.repair_undo.as_ref().is_some_and(|u| u.is_fresh());
+        let deferred_fresh = self
+            .repair_undo
+            .as_ref()
+            .and_then(ReservationUndo::data)
+            .is_some_and(RepairUndo::is_fresh);
         self.reserved_retransmit_counts =
             (reserve && (retransmitted || deferred_fresh) && !syn && !probe && !keepalive)
                 .then(|| self.rack.diagnostic_packet_counts());
@@ -12490,7 +12936,11 @@ impl Connection {
         let initial_burst = fresh_data
             && count != 0
             && pmtu_probe.is_none()
-            && self.initial_pacing_room() >= count as u32;
+            && (if STREAM {
+                startup_room
+            } else {
+                self.initial_pacing_room()
+            }) >= count as u32;
         let timeout_recovery = self.sack_post_rto.is_some() || self.consecutive_timeouts != 0;
         self.last_discovery = pmtu_probe
             .filter(|_| reserve)
@@ -12501,68 +12951,100 @@ impl Connection {
                     selected_at: now,
                 })
             });
-        self.last_departure = reserve.then(|| Departure {
-            initial_burst,
-            data_ack,
-            defer_push: self.repair_undo.is_some()
-                && flags & PSH != 0
-                && (application_push || !group_push),
-            fresh_data,
-            deferred_fresh,
-            received_syn_data_acked,
-            segmentation,
-            selected_at: now,
-            start: seq.0,
-            payload: count,
-            stream: count != 0 && !keepalive,
-            syn,
-            syn_timestamp: timestamp.map(|(value, _)| value),
-            fast_open_option: syn
-                && !response_syn
-                && fast_open_option.is_some()
-                && !self.passive_open,
-            simultaneous_response: response_syn,
-            fin: flags & FIN != 0,
-            rto: !keepalive
-                && !probe
-                && (count != 0 || syn || flags & FIN != 0)
-                && (self.rto_deadline.is_none() || retransmitted || tlp),
-            rto_head: seq == self.snd_una,
-            prior_rto_deadline: self.rto_deadline.or_else(|| {
-                if seq == self.snd_una {
-                    None // The head restarts its timer at physical departure.
-                } else {
-                    self.rack
-                        .head_transmission(self.snd_una)
-                        .map(|(_, sent)| sent.saturating_add(self.rto()))
-                }
-            }),
-            tlp: (fresh_data || new_fin) && !tlp,
-            loss_probe: tlp,
-            timeout_recovery,
-            persist: probe && !urgent_probe,
-            keepalive,
-            shrink: retransmit
-                && self.shrink_unanswered_since.is_none()
-                && self.snd_wnd != 0
-                && self.flight() > self.snd_wnd,
-            unanswered: probe && !urgent_probe && self.persist_unanswered_since.is_none(),
-            retransmission: retransmitted && !keepalive,
-            fin_retransmission: flags & FIN != 0 && !new_fin,
-            ptb_repair,
-            bypass: probe
-                || tlp
-                || keepalive
-                || syn
-                || (retransmit && self.consecutive_timeouts != 0 && self.prr.is_none()),
-            ..Departure::default()
-        });
+        let staged = OFFERED && fresh_data;
+        debug_assert!(
+            !ACK_ONLY
+                || OFFERED && STREAM && count == 0 && self.send.len() == 0 && self.flight() == 0
+        );
+        let offered_ack = ACK_ONLY;
+        let compact = staged || offered_ack;
+        let departure = if reserve && (!compact || cfg!(debug_assertions)) {
+            Some(Departure {
+                initial_burst,
+                data_ack,
+                defer_push: matches!(self.repair_undo, Some(ReservationUndo::Data(_)))
+                    && flags & PSH != 0
+                    && (application_push || !group_push),
+                fresh_data,
+                deferred_fresh,
+                received_syn_data_acked,
+                segmentation,
+                selected_at: now,
+                start: seq.0,
+                payload: count,
+                stream: count != 0 && !keepalive,
+                syn,
+                syn_timestamp: timestamp.map(|(value, _)| value),
+                fast_open_option: syn
+                    && !response_syn
+                    && fast_open_option.is_some()
+                    && !self.passive_open,
+                simultaneous_response: response_syn,
+                fin: flags & FIN != 0,
+                rto: !keepalive
+                    && !probe
+                    && (count != 0 || syn || flags & FIN != 0)
+                    && (self.rto_deadline.is_none() || retransmitted || tlp),
+                rto_head: seq == self.snd_una,
+                prior_rto_deadline: self.prior_rto_deadline(seq),
+                tlp: (fresh_data || new_fin) && !tlp,
+                loss_probe: tlp,
+                timeout_recovery,
+                persist: probe && !urgent_probe,
+                keepalive,
+                shrink: retransmit
+                    && self.shrink_unanswered_since.is_none()
+                    && self.snd_wnd != 0
+                    && self.flight() > self.snd_wnd,
+                unanswered: probe && !urgent_probe && self.persist_unanswered_since.is_none(),
+                retransmission: retransmitted && !keepalive,
+                fin_retransmission: flags & FIN != 0 && !new_fin,
+                ptb_repair,
+                bypass: probe
+                    || tlp
+                    || keepalive
+                    || syn
+                    || (retransmit && self.consecutive_timeouts != 0 && self.prr.is_none()),
+                ..Departure::default()
+            })
+        } else {
+            None
+        };
+        if compact {
+            let end = seq.wrapping_add(count as u32);
+            // Fresh stream selection bounds the payload by the peer window
+            // less flight. No input can change it during the offered borrow.
+            debug_assert!(
+                !staged
+                    || (seq.distance_from(self.snd_una) < self.snd_wnd
+                        && end.distance_from(self.snd_una) <= self.snd_wnd)
+            );
+            debug_assert!(!sack_limited);
+            let record = StreamRecord {
+                start: seq,
+                end,
+                data_ack,
+                window,
+                received_syn_data_acked,
+            };
+            debug_assert_eq!(Some(record.departure(self, now)), departure);
+            debug_assert!(!staged || self.rack.fresh_room() != 0);
+            *offered.unwrap() = Some(record);
+            self.last_departure = None;
+        } else {
+            self.last_departure = departure;
+        }
         // Protocol payload/probes must not reopen an ordinary startup epoch.
-        if count != 0 && (!fresh_data || pmtu_probe.is_some() || !self.handshake_complete()) {
+        if !STREAM
+            && count != 0
+            && (!fresh_data || pmtu_probe.is_some() || !self.handshake_complete())
+        {
             self.initial_pacing_open = false;
         }
         self.last_pmtu_output = None;
-        if let Some(p) = &mut self.pmtud {
+        if !STREAM
+            && let Some(p) = &mut self.pmtud
+        {
             if let Some((size, payload, trailing)) = pmtu_probe {
                 p.start_probe(seq, payload as u32, trailing as u32, size);
             }
@@ -12667,11 +13149,16 @@ impl Connection {
         // Commit the on-wire endpoint only after output succeeds. A partial ACK
         // past an earlier collapsed mark must not lose PSH on retransmission.
         // Opt-in batch-only hints are transient, not application PUSH requests.
-        if self.repair_undo.is_none() && flags & PSH != 0 && (application_push || !group_push) {
+        if (!push_at_end || syn)
+            && !matches!(self.repair_undo, Some(ReservationUndo::Data(_)))
+            && flags & PSH != 0
+            && (application_push || !group_push)
+        {
             self.send
                 .collapse_push(seq.distance_from(self.send_base) as usize, count);
         }
-        self.update_time(now)?;
+        // Selection validated the clock before planning any output.
+        self.commit_checked_time(now);
         if !reserve {
             self.adaptive_departure(data_ack, fresh_data);
         }
@@ -12722,7 +13209,8 @@ impl Connection {
             let seq = seq.wrapping_add(u32::from(syn));
             // Strict recovery exits before persist; legacy probes retain their
             // separate policy. Record every real emission in the age ledger.
-            if !probe
+            if !STREAM
+                && !probe
                 && !deferred_ptb
                 && let Some(prr) = &mut self.prr
             {
@@ -12740,23 +13228,26 @@ impl Connection {
             if deferred_ptb {
                 self.reserved_ledger = None;
             } else {
-                self.rack.transmit(seq, end, now, retransmitted);
-                if retransmitted && !probe {
-                    self.rack.commit_retry_span(seq, end);
-                } else if !retransmitted {
-                    self.rack.commit_original_window(
-                        seq,
-                        end,
-                        !probe
-                            && seq.distance_from(self.snd_una) < self.snd_wnd
-                            && end.distance_from(self.snd_una) <= self.snd_wnd,
-                    );
-                }
-                if reserve {
-                    self.reserved_ledger = self.rack.departure_selection();
-                } else if let Some(selection) = self.rack.departure_selection() {
-                    let committed = self.rack.commit_departure(selection, seq, end, now);
-                    debug_assert!(committed);
+                let in_window = !retransmitted
+                    && !probe
+                    && seq.distance_from(self.snd_una) < self.snd_wnd
+                    && end.distance_from(self.snd_una) <= self.snd_wnd;
+                if !staged {
+                    self.rack
+                        .record_transmission(seq, end, now, retransmitted, in_window);
+                    if retransmitted && !probe {
+                        self.rack.commit_retry_span(seq, end);
+                    }
+                    if reserve {
+                        self.reserved_ledger = self.rack.departure_selection();
+                    } else if let Some(selection) = self.rack.departure_selection() {
+                        if fresh_data {
+                            self.rack.commit_new_packet(selection);
+                        } else {
+                            let committed = self.rack.commit_departure(selection, seq, end, now);
+                            debug_assert!(committed);
+                        }
+                    }
                 }
             }
             if !self.rack.valid() {
@@ -12764,7 +13255,8 @@ impl Connection {
                 self.prr = None;
             }
         }
-        if count != 0
+        if !STREAM
+            && count != 0
             && !deferred_ptb
             && let Some(mut recovery) = self.sack_recovery
         {
@@ -12818,45 +13310,13 @@ impl Connection {
             self.congestion.restart_after_idle(window);
         }
         if !challenge {
-            if count != 0 && !keepalive {
+            if !staged && count != 0 && !keepalive {
                 self.last_sent = now;
             }
             self.syn_pending = false;
         }
-        if flags & ACK != 0 {
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
-            //= reason=Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
-            //# TS.Recent holds a timestamp to be echoed in TSecr whenever a
-            //# segment is sent, and Last.ACK.sent holds the ACK field from the
-            //# last segment sent.  Last.ACK.sent will equal RCV.NXT except when
-            //# <ACK>s have been delayed.
-            self.last_ack_sent = self.receive.next();
-            self.ack_nomem = false;
-            self.ack_pending =
-                self.sack_send && (sack_limited || self.receive.has_pending_report());
-            self.ack_deadline = None;
-            self.unacked_segments = 0;
-            self.unacked_bytes = 0;
-            let shift = if !syn && self.scaling {
-                self.local_scale
-            } else {
-                0
-            };
-            let edge = self.receive.next().wrapping_add((window as u32) << shift);
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-            //= reason=Previously committed receive promises remain valid across scaled rounding and wrap: acceptance tests the highest edge advertised, never the current free space. The out-of-order map accepts arbitrary fragmentation without an interval-count limit. Holding the data is subject to the receive memory rules, as in Linux (a segment past the limit after collapse and prune is dropped, PROTO_MEM); the limit starts at twice the window (n0bw Q2), so a promise filled with small segments is held. Tests combine delayed promised bytes, batching and complete retained delivery.
-            //# 1)  The receiver MUST honor, as in window, any segment that would
-            //# have been in window for any <ACK> sent by the receiver.
-            //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
-            //= reason=Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
-            //# 2)  When window scaling is in effect, the receiver SHOULD track the
-            //# actual maximum window sequence number (which is likely to be
-            //# greater than the window announced by the most recent <ACK>, if
-            //# more than one segment has arrived since the application consumed
-            //# any data in the receive buffer).
-            if edge.after(self.advertised_edge) {
-                self.advertised_edge = edge;
-            }
+        if !staged && flags & ACK != 0 {
+            self.commit_ack_window(window, syn, sack_limited);
         }
         if challenge {
             self.refresh_challenge_budget(now);
@@ -12896,7 +13356,12 @@ impl Connection {
                 // its ACK cannot predate its first transmission.
                 self.sample = None;
             } else if self.sample.is_none() {
-                self.sample = Some((if syn { seq.wrapping_add(1) } else { end }, now));
+                // A synchronously submitted original is sampled by its RACK
+                // interval. Only an offer that becomes a held reservation
+                // needs this provisional scalar sample.
+                if !staged {
+                    self.sample = Some((if syn { seq.wrapping_add(1) } else { end }, now));
+                }
                 self.sample_departure = None;
             }
             if end.after(self.snd_nxt) {
@@ -12918,7 +13383,7 @@ impl Connection {
             // a head repair keeps RFC 6298's one-RTO protection, measured
             // from acceptance when reserved.
             let restart = retransmitted && !(ptb_repair && (reserve || seq != self.snd_una));
-            if (self.rto_deadline.is_none() || restart) && !probe {
+            if !staged && (self.rto_deadline.is_none() || restart) && !probe {
                 self.rto_deadline = Some(now.saturating_add(self.rto()));
             }
         }
@@ -12958,7 +13423,8 @@ impl Connection {
                 State::FinWait1
             };
         }
-        if !syn
+        if !STREAM
+            && !syn
             && count != 0
             && let Some((start, end)) = self.fast_open_retry
             && seq == start
@@ -13008,7 +13474,7 @@ impl Connection {
                 .map(|k| now.saturating_add(self.config.timebase.ticks_from_us(k.interval_us)));
         }
         if count != 0 && !keepalive {
-            if self.limited_pending && !retransmit && !probe {
+            if !STREAM && self.limited_pending && !retransmit && !probe {
                 self.limited_sent = self.limited_sent.saturating_add(count as u32);
                 self.limited_end = Some(seq.wrapping_add(count as u32));
                 // RFC 6675 repeats SetPipe across output polls for this ACK.
@@ -13027,30 +13493,20 @@ impl Connection {
             self.sws_deadline = None;
             self.sws_override = false;
         }
-        if count != 0 && !syn && !keepalive && !probe {
-            // Successful encode only: failed polls cannot start/advance CUBIC's
-            // clock or validate an application-limited flight for growth.
-            let flight = self.data_flight();
-            let unsent = self
-                .send
-                .len()
-                .saturating_sub(self.snd_nxt.distance_from(self.send_base) as usize);
-            // Sender SWS may leave <MSS credit in a fractional CUBIC window.
-            // Validate that case only with queued data and rwnd >= cwnd.
-            let cwnd_limited = unsent != 0
-                && self.snd_wnd >= self.congestion.cwnd()
-                && flight.saturating_add(unsent.min(self.mss) as u32) > self.congestion.cwnd();
-            self.congestion
-                .on_data_sent(now, flight, self.data_high(), cwnd_limited);
-        }
-        if count != 0 && !syn && !keepalive {
+        if !staged && count != 0 && !syn && !keepalive {
+            if !probe {
+                self.account_data_flight::<STREAM>(now);
+            }
             self.congestion.on_startup_sent(
                 self.snd_nxt,
-                self.pacing_enabled() && !initial_burst && !probe && !tlp && !retransmit,
+                !OFFERED && self.pacing_enabled() && !initial_burst && !probe && !tlp && !retransmit,
             );
         }
-        self.arm_work_with_probe((fresh_data || new_fin) && !tlp);
-        if count != 0
+        if !staged {
+            self.arm_work_with_probe((fresh_data || new_fin) && !tlp);
+        }
+        if !OFFERED
+            && count != 0
             && !syn
             && !keepalive
             && let Some(pacing) = self.config.pacing
@@ -13077,7 +13533,7 @@ impl Connection {
                 }
                 self.pacing_deadline = self.general_pacing_deadline(now);
             }
-        } else if count != 0 && !syn && !keepalive && self.pacing_enabled() {
+        } else if !OFFERED && count != 0 && !syn && !keepalive && self.pacing_enabled() {
             // Commit after encode and congestion/idle accounting. Schedule from
             // this output, never from an expired deadline (no catch-up bursts).
             let rtt = self.rtt.srtt().unwrap_or(self.rtt.rto());
@@ -13091,6 +13547,75 @@ impl Connection {
             }
         }
         Ok(Some(size))
+    }
+
+    fn commit_ack_window(&mut self, window: u16, syn: bool, sack_limited: bool) {
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-4.3
+        //= reason=Retains one pending echo value and last successfully committed ACK; separate ts_latest is TIME-WAIT freshness bookkeeping, not extra unprocessed echo queue.
+        //# TS.Recent holds a timestamp to be echoed in TSecr whenever a
+        //# segment is sent, and Last.ACK.sent holds the ACK field from the
+        //# last segment sent.  Last.ACK.sent will equal RCV.NXT except when
+        //# <ACK>s have been delayed.
+        self.last_ack_sent = self.receive.next();
+        self.ack_nomem = false;
+        self.ack_pending = self.sack_send && (sack_limited || self.receive.has_pending_report());
+        self.ack_deadline = None;
+        self.unacked_segments = 0;
+        self.unacked_bytes = 0;
+        let shift = if !syn && self.scaling {
+            self.local_scale
+        } else {
+            0
+        };
+        let edge = self.receive.next().wrapping_add((window as u32) << shift);
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+        //= reason=Previously committed receive promises remain valid across scaled rounding and wrap: acceptance tests the highest edge advertised, never the current free space. The out-of-order map accepts arbitrary fragmentation without an interval-count limit. Holding the data is subject to the receive memory rules, as in Linux (a segment past the limit after collapse and prune is dropped, PROTO_MEM); the limit starts at twice the window (n0bw Q2), so a promise filled with small segments is held. Tests combine delayed promised bytes, batching and complete retained delivery.
+        //# 1)  The receiver MUST honor, as in window, any segment that would
+        //# have been in window for any <ACK> sent by the receiver.
+        //= https://www.rfc-editor.org/rfc/rfc7323#section-2.4
+        //= reason=Tracks maximum successful advertised edge independently of current quantized field; not advanced on failed output.
+        //# 2)  When window scaling is in effect, the receiver SHOULD track the
+        //# actual maximum window sequence number (which is likely to be
+        //# greater than the window announced by the most recent <ACK>, if
+        //# more than one segment has arrived since the application consumed
+        //# any data in the receive buffer).
+        if edge.after(self.advertised_edge) {
+            self.advertised_edge = edge;
+        }
+    }
+
+    fn account_data_flight<const STREAM: bool>(&mut self, now: Instant) {
+        // Successful encode only: failed polls cannot start/advance CUBIC's
+        // clock or validate an application-limited flight for growth.
+        let flight = if STREAM {
+            debug_assert_eq!(self.flight(), self.data_flight());
+            self.flight()
+        } else {
+            self.data_flight()
+        };
+        let unsent = self
+            .send
+            .len()
+            .saturating_sub(self.snd_nxt.distance_from(self.send_base) as usize);
+        // Sender SWS may leave <MSS credit in a fractional CUBIC window.
+        // Validate that case only with queued data and rwnd >= cwnd.
+        let cwnd_limited = unsent != 0
+            && self.snd_wnd >= self.congestion.cwnd()
+            && flight.saturating_add(unsent.min(self.mss) as u32) > self.congestion.cwnd();
+        self.congestion
+            .on_data_sent(now, flight, self.data_high(), cwnd_limited);
+    }
+
+    // The offer holds the live socket through encapsulation and submission.
+    // These effects depend only on this selection and need to be visible
+    // when the offer returns, including when it leaves a held reservation.
+    fn settle_offered_stream(&mut self, r: &StreamRecord) {
+        if self.rto_deadline.is_none() {
+            self.rto_deadline = Some(self.now.saturating_add(self.rto()));
+        }
+        self.commit_ack_window(r.window, false, false);
+        self.account_data_flight::<true>(self.now);
+        self.congestion.on_startup_sent(self.snd_nxt, false);
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9937#section-6.4
@@ -13193,7 +13718,6 @@ impl Connection {
     // A fresh unpaced stream packet just acknowledged all contiguous
     // receive data. A payload has a loss timer. An ACK with an empty
     // send queue and no flight can still leave a keepalive or ECN pause.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn submitted_stream_deadline(&self) -> Option<Instant> {
         debug_assert!(!self.deadline_uses_clock() && !self.pacing_enabled());
         debug_assert_eq!(self.state, State::Established);
@@ -14728,6 +15252,467 @@ mod fast_path_differential_tests {
                 idle_a.keepalive_deadline.is_some(),
                 idle_a.config.keepalive.is_some()
             );
+        }
+    }
+
+    #[test]
+    fn stream_output_fast_path_matches_general_select_output() {
+        fn assert_stream_eq(fast: &mut Connection, slow: &mut Connection, now: Instant, reserve: bool, label: &str) {
+            assert!(
+                fast.selects_stream(),
+                "expected selects_stream() == true for case {label}"
+            );
+            let mut out_f = [0xAAu8; 2048];
+            let mut out_s = [0xAAu8; 2048];
+            let rf = fast.select_output::<true, false, false>(now, &mut out_f, reserve, None, None, None);
+            let rs = slow.select_output::<false, false, false>(now, &mut out_s, reserve, None, None, None);
+            assert_eq!(rf, rs, "result mismatch in {label} (reserve={reserve})");
+            if let Ok(Some(len)) = rf {
+                assert_eq!(
+                    &out_f[..len],
+                    &out_s[..len],
+                    "wire bytes mismatch in {label} (reserve={reserve})"
+                );
+            }
+            assert_eq!(
+                fast.last_departure, slow.last_departure,
+                "Departure mismatch in {label} (reserve={reserve})"
+            );
+            assert_eq!(
+                snapshot_timer_fields(fast),
+                snapshot_timer_fields(slow),
+                "timers mismatch in {label} (reserve={reserve})"
+            );
+            assert_eq!(
+                fast.next_deadline(),
+                slow.next_deadline(),
+                "next_deadline mismatch in {label} (reserve={reserve})"
+            );
+            assert_eq!(
+                fast.last_output_ecn(),
+                slow.last_output_ecn(),
+                "ECN mismatch in {label} (reserve={reserve})"
+            );
+            assert_eq!(fast.snd_nxt, slow.snd_nxt, "snd_nxt mismatch in {label}");
+            assert_eq!(fast.last_sent, slow.last_sent, "last_sent mismatch in {label}");
+            assert_eq!(
+                fast.rack.has_short_transmission(fast.mss as u32),
+                slow.rack.has_short_transmission(slow.mss as u32),
+                "rack short transmission mismatch in {label}"
+            );
+        }
+
+        for (timestamps, ecn, reserve) in [
+            (true, false, false),
+            (true, true, true),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            let base_cfg = ConnectionConfig {
+                timestamps,
+                ecn,
+                ecn_initiate: ecn,
+                ..ConnectionConfig::default()
+            };
+
+            // 1) Shared spans + non-shared tail + PSH
+            let (mut fast, mut slow) = established_pair(base_cfg.clone(), 10_000, 20_000);
+            for (byte, more) in [(0x3cu8, true), (0x71u8, false)] {
+                let p_f = crate::Payload::from_vec(alloc::vec![byte; 900]);
+                let p_s = crate::Payload::from_vec(alloc::vec![byte; 900]);
+                fast.prepare_shared_storage(&p_f, 16, 1 << 20).unwrap();
+                slow.prepare_shared_storage(&p_s, 16, 1 << 20).unwrap();
+                fast.write_shared(p_f, more, false, None).unwrap();
+                slow.write_shared(p_s, more, false, None).unwrap();
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_100, reserve, "shared_span_full");
+            if !reserve {
+                assert_stream_eq(&mut fast, &mut slow, 2_100, reserve, "shared_span_tail");
+            }
+
+            // 2) SWS hold and SWS override
+            let (mut fast, mut slow) = established_pair(base_cfg.clone(), 11_000, 21_000);
+            for c in [&mut fast, &mut slow] {
+                c.max_snd_wnd = 32_768;
+                c.snd_wnd = 200;
+                c.write(b"x".repeat(500).as_slice()).unwrap();
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_200, reserve, "sws_hold");
+            for c in [&mut fast, &mut slow] {
+                c.sws_override = true;
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_250, reserve, "sws_override");
+
+            // 3) Nagle hold vs TCP_NODELAY
+            let (mut fast, mut slow) = established_pair(base_cfg.clone(), 12_000, 22_000);
+            for c in [&mut fast, &mut slow] {
+                c.set_nagle(true);
+                c.write(b"first-small").unwrap();
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_300, false, "nagle_first");
+            for c in [&mut fast, &mut slow] {
+                c.write(b"second-small").unwrap();
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_310, reserve, "nagle_suppressed");
+            for c in [&mut fast, &mut slow] {
+                c.set_nagle(false); // TCP_NODELAY
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_320, reserve, "tcp_nodelay_emit");
+
+            // 4) Cork hold and uncork, plus explicit no-PSH write
+            let (mut fast, mut slow) = established_pair(base_cfg.clone(), 13_000, 23_000);
+            for c in [&mut fast, &mut slow] {
+                c.set_cork(true);
+                c.write_with_options(b"corked-partial", false, false).unwrap();
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_400, reserve, "cork_hold");
+            for c in [&mut fast, &mut slow] {
+                c.set_cork(false);
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_410, reserve, "cork_uncork");
+
+            // 5) Managed send_space cap below MSS (SWS bypass + burst PSH)
+            let (mut fast, mut slow) = established_pair(base_cfg.clone(), 14_000, 24_000);
+            let managed_path = {
+                use core::net::{IpAddr, Ipv4Addr};
+                use ntcp_path::{
+                    ContextId, Dscp, InterfaceKey, IpPrefix, Limits, NextHop, PathRequest,
+                    PathService, Route, ScopedAddress,
+                };
+                let mut svc = PathService::new(
+                    ContextId::new(101),
+                    Limits {
+                        links: 1,
+                        sources: 1,
+                        source_owners: 1,
+                        routes: 1,
+                        paths: 1,
+                        clients: 1,
+                    },
+                    [1; 16],
+                )
+                .unwrap();
+                let link = svc.register_link(InterfaceKey(1), 1500).unwrap();
+                let source = svc
+                    .register_source(
+                        ScopedAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap(),
+                        link,
+                    )
+                    .unwrap();
+                svc.add_route(Route {
+                    destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+                    source: None,
+                    dscp: None,
+                    link,
+                    next_hop: NextHop::OnLink,
+                    metric: 0,
+                })
+                .unwrap();
+                let (client, snapshot) = svc
+                    .acquire(PathRequest {
+                        source,
+                        destination: ScopedAddress::new(
+                            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+                            None,
+                        )
+                        .unwrap(),
+                        dscp: Dscp::new(0).unwrap(),
+                    })
+                    .unwrap();
+                crate::PreparedPath { client, snapshot }
+            };
+            for c in [&mut fast, &mut slow] {
+                c.managed_path = Some(managed_path);
+                c.managed_packet_budget = 1500;
+                c.set_send_buffer(256);
+                c.max_snd_wnd = 32_768;
+                c.snd_wnd = 256;
+                c.write(&[0x55; 256]).unwrap();
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_500, reserve, "managed_send_space_cap");
+
+            // 6) ECN flags (ECE + CWR) and idle restart after >= RTO
+            let idle_cfg = ConnectionConfig {
+                initial_window: InitialWindow::Iw10,
+                ..base_cfg.clone()
+            };
+            let (mut fast, mut slow) = established_pair(idle_cfg, 15_000, 25_000);
+            let idle_now = 2_000 + fast.rto() + 500;
+            for c in [&mut fast, &mut slow] {
+                c.ecn_echo = ecn;
+                c.ecn_cwr_pending = ecn;
+                // IW10 starts at 10*MSS; setting iw_fallback reduces restart_window to RFC 3390
+                // so cwnd > restart_window() triggers idle_reduction on idle restart.
+                c.iw_fallback = true;
+                assert!(c.congestion.cwnd() > c.restart_window());
+                c.write(b"after-idle-restart").unwrap();
+            }
+            assert_stream_eq(&mut fast, &mut slow, idle_now, reserve, "idle_restart_and_ecn");
+
+            // 7) ACK-only on established stream with empty send queue
+            let (mut fast, mut slow) = established_pair(base_cfg.clone(), 16_000, 26_000);
+            let tuple = test_tuple();
+            let incoming = Segment {
+                header: Header {
+                    source_port: tuple.remote.port(),
+                    destination_port: tuple.local.port(),
+                    sequence: 26_001,
+                    acknowledgment: fast.snd_nxt.0,
+                    flags: ACK | PSH,
+                    window: 32_768,
+                    urgent_pointer: 0,
+                },
+                options: wire::Options {
+                    timestamps: timestamps.then_some((60_000, fast.timestamp_value(2_000))),
+                    ..wire::Options::default()
+                },
+                raw_options: &[],
+                payload: b"ack-me-now",
+            };
+            for c in [&mut fast, &mut slow] {
+                c.input(2_600, &incoming).unwrap();
+                c.ack_pending = true;
+                c.ecn_echo = ecn;
+            }
+            assert_stream_eq(&mut fast, &mut slow, 2_600, reserve, "ack_only");
+        }
+    }
+
+    #[test]
+    fn writable_exhaustive_small_domain_matches_reference() {
+        fn reference_writable(
+            c: &Connection,
+            lowat: Option<u32>,
+            request: TxTimestampRequest,
+        ) -> bool {
+            let usage = c.send_usage();
+            let space = c.send_space();
+            c.check_admission(lowat, request, space.saturating_sub(usage))
+                .is_ok_and(|room| room != 0)
+                && usage < space
+                && space - usage >= usage / 2
+                && lowat
+                    .filter(|&limit| limit != u32::MAX)
+                    .is_none_or(|limit| (c.notsent_bytes() as u64) << 1 < u64::from(limit))
+        }
+
+        let states = [
+            State::SynSent,
+            State::SynReceived,
+            State::Established,
+            State::CloseWait,
+            State::FinWait1,
+            State::FinWait2,
+            State::Closing,
+            State::LastAck,
+            State::TimeWait,
+            State::Closed,
+        ];
+        let lowats = [None, Some(0), Some(1), Some(2), Some(4), Some(8), Some(16)];
+        let requests = [
+            TxTimestampRequest::default(),
+            TxTimestampRequest {
+                scheduled: true,
+                ..TxTimestampRequest::default()
+            },
+        ];
+
+        for send_cap in [1usize, 4, 8, 12] {
+            let cfg = ConnectionConfig {
+                send_capacity: send_cap,
+                ..ConnectionConfig::default()
+            };
+            let (mut c, _) = established_pair(cfg, 30_000, 40_000);
+            c.set_send_buffer(send_cap);
+            for queued in 0..=send_cap {
+                let (mut base, _) = established_pair(
+                    ConnectionConfig {
+                        send_capacity: send_cap,
+                        ..ConnectionConfig::default()
+                    },
+                    30_000,
+                    40_000,
+                );
+                base.set_send_buffer(send_cap);
+                if queued != 0 {
+                    let wrote = base.write(&alloc::vec![0x42u8; queued]).unwrap();
+                    assert_eq!(wrote, queued);
+                }
+                for sent in 0..=queued {
+                    base.snd_nxt = base.send_base.wrapping_add(sent as u32);
+                    for acked in [
+                        0u64,
+                        u64::MAX - base.send.len() as u64 - 1,
+                        u64::MAX - base.send.len() as u64,
+                    ] {
+                        base.acknowledged = acked;
+                        for &state in &states {
+                            base.state = state;
+                            for shutdown in [false, true] {
+                                base.shutdown = shutdown;
+                                for &lowat in &lowats {
+                                    for &req in &requests {
+                                        let actual = base.writable(lowat, req);
+                                        let expected = reference_writable(&base, lowat, req);
+                                        assert_eq!(
+                                            actual, expected,
+                                            "writable mismatch: cap={send_cap} queued={queued} sent={sent} acked={acked} state={state:?} shutdown={shutdown} lowat={lowat:?} req={req:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Verify send_storage_fits against the direct ledger_growth formula.
+            for accepted in [0usize, 1, 64, 512, 1460, 4096] {
+                let live = c.send.len() + accepted;
+                let expected = live <= c.send.allocation_capacity()
+                    && c.ledger_growth(live).0 <= c.ledger_capacity();
+                assert_eq!(
+                    c.send_storage_fits(accepted),
+                    expected,
+                    "send_storage_fits mismatch: cap={send_cap} accepted={accepted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offered_and_immediate_submission_equivalence_and_cancel_paths() {
+        for (timestamps, with_pmtud) in [(true, false), (false, false), (true, true)] {
+            let pmtud = with_pmtud.then(|| crate::PmtudConfig::new(1500));
+            let cfg = ConnectionConfig {
+                timestamps,
+                pmtud,
+                ..ConnectionConfig::default()
+            };
+
+            // 1) Immediate offered submission vs reserved submission + short final segment + RACK short state
+            let (mut imm, mut res) = established_pair(cfg.clone(), 50_000, 60_000);
+            // Queue one full MSS plus a short final segment so RACK tracks short_transmission.
+            let payload_len = imm.mss + 77;
+            let data = alloc::vec![0x6au8; payload_len];
+            imm.write(&data).unwrap();
+            res.write(&data).unwrap();
+
+            for step in 0..2 {
+                let now = 2_500 + step * 50;
+                let mut buf_imm = [0u8; 2048];
+                let mut buf_res = [0u8; 2048];
+                let mut record = None;
+                let n_imm = imm.transmit_offered(now, &mut buf_imm, &mut record).unwrap().unwrap();
+                let n_res = res.transmit_selected(now, &mut buf_res, true).unwrap().unwrap();
+                assert_eq!(n_imm, n_res);
+                assert_eq!(&buf_imm[..n_imm], &buf_res[..n_res]);
+
+                let receipt = crate::PhysicalReceipt {
+                    ip_packet_len: n_imm as u32 + 20,
+                    dont_fragment: true,
+                };
+                if !with_pmtud {
+                    let rec = record.expect("pmtud=None should take offered StreamRecord path");
+                    assert!(rec.has_data());
+                    imm.submit_immediate_stream(now, rec);
+                    // Also check submitted_stream_deadline matches next_deadline.
+                    assert_eq!(imm.submitted_stream_deadline(), imm.next_deadline());
+                } else {
+                    assert!(record.is_none(), "pmtud=Some must fall back to general path");
+                    let d = imm
+                        .can_submit_immediate(now)
+                        .expect("scalar non-probe departure should allow immediate submit");
+                    imm.submit_immediate_departure(now, d, receipt);
+                }
+
+                let mut d_res = res.last_departure.unwrap();
+                let count = d_res.payload;
+                assert!(!res.accept_reserved_output(now, &mut d_res, 0, count, true).unwrap());
+                res.certify_submission(&d_res, 0, count, receipt);
+
+                assert_eq!(imm.snd_nxt, res.snd_nxt);
+                assert_eq!(imm.last_sent, res.last_sent);
+                assert_eq!(snapshot_timer_fields(&imm), snapshot_timer_fields(&res));
+                assert_eq!(imm.next_deadline(), res.next_deadline());
+                assert_eq!(
+                    imm.rack.has_short_transmission(imm.mss as u32),
+                    res.rack.has_short_transmission(res.mss as u32)
+                );
+                if step == 1 {
+                    assert!(
+                        imm.rack.has_short_transmission(imm.mss as u32),
+                        "short final segment must set RACK short transmission state"
+                    );
+                }
+            }
+
+            // 2) Device refusal after offer (`finish_offered_record`) -> later accept vs release/cancel
+            if !with_pmtud {
+                let (mut refused_accept, mut baseline) = established_pair(cfg.clone(), 51_000, 61_000);
+                refused_accept.write(b"deferred-after-offer").unwrap();
+                baseline.write(b"deferred-after-offer").unwrap();
+                let mut buf_a = [0u8; 2048];
+                let mut buf_b = [0u8; 2048];
+                let mut rec = None;
+                let na = refused_accept
+                    .transmit_offered(3_000, &mut buf_a, &mut rec)
+                    .unwrap()
+                    .unwrap();
+                let nb = baseline
+                    .transmit_selected(3_000, &mut buf_b, true)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&buf_a[..na], &buf_b[..nb]);
+                refused_accept.finish_offered_record(rec.unwrap());
+                assert_eq!(refused_accept.last_departure, baseline.last_departure);
+                assert_eq!(
+                    snapshot_timer_fields(&refused_accept),
+                    snapshot_timer_fields(&baseline)
+                );
+
+                // Cancel helpers after an offered StreamRecord must return false cleanly (no undo captured).
+                assert!(!refused_accept.cancel_reserved_repair());
+                assert!(!refused_accept.cancel_reserved_resource(3_010).unwrap());
+
+                // Later acceptance at t = 3_050 matches baseline reservation acceptance identically.
+                let mut da = refused_accept.last_departure.unwrap();
+                let mut db = baseline.last_departure.unwrap();
+                let (pa, pb) = (da.payload, db.payload);
+                assert!(!refused_accept.accept_reserved_output(3_050, &mut da, 0, pa, true).unwrap());
+                assert!(!baseline.accept_reserved_output(3_050, &mut db, 0, pb, true).unwrap());
+                assert_eq!(
+                    snapshot_timer_fields(&refused_accept),
+                    snapshot_timer_fields(&baseline)
+                );
+
+                // With local_refusals = true, transmit_offered falls back to transmit_selected and
+                // captures fresh undo so cancel_reserved_resource succeeds cleanly!
+                let (mut local_ref, _) = established_pair(cfg.clone(), 52_000, 62_000);
+                local_ref.local_refusals = true;
+                local_ref.write(b"cancel-me").unwrap();
+                let mut rec2 = None;
+                let n = local_ref
+                    .transmit_offered(3_100, &mut buf_a, &mut rec2)
+                    .unwrap()
+                    .unwrap();
+                assert!(n > 0 && rec2.is_none());
+                assert!(local_ref.cancel_reserved_resource(3_110).unwrap());
+                assert_eq!(local_ref.flight(), 0);
+
+                // Control FIN after shutdown: transmit_offered falls back and captures ControlUndo,
+                // allowing cancel_reserved_unsubmitted to withdraw it cleanly.
+                let (mut fin_c, _) = established_pair(cfg.clone(), 53_000, 63_000);
+                fin_c.shutdown().unwrap();
+                let mut rec3 = None;
+                let nf = fin_c
+                    .transmit_offered(3_200, &mut buf_a, &mut rec3)
+                    .unwrap()
+                    .unwrap();
+                assert!(nf > 0 && rec3.is_none());
+                assert_eq!(fin_c.state(), State::FinWait1);
+                assert!(fin_c.cancel_reserved_unsubmitted(3_210).unwrap());
+                assert_eq!(fin_c.state(), State::Established);
+            }
         }
     }
 }

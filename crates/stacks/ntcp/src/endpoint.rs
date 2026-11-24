@@ -6,7 +6,7 @@ pub(crate) mod mac_cost_tests;
 
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use core::{
-    cell::Cell,
+    cell::{Cell, OnceCell},
     net::{IpAddr, SocketAddr},
     num::NonZeroU8,
 };
@@ -113,6 +113,370 @@ impl StreamState<'_> {
 
     pub fn send_progress(self) -> SendProgress {
         self.0.send_progress()
+    }
+}
+
+/// Exclusive access to a live stream. Its owner and reservation cannot change
+/// between checking the cursor or timestamps and transferring the bytes.
+pub struct StreamIo<'a> {
+    endpoint: &'a mut Endpoint,
+    id: ConnectionId,
+    reserved: bool,
+}
+
+impl StreamIo<'_> {
+    pub fn state(&self) -> StreamState<'_> {
+        StreamState(
+            &self.endpoint.slots[self.id.slot]
+                .as_ref()
+                .unwrap()
+                .connection,
+        )
+    }
+
+    /// Bytes to inspect before reading, or None when a nonempty read would
+    /// just report WouldBlock. A reservation or an older clock requires
+    /// entering the reader even when there are no bytes.
+    pub fn read_available(&self) -> Option<usize> {
+        let stream = self.state();
+        let available = stream.readable_bytes();
+        if stream.0.awaiting_stream_data(available)
+            && !self.reserved
+            && stream.0.at_time(self.endpoint.now)
+        {
+            None
+        } else {
+            Some(available)
+        }
+    }
+
+    pub fn peek_timestamps(&self, count: usize) -> Result<Option<RxReadTimestamps>, EndpointError> {
+        Ok(self.state().0.peek_rx_timestamps(count)?)
+    }
+
+    pub fn read(self, out: &mut [u8]) -> Result<usize, EndpointError> {
+        self.read_with_wait(out).map(|(count, _)| count)
+    }
+
+    /// Read bytes and report whether a subsequent nonempty read at this
+    /// clock would wait for input. A reservation keeps its ordinary read
+    /// path, including invalidation of provisional send state.
+    pub fn read_with_wait(self, out: &mut [u8]) -> Result<(usize, bool), EndpointError> {
+        let endpoint = self.endpoint;
+        let slot = endpoint.slots[self.id.slot].as_mut().unwrap();
+        let connection = &mut slot.connection;
+        let same_clock = connection.at_time(endpoint.now);
+        if self.reserved {
+            connection.forget_reserved_undo();
+        } else if !same_clock {
+            connection.update_time(endpoint.now)?;
+        }
+        let (count, update) = connection.read_stream(out)?;
+        if connection.receive_tuned()
+            && let Some(target) = connection.receive_space_adjust()
+        {
+            connection.raise_receive_clamp(target);
+        }
+        let waiting =
+            !self.reserved && connection.awaiting_stream_data(connection.open_readable_bytes());
+        let charge = connection.settle_receive_charge();
+        // A stream read can newly arm a window update or free a drained
+        // deque. At the same clock it otherwise changes no timer, event
+        // or managed progress. Keep the scheduler's live output hint.
+        let settled = same_clock
+            && !update
+            && !self.reserved
+            && slot.steady()
+            && !slot.connection.refresh_work()
+            && endpoint.memory_waiters.is_empty();
+        let output_checked = slot.output_checked;
+        if let Some((old, new)) = charge {
+            endpoint.recharge(old, new);
+        }
+        if settled {
+            if !output_checked {
+                endpoint.queue_connection_output(self.id.slot);
+            } else {
+                debug_assert!(
+                    endpoint.output.contains(self.id.slot)
+                        || endpoint.slots[self.id.slot]
+                            .as_ref()
+                            .unwrap()
+                            .connection
+                            .output_idle()
+                );
+            }
+        } else {
+            endpoint.refresh(self.id.slot);
+        }
+        Ok((count, waiting))
+    }
+
+    /// Queue bytes with PUSH at the end, retaining the timestamp request for
+    /// the last accepted byte when one was specified.
+    pub fn write(
+        self,
+        bytes: &[u8],
+        timestamp: Option<TxTimestampRequest>,
+    ) -> Result<usize, EndpointError> {
+        self.write_copy(bytes, true, false, false, None, timestamp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_copy(
+        self,
+        bytes: &[u8],
+        push: bool,
+        more: bool,
+        end_of_record: bool,
+        lowat: Option<u32>,
+        request: Option<TxTimestampRequest>,
+    ) -> Result<usize, EndpointError> {
+        let endpoint = self.endpoint;
+        let connection = &mut endpoint.slots[self.id.slot].as_mut().unwrap().connection;
+        if self.reserved {
+            connection.forget_reserved_undo();
+        } else if !connection.at_time(endpoint.now) {
+            connection.update_time(endpoint.now)?;
+        }
+        let room = endpoint.prepare_write_accessed(self.id, bytes.len(), lowat, request)?;
+        let index = self.id.slot;
+        let slot = endpoint.slots[index].as_mut().unwrap();
+        let count =
+            slot.connection
+                .write_prepared(bytes, push, more, end_of_record, room, request)?;
+        // Appending to a synchronized stream leaves new unsent bytes. It
+        // changes the write timers and can free a memory-waiting writer,
+        // but cannot advance SND.UNA or the managed path's delivery.
+        if count != 0
+            && !self.reserved
+            && slot.mapped
+            && slot.connection.state() == State::Established
+            && slot.steady()
+            && !slot.connection.refresh_after_write()
+            && !slot.connection.managed_results.unpublished()
+        {
+            debug_assert!(!slot.connection.output_idle());
+            debug_assert!(
+                endpoint.managed_context.is_none()
+                    || slot.connection.unacknowledged() == endpoint.progress_una[index]
+                    || endpoint.progress.contains(index)
+            );
+            if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
+                endpoint.events.push(index);
+            }
+            endpoint.output.push(index);
+            endpoint.defer_deadline::<false>(index);
+        } else {
+            endpoint.refresh(index);
+        }
+        Ok(count)
+    }
+
+    pub fn read_terminal(self, out: &mut [u8]) -> Result<usize, EndpointError> {
+        let connection = &mut self.endpoint.slots[self.id.slot]
+            .as_mut()
+            .unwrap()
+            .connection;
+        if !self.reserved {
+            connection.update_time(self.endpoint.now)?;
+        }
+        Ok(connection.read_terminal(out)?)
+    }
+}
+
+/// Result of offering one directly addressed scalar output to a device.
+pub enum FreshPoll {
+    /// Use the regular scheduler, for example for repair or an aggregate.
+    Unavailable,
+    Empty {
+        more_work: bool,
+    },
+    Submitted {
+        more_work: bool,
+        owner_drained: bool,
+    },
+    Reserved {
+        more_work: bool,
+        attempt: crate::TransmitAttempt,
+    },
+}
+
+/// A preflighted segment during a synchronous device offer. Encapsulation
+/// can write the headroom and pad the frame. The original TCP bytes remain
+/// available if submission blocks and the endpoint must retain them.
+pub struct FreshTransmit<'a> {
+    endpoint: &'a mut Endpoint,
+    owner: ConnectionId,
+    attempt: crate::TransmitAttempt,
+    packet: OnceCell<Transmit>,
+    len: usize,
+    bytes: &'a mut [u8],
+    offset: usize,
+    record: Option<crate::connection::StreamRecord>,
+    complete: bool,
+}
+
+impl FreshTransmit<'_> {
+    pub fn packet(&self) -> &Transmit {
+        let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+        self.packet
+            .get_or_init(|| slot.transmit(self.owner, self.len))
+    }
+    pub fn owner(&self) -> ConnectionId {
+        self.owner
+    }
+    pub fn plain_encapsulation(&mut self) -> Option<(ConnectedIpHeader<'_>, &mut [u8])> {
+        let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+        slot.ipv4_options.is_empty().then(|| {
+            (
+                ConnectedIpHeader {
+                    slot,
+                    len: self.len,
+                },
+                &mut self.bytes[..self.offset],
+            )
+        })
+    }
+    pub fn attempt(&self) -> crate::TransmitAttempt {
+        self.attempt
+    }
+    pub fn managed_context(&self) -> Option<ntcp_path::ContextId> {
+        self.endpoint.managed_context()
+    }
+    /// The IP/transport metadata and the disjoint, writable prefix.
+    pub fn encapsulation(&mut self) -> (&Transmit, &mut [u8]) {
+        let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+        let packet = self
+            .packet
+            .get_or_init(|| slot.transmit(self.owner, self.len));
+        (packet, &mut self.bytes[..self.offset])
+    }
+    pub fn headroom(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.offset]
+    }
+    pub fn frame(&self) -> &[u8] {
+        &self.bytes[..self.offset + self.len]
+    }
+    /// Whether the selected TCP segment carries bytes which can remain in
+    /// the device after submission.
+    pub fn carries_payload(&self) -> bool {
+        let encoded = || self.len > usize::from(self.bytes[self.offset + 12] >> 4) * 4;
+        if let Some(record) = &self.record {
+            debug_assert_eq!(record.has_data(), encoded());
+            record.has_data()
+        } else {
+            encoded()
+        }
+    }
+
+    pub fn padded_frame(&mut self, minimum: usize) -> Option<&[u8]> {
+        let end = self.offset + self.len;
+        let len = end.max(minimum);
+        self.bytes.get_mut(end..len)?.fill(0);
+        Some(&self.bytes[..len])
+    }
+
+    fn submitted(
+        &mut self,
+        now: Instant,
+        receipt: crate::PhysicalReceipt,
+        departure: Option<crate::output_reservation::Departure>,
+        finish_owner: bool,
+    ) -> bool {
+        self.complete = true;
+        let endpoint = &mut self.endpoint;
+        let index = self.owner.slot;
+        let Some(slot) = endpoint.slots.get_mut(index).and_then(Option::as_mut) else {
+            debug_assert!(false, "live scalar transmit owner");
+            return false;
+        };
+        let connection = &mut slot.connection;
+        let stream = if let Some(record) = self.record.take() {
+            connection.submit_immediate_stream(now, record);
+            true
+        } else if let Some(d) = departure {
+            connection.submit_immediate_departure(now, d, receipt);
+            false
+        } else {
+            debug_assert!(false, "preflighted immediate submission missing selection");
+            return false;
+        };
+        endpoint.preflighted.set(None);
+        if stream {
+            // The offer held this steady socket through submission. A data
+            // packet or ACK leaves the send head and ACK as its only
+            // possible output, with the owner still in the scheduler.
+            let drained = finish_owner && connection.stream_queue_drained();
+            debug_assert_eq!(drained, finish_owner && connection.output_idle());
+            debug_assert!(!connection.refresh_work());
+            debug_assert!(endpoint.slots[index].as_ref().unwrap().steady());
+            debug_assert!(!endpoint.is_output_reserved(self.owner));
+            debug_assert!(endpoint.output.contains(index));
+            endpoint.refresh_steady::<true>(index);
+            if drained {
+                endpoint.output.remove(index);
+            }
+            drained
+        } else {
+            endpoint.refresh(index);
+            false
+        }
+    }
+}
+
+impl Drop for FreshTransmit<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            let Some(slot) = self
+                .endpoint
+                .slots
+                .get_mut(self.owner.slot)
+                .and_then(Option::as_mut)
+            else {
+                debug_assert!(false, "live scalar transmit owner");
+                return;
+            };
+            let packet = *self
+                .packet
+                .get_or_init(|| slot.transmit(self.owner, self.len));
+            if let Some(record) = self.record.take() {
+                slot.connection.finish_offered_record(record);
+            }
+            let Some(tcp) = self.bytes.get(self.offset..) else {
+                debug_assert!(false, "valid headroom offset in FreshTransmit");
+                return;
+            };
+            if let Err(_error) = self.endpoint.capture_selection(
+                self.attempt.reservation,
+                self.attempt,
+                &packet,
+                tcp,
+                None,
+                None,
+            ) {
+                debug_assert!(false, "live scalar transmit owner: {_error:?}");
+            }
+        }
+    }
+}
+
+/// An exclusively borrowed, validated physical transmit attempt. Dropping it
+/// leaves the reservation held, for example when the backend is blocked.
+pub struct PreparedTransmit<'a> {
+    endpoint: &'a mut Endpoint,
+    index: usize,
+    now: Instant,
+}
+
+impl PreparedTransmit<'_> {
+    /// Commit the departure after the backend reports physical submission.
+    /// Validation completed when this permit was constructed under an
+    /// exclusive borrow of the endpoint, so commitment is infallible.
+    pub fn submitted(self, receipt: crate::PhysicalReceipt) {
+        self.endpoint.preflighted.set(None);
+        self.endpoint
+            .commit_validated_transmit_receipt(self.now, self.index, Some(receipt));
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -434,21 +798,15 @@ pub struct IpHeader {
 #[derive(Clone, Copy)]
 pub struct ConnectedIpHeader<'a> {
     slot: &'a Slot,
-    ip: IpMetadata,
     len: usize,
 }
 
 impl<'a> ConnectedIpHeader<'a> {
     pub fn fields(self) -> IpHeader {
-        IpHeader {
-            ip: self.ip,
-            hop_limit: self.slot.hop_limit,
-            dscp: self.slot.dscp,
-            ecn: self.slot.connection.last_output_ecn(),
-        }
+        self.slot.ip_header()
     }
-    pub fn ip(&self) -> &IpMetadata {
-        &self.ip
+    pub fn ip(self) -> &'a IpMetadata {
+        &self.slot.connection.ip
     }
     pub fn hop_limit(self) -> u8 {
         self.slot.hop_limit
@@ -466,7 +824,8 @@ impl<'a> ConnectedIpHeader<'a> {
         self.slot.connection.pseudo_header().address_protocol_sum()
     }
     pub fn matches_route(self, route: &crate::ManagedRoute) -> bool {
-        self.slot.matches_route(route, self.ip.destination)
+        self.slot
+            .matches_route(route, self.slot.connection.ip.destination)
     }
 }
 
@@ -717,6 +1076,43 @@ struct Slot {
 }
 
 impl Slot {
+    fn ip_header(&self) -> IpHeader {
+        IpHeader {
+            ip: self.connection.ip,
+            hop_limit: self.hop_limit,
+            dscp: self.dscp,
+            ecn: self.connection.last_output_ecn(),
+        }
+    }
+
+    fn transmit(&self, id: ConnectionId, len: usize) -> Transmit {
+        let header = self.ip_header();
+        Transmit {
+            connection: Some(id),
+            tx_timestamp: self
+                .connection
+                .last_output_range
+                .map(|range| TxTimestampToken::new(id, range)),
+            ecn: header.ecn,
+            ipv4_options: self.ipv4_options,
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
+            //# At all other times, a previous segment has either been sent or
+            //# received on this connection, and TCP implementations MUST use the
+            //# same local address that was used in those previous segments (MUST-
+            //# 45).
+            ip: header.ip,
+            len,
+            //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
+            //# TCP implementations
+            //# SHOULD pass the current Differentiated Services field value without
+            //# change to the IP layer, when it sends segments on the connection
+            //# (SHLD-22).
+            hop_limit: header.hop_limit,
+            dscp: header.dscp,
+            mark: self.mark,
+        }
+    }
+
     // Neither closed nor in TIME-WAIT, counted as it is, with no listener
     // handoff or Fast Open owner left: the state part of Endpoint::refresh
     // has nothing to do.
@@ -1575,8 +1971,12 @@ impl Endpoint {
             .ok_or(EndpointError::InvalidHandle)
     }
     fn retained_slot_mut(&mut self, id: ConnectionId) -> Result<&mut Slot, EndpointError> {
-        self.retained_slot(id)?;
-        Ok(self.slots[id.slot].as_mut().unwrap())
+        if self.generations.get(id.slot) != Some(&id.generation) {
+            return Err(EndpointError::InvalidHandle);
+        }
+        self.slots[id.slot]
+            .as_mut()
+            .ok_or(EndpointError::InvalidHandle)
     }
     fn slot(&self, id: ConnectionId) -> Result<&Slot, EndpointError> {
         let slot = self.retained_slot(id)?;
@@ -1586,11 +1986,28 @@ impl Endpoint {
         Ok(slot)
     }
     fn slot_mut(&mut self, id: ConnectionId) -> Result<&mut Slot, EndpointError> {
-        self.slot(id)?;
+        self.access_slot(id, false)
+    }
+
+    // An application call may invalidate the undo state of a held departure.
+    // Reserved owners keep their selection time until the backend responds.
+    fn access_slot(
+        &mut self,
+        id: ConnectionId,
+        invalidate_undo: bool,
+    ) -> Result<&mut Slot, EndpointError> {
         let reserved = self.is_output_reserved(id);
-        let slot = self.slots[id.slot].as_mut().unwrap();
-        if !reserved {
-            slot.connection.update_time(self.now)?;
+        let now = self.now;
+        let slot = self.retained_slot_mut(id)?;
+        if slot.released {
+            return Err(EndpointError::InvalidHandle);
+        }
+        if reserved {
+            if invalidate_undo {
+                slot.connection.forget_reserved_undo();
+            }
+        } else {
+            slot.connection.update_time(now)?;
         }
         Ok(slot)
     }
@@ -3647,7 +4064,7 @@ impl Endpoint {
         {
             #[cfg(debug_assertions)]
             self.check_refresh_steady(index);
-            self.refresh_steady(index);
+            self.refresh_steady::<false>(index);
             return;
         }
         self.refresh_walk(index);
@@ -3657,28 +4074,41 @@ impl Endpoint {
     }
 
     // The part of the walk a steady connection with nothing pending needs.
-    fn refresh_steady(&mut self, index: usize) {
-        if self.managed_context.is_some()
+    fn refresh_steady<const OFFERED: bool>(&mut self, index: usize) {
+        if !OFFERED
+            && self.managed_context.is_some()
             && let Some(slot) = &self.slots[index]
             && (slot.connection.unacknowledged() != self.progress_una[index]
                 || slot.connection.managed_results.unpublished())
         {
             self.progress.push(index);
         }
+        // A submitted original cannot move SND.UNA or publish a PMTU result.
+        debug_assert!(
+            !OFFERED
+                || self.managed_context.is_none()
+                || self.progress.contains(index)
+                || self.slots[index].as_ref().is_some_and(|slot| {
+                    slot.connection.unacknowledged() == self.progress_una[index]
+                        && !slot.connection.managed_results.unpublished()
+                })
+        );
         // This is the live socket slot. A held reservation owns this slot
         // until it is released, including for a closed connection's reset.
         let reserved = self.has_output_reservations() && self.reservation_owners[index].is_some();
         debug_assert_eq!(reserved, self.is_output_reserved(self.id(index)));
-        if reserved {
+        if !OFFERED && reserved {
             self.set_deadline(index, None);
             return;
         }
-        self.defer_deadline(index);
+        self.defer_deadline::<OFFERED>(index);
         let slot = self.slots[index].as_ref().unwrap();
         if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
             self.events.push(index);
         }
-        self.queue_connection_output(index);
+        if !OFFERED {
+            self.queue_connection_output(index);
+        }
     }
 
     fn queue_connection_output(&mut self, index: usize) {
@@ -5115,8 +5545,18 @@ impl Endpoint {
         lowat: Option<u32>,
         timestamp: Option<TxTimestampRequest>,
     ) -> Result<usize, EndpointError> {
-        self.reserved_call(id)?;
-        let slot = self.slot_mut(id)?;
+        self.access_slot(id, true)?;
+        self.prepare_write_accessed(id, len, lowat, timestamp)
+    }
+
+    fn prepare_write_accessed(
+        &mut self,
+        id: ConnectionId,
+        len: usize,
+        lowat: Option<u32>,
+        timestamp: Option<TxTimestampRequest>,
+    ) -> Result<usize, EndpointError> {
+        let slot = self.slots[id.slot].as_mut().unwrap();
         let connection = &mut slot.connection;
         let accepted = connection.write_prefix(len, lowat, timestamp)?;
         // A write into the existing ring and ledgers has no allocation to
@@ -5658,40 +6098,8 @@ impl Endpoint {
         lowat: Option<u32>,
         request: Option<TxTimestampRequest>,
     ) -> Result<usize, EndpointError> {
-        let room = self.prepare_write_metadata(id, bytes.len(), lowat, request)?;
-        let index = id.slot;
-        let reserved = self.has_output_reservations() && self.reservation_owners[index].is_some();
-        debug_assert_eq!(reserved, self.is_output_reserved(id));
-        let slot = self.slots[index].as_mut().unwrap();
-        let count =
-            slot.connection
-                .write_prepared(bytes, push, more, end_of_record, room, request)?;
-        // Appending to a synchronized stream leaves new unsent bytes. It
-        // changes the write timers and can free a memory-waiting writer,
-        // but cannot advance SND.UNA or the managed path's delivery.
-        if count != 0
-            && !reserved
-            && slot.mapped
-            && slot.connection.state() == State::Established
-            && slot.steady()
-            && !slot.connection.refresh_after_write()
-            && !slot.connection.managed_results.unpublished()
-        {
-            debug_assert!(!slot.connection.output_idle());
-            debug_assert!(
-                self.managed_context.is_none()
-                    || slot.connection.unacknowledged() == self.progress_una[index]
-                    || self.progress.contains(index)
-            );
-            if slot.listener.is_none() && !slot.released && slot.connection.events_pending() {
-                self.events.push(index);
-            }
-            self.output.push(index);
-            self.defer_deadline(index);
-        } else {
-            self.refresh(index);
-        }
-        Ok(count)
+        self.stream_io(id)?
+            .write_copy(bytes, push, more, end_of_record, lowat, request)
     }
 
     pub fn report_tx_timestamp(
@@ -5775,8 +6183,7 @@ impl Endpoint {
         id: ConnectionId,
         pending: bool,
     ) -> Result<(), EndpointError> {
-        self.reserved_call(id)?;
-        self.slot_mut(id)?
+        self.access_slot(id, true)?
             .connection
             .set_fast_open_write_pending(pending)?;
         Ok(())
@@ -5799,8 +6206,7 @@ impl Endpoint {
         end_of_record: bool,
         force: bool,
     ) -> Result<(), EndpointError> {
-        self.reserved_call(id)?;
-        self.slot_mut(id)?
+        self.access_slot(id, true)?
             .connection
             .finish_send(end, more, end_of_record, force);
         self.refresh(id.slot);
@@ -5827,15 +6233,13 @@ impl Endpoint {
 
     /// Hold partial output until uncork, explicit NODELAY, or a 200ms timeout.
     pub fn set_cork(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
-        self.reserved_call(id)?;
-        self.slot_mut(id)?.connection.set_cork(enabled);
+        self.access_slot(id, true)?.connection.set_cork(enabled);
         self.refresh(id.slot);
         Ok(())
     }
 
     pub fn flush(&mut self, id: ConnectionId) -> Result<usize, EndpointError> {
-        self.reserved_call(id)?;
-        let count = self.slot_mut(id)?.connection.flush()?;
+        let count = self.access_slot(id, true)?.connection.flush()?;
         self.refresh(id.slot);
         Ok(count)
     }
@@ -5860,57 +6264,19 @@ impl Endpoint {
         Ok(self.slot(id)?.connection.peek_terminal(out)?)
     }
 
-    pub fn read(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
+    pub fn stream_io(&mut self, id: ConnectionId) -> Result<StreamIo<'_>, EndpointError> {
         self.slot(id)?;
         let reserved = self.has_output_reservations() && self.reservation_owners[id.slot].is_some();
         debug_assert_eq!(reserved, self.is_output_reserved(id));
-        let slot = self.slots[id.slot].as_mut().unwrap();
-        let connection = &mut slot.connection;
-        let same_clock = connection.at_time(self.now);
-        if reserved {
-            connection.forget_reserved_undo();
-        } else if !same_clock {
-            connection.update_time(self.now)?;
-        }
-        let (count, update) = connection.read_stream(out)?;
-        if connection.receive_tuned()
-            && let Some(target) = connection.receive_space_adjust()
-        {
-            connection.raise_receive_clamp(target);
-        }
-        // Frames read to their end go back to the budget, waking writers
-        // waiting for memory (sock_rfree).
-        let charge = connection.settle_receive_charge();
-        // A stream read can newly arm a window update or free a drained
-        // deque. At the same clock it otherwise changes no timer, event
-        // or managed progress. Keep the scheduler's live output hint.
-        let settled = same_clock
-            && !update
-            && !reserved
-            && slot.steady()
-            && !slot.connection.refresh_work()
-            && self.memory_waiters.is_empty();
-        let output_checked = slot.output_checked;
-        if let Some((old, new)) = charge {
-            self.recharge(old, new);
-        }
-        if settled {
-            if !output_checked {
-                self.queue_connection_output(id.slot);
-            } else {
-                debug_assert!(
-                    self.output.contains(id.slot)
-                        || self.slots[id.slot]
-                            .as_ref()
-                            .unwrap()
-                            .connection
-                            .output_idle()
-                );
-            }
-        } else {
-            self.refresh(id.slot);
-        }
-        Ok(count)
+        Ok(StreamIo {
+            endpoint: self,
+            id,
+            reserved,
+        })
+    }
+
+    pub fn read(&mut self, id: ConnectionId, out: &mut [u8]) -> Result<usize, EndpointError> {
+        self.stream_io(id)?.read(out)
     }
 
     // Socket adapters may drain accepted bytes after CLOSED; the normal read
@@ -5921,7 +6287,7 @@ impl Endpoint {
         id: ConnectionId,
         out: &mut [u8],
     ) -> Result<usize, EndpointError> {
-        Ok(self.slot_mut(id)?.connection.read_terminal(out)?)
+        self.stream_io(id)?.read_terminal(out)
     }
 
     // Count only bytes eligible for terminal draining.
@@ -5939,8 +6305,7 @@ impl Endpoint {
         if self.is_output_reserved(id) && self.state(id)? == State::SynSent {
             return Err(EndpointError::OutputReserved);
         }
-        self.reserved_call(id)?;
-        self.slot_mut(id)?.connection.shutdown()?;
+        self.access_slot(id, true)?.connection.shutdown()?;
         self.refresh(id.slot);
         Ok(())
     }
@@ -5966,8 +6331,7 @@ impl Endpoint {
         Ok(())
     }
     pub fn set_nagle(&mut self, id: ConnectionId, enabled: bool) -> Result<(), EndpointError> {
-        self.reserved_call(id)?;
-        self.slot_mut(id)?.connection.set_nagle(enabled);
+        self.access_slot(id, true)?.connection.set_nagle(enabled);
         self.refresh(id.slot);
         Ok(())
     }
@@ -6335,8 +6699,7 @@ impl Endpoint {
         id: ConnectionId,
         limit: Option<NonZeroU8>,
     ) -> Result<(), EndpointError> {
-        self.reserved_call(id)?;
-        self.slot_mut(id)?
+        self.access_slot(id, true)?
             .connection
             .set_handshake_retransmission_limit(limit);
         self.refresh(id.slot);
@@ -6406,6 +6769,9 @@ impl Endpoint {
     }
     pub fn tuple(&self, id: ConnectionId) -> Result<Tuple, EndpointError> {
         Ok(self.slot(id)?.connection.tuple())
+    }
+    pub fn stream_state(&self, id: ConnectionId) -> Result<StreamState<'_>, EndpointError> {
+        Ok(StreamState(&self.slot(id)?.connection))
     }
     pub fn readable_bytes(&self, id: ConnectionId) -> Result<usize, EndpointError> {
         Ok(self.slot(id)?.connection.readable_bytes())
@@ -6799,7 +7165,7 @@ impl Endpoint {
     // Input, reads, writes and output selection can all refresh one owner
     // between timer queries. Resolve its deadline just once when the caller
     // looks at the timer queue or before another owner takes its place.
-    fn defer_deadline(&mut self, index: usize) {
+    fn defer_deadline<const SUBMITTED: bool>(&mut self, index: usize) {
         // Returning socket memory can refresh a waiting writer from inside
         // another connection's operation, before its own refresh completes.
         let slot = self.slots[index].as_ref().unwrap();
@@ -6813,8 +7179,20 @@ impl Endpoint {
             self.deadlines.set(index, None);
             self.deferred_deadline = index;
         }
-        self.socket_poll_at = 0;
-        self.sampled_deadline.set(None);
+        let sampled = if SUBMITTED {
+            let slot = self.slots[index].as_ref().unwrap();
+            debug_assert!(slot.memory_retry.is_none());
+            let next = slot.connection.submitted_stream_deadline();
+            self.socket_poll_at = self
+                .deadlines
+                .earliest_possible()
+                .min(next.unwrap_or(Instant::MAX));
+            Some(next)
+        } else {
+            self.socket_poll_at = 0;
+            None
+        };
+        self.sampled_deadline.set(sampled);
         #[cfg(debug_assertions)]
         self.expected_deadline
             .set(self.slots[index].as_ref().unwrap().deadline());
@@ -7586,8 +7964,26 @@ impl Endpoint {
         }
     }
 
+    /// Finish polling a single owner after accepting its output at the
+    /// current clock. Acceptance refreshed its deadline and kept its place
+    /// in the output queue. When it has no more output, a poll for that same
+    /// owner would just consume the queue entry.
+    pub fn finish_idle_output(&mut self, id: ConnectionId) -> bool {
+        if !self.cleanup.is_empty() || self.is_output_reserved(id) {
+            return false;
+        }
+        let Ok(slot) = self.retained_slot(id) else {
+            return false;
+        };
+        if slot.connection.state() == State::Closed || !slot.connection.output_idle() {
+            return false;
+        }
+        self.output.remove(id.slot);
+        true
+    }
+
     pub fn is_output_reserved(&self, id: ConnectionId) -> bool {
-        let reserved = self.reservation_of(Some(id)).is_some();
+        let reserved = self.has_output_reservations() && self.reservation_of(Some(id)).is_some();
         debug_assert_eq!(
             reserved,
             self.reservations.iter().any(|slot| {
@@ -7793,6 +8189,31 @@ impl Endpoint {
         self.polled(polled)
     }
 
+    /// The connected owner a one-turn output poll would select in the
+    /// absence of retained work. An embedding can offer its frame directly
+    /// to the device before capturing a reservation. A stateless turn,
+    /// cleanup or an outstanding reservation uses the regular scheduler.
+    pub fn next_fresh_connection(&self) -> Option<ConnectionId> {
+        if self.has_output_reservations()
+            || !self.cleanup.is_empty()
+            || self.control_turn && self.stateless_pending()
+        {
+            return None;
+        }
+        self.output.first().map(|index| self.id(index))
+    }
+
+    /// Whether the poll following this owner's fresh packet would inspect
+    /// it again. There is no reservation, cleanup or stateless turn ahead
+    /// of it, and moving it to the back leaves it at the head.
+    pub fn follows_own_output(&self, id: ConnectionId) -> bool {
+        self.output.sole(id.slot)
+            && self.generations.get(id.slot) == Some(&id.generation)
+            && !self.has_output_reservations()
+            && self.cleanup.is_empty()
+            && !self.stateless_pending()
+    }
+
     /// Select a reservation, leaving its packet metadata in place for
     /// `transmit_attempt_packet_ref`. A supplied owner restricts the poll
     /// to that connection, otherwise every output lane is eligible.
@@ -7810,6 +8231,104 @@ impl Endpoint {
             self.poll_reserved_any(now, out, budget, None)?
         };
         Ok((result.more_work, result.attempt))
+    }
+
+    /// Offer a fresh scalar segment before making a retained copy. The
+    /// callback has exclusively borrowed its owner through the physical
+    /// attempt. Returning no receipt (including link or device backpressure)
+    /// leaves an ordinary, fully captured reservation. A directed poll can
+    /// also consume the drained owner's hint when it has budget to poll again.
+    pub fn offer_fresh_transmit(
+        &mut self,
+        now: Instant,
+        id: ConnectionId,
+        bytes: &mut [u8],
+        headroom: usize,
+        finish_owner: bool,
+        submit: impl FnOnce(&mut FreshTransmit<'_>) -> Option<crate::PhysicalReceipt>,
+    ) -> Result<FreshPoll, EndpointError> {
+        self.retained_slot(id)?;
+        if self.free_reservations == 0
+            || !self.cleanup.is_empty()
+            || self.reservations[0].gso.is_some()
+        {
+            return Ok(FreshPoll::Unavailable);
+        }
+        // A synchronous offer usually starts with every reservation free.
+        // In that case the first slot is also the scheduler's first free one.
+        let reservation = if self.has_output_reservations() {
+            if self.is_output_reserved(id) {
+                return Ok(FreshPoll::Unavailable);
+            }
+            let Some(slot) = self.reservations.iter_mut().find(|s| s.current.is_none()) else {
+                return Ok(FreshPoll::Unavailable);
+            };
+            slot
+        } else {
+            &mut self.reservations[0]
+        };
+        let out = bytes.get_mut(headroom..).ok_or(Error::InvalidArgument)?;
+        let len = out.len().min(reservation.bytes.len());
+        let attempt = reservation.token()?;
+        self.clock(now)?;
+        let mut record = None;
+        let len = if self.output.contains(id.slot) {
+            self.poll_connection(
+                now,
+                &mut out[..len],
+                id,
+                true,
+                None,
+                None,
+                Some(&mut record),
+                |_, _, len| len,
+            )?
+        } else {
+            None
+        };
+        let more_work = self.has_pending_output();
+        let Some(len) = len else {
+            return Ok(FreshPoll::Empty { more_work });
+        };
+        // A held steady socket only publishes delivery progress and masks
+        // its timer. The offer cannot service either one while its caller
+        // owns the endpoint. A completed scalar send preserves the delivery
+        // cursor and publications for refresh, and installs the final timer.
+        let slot = self.slots[id.slot].as_ref().unwrap();
+        let immediate = if slot.steady()
+            && !slot.connection.refresh_work()
+            && slot.connection.last_discovery.is_none()
+        {
+            if record.is_some() {
+                Some(None)
+            } else {
+                slot.connection.can_submit_immediate(now).map(Some)
+            }
+        } else {
+            None
+        };
+        let mut selected = FreshTransmit {
+            len,
+            packet: OnceCell::new(),
+            endpoint: self,
+            owner: id,
+            attempt,
+            bytes,
+            offset: headroom,
+            record,
+            complete: false,
+        };
+        if let Some(departure) = immediate
+            && let Some(receipt) = submit(&mut selected)
+        {
+            let owner_drained = selected.submitted(now, receipt, departure, finish_owner);
+            Ok(FreshPoll::Submitted {
+                more_work,
+                owner_drained,
+            })
+        } else {
+            Ok(FreshPoll::Reserved { more_work, attempt })
+        }
     }
 
     pub(crate) fn poll_reserved_any(
@@ -7843,15 +8362,13 @@ impl Endpoint {
             }
             let resize = reply.as_mut().map(|f| &mut **f as _);
             let result = self.poll_reserved_selected(now, out, 1, owner, None, resize)?;
-            if let Some(id) = owner {
-                // Repairs share the ready queue rather than monopolizing its head.
-                if self.is_output_reserved(id) {
-                    self.output.remove(id.slot);
-                    self.output.push(id.slot);
-                }
-            }
             if result.attempt.is_some() {
                 return Ok(result);
+            }
+            if let Some(id) = owner
+                && self.is_output_reserved(id)
+            {
+                self.output.move_to_back(id.slot);
             }
         }
         Ok(Polled {
@@ -7985,8 +8502,7 @@ impl Endpoint {
                 .unwrap()
                 .abandon_attempt = attempt;
             if let Some(id) = connection {
-                self.output.remove(id.slot);
-                self.output.push(id.slot);
+                self.output.move_to_back(id.slot);
             }
             self.control_turn = true;
             debug_assert_eq!(
@@ -8003,36 +8519,41 @@ impl Endpoint {
         }
         // Reserve identity before selection: exhaustion must not consume output.
         let attempt = self.reservations[index].token()?;
-        // A synchronous push polls its owner again after accepting a frame.
-        // If the ready entry is idle, consume it here, with the same clock
-        // checks and timer update as an empty selection. A closed connection
-        // or listener cleanup still needs the full poll for reclamation.
+        let capacity = out.len().min(self.reservations[index].bytes.len());
         if let Some(id) = selected
+            && budget == 1
             && self.cleanup.is_empty()
             && shared.is_none()
-            && let Some(slot) = self.slots.get(id.slot).and_then(Option::as_ref)
+            && self.reservations[index].gso.is_none()
+            && self.slots.get(id.slot).is_some_and(Option::is_some)
             && self.id(id.slot) == id
-            && (!self.output.contains(id.slot)
-                || slot.connection.state() != State::Closed && slot.connection.output_idle())
         {
+            // No held reservation, competing lane, cleanup, or aggregate.
+            // The one ready owner can consume this turn directly.
             self.clock(now)?;
-            if self.output.contains(id.slot) {
-                self.output.remove(id.slot);
-                let slot = self.slots[id.slot].as_mut().unwrap();
-                if let Err(error) = slot.connection.check_time(now) {
-                    self.output.push(id.slot);
-                    return Err(error.into());
-                }
-                slot.output_checked = false;
-                let deadline = slot.deadline();
-                self.set_deadline(id.slot, deadline);
+            let packet = if self.output.contains(id.slot) {
+                self.poll_connection(
+                    now,
+                    &mut out[..capacity],
+                    id,
+                    true,
+                    None,
+                    None,
+                    None,
+                    Slot::transmit,
+                )?
+            } else {
+                None
+            };
+            let more_work = self.has_pending_output();
+            if let Some(packet) = &packet {
+                self.capture_selection(index, attempt, packet, out, None, None)?;
             }
             return Ok(Polled {
-                more_work: self.has_pending_output(),
-                attempt: None,
+                more_work,
+                attempt: packet.is_some().then_some(attempt),
             });
         }
-        let capacity = out.len().min(self.reservations[index].bytes.len());
         // Move the preallocated payload backing temporarily to avoid aliasing
         // the endpoint during selection; restore it on every result, no allocation.
         let mut payload = core::mem::take(&mut self.reservations[index].payload);
@@ -8069,62 +8590,70 @@ impl Endpoint {
         );
         self.reservations[index].payload = payload;
         // By reference: the packet is copied once, into the reservation.
-        let (output, mut zone) = match &output {
+        let (output, zone) = match &output {
             Ok((output, zone)) => (output, *zone),
             Err(error) => return Err(*error),
         };
         if let Some(packet) = &output.packet {
-            if let Some(parts) = shared.filter(|p| !p.is_empty()) {
-                self.reservations[index].capture_shared(packet, out, parts, attempt)?;
-            } else {
-                self.reservations[index].capture(packet, out, attempt);
-            }
-            self.reservation_held(index);
-            if let Some(id) = packet.connection {
-                zone = self.retained_slot(id)?.connection.scoped_tuple().zone();
-            }
-            self.reservations[index].current.as_mut().unwrap().zone = zone;
-            if let Some(id) = packet.connection {
-                let connection = &self.retained_slot(id)?.connection;
-                let departure = connection.last_departure;
-                // Captured without one; only a probe's intent is copied.
-                if let Some(intent) = connection.last_discovery {
-                    self.reservations[index].current.as_mut().unwrap().discovery = Some(intent);
-                }
-                let r = self.reservations[index].current.as_mut().unwrap();
-                r.departure = departure;
-                if let Some(s) = departure.and_then(|d| d.segmentation) {
-                    // Use the same exact-prefix acceptance path as MTU repair.
-                    // GSO has no selected PMTU packet, and selection ends it
-                    // before any pending Transmit timestamp target, so there
-                    // is no observation to cancel on rejection (Scheduled
-                    // stands, as for scalar output); physical evidence
-                    // commits at accept.
-                    r.repaired = true;
-                    r.finished = false;
-                    r.emitted_bytes = s.segment_payload_len;
-                    // The first segment's own token; the reservation keeps
-                    // the whole range's.
-                    let first = packet
-                        .tx_timestamp
-                        .map(|token| token.part(0, s.segment_payload_len));
-                    r.emitted_packet = Some(Transmit {
-                        tx_timestamp: first,
-                        ..r.packet
-                    });
-                }
-                self.refresh(id.slot);
-            }
-            Ok(Polled {
-                more_work: output.more_work,
-                attempt: Some(attempt),
-            })
-        } else {
-            Ok(Polled {
-                more_work: output.more_work,
-                attempt: None,
-            })
+            self.capture_selection(index, attempt, packet, out, shared, zone)?;
         }
+        Ok(Polled {
+            more_work: output.more_work,
+            attempt: output.packet.is_some().then_some(attempt),
+        })
+    }
+
+    fn capture_selection(
+        &mut self,
+        index: usize,
+        attempt: crate::TransmitAttempt,
+        packet: &Transmit,
+        out: &[u8],
+        shared: Option<&mut Vec<crate::Payload>>,
+        zone: Option<ntcp_path::LinkId>,
+    ) -> Result<(), EndpointError> {
+        if let Some(parts) = shared.filter(|p| !p.is_empty()) {
+            self.reservations[index].capture_shared(packet, out, parts, attempt)?;
+        } else {
+            self.reservations[index].capture(packet, out, attempt);
+        }
+        self.reservation_held(index);
+        if let Some(id) = packet.connection {
+            // Selection holds this generation until its reservation is
+            // accepted or withdrawn. The probe intent lives on the owner.
+            let connection = &self.retained_slot(id)?.connection;
+            let departure = connection.last_departure;
+            let probe = connection.last_discovery.is_some();
+            let zone = connection.scoped_tuple().zone();
+            let r = self.reservations[index].current.as_mut().unwrap();
+            r.zone = zone;
+            r.departure = departure;
+            r.probe = probe;
+            if let Some(s) = departure.and_then(|d| d.segmentation) {
+                // Use the same exact-prefix acceptance path as MTU repair.
+                // GSO has no selected PMTU packet, and selection ends it
+                // before any pending Transmit timestamp target, so there
+                // is no observation to cancel on rejection (Scheduled
+                // stands, as for scalar output); physical evidence
+                // commits at accept.
+                r.repaired = true;
+                r.finished = false;
+                r.emitted_bytes = s.segment_payload_len;
+                // The first segment's own token; the reservation keeps
+                // the whole range's.
+                let first = packet
+                    .tx_timestamp
+                    .map(|token| token.part(0, s.segment_payload_len));
+                r.emitted_packet = Some(Transmit {
+                    tx_timestamp: first,
+                    ..r.packet
+                });
+            }
+            self.refresh(id.slot);
+        } else {
+            self.reservations[index].current.as_mut().unwrap().zone = zone;
+        }
+        Ok(())
     }
 
     /// Read-only form of every check `accept_transmit` performs. Ok(true)
@@ -8132,6 +8661,18 @@ impl Endpoint {
     /// and no intervening Endpoint call succeeds and returns true, so an
     /// embedding can finish all fallible work before a physical submission.
     pub fn preflight_accept_transmit(
+        &self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+    ) -> Result<bool, EndpointError> {
+        let valid = self.validate_transmit_submission(now, attempt)?;
+        if valid {
+            self.preflighted.set(Some((attempt, now)));
+        }
+        Ok(valid)
+    }
+
+    fn validate_transmit_submission(
         &self,
         now: Instant,
         attempt: crate::TransmitAttempt,
@@ -8149,18 +8690,34 @@ impl Endpoint {
         let count = if r.repaired {
             r.emitted_bytes
         } else {
-            r.departure.map_or(0, |d| d.payload)
+            r.departure.as_ref().map_or(0, |d| d.payload)
         };
         if let Some(id) = r.packet.connection {
             let owner = &self.retained_slot(id)?.connection;
-            owner.check_time(now)?;
             if let Some(d) = &r.departure {
                 owner.validate_reserved_output(now, d, r.offset, count)?;
+            } else {
+                owner.check_time(now)?;
             }
         }
         self.check_clock(now)?;
-        self.preflighted.set(Some((attempt, now)));
         Ok(true)
+    }
+
+    /// Validate once and hold the endpoint across a synchronous backend call.
+    pub fn prepare_transmit_submission(
+        &mut self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+    ) -> Result<Option<PreparedTransmit<'_>>, EndpointError> {
+        if !self.validate_transmit_submission(now, attempt)? {
+            return Ok(None);
+        }
+        Ok(Some(PreparedTransmit {
+            endpoint: self,
+            index: attempt.reservation,
+            now,
+        }))
     }
 
     pub fn accept_transmit(
@@ -8180,51 +8737,97 @@ impl Endpoint {
         // were (input and timers refuse a reserved connection, refresh
         // unschedules its deadline, and slot_mut skips update_time). A
         // later endpoint clock fails check_clock below.
+        self.accept_transmit_receipt(now, attempt, None)
+    }
+
+    fn accept_transmit_receipt(
+        &mut self,
+        now: Instant,
+        attempt: crate::TransmitAttempt,
+        receipt: Option<crate::PhysicalReceipt>,
+    ) -> Result<bool, EndpointError> {
         let preflighted = self.preflighted.take() == Some((attempt, now));
-        let Some(r) = self
-            .reservations
-            .get(attempt.reservation)
-            .and_then(|slot| slot.current.as_ref())
-        else {
-            return Ok(false);
-        };
-        if r.attempt != Some(attempt) {
-            return Ok(false);
-        }
-        let index = attempt.reservation;
-        let connection = r.packet.connection;
-        if let Some(id) = connection
-            && r.departure.is_none()
-        {
-            self.retained_slot(id)?.connection.check_time(now)?;
-        }
-        self.check_clock(now)?;
-        let finished = r.finished;
-        let mut withdrawn = false;
-        if let Some(id) = connection {
-            self.retained_slot(id)?;
-            let owner = &mut self.slots[id.slot].as_mut().unwrap().connection;
-            let r = self.reservations[index].current.as_mut().unwrap();
-            if let Some(d) = &mut r.departure {
-                let count = if r.repaired {
-                    r.emitted_bytes
-                } else {
-                    d.payload
-                };
-                withdrawn = if preflighted {
-                    owner.accept_validated_output(now, d, r.offset, count, finished)?
-                } else {
-                    owner.accept_reserved_output(now, d, r.offset, count, finished)?
-                };
+        if preflighted {
+            let Some(r) = self
+                .reservations
+                .get(attempt.reservation)
+                .and_then(|slot| slot.current.as_ref())
+            else {
+                return Ok(false);
+            };
+            if r.attempt != Some(attempt) {
+                return Ok(false);
             }
+            let connection = r.packet.connection;
+            if let Some(id) = connection
+                && r.departure.is_none()
+            {
+                self.retained_slot(id)?.connection.check_time(now)?;
+            }
+            self.check_clock(now)?;
+            if let Some(id) = connection {
+                self.retained_slot(id)?;
+            }
+        } else if !self.validate_transmit_submission(now, attempt)? {
+            return Ok(false);
         }
-        self.clock(now)?;
-        self.complete_reserved_accept(index, finished || withdrawn);
+        self.commit_validated_transmit_receipt(now, attempt.reservation, receipt);
         Ok(true)
     }
 
+    // The attempt, owner generation, departure and endpoint clock have all
+    // been validated. Commitment is structurally infallible.
+    fn commit_validated_transmit_receipt(
+        &mut self,
+        now: Instant,
+        index: usize,
+        receipt: Option<crate::PhysicalReceipt>,
+    ) {
+        let Some(r) = self.reservations.get(index).and_then(|s| s.current.as_ref()) else {
+            debug_assert!(false, "validated reservation missing");
+            return;
+        };
+        let finished = r.finished;
+        let connection = r.packet.connection;
+        let mut withdrawn = false;
+        if let Some(id) = connection {
+            if let Some(slot) = self.slots.get_mut(id.slot).and_then(Option::as_mut) {
+                let owner = &mut slot.connection;
+                let Some(r) = self.reservations[index].current.as_mut() else {
+                    debug_assert!(false, "validated reservation missing");
+                    return;
+                };
+                if let Some(d) = &mut r.departure {
+                    let count = if r.repaired {
+                        r.emitted_bytes
+                    } else {
+                        d.payload
+                    };
+                    withdrawn = owner.accept_validated_output(now, d, r.offset, count, finished);
+                    if let Some(receipt) = receipt {
+                        owner.certify_submission(d, r.offset, count, receipt);
+                        if r.probe
+                            && !r.repaired
+                            && r.offset == 0
+                            && let Some(intent) = owner.last_discovery
+                        {
+                            owner.retain_probe_receipt(Seq(d.start), intent, receipt);
+                        }
+                    }
+                }
+            } else {
+                debug_assert!(false, "validated owner slot missing");
+            }
+        }
+        self.now = now;
+        self.complete_reserved_accept(index, finished || withdrawn);
+    }
+
     fn complete_reserved_accept(&mut self, index: usize, finished: bool) {
-        let r = self.reservations[index].current.as_mut().unwrap();
+        let Some(r) = self.reservations[index].current.as_mut() else {
+            debug_assert!(false, "missing reservation in complete_reserved_accept");
+            return;
+        };
         let connection = r.packet.connection;
         if finished {
             self.clear_reservation(index);
@@ -8437,7 +9040,7 @@ impl Endpoint {
                 && r.offset == 0
                 && !r.repaired
                 && r.finished
-                && r.discovery.is_none()
+                && !r.probe
                 && r.departure.is_some_and(|d| {
                     d.fresh_data
                         && d.payload != 0
@@ -8723,6 +9326,68 @@ impl Endpoint {
             .map(|(output, _)| output)
     }
 
+    // Select data or control from one ready socket. The caller has checked
+    // its generation and the endpoint clock. An empty selection retires the
+    // readiness hint, including a closed socket's last poll.
+    #[allow(clippy::too_many_arguments)]
+    fn poll_connection<T>(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        id: ConnectionId,
+        reserve: bool,
+        gso: Option<crate::output_reservation::GsoBuffer<'_>>,
+        shared: Option<&mut Vec<crate::Payload>>,
+        offered: Option<&mut Option<crate::connection::StreamRecord>>,
+        describe: impl FnOnce(&Slot, ConnectionId, usize) -> T,
+    ) -> Result<Option<T>, EndpointError> {
+        let index = id.slot;
+        let slot = self.slots[index].as_mut().unwrap();
+        let output = if let Some(record) = offered {
+            slot.connection.transmit_offered(now, out, record)
+        } else if let Some(parts) = shared {
+            slot.connection.transmit_shared_selected(now, out, parts)
+        } else if reserve {
+            slot.connection
+                .transmit_selected_with_gso(now, out, true, gso)
+        } else {
+            slot.connection.transmit(now, out)
+        };
+        match output {
+            Ok(Some(len)) => {
+                slot.closed_output_drained = slot.connection.state() == State::Closed;
+                let packet = describe(slot, id, len);
+                self.control_turn = true;
+                if reserve {
+                    self.output.move_to_back(index);
+                } else {
+                    self.output.remove(index);
+                    self.refresh(index);
+                }
+                Ok(Some(packet))
+            }
+            Ok(None) => {
+                self.output.remove(index);
+                slot.output_checked = false;
+                let deadline = slot.deadline();
+                let closed = slot.connection.state() == State::Closed;
+                if closed {
+                    slot.closed_output_drained = true;
+                }
+                let reclaim = closed && slot.released && !slot.connection.reset_pending();
+                self.set_deadline(index, deadline);
+                if reclaim {
+                    self.reclaim(index);
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                self.output.move_to_back(index);
+                Err(error.into())
+            }
+        }
+    }
+
     // Also returns the zone a selected stateless reply was queued with.
     #[allow(clippy::too_many_arguments)] // Selection policy and reusable output carriers stay explicit.
     fn poll_transmit_inner(
@@ -8845,93 +9510,30 @@ impl Endpoint {
             let Some(index) = next else {
                 continue;
             };
-            self.output.remove(index);
-            let connection = self.id(index);
-            let slot = self.slots[index].as_mut().unwrap();
-            let tuple = slot.connection.tuple();
-            let output = if let Some(parts) = shared.as_deref_mut() {
-                slot.connection.transmit_shared_selected(now, out, parts)
-            } else if reserve {
-                slot.connection.transmit_selected_with_gso(
-                    now,
-                    out,
-                    true,
-                    gso.as_mut()
-                        .map(|buffer| crate::output_reservation::GsoBuffer {
-                            limits: buffer.limits,
-                            payload: &mut *buffer.payload,
-                        }),
-                )
-            } else {
-                slot.connection.transmit(now, out)
-            };
-            match output {
-                Ok(Some(len)) => {
-                    slot.closed_output_drained = slot.connection.state() == State::Closed;
-                    let hop_limit = slot.hop_limit;
-                    let dscp = slot.dscp;
-                    let mark = slot.mark;
-                    let ecn = slot.connection.last_output_ecn();
-                    let ipv4_options = slot.ipv4_options;
-                    let tx_timestamp = slot
-                        .connection
-                        .last_output_range
-                        .map(|range| TxTimestampToken::new(connection, range));
-                    self.control_turn = true;
-                    if !reserve {
-                        self.refresh(index);
-                    } else {
-                        // Preserve candidate order, but do not reclaim before capture.
-                        self.output.push(index);
-                    }
-                    return Ok((
-                        PollTransmit {
-                            packet: Some(Transmit {
-                                connection: Some(connection),
-                                tx_timestamp,
-                                ecn,
-                                ipv4_options,
-                                ip: IpMetadata {
-                                    //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.1
-                                    //# At all other times, a previous segment has either been sent or
-                                    //# received on this connection, and TCP implementations MUST use the
-                                    //# same local address that was used in those previous segments (MUST-
-                                    //# 45).
-                                    source: tuple.local.ip(),
-                                    destination: tuple.remote.ip(),
-                                },
-                                len,
-                                //= https://www.rfc-editor.org/rfc/rfc9293#section-3.9.1.9
-                                //# TCP implementations
-                                //# SHOULD pass the current Differentiated Services field value without
-                                //# change to the IP layer, when it sends segments on the connection
-                                //# (SHLD-22).
-                                hop_limit,
-                                dscp,
-                                mark,
-                            }),
-                            more_work: self.has_pending_output(),
-                        },
-                        None,
-                    ));
-                }
-                Ok(None) => {
-                    slot.output_checked = false;
-                    let deadline = slot.deadline();
-                    let closed = slot.connection.state() == State::Closed;
-                    if closed {
-                        slot.closed_output_drained = true;
-                    }
-                    let reclaim = closed && slot.released && !slot.connection.reset_pending();
-                    self.set_deadline(index, deadline);
-                    if reclaim {
-                        self.reclaim(index);
-                    }
-                }
-                Err(error) => {
-                    self.output.push(index);
-                    return Err(error.into());
-                }
+            let id = self.id(index);
+            let gso = gso
+                .as_mut()
+                .map(|buffer| crate::output_reservation::GsoBuffer {
+                    limits: buffer.limits,
+                    payload: &mut *buffer.payload,
+                });
+            if let Some(packet) = self.poll_connection(
+                now,
+                out,
+                id,
+                reserve,
+                gso,
+                shared.as_deref_mut(),
+                None,
+                Slot::transmit,
+            )? {
+                return Ok((
+                    PollTransmit {
+                        packet: Some(packet),
+                        more_work: self.has_pending_output(),
+                    },
+                    None,
+                ));
             }
         }
         Ok((
@@ -12042,6 +12644,575 @@ mod reserved_poll_tests {
         }
         let server = b.accept(listener).unwrap();
         (a, b, client, server)
+    }
+
+    #[test]
+    fn immediate_and_blocked_scalar_offers_preserve_the_reserved_segment_and_timers() {
+        for blocked in [false, true] {
+            let (mut a, _, ca, _) = pair_connected(41003);
+            let (mut b, _, cb, _) = pair_connected(41003);
+            let payload = [0x7b; 37];
+            for (ep, id) in [(&mut a, ca), (&mut b, cb)] {
+                ep.enable_output_reservations_with_capacity(2).unwrap();
+                ep.write(id, &payload).unwrap();
+            }
+            assert_eq!(b.next_fresh_connection(), Some(cb));
+            assert!(b.follows_own_output(cb));
+            let mut tcp = [0; 2048];
+            let (poll, attempt) = a.poll_reserved_transmit_for(9, ca, &mut tcp, 1).unwrap();
+            let packet = poll.packet.unwrap();
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: packet.len as u32 + 20,
+                dont_fragment: true,
+            };
+            let mut bytes = [0xa5; 2048];
+            let prefix = 34;
+            let offered = b
+                .offer_fresh_transmit(9, cb, &mut bytes, prefix, false, |frame| {
+                    assert_eq!(frame.packet().ip, packet.ip);
+                    assert_eq!(&frame.frame()[prefix..], &tcp[..packet.len]);
+                    assert!(frame.carries_payload());
+                    frame.headroom().fill(0x82);
+                    let end = prefix + packet.len;
+                    assert_eq!(&frame.padded_frame(end + 5).unwrap()[end..], &[0; 5]);
+                    (!blocked).then_some(receipt)
+                })
+                .unwrap();
+            let at = if blocked { 21 } else { 9 };
+            match offered {
+                FreshPoll::Reserved { attempt, more_work } if blocked => {
+                    assert_eq!(more_work, poll.more_work);
+                    let slot = &b.reservations[attempt.reservation];
+                    assert_eq!(&slot.bytes[..packet.len], &tcp[..packet.len]);
+                    assert!(b.accept_transmit_submitted(at, attempt, receipt).unwrap());
+                }
+                FreshPoll::Submitted {
+                    more_work,
+                    owner_drained: false,
+                } if !blocked => {
+                    assert_eq!(more_work, poll.more_work);
+                    assert!(b.finish_idle_output(cb));
+                    assert!(!b.has_pending_output());
+                }
+                _ => panic!("steady segment was not offered"),
+            }
+            assert!(
+                a.accept_transmit_submitted(at, attempt.unwrap(), receipt)
+                    .unwrap()
+            );
+            if !blocked {
+                assert!(a.finish_idle_output(ca));
+            }
+            assert_eq!(a.next_deadline(), b.next_deadline());
+            assert_eq!(a.transport_info(ca).unwrap(), b.transport_info(cb).unwrap());
+            assert_eq!(a.has_pending_output(), b.has_pending_output());
+            assert_eq!(a.has_output_reservations(), b.has_output_reservations());
+        }
+    }
+
+    #[test]
+    fn offered_ack_matches_a_reserved_ack_on_acceptance_and_retry() {
+        for blocked in [false, true] {
+            let prepare = || {
+                let (mut peer, mut ep, sender, receiver) = pair_connected(41004);
+                peer.write(sender, b"data to acknowledge").unwrap();
+                let mut tcp = [0; 2048];
+                let packet = peer.poll_transmit(2, &mut tcp, 16).unwrap().packet.unwrap();
+                ep.input(2, packet.ip, &tcp[..packet.len]).unwrap();
+                ep.enable_output_reservations_with_capacity(2).unwrap();
+                let now = 2 + ep.config.connection.timebase.ticks_from_us(200_000);
+                ep.on_timeout(now, 16).unwrap();
+                (ep, receiver, now)
+            };
+            let (mut reserved, ra, at) = prepare();
+            let (mut offered, rb, _) = prepare();
+            let mut tcp = [0; 2048];
+            let (poll, attempt) = reserved.poll_reserved_transmit_for(at, ra, &mut tcp, 1).unwrap();
+            let packet = poll.packet.unwrap();
+            assert_eq!(packet.len, usize::from(tcp[12] >> 4) * 4);
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: packet.len as u32 + 20,
+                dont_fragment: true,
+            };
+            let mut bytes = [0; 2048];
+            let result = offered
+                .offer_fresh_transmit(at, rb, &mut bytes, 0, false, |frame| {
+                    assert_eq!(frame.frame(), &tcp[..packet.len]);
+                    assert_eq!(frame.packet(), &packet);
+                    assert!(!frame.carries_payload());
+                    (!blocked).then_some(receipt)
+                })
+                .unwrap();
+            let accepted = at + u64::from(blocked);
+            match result {
+                FreshPoll::Reserved { attempt, more_work } if blocked => {
+                    assert_eq!(more_work, poll.more_work);
+                    assert!(
+                        offered
+                            .accept_transmit_submitted(accepted, attempt, receipt)
+                            .unwrap()
+                    );
+                }
+                FreshPoll::Submitted { more_work, .. } if !blocked => {
+                    assert_eq!(more_work, poll.more_work)
+                }
+                _ => panic!("expected a scalar ACK"),
+            }
+            assert!(
+                reserved
+                    .accept_transmit_submitted(accepted, attempt.unwrap(), receipt)
+                    .unwrap()
+            );
+            assert_eq!(reserved.next_deadline(), offered.next_deadline());
+            assert_eq!(
+                reserved.transport_info(ra).unwrap(),
+                offered.transport_info(rb).unwrap()
+            );
+            assert_eq!(reserved.has_pending_output(), offered.has_pending_output());
+        }
+    }
+
+    #[test]
+    fn probe_receipt_retained_across_app_write_and_withdrawn_probe_not_retained() {
+        use core::net::{IpAddr, Ipv4Addr};
+        use ntcp_path::{
+            ContextId, InterfaceKey, IpPrefix, Limits, NextHop, PathRequest, PathService, Route,
+            ScopedAddress,
+        };
+
+        let make_managed_pair = |port: u16| {
+            let mut svc = PathService::new(
+                ContextId::new(102),
+                Limits {
+                    links: 1,
+                    sources: 1,
+                    source_owners: 1,
+                    routes: 1,
+                    paths: 2,
+                    clients: 2,
+                },
+                [9; 16],
+            )
+            .unwrap();
+            let link = svc.register_link(InterfaceKey(1), 1500).unwrap();
+            let src_a = svc
+                .register_source(
+                    ScopedAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), None).unwrap(),
+                    link,
+                )
+                .unwrap();
+            svc.add_route(Route {
+                destination: IpPrefix::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+                source: None,
+                dscp: None,
+                link,
+                next_hop: NextHop::OnLink,
+                metric: 0,
+            })
+            .unwrap();
+            struct FixedProvider(PathService, ntcp_path::SourceId);
+            impl crate::PathProvider for FixedProvider {
+                type Error = ntcp_path::Error;
+                fn prepare(
+                    &mut self,
+                    request: crate::PathFactoryRequest,
+                ) -> Result<crate::PreparedFactory, Self::Error> {
+                    let (client, snapshot) = self.0.acquire(PathRequest {
+                        source: self.1,
+                        destination: ScopedAddress::new(request.tuple.remote.ip(), request.zone)
+                            .unwrap(),
+                        dscp: request.dscp,
+                    })?;
+                    Ok(crate::PreparedFactory {
+                        path: crate::PreparedPath { client, snapshot },
+                        receive: crate::ReceiveIpCapability::new(self.0.context(), false, 1500)
+                            .unwrap(),
+                    })
+                }
+                fn commit(&mut self, _prepared: crate::PreparedPath, _owner: ConnectionId) {}
+                fn cancel(&mut self, prepared: crate::PreparedPath) {
+                    let _ = self.0.release(prepared.client);
+                }
+            }
+
+            let mut pmtud = crate::PmtudConfig::new(1500);
+            pmtud.initial_mtu = Some(1024);
+            let mut cfg_a = EndpointConfig::default();
+            cfg_a.connection.pmtud = Some(pmtud);
+            let mut a = Endpoint::new(cfg_a.clone(), [1; 32], 0, |_| true).unwrap();
+            a.enable_managed_paths(svc.context()).unwrap();
+            let mut provider = FixedProvider(svc, src_a);
+            let mut cfg_b = EndpointConfig::default();
+            cfg_b.connection.delayed_ack_us = 0;
+            let mut b = Endpoint::new(cfg_b, [2; 32], 0, |_| true).unwrap();
+            let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+            let local: SocketAddr = SocketAddr::new("192.0.2.1".parse().unwrap(), port);
+            let listener = b.listen(remote, 8).unwrap();
+            let ca = a
+                .connect_with_path_provider(
+                    0,
+                    local,
+                    remote,
+                    crate::ManagedOpenOptions {
+                        transport: ActiveOpenOptions::from(&cfg_a.connection),
+                        dscp: 0,
+                        ipv4_options: OutgoingIpv4Options::default(),
+                        registration: None,
+                        receive_authority: None,
+                    },
+                    &mut provider,
+                )
+                .unwrap();
+            let mut out = [0u8; 2048];
+            loop {
+                let mut moved = false;
+                while let Some(p) = a.poll_transmit(1, &mut out, 16).unwrap().packet {
+                    b.input(1, p.ip, &out[..p.len]).unwrap();
+                    moved = true;
+                }
+                while let Some(p) = b.poll_transmit(1, &mut out, 16).unwrap().packet {
+                    a.input(1, p.ip, &out[..p.len]).unwrap();
+                    moved = true;
+                }
+                if !moved {
+                    break;
+                }
+            }
+            let sb = b.accept(listener).unwrap();
+            // Confirm initial baseline delivery so PLPMTUD enters search state.
+            a.write(ca, b"x").unwrap();
+            let p = a.poll_transmit(2, &mut out, 8).unwrap().packet.unwrap();
+            b.input(3, p.ip, &out[..p.len]).unwrap();
+            let ack = b.poll_transmit(3, &mut out, 8).unwrap().packet.unwrap();
+            a.input(4, ack.ip, &out[..ack.len]).unwrap();
+            a.enable_output_reservations_with_capacity(2).unwrap();
+            (a, b, ca, sb)
+        };
+
+        // Case 1: Probe selected and reserved -> app writes additional bytes while reserved ->
+        // probe intent remains accessible via discovery_intent, and accept_transmit_submitted
+        // retains the probe receipt so peer ACK confirms the probe.
+        let (mut a, mut b, ca, _sb) = make_managed_pair(41005);
+        a.write(ca, &[0x33; 20_000]).unwrap();
+        let mut out = [0u8; 2048];
+        let mut probe_attempt = None;
+        let mut probe_packet = None;
+        let mut probe_wire = alloc::vec::Vec::new();
+        for step in 0..8u64 {
+            let now = 10 + step;
+            let (poll, att) = a.poll_reserved_transmit_for(now, ca, &mut out, 4).unwrap();
+            let Some(att) = att else { break };
+            let pkt = poll.packet.unwrap();
+            if a.transmit_discovery_intent(att).is_some() {
+                probe_attempt = Some((now, att));
+                probe_packet = Some(pkt);
+                probe_wire = out[..pkt.len].to_vec();
+                break;
+            }
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: pkt.len as u32 + 20,
+                dont_fragment: true,
+            };
+            assert!(a.accept_transmit_submitted(now, att, receipt).unwrap());
+            b.input(now, pkt.ip, &out[..pkt.len]).unwrap();
+            while let Some(ack) = b.poll_transmit(now, &mut out, 8).unwrap().packet {
+                a.input(now, ack.ip, &out[..ack.len]).unwrap();
+            }
+        }
+        let (probe_now, att) = probe_attempt.expect("expected a PLPMTUD probe attempt");
+        let intent = a
+            .transmit_discovery_intent(att)
+            .expect("probe attempt must expose discovery_intent");
+        let pkt = probe_packet.unwrap();
+
+        // Application write on the reserved owner must NOT erase `last_discovery` or probe tracking.
+        a.write(ca, b"app-write-while-probe-reserved").unwrap();
+        assert_eq!(a.transmit_discovery_intent(att), Some(intent));
+
+        let receipt = crate::PhysicalReceipt {
+            ip_packet_len: pkt.len as u32 + 20,
+            dont_fragment: true,
+        };
+        assert!(a.accept_transmit_submitted(probe_now, att, receipt).unwrap());
+        b.input(probe_now + 1, pkt.ip, &probe_wire).unwrap();
+        while let Some(ack) = b.poll_transmit(probe_now + 1, &mut out, 8).unwrap().packet {
+            a.input(probe_now + 2, ack.ip, &out[..ack.len]).unwrap();
+        }
+        let confirmed = a
+            .take_confirmed_probe(ca)
+            .unwrap()
+            .expect("probe receipt must be retained across app write and confirmed on ACK");
+        assert_eq!(confirmed.intent, intent);
+        assert_eq!(confirmed.receipt, receipt);
+
+        // Case 2: Withdrawn probe (rejected before submission) must NOT retain a probe receipt.
+        let (mut a2, mut b2, ca2, _sb2) = make_managed_pair(41006);
+        a2.write(ca2, &[0x44; 20_000]).unwrap();
+        let mut withdrawn_att = None;
+        for step in 0..8u64 {
+            let now = 10 + step;
+            let (poll, att) = a2.poll_reserved_transmit_for(now, ca2, &mut out, 4).unwrap();
+            let Some(att) = att else { break };
+            let pkt = poll.packet.unwrap();
+            if a2.transmit_discovery_intent(att).is_some() {
+                withdrawn_att = Some((now, att));
+                break;
+            }
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: pkt.len as u32 + 20,
+                dont_fragment: true,
+            };
+            assert!(a2.accept_transmit_submitted(now, att, receipt).unwrap());
+            b2.input(now, pkt.ip, &out[..pkt.len]).unwrap();
+            while let Some(ack) = b2.poll_transmit(now, &mut out, 8).unwrap().packet {
+                a2.input(now, ack.ip, &out[..ack.len]).unwrap();
+            }
+        }
+        let (_w_now, att2) = withdrawn_att.expect("expected second PLPMTUD probe attempt");
+        assert!(a2.reject_unsubmitted(att2).unwrap());
+        assert_eq!(a2.transmit_discovery_intent(att2), None);
+        // Abandon the rejected reservation (never submitted) and verify no probe receipt was stored.
+        assert!(a2.abandon_transmit(att2).unwrap());
+        assert_eq!(a2.take_confirmed_probe(ca2).unwrap(), None);
+        assert!(a2.slots[ca2.slot].as_ref().unwrap().connection.managed_results.receipt.is_none());
+    }
+
+    #[test]
+    fn offered_transmit_handles_shutdown_pmtud_keepalive_and_drop_capture() {
+        // 1) Shutdown before offer (FIN falls back from StreamRecord, immediate submit & blocked Drop)
+        for blocked in [false, true] {
+            let (mut a, _, ca, _) = pair_connected(41007);
+            let (mut b, _, cb, _) = pair_connected(41007);
+            for (ep, id) in [(&mut a, ca), (&mut b, cb)] {
+                ep.enable_output_reservations_with_capacity(2).unwrap();
+                ep.shutdown(id).unwrap();
+            }
+            let mut tcp = [0u8; 2048];
+            let (poll, att_a) = a.poll_reserved_transmit_for(10, ca, &mut tcp, 1).unwrap();
+            let pkt = poll.packet.unwrap();
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: pkt.len as u32 + 20,
+                dont_fragment: true,
+            };
+            let mut bytes = [0u8; 2048];
+            let offered = b
+                .offer_fresh_transmit(10, cb, &mut bytes, 14, true, |frame| {
+                    assert_eq!(&frame.frame()[14..], &tcp[..pkt.len]);
+                    (!blocked).then_some(receipt)
+                })
+                .unwrap();
+            match offered {
+                FreshPoll::Submitted { .. } if !blocked => {}
+                FreshPoll::Reserved { attempt, .. } if blocked => {
+                    assert!(b.accept_transmit_submitted(10, attempt, receipt).unwrap());
+                }
+                _ => panic!("unexpected offer outcome for shutdown FIN"),
+            }
+            assert!(
+                a.accept_transmit_submitted(10, att_a.unwrap(), receipt)
+                    .unwrap()
+            );
+            assert_eq!(a.state(ca).unwrap(), State::FinWait1);
+            assert_eq!(b.state(cb).unwrap(), State::FinWait1);
+            assert_eq!(a.next_deadline(), b.next_deadline());
+        }
+
+        // 2) Blocked offer Drop capture followed by shutdown while reserved:
+        // dropping FreshTransmit without calling submitted captures the reservation cleanly,
+        // and calling shutdown() queues FIN to leave right after acceptance.
+        {
+            let (mut ep, _, id, _) = pair_connected(41008);
+            ep.enable_output_reservations_with_capacity(2).unwrap();
+            ep.write(id, b"blocked-then-shutdown").unwrap();
+            let mut bytes = [0u8; 2048];
+            let FreshPoll::Reserved { attempt, .. } = ep
+                .offer_fresh_transmit(12, id, &mut bytes, 20, true, |_frame| None)
+                .unwrap()
+            else {
+                panic!("returning None must capture reservation on Drop");
+            };
+            assert!(ep.is_output_reserved(id));
+            // Shutdown while the captured reservation is held.
+            ep.shutdown(id).unwrap();
+            assert_eq!(ep.state(id).unwrap(), State::Established);
+            let pkt = ep.transmit_attempt_packet(attempt).unwrap();
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: pkt.len as u32 + 20,
+                dont_fragment: true,
+            };
+            assert!(ep.accept_transmit_submitted(13, attempt, receipt).unwrap());
+            // Next offer delivers the queued FIN.
+            let FreshPoll::Submitted { .. } = ep
+                .offer_fresh_transmit(14, id, &mut bytes, 20, true, |frame| {
+                    Some(crate::PhysicalReceipt {
+                        ip_packet_len: frame.packet().len as u32 + 20,
+                        dont_fragment: true,
+                    })
+                })
+                .unwrap()
+            else {
+                panic!("FIN should submit cleanly after prior reservation accepted");
+            };
+            assert_eq!(ep.state(id).unwrap(), State::FinWait1);
+        }
+
+        // 3) PMTUD pending during offer (both immediate submit and blocked Drop capture)
+        for blocked in [false, true] {
+            let make_pmtud_pair = |port: u16| {
+                let mut cfg = EndpointConfig::default();
+                cfg.connection.pmtud = Some(crate::PmtudConfig::new(1500));
+                let mut a = Endpoint::new(cfg, [1; 32], 0, |_| true).unwrap();
+                let mut b = Endpoint::new(EndpointConfig::default(), [2; 32], 0, |_| true).unwrap();
+                let remote: SocketAddr = "192.0.2.2:8080".parse().unwrap();
+                let local: SocketAddr = SocketAddr::new("192.0.2.1".parse().unwrap(), port);
+                let listener = b.listen(remote, 8).unwrap();
+                let client = a.connect(0, local, remote).unwrap();
+                let mut out = [0u8; 2048];
+                loop {
+                    let mut moved = false;
+                    while let Some(p) = a.poll_transmit(1, &mut out, 16).unwrap().packet {
+                        b.input(1, p.ip, &out[..p.len]).unwrap();
+                        moved = true;
+                    }
+                    while let Some(p) = b.poll_transmit(1, &mut out, 16).unwrap().packet {
+                        a.input(1, p.ip, &out[..p.len]).unwrap();
+                        moved = true;
+                    }
+                    if !moved {
+                        break;
+                    }
+                }
+                let _server = b.accept(listener).unwrap();
+                a.enable_output_reservations_with_capacity(2).unwrap();
+                (a, client)
+            };
+            let (mut a, ca) = make_pmtud_pair(41009);
+            let (mut b, cb) = make_pmtud_pair(41009);
+            a.write(ca, b"pmtud-payload").unwrap();
+            b.write(cb, b"pmtud-payload").unwrap();
+            let mut tcp = [0u8; 2048];
+            let (poll, att_a) = a.poll_reserved_transmit_for(15, ca, &mut tcp, 1).unwrap();
+            let pkt = poll.packet.unwrap();
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: pkt.len as u32 + 20,
+                dont_fragment: true,
+            };
+            let mut bytes = [0u8; 2048];
+            let offered = b
+                .offer_fresh_transmit(15, cb, &mut bytes, 14, false, |frame| {
+                    assert_eq!(&frame.frame()[14..], &tcp[..pkt.len]);
+                    (!blocked).then_some(receipt)
+                })
+                .unwrap();
+            match offered {
+                FreshPoll::Submitted { .. } if !blocked => {}
+                FreshPoll::Reserved { attempt, .. } if blocked => {
+                    assert!(b.accept_transmit_submitted(15, attempt, receipt).unwrap());
+                }
+                _ => panic!("unexpected PMTUD offer outcome"),
+            }
+            assert!(
+                a.accept_transmit_submitted(15, att_a.unwrap(), receipt)
+                    .unwrap()
+            );
+            assert_eq!(a.next_deadline(), b.next_deadline());
+            assert_eq!(a.transport_info(ca).unwrap(), b.transport_info(cb).unwrap());
+        }
+
+        // 4) Keepalive pending during offer
+        for blocked in [false, true] {
+            let prepare_ka = || {
+                let (mut a, _, ca, _) = pair_connected(41010);
+                a.enable_output_reservations_with_capacity(2).unwrap();
+                a.set_keepalive(
+                    ca,
+                    Some(crate::KeepaliveConfig {
+                        idle_us: 1_000_000,
+                        interval_us: 500_000,
+                        probes: 3,
+                        ..crate::KeepaliveConfig::default()
+                    }),
+                )
+                .unwrap();
+                let due = a.next_deadline().unwrap();
+                a.on_timeout(due, 16).unwrap();
+                (a, ca, due)
+            };
+            let (mut a, ca, due) = prepare_ka();
+            let (mut b, cb, _) = prepare_ka();
+            let mut tcp = [0u8; 2048];
+            let (poll, att_a) = a.poll_reserved_transmit_for(due, ca, &mut tcp, 1).unwrap();
+            let pkt = poll.packet.unwrap();
+            let receipt = crate::PhysicalReceipt {
+                ip_packet_len: pkt.len as u32 + 20,
+                dont_fragment: true,
+            };
+            let mut bytes = [0u8; 2048];
+            let offered = b
+                .offer_fresh_transmit(due, cb, &mut bytes, 0, false, |frame| {
+                    assert_eq!(frame.frame(), &tcp[..pkt.len]);
+                    (!blocked).then_some(receipt)
+                })
+                .unwrap();
+            match offered {
+                FreshPoll::Submitted { .. } if !blocked => {}
+                FreshPoll::Reserved { attempt, .. } if blocked => {
+                    assert!(b.accept_transmit_submitted(due, attempt, receipt).unwrap());
+                }
+                _ => panic!("unexpected keepalive offer outcome"),
+            }
+            assert!(
+                a.accept_transmit_submitted(due, att_a.unwrap(), receipt)
+                    .unwrap()
+            );
+            assert_eq!(a.next_deadline(), b.next_deadline());
+            assert_eq!(a.transport_info(ca).unwrap(), b.transport_info(cb).unwrap());
+        }
+    }
+
+    #[test]
+    fn stream_io_zero_length_read_matches_endpoint_read() {
+        let (mut a, mut b, ca, sb) = pair_connected(41011);
+        // Empty receive queue: read_available() is None; zero-length read returns InvalidArgument
+        // on both Endpoint::read and StreamIo::read / read_with_wait.
+        assert_eq!(b.stream_io(sb).unwrap().read_available(), None);
+        assert_eq!(
+            b.read(sb, &mut []),
+            Err(EndpointError::Connection(Error::InvalidArgument))
+        );
+        assert_eq!(
+            b.stream_io(sb).unwrap().read(&mut []),
+            Err(EndpointError::Connection(Error::InvalidArgument))
+        );
+        assert_eq!(
+            b.stream_io(sb).unwrap().read_with_wait(&mut []),
+            Err(EndpointError::Connection(Error::InvalidArgument))
+        );
+
+        // With queued data: read_available() is Some(len); zero-length read still returns
+        // InvalidArgument and leaves all queued bytes intact for the subsequent non-empty read.
+        a.write(ca, b"hello-stream-io").unwrap();
+        let mut out = [0u8; 2048];
+        let pkt = a.poll_transmit(5, &mut out, 8).unwrap().packet.unwrap();
+        b.input(5, pkt.ip, &out[..pkt.len]).unwrap();
+
+        assert_eq!(
+            b.stream_io(sb).unwrap().read_available(),
+            Some(b"hello-stream-io".len())
+        );
+        assert_eq!(
+            b.read(sb, &mut []),
+            Err(EndpointError::Connection(Error::InvalidArgument))
+        );
+        assert_eq!(
+            b.stream_io(sb).unwrap().read_with_wait(&mut []),
+            Err(EndpointError::Connection(Error::InvalidArgument))
+        );
+
+        let mut buf = [0u8; 32];
+        let (n1, waiting1) = b.stream_io(sb).unwrap().read_with_wait(&mut buf).unwrap();
+        assert_eq!(&buf[..n1], b"hello-stream-io");
+        assert!(waiting1);
     }
 
     #[test]

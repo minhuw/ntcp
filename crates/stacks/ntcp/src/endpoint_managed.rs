@@ -402,41 +402,7 @@ impl Endpoint {
         attempt: crate::TransmitAttempt,
         receipt: PhysicalReceipt,
     ) -> Result<bool, EndpointError> {
-        let probe = self.discovery_intent(attempt).and_then(|intent| {
-            let r = self.reservations[attempt.reservation].current.as_ref()?;
-            (r.offset == 0).then_some((r.packet.connection?, r.departure?.start, *intent))
-        });
-        // The exact physical packet this attempt submits, read before
-        // acceptance advances or clears the reservation.
-        let physical = self
-            .reservations
-            .get(attempt.reservation)
-            .and_then(|slot| slot.current.as_ref())
-            .filter(|r| r.attempt == Some(attempt))
-            .and_then(|r| {
-                let d = r.departure.as_ref()?;
-                let count = if r.repaired {
-                    r.emitted_bytes
-                } else {
-                    d.payload
-                };
-                Some((r.packet.connection?, d.submitted_range(r.offset, count)))
-            });
-        if !self.accept_transmit(now, attempt)? {
-            return Ok(false);
-        }
-        if let Some((id, range)) = physical
-            && let Ok(slot) = self.retained_slot_mut(id)
-        {
-            slot.connection.certify_range(range, receipt);
-        }
-        if let Some((id, start, intent)) = probe
-            && let Ok(slot) = self.retained_slot_mut(id)
-        {
-            slot.connection
-                .retain_probe_receipt(Seq(start), intent, receipt);
-        }
-        Ok(true)
+        self.accept_transmit_receipt(now, attempt, Some(receipt))
     }
 
     /// `accept_transmit_group` for a backend outcome of definitely
@@ -1497,11 +1463,15 @@ impl Endpoint {
             .get(attempt.reservation)?
             .current
             .as_ref()?;
-        if r.attempt != Some(attempt) || r.repaired {
+        if r.attempt != Some(attempt) || !r.probe || r.repaired {
             return None;
         }
         r.departure.as_ref()?;
-        r.discovery.as_ref()
+        self.retained_slot(r.packet.connection?)
+            .ok()?
+            .connection
+            .last_discovery
+            .as_ref()
     }
 }
 
