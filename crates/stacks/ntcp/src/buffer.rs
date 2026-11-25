@@ -65,10 +65,13 @@ impl TxSeg {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn drop_payload_cold(_: Payload) {}
+
 #[derive(Debug)]
 pub(crate) struct SendBuffer {
     entries: VecDeque<TxSeg>,
-    ptb: PtbMarks,
     len: usize,
     chunk_bytes: usize,
     capacity: usize,
@@ -84,6 +87,11 @@ pub(crate) struct SendBuffer {
     // Bytes ending at push_end known to carry only that final PUSH.
     single_push_len: usize,
     eor_end: usize,
+    // True once any PTB or retransmission mark has been inserted into `ptb`
+    // since the last clear; keeps the common non-PTB ACK/clear path off the
+    // 120-byte `PtbMarks` storage.
+    has_ptb: bool,
+    ptb: PtbMarks,
 }
 
 impl SendBuffer {
@@ -102,7 +110,6 @@ impl SendBuffer {
         }
         Ok(Self {
             entries,
-            ptb: PtbMarks::default(),
             len: 0,
             chunk_bytes: 0,
             capacity,
@@ -113,6 +120,8 @@ impl SendBuffer {
             push_end: 0,
             single_push_len: 0,
             eor_end: 0,
+            has_ptb: false,
+            ptb: PtbMarks::default(),
         })
     }
 
@@ -122,7 +131,6 @@ impl SendBuffer {
     pub(crate) fn unallocated(capacity: usize) -> Self {
         Self {
             entries: VecDeque::new(),
-            ptb: PtbMarks::default(),
             len: 0,
             chunk_bytes: 0,
             capacity,
@@ -133,6 +141,8 @@ impl SendBuffer {
             push_end: 0,
             single_push_len: 0,
             eor_end: 0,
+            has_ptb: false,
+            ptb: PtbMarks::default(),
         }
     }
 
@@ -143,6 +153,10 @@ impl SendBuffer {
 
     #[inline]
     pub(crate) fn ptb_storage_bytes(&self) -> usize {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return 0;
+        }
         self.ptb.storage_bytes()
     }
 
@@ -185,13 +199,39 @@ impl SendBuffer {
     }
 
     /// Releases every live `ChunkRef` back to `pool` and empties the queue.
+    #[inline]
     pub(crate) fn clear_chunks(&mut self, pool: &mut TxPool) {
-        for seg in self.entries.drain(..) {
+        if self.entries.len() == 1 && self.shared_entries == 0 && !self.has_ptb {
+            let seg = self.entries.pop_front().unwrap();
+            match seg.data {
+                TxSegData::Chunk { chunk, .. } => pool.release(chunk),
+                TxSegData::Shared(payload) => drop_payload_cold(payload),
+                TxSegData::Released(_) => {}
+            }
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            self.len = 0;
+            self.chunk_bytes = 0;
+            self.push_end = 0;
+            self.single_push_len = 0;
+            self.eor_end = 0;
+            return;
+        }
+        self.clear_chunks_slow(pool);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn clear_chunks_slow(&mut self, pool: &mut TxPool) {
+        while let Some(seg) = self.entries.pop_front() {
             if let TxSegData::Chunk { chunk, .. } = seg.data {
                 pool.release(chunk);
             }
         }
-        self.ptb.clear();
+        if self.has_ptb {
+            self.ptb.clear();
+            self.has_ptb = false;
+        }
+        debug_assert_eq!(self.ptb, PtbMarks::default());
         self.len = 0;
         self.chunk_bytes = 0;
         self.shared_entries = 0;
@@ -210,7 +250,11 @@ impl SendBuffer {
         debug_assert_eq!(self.shared_spans, 0);
         debug_assert!(self.push_end == 0 && self.eor_end == 0);
         self.entries = VecDeque::new();
-        self.ptb.clear();
+        if self.has_ptb {
+            self.ptb.clear();
+            self.has_ptb = false;
+        }
+        debug_assert_eq!(self.ptb, PtbMarks::default());
         self.push_end = 0;
         self.single_push_len = 0;
         self.eor_end = 0;
@@ -277,11 +321,9 @@ impl SendBuffer {
     /// `ENTRY_SPLIT_SPARE` spare slots without reallocating.
     #[inline]
     pub(crate) fn has_entry_room(&self, new_entries: usize) -> bool {
-        self.entries
-            .len()
-            .checked_add(new_entries)
-            .and_then(|n| n.checked_add(ENTRY_SPLIT_SPARE))
-            .is_some_and(|needed| self.entries.capacity() >= needed)
+        new_entries
+            .checked_add(ENTRY_SPLIT_SPARE)
+            .is_some_and(|needed| self.entries.capacity() - self.entries.len() >= needed)
     }
 
     /// Peak additional bytes reallocating `self.entries` for `new_entries`
@@ -322,11 +364,62 @@ impl SendBuffer {
     ///
     /// Returns the number of bytes actually copied (`< input.len()` only if the
     /// chunk source ran dry or arena page allocation failed).
+    #[inline]
     pub(crate) fn append(&mut self, pool: &mut TxPool, input: &[u8]) -> usize {
         debug_assert!(input.len() <= self.remaining());
-        if input.is_empty() {
+        let n = input.len();
+        if n == 0 {
             return 0;
         }
+        if n <= pool.tail_remaining() {
+            let can_extend = if let Some(back) = self.entries.back()
+                && back.flags == 0
+                && let TxSegData::Chunk {
+                    chunk,
+                    offset: back_off,
+                    len: back_len,
+                } = &back.data
+            {
+                pool.tail_continues(chunk, *back_off + *back_len)
+            } else {
+                false
+            };
+            if can_extend {
+                let (_off, taken) = pool.append_to_tail_no_dup(input);
+                debug_assert_eq!(taken, n);
+                if let Some(back) = self.entries.back_mut()
+                    && let TxSegData::Chunk { len: back_len, .. } = &mut back.data
+                {
+                    *back_len += taken as u32;
+                }
+            } else {
+                assert!(
+                    self.entries.len() < self.entries.capacity(),
+                    "TxSeg entries not reserved before append"
+                );
+                let (chunk, off, taken) = pool.append_to_tail_and_dup(input);
+                debug_assert_eq!(taken, n);
+                let start = self.head.wrapping_add(self.len as u64);
+                self.entries.push_back(TxSeg {
+                    start,
+                    data: TxSegData::Chunk {
+                        chunk,
+                        offset: off,
+                        len: taken as u32,
+                    },
+                    flags: 0,
+                });
+            }
+            self.len += n;
+            self.chunk_bytes += n;
+            return n;
+        }
+        self.append_slow(pool, input)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn append_slow(&mut self, pool: &mut TxPool, input: &[u8]) -> usize {
         let entries = &mut self.entries;
         let head = self.head;
         let len_ref = &mut self.len;
@@ -339,7 +432,7 @@ impl SendBuffer {
                     offset: back_off,
                     len: back_len,
                 } = &mut back.data
-                && core::ptr::eq(arena.get(chunk), arena.get(tail))
+                && arena.same_chunk(chunk, tail)
                 && *back_off + *back_len == off
             {
                 *back_len += taken;
@@ -571,6 +664,7 @@ impl SendBuffer {
     }
 
     // Whether a byte of the range carries PUSH (D5 entry walk fallback).
+    #[inline]
     pub(crate) fn pushed(&self, offset: usize, count: usize) -> bool {
         let Some(last) = self.push_offset() else {
             return false;
@@ -585,6 +679,12 @@ impl SendBuffer {
         if distance < self.single_push_len {
             return false;
         }
+        self.pushed_slow(offset, count)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pushed_slow(&self, offset: usize, count: usize) -> bool {
         let range_end = offset.saturating_add(count).min(self.len);
         if offset >= range_end {
             return false;
@@ -705,6 +805,7 @@ impl SendBuffer {
     }
 
     // A nonempty append puts its last byte strictly past all old marks.
+    #[inline]
     pub(crate) fn finish_append(&mut self, push: bool, end_of_record: bool) {
         if push || end_of_record {
             let end = self.len;
@@ -753,6 +854,7 @@ impl SendBuffer {
 
     // EOR is a local coalescing boundary, not a TCP wire flag or framing
     // guarantee (RFC 9293 section 3.7.1). PUSH may collapse; EOR never does.
+    #[inline]
     pub(crate) fn record_len(&self, offset: usize, limit: usize) -> usize {
         self.record_len_within(offset, limit.min(self.len.saturating_sub(offset)))
     }
@@ -764,6 +866,12 @@ impl SendBuffer {
         if !self.record_ends_after(offset) || limit == 0 {
             return limit;
         }
+        self.record_len_eor(offset, limit)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_len_eor(&self, offset: usize, limit: usize) -> usize {
         let range_end = offset + limit;
         let Some(mut idx) = self.entry_at(offset) else {
             return limit;
@@ -813,24 +921,40 @@ impl SendBuffer {
     // Mark eligible bytes (never retransmitted, not already pending) of one
     // range as PTB repair work; returns how many became pending.
     pub(crate) fn mark_ptb(&mut self, offset: usize, count: usize) -> usize {
+        if count == 0 || offset >= self.len {
+            return 0;
+        }
+        self.has_ptb = true;
         self.ptb.mark_ptb(offset, count, self.len)
     }
 
     // Delivery or abandonment of one range: withdraw its PTB work and its
     // outstanding PTB copies. Returns (pending, copies) cleared.
     pub(crate) fn release_ptb(&mut self, offset: usize, count: usize) -> (usize, usize) {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return (0, 0);
+        }
         self.ptb.release_ptb(offset, count, self.len)
     }
 
     // Mark an outstanding PTB copy on one range; returns how many bytes were
     // newly marked.
     pub(crate) fn mark_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
+        if count == 0 || offset >= self.len {
+            return 0;
+        }
+        self.has_ptb = true;
         self.ptb.mark_ptb_copy(offset, count, self.len)
     }
 
     // HighRxt moved over one range: SetPipe's retransmission term now counts
     // its outstanding PTB copies. Returns how many marks were cleared.
     pub(crate) fn clear_ptb_copy(&mut self, offset: usize, count: usize) -> usize {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return 0;
+        }
         self.ptb.clear_ptb_copy(offset, count, self.len)
     }
 
@@ -838,6 +962,10 @@ impl SendBuffer {
     // PTB work and never become eligible again. Returns the pending bytes it
     // withdrew.
     pub(crate) fn mark_retransmitted(&mut self, offset: usize, count: usize) -> usize {
+        if count == 0 || offset >= self.len {
+            return 0;
+        }
+        self.has_ptb = true;
         self.ptb.mark_retransmitted(offset, count, self.len)
     }
 
@@ -849,31 +977,55 @@ impl SendBuffer {
         end: usize,
         limit: usize,
     ) -> Option<(usize, usize)> {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return None;
+        }
         self.ptb.next_ptb(offset, end, limit, self.len)
     }
 
     // First contiguous run of outstanding PTB copies in [offset, end).
     pub(crate) fn next_ptb_copy(&self, offset: usize, end: usize) -> Option<(usize, usize)> {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return None;
+        }
         self.ptb.next_ptb_copy(offset, end, self.len)
     }
 
     // Bytes of one range that carry PTB work.
     pub(crate) fn count_ptb(&self, offset: usize, count: usize) -> usize {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return 0;
+        }
         self.ptb.count_ptb(offset, count, self.len)
     }
 
     #[cfg(test)]
     pub(crate) fn ptb_pending(&self, offset: usize) -> bool {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return false;
+        }
         self.ptb.ptb_pending(offset, self.len)
     }
 
     #[cfg(test)]
     pub(crate) fn ptb_copy(&self, offset: usize) -> bool {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return false;
+        }
         self.ptb.ptb_copy(offset, self.len)
     }
 
     #[cfg(test)]
     pub(crate) fn retransmitted(&self, offset: usize) -> bool {
+        if !self.has_ptb {
+            debug_assert_eq!(self.ptb, PtbMarks::default());
+            return false;
+        }
         self.ptb.retransmitted(offset, self.len)
     }
 
@@ -927,7 +1079,9 @@ impl SendBuffer {
             }
         }
         self.len = len;
-        self.ptb.truncate(len);
+        if self.has_ptb {
+            self.ptb.truncate(len);
+        }
         if self.push_end > len {
             self.find_last_push();
         }
@@ -942,6 +1096,7 @@ impl SendBuffer {
     //# The acknowledgment mechanism employed is cumulative so that an acknowledgment of
     //# sequence number X indicates that all octets up to but not including X have been
     //# received.
+    #[inline]
     pub(crate) fn acknowledge(&mut self, pool: &mut TxPool, count: usize) -> Result<(), ()> {
         if count > self.len {
             return Err(());
@@ -950,10 +1105,30 @@ impl SendBuffer {
             return Ok(());
         }
         if count == self.len {
-            self.clear_chunks(pool);
+            if self.entries.len() == 1 && self.shared_entries == 0 && !self.has_ptb {
+                let seg = self.entries.pop_front().unwrap();
+                match seg.data {
+                    TxSegData::Chunk { chunk, .. } => pool.release(chunk),
+                    TxSegData::Shared(payload) => drop_payload_cold(payload),
+                    TxSegData::Released(_) => {}
+                }
+                debug_assert_eq!(self.ptb, PtbMarks::default());
+                self.len = 0;
+                self.chunk_bytes = 0;
+                self.push_end = 0;
+                self.single_push_len = 0;
+                self.eor_end = 0;
+            } else {
+                self.clear_chunks_slow(pool);
+            }
             self.head = self.head.wrapping_add(count as u64);
             return Ok(());
         }
+        self.acknowledge_partial(pool, count);
+        Ok(())
+    }
+
+    fn acknowledge_partial(&mut self, pool: &mut TxPool, count: usize) {
         let mut rem = count;
         while rem > 0 {
             let front_len = self.entries.front().unwrap().len();
@@ -992,7 +1167,8 @@ impl SendBuffer {
                 rem = 0;
             }
         }
-        if let Some(front) = self.entries.front_mut()
+        if self.shared_entries != 0
+            && let Some(front) = self.entries.front_mut()
             && front.flags & FLAG_CONTIGUOUS_SHARED != 0
         {
             front.flags &= !FLAG_CONTIGUOUS_SHARED;
@@ -1000,10 +1176,11 @@ impl SendBuffer {
         }
         self.len -= count;
         self.head = self.head.wrapping_add(count as u64);
-        self.ptb.drop_prefix(count);
+        if self.has_ptb {
+            self.ptb.drop_prefix(count);
+        }
         self.push_end = self.push_end.saturating_sub(count);
         self.eor_end = self.eor_end.saturating_sub(count);
-        Ok(())
     }
 
     // Borrow a scalar payload directly when the selected bytes all come
@@ -1103,6 +1280,125 @@ impl SendBuffer {
         count
     }
 
+    /// Borrow a single `TxPart` covering `[offset, offset + count)` when all
+    /// requested bytes lie inside one `TxSeg` (the common non-straddling case).
+    /// Fast-paths the front chunk entry inline so callers avoid stack frames
+    /// and out-of-line calls on single-segment sends.
+    #[inline(always)]
+    pub(crate) fn single_tx_part<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        count: usize,
+    ) -> Option<TxPart<'a>> {
+        if count == 0 {
+            return None;
+        }
+        let front = self.entries.front()?;
+        if let TxSegData::Chunk {
+            chunk,
+            offset: chunk_off,
+            len,
+        } = &front.data
+            && offset
+                .checked_add(count)
+                .is_some_and(|end| end <= *len as usize)
+        {
+            let start = *chunk_off as usize + offset;
+            return ChunkSlice::new(arena.get(chunk), start..start + count).map(TxPart::Chunk);
+        }
+        self.single_tx_part_slow(arena, offset, count)
+    }
+
+    #[inline(never)]
+    fn single_tx_part_slow<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        count: usize,
+    ) -> Option<TxPart<'a>> {
+        let idx = self.entry_at(offset)?;
+        let seg = &self.entries[idx];
+        let rel = offset - self.seg_start(seg);
+        if rel.checked_add(count)? > seg.len() {
+            return None;
+        }
+        match &seg.data {
+            TxSegData::Chunk {
+                chunk,
+                offset: chunk_off,
+                ..
+            } => {
+                let start = *chunk_off as usize + rel;
+                let slice = ChunkSlice::new(arena.get(chunk), start..start + count)
+                    .expect("chunk slice within filled prefix");
+                Some(TxPart::Chunk(slice))
+            }
+            TxSegData::Shared(payload) => {
+                let slice = PayloadSlice::new(payload, rel..rel + count)
+                    .expect("payload slice within bounds");
+                Some(TxPart::Shared(slice))
+            }
+            TxSegData::Released(_) => None,
+        }
+    }
+
+    /// Borrow a contiguous byte slice covering `[offset, offset + count)` when
+    /// all requested bytes lie inside one `TxSeg` (used by TCP header checksum
+    /// and gather encoding without constructing `ChunkSlice` or `TxPartsBuf`).
+    #[inline(always)]
+    pub(crate) fn single_tx_slice<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        count: usize,
+    ) -> Option<&'a [u8]> {
+        if count == 0 {
+            return None;
+        }
+        let front = self.entries.front()?;
+        if let TxSegData::Chunk {
+            chunk,
+            offset: chunk_off,
+            len,
+        } = &front.data
+            && offset
+                .checked_add(count)
+                .is_some_and(|end| end <= *len as usize)
+        {
+            let start = *chunk_off as usize + offset;
+            return Some(arena.get(chunk).bytes(start..start + count));
+        }
+        self.single_tx_slice_slow(arena, offset, count)
+    }
+
+    #[inline(never)]
+    fn single_tx_slice_slow<'a>(
+        &'a self,
+        arena: &'a ChunkArena,
+        offset: usize,
+        count: usize,
+    ) -> Option<&'a [u8]> {
+        let idx = self.entry_at(offset)?;
+        let seg = &self.entries[idx];
+        let rel = offset - self.seg_start(seg);
+        if rel.checked_add(count)? > seg.len() {
+            return None;
+        }
+        match &seg.data {
+            TxSegData::Chunk {
+                chunk,
+                offset: chunk_off,
+                ..
+            } => {
+                let start = *chunk_off as usize + rel;
+                Some(arena.get(chunk).bytes(start..start + count))
+            }
+            TxSegData::Shared(payload) => Some(&payload.as_slice()[rel..rel + count]),
+            TxSegData::Released(_) => None,
+        }
+    }
+
     /// Borrow covering `TxPart` slices for `[offset, offset + count)` directly
     /// from the queue's chunks and shared payloads (zero copy), merging
     /// adjacent contiguous slices from the same `TxChunk`.
@@ -1116,6 +1412,10 @@ impl SendBuffer {
         let count = count.min(self.len.saturating_sub(offset));
         if count == 0 {
             return 0;
+        }
+        if let Some(part) = self.single_tx_part(arena, offset, count) {
+            out.push(part);
+            return count;
         }
         let Some(mut idx) = self.entry_at(offset) else {
             return 0;

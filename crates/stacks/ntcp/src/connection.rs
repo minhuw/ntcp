@@ -2025,17 +2025,25 @@ impl Connection {
             + self.rx_timestamps.storage_bytes()
     }
 
+    #[inline]
     pub(crate) fn settle_send_entries_charge(&mut self) -> Option<(usize, usize)> {
         let storage = self.send.entries_storage_bytes();
+        if storage == self.send_entries_charged {
+            return None;
+        }
         self.large_send_ring = storage > SEND_RING_RESERVE;
         let old = core::mem::replace(&mut self.send_entries_charged, storage);
-        (old != storage).then_some((old, storage))
+        Some((old, storage))
     }
 
+    #[inline]
     pub(crate) fn settle_send_ptb_charge(&mut self) -> Option<(usize, usize)> {
         let storage = self.send.ptb_storage_bytes();
+        if storage == self.send_ptb_charged {
+            return None;
+        }
         let old = core::mem::replace(&mut self.send_ptb_charged, storage);
-        (old != storage).then_some((old, storage))
+        Some((old, storage))
     }
 
     #[inline]
@@ -2048,6 +2056,16 @@ impl Connection {
     }
 
     #[inline]
+    pub(crate) fn single_send_tx_part<'a>(
+        &'a self,
+        arena: &'a ntcp_buffer::ChunkArena,
+        offset: usize,
+        count: usize,
+    ) -> Option<ntcp_buffer::TxPart<'a>> {
+        self.send.single_tx_part(arena, offset, count)
+    }
+
+    #[inline]
     pub(crate) fn send_tx_parts<'a>(
         &'a self,
         arena: &'a ntcp_buffer::ChunkArena,
@@ -2056,6 +2074,65 @@ impl Connection {
         out: &mut TxPartsBuf<'a>,
     ) -> usize {
         self.send.tx_parts(arena, offset, count, out)
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn encode_stream_multi_parts(
+        &self,
+        arena: &ntcp_buffer::ChunkArena,
+        offset: usize,
+        wire_count: usize,
+        wire_header: Header,
+        timestamps: Option<(u32, u32)>,
+        out: &mut [u8],
+        partial: bool,
+        gather: bool,
+    ) -> Result<usize, wire::WireError> {
+        let mut parts = TxPartsBuf::new();
+        let covered = self.send.tx_parts(arena, offset, wire_count, &mut parts);
+        debug_assert_eq!(covered, wire_count);
+        wire::encode_stream_parts(
+            self.pseudo_header,
+            self.wire_ports,
+            wire_header,
+            timestamps,
+            parts.as_slice(),
+            wire_count,
+            out,
+            partial,
+            gather,
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn encode_multi_parts(
+        &self,
+        arena: &ntcp_buffer::ChunkArena,
+        offset: usize,
+        wire_count: usize,
+        wire_header: Header,
+        options: &[u8],
+        out: &mut [u8],
+        partial: bool,
+        gather: bool,
+    ) -> Result<usize, wire::WireError> {
+        let mut parts = TxPartsBuf::new();
+        let covered = self.send.tx_parts(arena, offset, wire_count, &mut parts);
+        debug_assert_eq!(covered, wire_count);
+        wire::encode_parts_with(
+            self.ip,
+            wire_header,
+            options,
+            parts.as_slice(),
+            wire_count,
+            out,
+            partial,
+            gather,
+        )
     }
 
     #[inline]
@@ -6966,8 +7043,10 @@ impl Connection {
                 if accepted > pool.tail_remaining() {
                     return false;
                 }
-                let needed = self.send.needed_entries_for_copy(pool, accepted);
-                if !self.send.has_entry_room(needed) {
+                if accepted > 0
+                    && !self.send.has_entry_room(1)
+                    && (!self.send.can_extend_tail(pool) || !self.send.has_entry_room(0))
+                {
                     return false;
                 }
             }
@@ -13563,22 +13642,43 @@ impl Connection {
         let encoded = if STREAM {
             debug_assert!(!shared_payload && !keepalive_garbage && segmentation.is_none());
             debug_assert_eq!(option_len, 12 * usize::from(options.timestamps.is_some()));
-            let mut parts = TxPartsBuf::new();
-            if wire_count != 0 && (!partial || gather) {
-                let covered = self.send.tx_parts(pool.arena(), offset, wire_count, &mut parts);
-                debug_assert_eq!(covered, wire_count);
+            if wire_count == 0 || (partial && !gather) {
+                wire::encode_stream_slice(
+                    self.pseudo_header,
+                    self.wire_ports,
+                    wire_header,
+                    options.timestamps,
+                    &[],
+                    wire_count,
+                    out,
+                    partial,
+                    false,
+                )
+            } else if let Some(slice) = self.send.single_tx_slice(pool.arena(), offset, wire_count)
+            {
+                wire::encode_stream_slice(
+                    self.pseudo_header,
+                    self.wire_ports,
+                    wire_header,
+                    options.timestamps,
+                    slice,
+                    wire_count,
+                    out,
+                    partial,
+                    gather,
+                )
+            } else {
+                self.encode_stream_multi_parts(
+                    pool.arena(),
+                    offset,
+                    wire_count,
+                    wire_header,
+                    options.timestamps,
+                    out,
+                    partial,
+                    gather,
+                )
             }
-            wire::encode_stream_parts(
-                self.pseudo_header,
-                self.wire_ports,
-                wire_header,
-                options.timestamps,
-                parts.as_slice(),
-                wire_count,
-                out,
-                partial,
-                gather,
-            )
         } else {
             let ip = self.ip;
             let mut encoded_options = [0; 40];
@@ -13596,18 +13696,36 @@ impl Connection {
                 )
             } else if keepalive_garbage {
                 wire::encode_with(ip, wire_header, options, &[0u8], out, partial)
-            } else {
-                let mut parts = TxPartsBuf::new();
-                if wire_count != 0 && (!partial || gather) {
-                    let covered = self.send.tx_parts(pool.arena(), offset, wire_count, &mut parts);
-                    debug_assert_eq!(covered, wire_count);
-                }
-                wire::encode_parts_with(
+            } else if wire_count == 0 || (partial && !gather) {
+                wire::encode_slice_with(
                     ip,
                     wire_header,
                     options,
-                    parts.as_slice(),
+                    &[],
                     wire_count,
+                    out,
+                    partial,
+                    false,
+                )
+            } else if let Some(slice) = self.send.single_tx_slice(pool.arena(), offset, wire_count)
+            {
+                wire::encode_slice_with(
+                    ip,
+                    wire_header,
+                    options,
+                    slice,
+                    wire_count,
+                    out,
+                    partial,
+                    gather,
+                )
+            } else {
+                self.encode_multi_parts(
+                    pool.arena(),
+                    offset,
+                    wire_count,
+                    wire_header,
+                    options,
                     out,
                     partial,
                     gather,

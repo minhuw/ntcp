@@ -6,7 +6,7 @@ use ntcp_buffer::{ChunkArena, ChunkRef, ChunkSlice, HeapChunkSource, TxChunkSour
 /// Stack-inline buffer for borrowed `TxPart` slices with heap overflow only
 /// when a segment spans more than `N` parts. `TxPart` is `Copy`, so the
 /// inline `[MaybeUninit<TxPart<'a>>; N]` array needs no element drop.
-pub(crate) struct TxPartsBuf<'a, const N: usize = 32> {
+pub(crate) struct TxPartsBuf<'a, const N: usize = 8> {
     inline: [MaybeUninit<TxPart<'a>>; N],
     len: usize,
     overflow: Vec<TxPart<'a>>,
@@ -147,8 +147,13 @@ pub(crate) struct TxPool {
     arena: ChunkArena,
     source: TxSource,
     tail: Option<ChunkRef>,
+    // Cached remaining writable bytes in `tail` (0 when `tail.is_none()`).
+    tail_remaining: u32,
     // Sum of `chunk.capacity()` for every live chunk currently in `arena`.
     chunk_bytes: usize,
+    // Cached `arena.storage_bytes() + chunk_bytes`, updated only when chunks or
+    // arena pages are allocated, freed, or shrunk.
+    storage_bytes: usize,
 }
 
 impl fmt::Debug for TxPool {
@@ -168,7 +173,9 @@ impl TxPool {
             arena: ChunkArena::new(),
             source: TxSource::Custom(source),
             tail: None,
+            tail_remaining: 0,
             chunk_bytes: 0,
+            storage_bytes: 0,
         }
     }
 
@@ -177,7 +184,9 @@ impl TxPool {
             arena: ChunkArena::new(),
             source: TxSource::Heap(HeapChunkSource::default()),
             tail: None,
+            tail_remaining: 0,
             chunk_bytes: 0,
+            storage_bytes: 0,
         }
     }
 
@@ -187,7 +196,9 @@ impl TxPool {
             arena: ChunkArena::new(),
             source: TxSource::Heap(HeapChunkSource::new(chunk_size)),
             tail: None,
+            tail_remaining: 0,
             chunk_bytes: 0,
+            storage_bytes: 0,
         }
     }
 
@@ -216,16 +227,24 @@ impl TxPool {
     /// chunks' capacities).
     #[inline]
     pub(crate) fn storage_bytes(&self) -> usize {
-        self.arena.storage_bytes() + self.chunk_bytes
+        debug_assert_eq!(
+            self.storage_bytes,
+            self.arena.storage_bytes() + self.chunk_bytes
+        );
+        self.storage_bytes
     }
 
     /// Remaining writable bytes in the shared tail chunk (`0` if there is no
     /// tail chunk or it is full).
     #[inline]
     pub(crate) fn tail_remaining(&self) -> usize {
-        self.tail
-            .as_ref()
-            .map_or(0, |handle| self.arena.get(handle).remaining())
+        debug_assert_eq!(
+            self.tail_remaining as usize,
+            self.tail
+                .as_ref()
+                .map_or(0, |handle| self.arena.get(handle).remaining())
+        );
+        self.tail_remaining as usize
     }
 
     /// Whether `handle` points to the current shared tail chunk and its filled
@@ -233,15 +252,14 @@ impl TxPool {
     #[inline]
     pub(crate) fn tail_continues(&self, handle: &ChunkRef, end: u32) -> bool {
         self.tail.as_ref().is_some_and(|tail| {
-            let chunk = self.arena.get(tail);
-            core::ptr::eq(self.arena.get(handle), chunk) && chunk.len() as u32 == end
+            self.arena.same_chunk(handle, tail) && self.arena.get(tail).len() as u32 == end
         })
     }
 
     /// Whether two handles reference the same chunk in this pool's arena.
     #[inline]
     pub(crate) fn same_chunk(&self, a: &ChunkRef, b: &ChunkRef) -> bool {
-        core::ptr::eq(self.arena.get(a), self.arena.get(b))
+        self.arena.same_chunk(a, b)
     }
 
     /// Whether a tail chunk is held only by the pool itself (no connection's
@@ -251,6 +269,12 @@ impl TxPool {
         self.tail
             .as_ref()
             .is_some_and(|handle| self.arena.references(handle) == 1)
+    }
+
+    /// Fast O(1) check for whether the arena has grown past a single page.
+    #[inline]
+    pub(crate) fn has_multiple_arena_pages(&self) -> bool {
+        self.arena.page_count() > 1
     }
 
     /// Whether the arena grew past a single page during a burst and now holds
@@ -317,6 +341,42 @@ impl TxPool {
     /// Stops cleanly and returns the prefix length copied so far if the
     /// chunk source runs dry (`allocate() -> None`) or arena page growth fails
     /// (`try_insert() -> Err`).
+    /// Fast path for a copying write that fits completely inside the current
+    /// shared tail chunk and needs a new `ChunkRef` for the caller's entry:
+    /// copies bytes and increments the refcount in a single arena slot lookup.
+    #[inline]
+    pub(crate) fn append_to_tail_and_dup(&mut self, bytes: &[u8]) -> (ChunkRef, u32, usize) {
+        debug_assert!(!bytes.is_empty() && bytes.len() <= self.tail_remaining as usize);
+        let tail = self.tail.as_ref().expect("tail chunk present");
+        let (offset, taken, full, dup) = self.arena.append_and_dup(tail, bytes);
+        self.tail_remaining -= taken as u32;
+        if full {
+            debug_assert_eq!(self.tail_remaining, 0);
+            let tail = self.tail.take().unwrap();
+            self.release(tail);
+        }
+        (dup, offset, taken)
+    }
+
+    /// Fast path for a copying write that fits completely inside the current
+    /// shared tail chunk and extends an existing entry pointing to `tail`.
+    #[inline]
+    pub(crate) fn append_to_tail_no_dup(&mut self, bytes: &[u8]) -> (u32, usize) {
+        debug_assert!(!bytes.is_empty() && bytes.len() <= self.tail_remaining as usize);
+        let tail = self.tail.as_ref().expect("tail chunk present");
+        let chunk = self.arena.get_mut(tail);
+        let offset = chunk.len() as u32;
+        let taken = chunk.append(bytes);
+        let full = chunk.is_full();
+        self.tail_remaining -= taken as u32;
+        if full {
+            debug_assert_eq!(self.tail_remaining, 0);
+            let tail = self.tail.take().unwrap();
+            self.release(tail);
+        }
+        (offset, taken)
+    }
+
     pub(crate) fn append_into(
         &mut self,
         mut bytes: &[u8],
@@ -328,7 +388,8 @@ impl TxPool {
                 let Some(chunk) = self.source.allocate() else {
                     break;
                 };
-                if chunk.remaining() == 0 {
+                let rem = chunk.remaining() as u32;
+                if rem == 0 {
                     break;
                 }
                 let cap = chunk.capacity();
@@ -336,6 +397,8 @@ impl TxPool {
                     break;
                 };
                 self.chunk_bytes += cap;
+                self.storage_bytes = self.arena.storage_bytes() + self.chunk_bytes;
+                self.tail_remaining = rem;
                 self.tail = Some(handle);
             }
             let tail = self.tail.take().unwrap();
@@ -344,8 +407,10 @@ impl TxPool {
             let taken = chunk.append(bytes);
             let full = chunk.is_full();
             debug_assert!(taken > 0);
+            self.tail_remaining -= taken as u32;
             emit(&mut self.arena, &tail, offset, taken as u32);
             if full {
+                debug_assert_eq!(self.tail_remaining, 0);
                 self.release(tail);
             } else {
                 self.tail = Some(tail);
@@ -363,9 +428,17 @@ impl TxPool {
 
     #[inline]
     pub(crate) fn release(&mut self, handle: ChunkRef) {
-        if let Some(chunk) = self.arena.release(handle) {
-            self.chunk_bytes -= chunk.capacity();
+        let freed = self.arena.release_drop(handle);
+        if freed != 0 {
+            self.finish_release(freed);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn finish_release(&mut self, freed: usize) {
+        self.chunk_bytes -= freed;
+        self.storage_bytes = self.arena.storage_bytes() + self.chunk_bytes;
     }
 
     /// Release the shared tail chunk if no connection holds a reference to it
@@ -374,6 +447,7 @@ impl TxPool {
     pub(crate) fn release_idle_tail(&mut self) -> bool {
         if self.has_idle_tail() {
             let tail = self.tail.take().unwrap();
+            self.tail_remaining = 0;
             self.release(tail);
             return true;
         }
@@ -392,7 +466,8 @@ impl TxPool {
         let Some(chunk) = self.source.allocate() else {
             return false;
         };
-        if chunk.remaining() < needed {
+        let rem = chunk.remaining();
+        if rem < needed {
             return false;
         }
         let cap = chunk.capacity();
@@ -400,9 +475,11 @@ impl TxPool {
             return false;
         };
         self.chunk_bytes += cap;
+        self.tail_remaining = rem as u32;
         if let Some(old_tail) = self.tail.replace(handle) {
             self.release(old_tail);
         }
+        self.storage_bytes = self.arena.storage_bytes() + self.chunk_bytes;
         true
     }
 
@@ -416,12 +493,14 @@ impl TxPool {
         } else {
             self.arena.shrink();
         }
+        self.storage_bytes = self.arena.storage_bytes() + self.chunk_bytes;
         before.saturating_sub(self.storage_bytes())
     }
 
     /// Unconditionally release the pool's tail reference (used at teardown).
     pub(crate) fn release_tail(&mut self) {
         if let Some(tail) = self.tail.take() {
+            self.tail_remaining = 0;
             self.release(tail);
         }
     }

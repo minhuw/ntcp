@@ -104,22 +104,26 @@ impl ChunkArena {
     }
 
     /// Chunks with at least one reference.
+    #[inline]
     pub fn live(&self) -> usize {
         self.live
     }
 
     /// Pages currently allocated in the arena.
+    #[inline]
     pub fn page_count(&self) -> usize {
         self.present
     }
 
     /// Total chunk slots across currently allocated pages.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.present * PAGE
     }
 
     /// Exact heap bytes the arena itself holds (its allocated pages and
     /// tables), not the chunks' memory, which their owner charges per chunk.
+    #[inline]
     pub fn storage_bytes(&self) -> usize {
         self.present * size_of::<[Entry; PAGE]>()
             + self.pages.capacity() * size_of::<Page>()
@@ -128,6 +132,7 @@ impl ChunkArena {
 
     /// Bytes the arena itself holds (its pages and tables), not the chunks'
     /// memory, which their owner charges per chunk.
+    #[inline]
     pub fn held_bytes(&self) -> usize {
         self.storage_bytes()
     }
@@ -190,7 +195,19 @@ impl ChunkArena {
     #[inline]
     fn check(&self, entry: &Entry, handle: &ChunkRef) {
         #[cfg(debug_assertions)]
-        assert_eq!(handle.arena, self.id, "ChunkRef from another arena");
+        Self::check_entry(self.id, entry, handle);
+        #[cfg(not(debug_assertions))]
+        Self::check_entry(entry, handle);
+    }
+
+    #[inline]
+    fn check_entry(
+        #[cfg(debug_assertions)] arena_id: u32,
+        entry: &Entry,
+        handle: &ChunkRef,
+    ) {
+        #[cfg(debug_assertions)]
+        assert_eq!(handle.arena, arena_id, "ChunkRef from another arena");
         debug_assert_eq!(entry.generation, handle.generation, "stale ChunkRef");
     }
 
@@ -308,14 +325,71 @@ impl ChunkArena {
         }
     }
 
+    /// Whether `a` and `b` reference the same chunk in this arena.
+    #[inline]
+    pub fn same_chunk(&self, a: &ChunkRef, b: &ChunkRef) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            let _ = self.get(a);
+            let _ = self.get(b);
+        }
+        a.index == b.index
+    }
+
     /// The chunk `handle` references, to append to its unfilled part while
     /// other references cover its filled prefix.
     #[inline]
     pub fn get_mut(&mut self, handle: &ChunkRef) -> &mut TxChunk {
-        let entry = self.entry(handle.index);
-        self.check(entry, handle);
-        match &mut self.entry_mut(handle.index).slot {
+        #[cfg(debug_assertions)]
+        let id = self.id;
+        let entry = self.entry_mut(handle.index);
+        #[cfg(debug_assertions)]
+        Self::check_entry(id, entry, handle);
+        #[cfg(not(debug_assertions))]
+        Self::check_entry(entry, handle);
+        match &mut entry.slot {
             Slot::Live { chunk, .. } => chunk,
+            Slot::Free { .. } => panic!("ChunkRef into a free slot"),
+        }
+    }
+
+    /// Appends `bytes` into `handle`'s chunk and takes another reference to it
+    /// in a single slot lookup. Returns `(offset, taken, is_full, dup)`.
+    ///
+    /// # Panics
+    /// If `handle` does not refer to a live slot or `bytes` is empty / chunk is full.
+    #[inline]
+    pub fn append_and_dup(
+        &mut self,
+        handle: &ChunkRef,
+        bytes: &[u8],
+    ) -> (u32, usize, bool, ChunkRef) {
+        #[cfg(debug_assertions)]
+        let id = self.id;
+        let entry = self.entry_mut(handle.index);
+        #[cfg(debug_assertions)]
+        Self::check_entry(id, entry, handle);
+        #[cfg(not(debug_assertions))]
+        Self::check_entry(entry, handle);
+        match &mut entry.slot {
+            Slot::Live { count, chunk } => {
+                let offset = chunk.len() as u32;
+                let taken = chunk.append(bytes);
+                debug_assert!(taken > 0);
+                let full = chunk.is_full();
+                *count += 1;
+                (
+                    offset,
+                    taken,
+                    full,
+                    ChunkRef {
+                        index: handle.index,
+                        generation: handle.generation,
+                        #[cfg(debug_assertions)]
+                        arena: handle.arena,
+                    },
+                )
+            }
             Slot::Free { .. } => panic!("ChunkRef into a free slot"),
         }
     }
@@ -334,9 +408,14 @@ impl ChunkArena {
     /// Another reference to `handle`'s chunk.
     #[inline]
     pub fn dup(&mut self, handle: &ChunkRef) -> ChunkRef {
-        let entry = self.entry(handle.index);
-        self.check(entry, handle);
-        match &mut self.entry_mut(handle.index).slot {
+        #[cfg(debug_assertions)]
+        let id = self.id;
+        let entry = self.entry_mut(handle.index);
+        #[cfg(debug_assertions)]
+        Self::check_entry(id, entry, handle);
+        #[cfg(not(debug_assertions))]
+        Self::check_entry(entry, handle);
+        match &mut entry.slot {
             Slot::Live { count, .. } => *count += 1,
             Slot::Free { .. } => panic!("ChunkRef into a free slot"),
         }
@@ -352,10 +431,14 @@ impl ChunkArena {
     /// returns the chunk, for the owner to keep for reuse or drop.
     #[inline]
     pub fn release(&mut self, handle: ChunkRef) -> Option<TxChunk> {
-        let entry = self.entry(handle.index);
-        self.check(entry, &handle);
+        #[cfg(debug_assertions)]
+        let id = self.id;
         let free = self.free;
         let entry = self.entry_mut(handle.index);
+        #[cfg(debug_assertions)]
+        Self::check_entry(id, entry, &handle);
+        #[cfg(not(debug_assertions))]
+        Self::check_entry(entry, &handle);
         match &mut entry.slot {
             Slot::Live { count, .. } if *count > 1 => {
                 *count -= 1;
@@ -373,6 +456,47 @@ impl ChunkArena {
         self.free = handle.index;
         self.live -= 1;
         Some(chunk)
+    }
+
+    /// Gives `handle`'s reference back and drops the chunk if it was the last
+    /// reference, returning the freed chunk's capacity (or `0` if references
+    /// remain). Keeps the common decrement path free of `TxChunk` drop glue
+    /// and 40-byte `Option<TxChunk>` return copies.
+    #[inline]
+    pub fn release_drop(&mut self, handle: ChunkRef) -> usize {
+        #[cfg(debug_assertions)]
+        let id = self.id;
+        let entry = self.entry_mut(handle.index);
+        #[cfg(debug_assertions)]
+        Self::check_entry(id, entry, &handle);
+        #[cfg(not(debug_assertions))]
+        Self::check_entry(entry, &handle);
+        match &mut entry.slot {
+            Slot::Live { count, .. } if *count > 1 => {
+                *count -= 1;
+                0
+            }
+            Slot::Live { .. } => self.release_last(handle.index),
+            Slot::Free { .. } => panic!("ChunkRef into a free slot"),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release_last(&mut self, index: u32) -> usize {
+        let free = self.free;
+        let entry = self.entry_mut(index);
+        let Slot::Live { chunk, .. } =
+            core::mem::replace(&mut entry.slot, Slot::Free { next: free })
+        else {
+            unreachable!()
+        };
+        entry.generation = entry.generation.wrapping_add(1);
+        self.free = index;
+        self.live -= 1;
+        let cap = chunk.capacity();
+        drop(chunk);
+        cap
     }
 
     /// Frees the pages with no live entry, as an owner gives memory back

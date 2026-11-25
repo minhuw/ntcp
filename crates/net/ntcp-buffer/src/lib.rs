@@ -206,6 +206,7 @@ pub struct TxPacket<'a> {
     pub payload: &'a [TxPart<'a>],
 }
 impl TxPacket<'_> {
+    #[inline]
     pub fn checked_len(&self) -> Option<usize> {
         self.payload
             .iter()
@@ -222,18 +223,21 @@ pub enum TxPart<'a> {
     Shared(PayloadSlice<'a>),
 }
 impl<'a> TxPart<'a> {
+    #[inline]
     pub fn bytes(&self) -> &'a [u8] {
         match self {
             Self::Chunk(slice) => slice.bytes(),
             Self::Shared(slice) => slice.bytes(),
         }
     }
+    #[inline]
     pub fn len(&self) -> usize {
         match self {
             Self::Chunk(slice) => slice.len(),
             Self::Shared(slice) => slice.len(),
         }
     }
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -434,6 +434,7 @@ impl FreshTransmit<'_> {
 
     /// Expose the encapsulated frame as a scatter-gather `TxPacket`, padding
     /// short frames up to `minimum` bytes inline when `offset + len < minimum`.
+    #[inline]
     pub fn with_tx_packet<R>(
         &mut self,
         minimum: usize,
@@ -441,37 +442,55 @@ impl FreshTransmit<'_> {
     ) -> Option<R> {
         let total = self.offset + self.len;
         if total < minimum {
-            if minimum > self.bytes.len() {
-                return None;
-            }
-            if self.payload_len != 0 {
-                let mut parts = TxPartsBuf::new();
-                let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
-                let covered = slot.connection.send_tx_parts(
-                    self.endpoint.tx_pool.arena(),
-                    self.payload_offset,
-                    self.payload_len,
-                    &mut parts,
-                );
-                debug_assert_eq!(covered, self.payload_len);
-                let mut dst = self.offset + self.header_len;
-                for part in parts.as_slice() {
-                    let src = part.bytes();
-                    self.bytes[dst..dst + src.len()].copy_from_slice(src);
-                    dst += src.len();
-                }
-                debug_assert_eq!(dst, total);
-            }
-            self.bytes[total..minimum].fill(0);
+            return self.with_tx_packet_padded(minimum, total, f);
+        }
+        let header = &self.bytes[..self.offset + self.header_len];
+        if self.payload_len == 0 {
             let packet = TxPacket {
-                header: &self.bytes[..minimum],
+                header,
                 payload: &[],
             };
-            Some(f(&packet))
-        } else {
-            let mut parts = TxPartsBuf::new();
-            if self.payload_len != 0 {
-                let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+            return Some(f(&packet));
+        }
+        let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+        if let Some(part) = slot.connection.single_send_tx_part(
+            self.endpoint.tx_pool.arena(),
+            self.payload_offset,
+            self.payload_len,
+        ) {
+            let parts = [part];
+            let packet = TxPacket {
+                header,
+                payload: &parts,
+            };
+            return Some(f(&packet));
+        }
+        Some(self.with_tx_packet_multi(f))
+    }
+
+    #[cold]
+    fn with_tx_packet_padded<R>(
+        &mut self,
+        minimum: usize,
+        total: usize,
+        f: impl FnOnce(&TxPacket<'_>) -> R,
+    ) -> Option<R> {
+        if minimum > self.bytes.len() {
+            return None;
+        }
+        if self.payload_len != 0 {
+            let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+            let dst = self.offset + self.header_len;
+            if let Some(part) = slot.connection.single_send_tx_part(
+                self.endpoint.tx_pool.arena(),
+                self.payload_offset,
+                self.payload_len,
+            ) {
+                let src = part.bytes();
+                self.bytes[dst..dst + src.len()].copy_from_slice(src);
+                debug_assert_eq!(dst + src.len(), total);
+            } else {
+                let mut parts = TxPartsBuf::new();
                 let covered = slot.connection.send_tx_parts(
                     self.endpoint.tx_pool.arena(),
                     self.payload_offset,
@@ -479,13 +498,39 @@ impl FreshTransmit<'_> {
                     &mut parts,
                 );
                 debug_assert_eq!(covered, self.payload_len);
+                let mut at = dst;
+                for part in parts.as_slice() {
+                    let src = part.bytes();
+                    self.bytes[at..at + src.len()].copy_from_slice(src);
+                    at += src.len();
+                }
+                debug_assert_eq!(at, total);
             }
-            let packet = TxPacket {
-                header: &self.bytes[..self.offset + self.header_len],
-                payload: parts.as_slice(),
-            };
-            Some(f(&packet))
         }
+        self.bytes[total..minimum].fill(0);
+        let packet = TxPacket {
+            header: &self.bytes[..minimum],
+            payload: &[],
+        };
+        Some(f(&packet))
+    }
+
+    #[cold]
+    fn with_tx_packet_multi<R>(&self, f: impl FnOnce(&TxPacket<'_>) -> R) -> R {
+        let mut parts = TxPartsBuf::new();
+        let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
+        let covered = slot.connection.send_tx_parts(
+            self.endpoint.tx_pool.arena(),
+            self.payload_offset,
+            self.payload_len,
+            &mut parts,
+        );
+        debug_assert_eq!(covered, self.payload_len);
+        let packet = TxPacket {
+            header: &self.bytes[..self.offset + self.header_len],
+            payload: parts.as_slice(),
+        };
+        f(&packet)
     }
 
     fn submitted(
@@ -2868,32 +2913,65 @@ impl Endpoint {
         self.tx_pool.live()
     }
 
+    #[inline]
     fn settle_tx_pool_charge(&mut self) {
         let storage = self.tx_pool.storage_bytes();
-        let old = core::mem::replace(&mut self.tx_pool_charged, storage);
-        if old != storage {
+        if self.tx_pool_charged != storage {
+            let old = core::mem::replace(&mut self.tx_pool_charged, storage);
             self.recharge(old, storage);
         }
     }
 
+    #[cold]
     fn shrink_tx_pool(&mut self) {
         self.tx_pool.shrink();
         self.settle_tx_pool_charge();
     }
 
+    #[inline]
+    fn tx_pool_low_threshold(&self) -> usize {
+        let own_low = self
+            .config
+            .buffer_low_bytes
+            .unwrap_or(self.config.max_buffer_bytes / 2);
+        self.budget
+            .memory(crate::BufferMemory {
+                low: own_low,
+                pressure: 0,
+                high: 0,
+            })
+            .low
+    }
+
+    #[inline]
     fn tx_pool_should_shrink(&self) -> bool {
         self.budget.under_pressure()
             || !self.memory_waiters.is_empty()
             || self.budget.has_group_waiters()
-            || self.budget.allocated() >= self.memory().low
+            || self.budget.allocated() >= self.tx_pool_low_threshold()
             || self.occupied.is_empty()
     }
 
+    #[inline(always)]
     fn maybe_shrink_and_settle_tx_pool(&mut self) {
-        if self.tx_pool_charged > 0
-            && ((self.tx_pool_should_shrink()
-                && (self.tx_pool.has_idle_tail() || self.tx_pool.live() == 0))
-                || self.tx_pool.has_excess_arena_pages())
+        if self.tx_pool_charged == 0 {
+            debug_assert_eq!(self.tx_pool.storage_bytes(), 0);
+            return;
+        }
+        if self.tx_pool_charged != self.tx_pool.storage_bytes()
+            || self.tx_pool.has_multiple_arena_pages()
+            || self.tx_pool_should_shrink()
+        {
+            self.maybe_shrink_and_settle_tx_pool_slow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn maybe_shrink_and_settle_tx_pool_slow(&mut self) {
+        if (self.tx_pool_should_shrink()
+            && (self.tx_pool.has_idle_tail() || self.tx_pool.live() == 0))
+            || self.tx_pool.has_excess_arena_pages()
         {
             self.tx_pool.shrink();
         }

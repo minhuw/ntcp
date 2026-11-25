@@ -105,30 +105,36 @@ impl TxChunk {
         Self::try_heap(capacity).expect("heap chunk allocation failed")
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity as usize
     }
 
     /// Bytes filled so far: the frozen prefix.
+    #[inline]
     pub fn len(&self) -> usize {
         self.filled as usize
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.filled == 0
     }
 
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.filled == self.capacity
     }
 
     /// Room left past the filled prefix.
+    #[inline]
     pub fn remaining(&self) -> usize {
         (self.capacity - self.filled) as usize
     }
 
     /// Copies as much of `bytes` as fits past the filled prefix and freezes
     /// it; returns how many bytes it took.
+    #[inline]
     pub fn append(&mut self, bytes: &[u8]) -> usize {
         let count = bytes.len().min(self.remaining());
         // SAFETY: filled + count <= capacity, and those bytes are past the
@@ -149,6 +155,7 @@ impl TxChunk {
     ///
     /// # Panics
     /// If `range` is not inside the filled prefix.
+    #[inline]
     pub fn bytes(&self, range: Range<usize>) -> &[u8] {
         assert!(
             range.start <= range.end && range.end <= self.len(),
@@ -163,6 +170,7 @@ impl TxChunk {
 
     /// The start of the chunk's memory, for its backend (a device address
     /// lookup); reading through it is sound only below `len()`.
+    #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.data.as_ptr()
     }
@@ -210,6 +218,7 @@ pub struct ChunkSlice<'a> {
 
 impl<'a> ChunkSlice<'a> {
     /// `range` of `chunk`'s filled prefix; None outside it.
+    #[inline]
     pub fn new(chunk: &'a TxChunk, range: Range<usize>) -> Option<Self> {
         (range.start <= range.end && range.end <= chunk.len()).then(|| Self {
             chunk,
@@ -218,26 +227,38 @@ impl<'a> ChunkSlice<'a> {
         })
     }
 
+    #[inline]
     pub fn chunk(&self) -> &'a TxChunk {
         self.chunk
     }
 
     /// Where the range starts in its chunk.
+    #[inline]
     pub fn offset(&self) -> usize {
         self.offset as usize
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     pub fn bytes(&self) -> &'a [u8] {
-        self.chunk
-            .bytes(self.offset as usize..(self.offset + self.len) as usize)
+        debug_assert!(self.offset as usize + self.len as usize <= self.chunk.len());
+        // SAFETY: `ChunkSlice::new` validated `offset + len <= chunk.len()`,
+        // and a chunk's filled prefix is immutable and only ever grows.
+        unsafe {
+            slice::from_raw_parts(
+                self.chunk.as_ptr().add(self.offset as usize),
+                self.len as usize,
+            )
+        }
     }
 }
 

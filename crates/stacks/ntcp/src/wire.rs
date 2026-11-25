@@ -797,6 +797,83 @@ pub(crate) fn encode_parts_with(
     )
 }
 
+/// Single-slice fast-path counterpart of `encode_parts_with`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_slice_with(
+    ip: IpMetadata,
+    header: Header,
+    options: &[u8],
+    payload: &[u8],
+    payload_len: usize,
+    out: &mut [u8],
+    partial: bool,
+    gather: bool,
+) -> Result<usize, WireError> {
+    if !options.is_empty() && !aligned_timestamp(options) {
+        validate_output_options(header.flags, options)?;
+    }
+    let pseudo = PseudoHeader::new(ip)?;
+    let option_len = options.len().div_ceil(4) * 4;
+    let ports = (u32::from(header.source_port) << 16) | u32::from(header.destination_port);
+    encode_segment_slice(
+        pseudo,
+        ports,
+        header,
+        option_len,
+        payload,
+        payload_len,
+        out,
+        partial,
+        gather,
+        |area| {
+            let (encoded, padding) = area.split_at_mut(options.len());
+            encoded.copy_from_slice(options);
+            padding.fill(0);
+            None
+        },
+    )
+}
+
+/// Stream fast-path counterpart of `encode_slice_with` for established
+/// segments carrying no options or an aligned Timestamps option.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_stream_slice(
+    pseudo_header: PseudoHeader,
+    ports: u32,
+    header: Header,
+    timestamps: Option<(u32, u32)>,
+    payload: &[u8],
+    payload_len: usize,
+    out: &mut [u8],
+    partial: bool,
+    gather: bool,
+) -> Result<usize, WireError> {
+    let option_len = if timestamps.is_some() { 12 } else { 0 };
+    encode_segment_slice(
+        pseudo_header,
+        ports,
+        header,
+        option_len,
+        payload,
+        payload_len,
+        out,
+        partial,
+        gather,
+        |area| {
+            if let Some((value, echo)) = timestamps {
+                area[..4].copy_from_slice(&[1, 1, 8, 10]);
+                area[4..8].copy_from_slice(&value.to_be_bytes());
+                area[8..12].copy_from_slice(&echo.to_be_bytes());
+                Some(0x0101 + 0x080a + u64::from(value) + u64::from(echo))
+            } else {
+                Some(0)
+            }
+        },
+    )
+}
+
 /// Stream fast-path counterpart of `encode_parts_with` for established
 /// segments carrying no options or an aligned Timestamps option.
 #[allow(clippy::too_many_arguments)]
@@ -955,7 +1032,7 @@ fn encode_segment_parts(
             + u64::from(header.sequence)
             + u64::from(header.acknowledgment);
         match payload {
-            [] => ntcp_ip_common::checksum_with_sum(&[], wide),
+            [] => !(fold_wide(wide) as u16),
             [only] => ntcp_ip_common::checksum_with_sum(only.bytes(), wide),
             many => !(sum_tx_parts(fold_wide(wide), many) as u16),
         }
@@ -977,6 +1054,79 @@ fn encode_segment_parts(
             at += bytes.len();
         }
         debug_assert_eq!(at, total);
+        Ok(total)
+    } else {
+        Ok(header_len)
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn encode_segment_slice(
+    pseudo_header: PseudoHeader,
+    ports: u32,
+    header: Header,
+    option_len: usize,
+    payload: &[u8],
+    payload_len: usize,
+    out: &mut [u8],
+    partial: bool,
+    gather: bool,
+    write_options: impl FnOnce(&mut [u8]) -> Option<u64>,
+) -> Result<usize, WireError> {
+    let header_len = 20 + option_len;
+    let total = header_len
+        .checked_add(payload_len)
+        .ok_or(WireError::TooLong)?;
+    if total > pseudo_header.limit as usize {
+        return Err(WireError::TooLong);
+    }
+    let required = if gather { total } else { header_len };
+    if out.len() < required {
+        return Err(WireError::OutputTooSmall);
+    }
+    debug_assert!(
+        (partial && !gather) || payload.len() == payload_len,
+        "slice payload length mismatch"
+    );
+    out[..4].copy_from_slice(&ports.to_be_bytes());
+    out[4..8].copy_from_slice(&header.sequence.to_be_bytes());
+    out[8..12].copy_from_slice(&header.acknowledgment.to_be_bytes());
+    out[12] = ((header_len / 4) as u8) << 4;
+    out[13] = header.flags;
+    out[14..16].copy_from_slice(&header.window.to_be_bytes());
+    out[18..20].copy_from_slice(&header.urgent_pointer.to_be_bytes());
+    let option_sum = write_options(&mut out[20..header_len]);
+    let sum = if partial {
+        pseudo_header.sum(total as u32) as u16
+    } else if let Some(options) = option_sum {
+        let fixed = pseudo_header.sum
+            + u32::from(u16::from_be_bytes([out[12], header.flags]))
+            + u32::from(header.window)
+            + u32::from(header.urgent_pointer);
+        let wide = u64::from(fixed)
+            + u64::from(ports)
+            + total as u64
+            + options
+            + u64::from(header.sequence)
+            + u64::from(header.acknowledgment);
+        if payload.is_empty() {
+            !(fold_wide(wide) as u16)
+        } else {
+            ntcp_ip_common::checksum_with_sum(payload, wide)
+        }
+    } else {
+        out[16..18].fill(0);
+        let header_sum = add_words(pseudo_header.sum(total as u32), &out[..header_len]);
+        if payload.is_empty() {
+            !(header_sum as u16)
+        } else {
+            ntcp_ip_common::checksum_with_sum(payload, u64::from(header_sum))
+        }
+    };
+    out[16..18].copy_from_slice(&sum.to_be_bytes());
+    if gather {
+        out[header_len..total].copy_from_slice(payload);
         Ok(total)
     } else {
         Ok(header_len)
