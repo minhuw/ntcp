@@ -11,12 +11,14 @@ struct SharedSegment {
 }
 unsafe extern "C" {
     fn ntcp_dpdk_reclaim(port: u16, queue: u16, budget: u32) -> i32;
+    fn ntcp_dpdk_reclaim_later_burst(port: u16, queue: u16) -> i32;
     fn ntcp_dpdk_payload_alloc(length: usize, iova: *mut u64) -> *mut u8;
     fn ntcp_dpdk_payload_free(address: *mut u8);
     fn ntcp_dpdk_shared_check(
         port: u16,
         queue: u16,
         pool: *mut c_void,
+        later_burst: i32,
         limit: *mut u16,
         stage: *mut i32,
     ) -> i32;
@@ -88,6 +90,32 @@ impl Drop for DpdkBuffer {
         unsafe { ntcp_dpdk_payload_free(self.address.as_ptr()) };
     }
 }
+/// How a TX queue gives external buffers back while it sends nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxRelease {
+    /// rte_eth_tx_done_cleanup frees what the device has sent.
+    Cleanup,
+    /// Sent mbufs are freed on a later burst; a completion poll frees only
+    /// some of them, so payload leases are copied (`lease_zero_copy_error`).
+    LaterBurst,
+}
+
+// The TxRelease of the ethdev driver (rte_eth_dev_info driver_name) known
+// to differ from the one ntcp_dpdk_shared_check probes for, or None: the
+// mlx5 PMD, under its PCI and auxiliary (SF) bus drivers' names (see
+// segmentation::psh_on_last_segment). In DPDK 26.03 it has no
+// tx_done_cleanup, but its tx_descriptor_status runs the completion
+// handler before it reads the ring (drivers/net/mlx5/mlx5_tx.c:270-279),
+// and that frees only what a CQE reported: a CQE is requested once 32 elts
+// were posted since the last request (mlx5_tx.h:718-747, MLX5_TX_COMP_THRESH
+// in mlx5_defs.h:23), so up to 31 descriptors stay held while TX is idle.
+// Nothing is inferred from a missing op: a tx_done_cleanup that only ran
+// the handler would leave the same 31, so mlx5 stays LaterBurst until one
+// also forces a CQE.
+pub(crate) fn tx_release(driver: &str) -> Option<TxRelease> {
+    matches!(driver, "mlx5_pci" | "mlx5_auxiliary").then_some(TxRelease::LaterBurst)
+}
+
 // The error of ntcp_dpdk_shared_check failing with `result` at `stage`
 // (shim.c's NTCP_SHARED_*), the segment limit it read for stage 10.
 fn shared_check_error(stage: i32, result: i32, limit: u16) -> io::Error {
@@ -108,6 +136,7 @@ fn shared_check_error(stage: i32, result: i32, limit: u16) -> io::Error {
         8 => "tx queue enables RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE",
         9 => "pool data room leaves under 134 octets past headroom",
         11 => "rte_eth_tx_done_cleanup",
+        12 => "rte_eth_tx_descriptor_status",
         _ => unreachable!("ntcp_dpdk_shared_check stage {stage}"),
     };
     dpdk_error(context, result)
@@ -122,8 +151,19 @@ impl Dpdk {
     /// Validate enabled multi-segment TX, descriptor limits and idle reclaim.
     /// This may reclaim already completed packets. The host keeps port/queue
     /// configuration unchanged; no offload is enabled here. The error names
-    /// the check that failed, with its errno.
+    /// the check that failed, with its errno. Where the driver frees sent
+    /// mbufs on a later burst (mlx5), chunks go by reference but payload
+    /// leases are copied (`lease_zero_copy_error`).
     pub fn enable_zero_copy(&mut self) -> io::Result<()> {
+        // SAFETY: EAL is live and the port valid, as from_borrowed requires.
+        let driver =
+            unsafe { driver_name(self.port) }.map_err(|r| dpdk_error("rte_eth_dev_info_get", r))?;
+        self.enable_shared(&driver, tx_release(&driver))
+    }
+    // enable_zero_copy for `driver`, whose release `known` is, or None for
+    // ntcp_dpdk_shared_check's tx_done_cleanup probe.
+    fn enable_shared(&mut self, driver: &str, known: Option<TxRelease>) -> io::Result<()> {
+        let release = known.unwrap_or(TxRelease::Cleanup);
         let (mut limit, mut stage) = (0, 0);
         // SAFETY: borrowed objects remain live and outputs are writable.
         let result = unsafe {
@@ -131,6 +171,7 @@ impl Dpdk {
                 self.port,
                 self.tx_queue,
                 self.pool.as_ptr(),
+                i32::from(release == TxRelease::LaterBurst),
                 &mut limit,
                 &mut stage,
             )
@@ -144,7 +185,25 @@ impl Dpdk {
             return Err(io::ErrorKind::Unsupported.into());
         }
         self.shared_limit = Some(limit);
+        self.tx_release = release;
+        self.lease_zero_copy = (release == TxRelease::LaterBurst).then(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{driver}: TX completes on a later burst; up to 31 descriptors stay \
+                     held while idle, so payload leases are copied"
+                ),
+            )
+        });
         Ok(())
+    }
+    /// Why payload leases (`transmit_zero_copy`, `TxPart::Shared`) are
+    /// copied although zero-copy TX is on: the driver frees sent mbufs on a
+    /// later burst, so a lease could stay held, its completion withheld,
+    /// for as long as TX is idle. None where leases go by reference, and
+    /// while zero-copy TX is off.
+    pub fn lease_zero_copy_error(&self) -> Option<&io::Error> {
+        self.lease_zero_copy.as_ref()
     }
     pub(super) fn reclaim_shared(&mut self, budget: usize) -> io::Result<usize> {
         if budget == 0 || self.shared_limit.is_none() {
@@ -153,11 +212,14 @@ impl Dpdk {
         // SAFETY: exclusive live borrowed queue. Never pass DPDK's zero/unlimited
         // sentinel. The owner budgets this service alongside RX and timestamps.
         let result = unsafe {
-            ntcp_dpdk_reclaim(
-                self.port,
-                self.tx_queue,
-                budget.min(u32::MAX as usize) as u32,
-            )
+            match self.tx_release {
+                TxRelease::Cleanup => ntcp_dpdk_reclaim(
+                    self.port,
+                    self.tx_queue,
+                    budget.min(u32::MAX as usize) as u32,
+                ),
+                TxRelease::LaterBurst => ntcp_dpdk_reclaim_later_burst(self.port, self.tx_queue),
+            }
         };
         if result < 0 {
             Err(io::Error::from_raw_os_error(-result))
@@ -166,6 +228,10 @@ impl Dpdk {
         }
     }
     pub(super) fn shared_capabilities(&self) -> Option<ZeroCopyCapabilities> {
+        // Leases are copied (lease_zero_copy_error).
+        if self.tx_release == TxRelease::LaterBurst {
+            return None;
+        }
         self.shared_limit.and_then(|limit| {
             // Reserve one descriptor for headers and one for Ethernet padding;
             // at least one payload segment must remain (matches
@@ -271,6 +337,25 @@ pub(super) fn ring_test(io: &mut Dpdk) {
         )
     );
     assert!(io.zero_copy_capabilities().is_none());
+    // Forced LaterBurst fails closed as well: here before its stage, which
+    // the PMD's missing tx_descriptor_status (the ethdev dummy) fails.
+    let error = io
+        .enable_shared("net_ring", Some(TxRelease::LaterBurst))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "rte_eth_tx_queue_info_get: {}",
+            io::Error::from_raw_os_error(95)
+        )
+    );
+    assert_eq!(
+        unsafe { ntcp_dpdk_reclaim_later_burst(io.port, io.tx_queue) },
+        -95
+    );
+    assert!(io.shared_limit.is_none());
+    assert_eq!(io.tx_release, TxRelease::Cleanup);
+    assert!(io.lease_zero_copy_error().is_none());
     // Limits below 3 (1 header + 1 payload + 1 Ethernet pad) must never
     // underflow and must report zero-copy unavailable.
     for limit in [0u16, 1, 2] {
@@ -372,12 +457,55 @@ pub(super) fn ring_test(io: &mut Dpdk) {
     unsafe { ntcp_test_check_shared(original.add(3), 13, original.add(100), 7, 34, 54) };
     assert_eq!(count.load(Ordering::SeqCst), 3);
     assert_eq!(unsafe { ntcp_test_available() }, 1023);
+    // LaterBurst, injected as the limit is: reclaim is the probe (one call,
+    // the dummy's ENOTSUP here), and leases are refused, never taken.
+    io.tx_release = TxRelease::LaterBurst;
+    assert_eq!(io.reclaim_transmit(0).unwrap(), 0);
+    assert_eq!(
+        io.reclaim_transmit(1).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(io.zero_copy_capabilities(), None);
+    let packet = OwnedPacket {
+        header: vec![0x42; 34],
+        payload: vec![base.slice(0..64).unwrap()],
+    };
+    assert!(!io.zero_copy_payload_supported(&packet.payload[0]));
+    assert_eq!(
+        io.transmit_zero_copy(&packet).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(unsafe { ntcp_test_available() }, 1023);
+    io.tx_release = TxRelease::Cleanup;
     io.shared_limit = None;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_mlx5_completes_on_a_later_burst() {
+        for name in ["mlx5_pci", "mlx5_auxiliary"] {
+            assert_eq!(tx_release(name), Some(TxRelease::LaterBurst), "{name}");
+        }
+        // The others are probed for tx_done_cleanup (TxRelease::Cleanup).
+        for name in [
+            "net_ring",
+            "net_null",
+            "net_memif",
+            "net_tap",
+            "net_virtio",
+            "net_mlx5",
+            "mlx5",
+            "mlx5_pci ",
+            "MLX5_PCI",
+            "mlx4_pci",
+            "",
+        ] {
+            assert_eq!(tx_release(name), None, "{name}");
+        }
+    }
 
     #[test]
     fn shared_check_error_names_the_check() {
@@ -397,6 +525,7 @@ mod tests {
                 "tx segment limit 2 is below 3 (header, payload and pad)",
             ),
             (11, "rte_eth_tx_done_cleanup"),
+            (12, "rte_eth_tx_descriptor_status"),
         ];
         let unsupported = io::Error::from_raw_os_error(95);
         for (stage, context) in expected {

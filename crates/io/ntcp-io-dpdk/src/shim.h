@@ -66,8 +66,9 @@ typedef void (*ntcp_release_fn)(void *);
 void *ntcp_dpdk_payload_alloc(size_t length, uint64_t *iova);
 void ntcp_dpdk_payload_free(void *address);
 int ntcp_dpdk_reclaim(uint16_t port, uint16_t queue, uint32_t budget);
-int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, uint16_t *limit,
-                           int *stage);
+int ntcp_dpdk_reclaim_later_burst(uint16_t port, uint16_t queue);
+int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, int later_burst,
+                           uint16_t *limit, int *stage);
 // Takes every lease, including on rejection or allocation failure.
 int ntcp_dpdk_shared_transmit(uint16_t port, uint16_t queue, void *pool,
     const uint8_t *header, uint16_t header_length,
@@ -136,6 +137,7 @@ int ntcp_dpdk_port_isolate(uint16_t port, char *message, size_t capacity);
 int ntcp_dpdk_port_socket(uint16_t port);
 void *ntcp_dpdk_pool_create(const char *name, uint32_t count, uint16_t data_size,
                             int socket, int *error);
+unsigned ntcp_dpdk_pool_in_use(const void *pool);
 int ntcp_dpdk_pool_free(void *pool);
 struct ntcp_port_config {
     uint16_t queues, rx_desc, tx_desc, mtu, mbuf_data_size;

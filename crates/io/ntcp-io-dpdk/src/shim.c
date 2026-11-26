@@ -504,15 +504,26 @@ int ntcp_dpdk_reclaim(uint16_t port, uint16_t queue, uint32_t budget) {
     if (!budget) return 0; // DPDK zero means unbounded: never forward it.
     return rte_eth_tx_done_cleanup(port, queue, budget);
 }
+// Completions of a queue that frees sent mbufs on a later burst, without
+// sending: mlx5's tx_descriptor_status runs its completion handler first
+// (drivers/net/mlx5/mlx5_tx.c:270-279). It cannot count what it freed.
+int ntcp_dpdk_reclaim_later_burst(uint16_t port, uint16_t queue) {
+    int result = rte_eth_tx_descriptor_status(port, queue, 0);
+    return result < 0 ? result : 0;
+}
 // The check of ntcp_dpdk_shared_check that failed, in `*stage`.
 enum {
     NTCP_SHARED_INFO = 1, NTCP_SHARED_QUEUE, NTCP_SHARED_CONF, NTCP_SHARED_QUEUE_INFO,
     NTCP_SHARED_MULTI_SEGS_CAPA, NTCP_SHARED_MULTI_SEGS, NTCP_SHARED_LIMITS,
     NTCP_SHARED_FAST_FREE, NTCP_SHARED_ROOM, NTCP_SHARED_SEGMENTS, NTCP_SHARED_CLEANUP,
+    NTCP_SHARED_DESCRIPTOR_STATUS,
 };
 
-int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, uint16_t *limit,
-                           int *stage) {
+// `later_burst`: the driver frees sent mbufs on a later burst (shared.rs
+// tx_release), so idle TX is served by ntcp_dpdk_reclaim_later_burst and
+// tx_done_cleanup is not consulted.
+int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, int later_burst,
+                           uint16_t *limit, int *stage) {
     struct rte_eth_dev_info info;
     *stage = NTCP_SHARED_INFO;
     int result = rte_eth_dev_info_get(port, &info);
@@ -545,6 +556,11 @@ int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, uint16_t *
     if (*limit < 3) return -ENOTSUP;
     // Idle TX must progress without waiting for another packet to be sent.
     // This may reclaim a completed packet but never changes port settings.
+    if (later_burst) {
+        // The ethdev dummy (no tx_descriptor_status) returns -ENOTSUP.
+        *stage = NTCP_SHARED_DESCRIPTOR_STATUS;
+        return ntcp_dpdk_reclaim_later_burst(port, queue);
+    }
     *stage = NTCP_SHARED_CLEANUP;
     result = ntcp_dpdk_reclaim(port, queue, 1);
     return result < 0 ? result : 0;
@@ -1087,6 +1103,10 @@ void *ntcp_dpdk_pool_create(const char *name, uint32_t count, uint16_t data_size
         (uint16_t)(data_size + RTE_PKTMBUF_HEADROOM), socket);
     *error = pool ? 0 : -rte_errno;
     return pool;
+}
+
+unsigned ntcp_dpdk_pool_in_use(const void *pool) {
+    return rte_mempool_in_use_count(pool);
 }
 
 // Freeing a pool with outstanding mbufs would leave live references to freed

@@ -827,6 +827,13 @@ fn hosted_network_e2e(eal: &'static Eal) {
         q0.borrow().zero_copy_error().map(ToString::to_string),
         Some(reason)
     );
+    // Leases are copied only where zero-copy TX is on (mlx5).
+    assert!(q0.borrow().lease_zero_copy_error().is_none());
+    // The ring PMD posts no RX mbufs: the pools are untouched.
+    assert_eq!(
+        (q0.borrow().pool_in_use(), q1.borrow().pool_in_use()),
+        (0, 0)
+    );
 
     let io_a = CrossQueue {
         tx: Rc::clone(&q0),
@@ -941,6 +948,10 @@ fn hosted_network_e2e(eal: &'static Eal) {
     let mut drain_buf = [0u8; 2048];
     while q0.borrow_mut().receive(&mut drain_buf).unwrap().is_some() {}
     while q1.borrow_mut().receive(&mut drain_buf).unwrap().is_some() {}
+    assert_eq!(
+        (q0.borrow().pool_in_use(), q1.borrow().pool_in_use()),
+        (0, 0)
+    );
     drop((q0, q1, port));
     assert_eq!(port_named("net_ring_e2e"), None);
     assert_eq!(pools(), (0, 0));

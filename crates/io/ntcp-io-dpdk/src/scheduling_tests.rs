@@ -483,12 +483,22 @@ fn scheduled_mbuf_encoding_and_rejection_not_live_launch() {
         assert_eq!(ntcp_test_available(), 1023);
         io.tx_scheduling = None;
         chunk_and_transmit_packet_ring_test(&mut io);
+        later_burst_ring_test(&mut io);
         segmented_network(io);
         assert_eq!(ntcp_test_available(), 1023);
         let io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
         dpdk_chunk_source_network(io);
         assert_eq!(ntcp_test_available(), 1023);
         assert_eq!(chunk::live_dpdk_chunks(), 0);
+        let mut charges = Vec::new();
+        for hold in [false, true] {
+            let io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
+            charges.push(later_burst_network(io, hold));
+            assert_eq!(ntcp_test_available(), 1023);
+            assert_eq!(chunk::live_dpdk_chunks(), 0);
+        }
+        // The chunks the device held were not charged.
+        assert_eq!(charges[0], charges[1]);
         for offload in [true, false] {
             let io = Dpdk::from_borrowed(port as u16, 0, 0, ntcp_test_pool()).unwrap();
             checksummed_network(io, offload);
@@ -1972,4 +1982,274 @@ unsafe fn dpdk_chunk_source_network(mut io: Dpdk) {
     drop(b);
     assert_eq!(unsafe { ntcp_test_available() }, 1023);
     assert_eq!(chunk::live_dpdk_chunks(), 0);
+}
+
+// TxRelease::LaterBurst (mlx5), injected with the descriptor limit since the
+// ring PMD grants neither: chunk parts still go by reference, but a packet
+// with a lease part goes by copy, so no mbuf the device keeps holds a lease.
+unsafe fn later_burst_ring_test(io: &mut Dpdk) {
+    use ntcp_io::{ChunkSlice, PayloadSlice};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    io.shared_limit = Some(8);
+    io.tx_release = TxRelease::LaterBurst;
+    let mut src = chunk::DpdkChunkSource::new(chunk::DEFAULT_DPDK_CHUNK_SIZE);
+    let mut c = src.allocate().unwrap();
+    let data: Vec<u8> = (0..1200).map(|i| (i % 241) as u8).collect();
+    c.append(&data);
+    let header = [0x24u8; 54];
+    let mut info = TestTxInfo::default();
+    let mut segs = [TestTxSeg::default(); 16];
+
+    let external = io.tx_external();
+    let parts = [TxPart::Chunk(ChunkSlice::new(&c, 0..1200).unwrap())];
+    let packet = TxPacket {
+        header: &header,
+        payload: &parts,
+    };
+    assert_eq!(
+        io.transmit_packet(&packet, TransmitRequest::default())
+            .unwrap(),
+        TxOutcome::Submitted
+    );
+    assert_eq!(io.tx_external(), external + 1);
+    assert_eq!(chunk::chunk_refcnt(&c), 2);
+    let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 16) };
+    assert_eq!((info.nb_segs, segs[1].external), (2, 1));
+    unsafe { ntcp_test_tx_free(m) };
+
+    let mut buffer = unsafe { DpdkBuffer::allocate(1024) }.unwrap();
+    buffer.as_mut_slice().fill(0x6d);
+    let released = Arc::new(AtomicUsize::new(0));
+    let state = released.clone();
+    let lease = buffer.freeze().with_release(move || {
+        state.fetch_add(1, Ordering::SeqCst);
+    });
+    let mixed = [
+        TxPart::Chunk(ChunkSlice::new(&c, 0..400).unwrap()),
+        TxPart::Shared(PayloadSlice::new(&lease, 100..700).unwrap()),
+    ];
+    let packet = TxPacket {
+        header: &header,
+        payload: &mixed,
+    };
+    assert_eq!(
+        io.transmit_packet(&packet, TransmitRequest::default())
+            .unwrap(),
+        TxOutcome::Submitted
+    );
+    assert_eq!(io.tx_external(), external + 1);
+    assert_eq!(chunk::chunk_refcnt(&c), 1);
+    // The mbuf the device still holds keeps no reference to the lease.
+    drop(lease);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+    let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 16) };
+    assert_eq!(info.pkt_len, 54 + 1000);
+    for seg in &segs[..usize::from(info.nb_segs)] {
+        assert_eq!(seg.external, 0);
+    }
+    let mut wire = vec![0u8; info.pkt_len as usize];
+    unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), wire.len() as u32) };
+    assert_eq!(&wire[54..454], &data[..400]);
+    assert_eq!(&wire[454..], &[0x6d; 600]);
+    unsafe { ntcp_test_tx_free(m) };
+
+    io.tx_release = TxRelease::Cleanup;
+    io.shared_limit = None;
+    drop((c, src));
+    assert_eq!(unsafe { ntcp_test_available() }, 1023);
+    assert_eq!(chunk::live_dpdk_chunks(), 0);
+}
+
+// ntcp-native over TxRelease::LaterBurst (mlx5's mode, injected): 4 KiB
+// writes go by reference, and with `hold` the device frees none of the
+// mbufs it was given until the end, as mlx5 frees sent mbufs only on a
+// later burst; the peer still receives and ACKs everything. Device-held
+// chunks are not charged: a writer the buffer cap refused writes again
+// once ACKs come back while they are held, and with everything ACKed the
+// charge, returned, is what it is without the hold (the caller compares;
+// the connection's ring and ledgers grew with cwnd, so it is above the
+// charge before the writes in both). Freed at last, the chunks go back to
+// the chunk source, which hands them out again. Driven with reclaim 0:
+// the PMD's probe is the ethdev dummy (later_burst_ring_test).
+unsafe fn later_burst_network(mut io: Dpdk, hold: bool) -> usize {
+    use ntcp_native::{
+        EthernetNextHop, Link, Network, NetworkConfig, ReadOutcome, WorkBudget, WriteOptions,
+    };
+    io.shared_limit = Some(8);
+    io.tx_release = TxRelease::LaterBurst;
+    let link = |side: u8| Link::Ethernet {
+        local_mac: [2, 0, 0, 0, 0, side],
+        next_hop: EthernetNextHop::Fixed([2, 0, 0, 0, 0, 3 - side]),
+    };
+    let config = |address: &str, side: u8| {
+        let mut config = NetworkConfig::new(address.parse().unwrap(), 1500);
+        config.tcp.max_connections = 2;
+        config.tcp.connection.nagle = false;
+        config.link = link(side);
+        config
+    };
+    let mut ca = config("10.75.0.1", 1);
+    // Room for a few chunks beyond one connection: the writes outrun it.
+    let cap = ca.buffer_budget(1, &io).unwrap() + 3 * chunk::DEFAULT_DPDK_CHUNK_SIZE;
+    ca.tcp.max_buffer_bytes = cap;
+    ca.tcp.buffer_pressure_bytes = Some(cap);
+    ca.tcp.buffer_low_bytes = Some(cap - 1);
+    let incoming = Rc::new(RefCell::new(VecDeque::new()));
+    let outgoing = Rc::new(RefCell::new(VecDeque::new()));
+    let peer = Peer {
+        incoming: incoming.clone(),
+        outgoing: outgoing.clone(),
+    };
+    let mut cb = config("10.75.0.2", 2);
+    cb.tcp.max_buffer_bytes = cb.buffer_budget(2, &peer).unwrap() + (4 << 20);
+    let mut a = Network::new(ca, io, [8; 32], 0).unwrap();
+    let mut b = Network::new(cb, peer, [9; 32], 0).unwrap();
+    let listener = b.listen(9300, 1).unwrap();
+    let client = a.connect("10.75.0.2:9300".parse().unwrap()).unwrap();
+    let budget = WorkBudget::new(64, 64, 64, 0);
+    let mut wire = vec![0u8; MAX_PACKET_LEN];
+    // The mbufs the device keeps, and whether each has an external buffer.
+    let mut held: Vec<(*mut c_void, bool)> = Vec::new();
+    let mut backlog = VecDeque::new();
+    // One round trip: a's frames to b, their mbufs kept in `keep` if given;
+    // b's frames back to a.
+    let mut exchange = |a: &mut Network<Dpdk>,
+                        b: &mut Network<Peer>,
+                        now: u64,
+                        mut keep: Option<&mut Vec<(*mut c_void, bool)>>| {
+        a.drive(now, budget).unwrap();
+        loop {
+            let mut info = TestTxInfo::default();
+            let mut segs = [TestTxSeg::default(); 16];
+            let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 16) };
+            if m.is_null() {
+                break;
+            }
+            let len = info.pkt_len as usize;
+            assert_eq!(
+                unsafe { ntcp_test_tx_read(m, wire.as_mut_ptr(), len as u32) } as usize,
+                len
+            );
+            incoming.borrow_mut().push_back(wire[..len].to_vec());
+            if let Some(held) = keep.as_mut() {
+                let segs = &segs[..usize::from(info.nb_segs).min(16)];
+                held.push((m, segs.iter().any(|s| s.external != 0)));
+            } else {
+                unsafe { ntcp_test_tx_free(m) };
+            }
+        }
+        b.drive(now, budget).unwrap();
+        backlog.extend(outgoing.borrow_mut().drain(..));
+        while let Some(frame) = backlog.front() {
+            if unsafe { ntcp_test_inject(frame.as_ptr(), frame.len() as u32) } != 0 {
+                break;
+            }
+            backlog.pop_front();
+        }
+    };
+    let mut server = None;
+    for step in 1..100u64 {
+        exchange(&mut a, &mut b, step * 1000, None);
+        server = b.accept(listener).ok();
+        if server.is_some() {
+            break;
+        }
+    }
+    let server = server.unwrap();
+    exchange(&mut a, &mut b, 200_000, None);
+
+    // Everything written was sent and ACKed.
+    let acked = |a: &Network<Dpdk>| {
+        let info = a.transport_info(client).unwrap();
+        info.unacked == 0 && info.send_used == 0
+    };
+    let data: Vec<u8> = (0..256 * 1024)
+        .map(|i| ((i * 23 + 7) % 251) as u8)
+        .collect();
+    let (mut sent, mut received) = (0, Vec::with_capacity(data.len()));
+    let mut out = vec![0u8; 65536];
+    // Writes the cap refused, and writes taken after a refusal while the
+    // device held chunks.
+    let (mut refused, mut resumed, mut waiting) = (0, 0, false);
+    for step in 0..20_000u64 {
+        while sent < data.len() {
+            let throttled = a.counters().memory_throttled_writes;
+            match a.try_write(
+                client,
+                &data[sent..data.len().min(sent + 4096)],
+                WriteOptions::default(),
+            ) {
+                Ok(receipt) => {
+                    sent += receipt.accepted;
+                    resumed += usize::from(waiting && held.iter().any(|&(_, external)| external));
+                    waiting = false;
+                }
+                Err(error) => {
+                    assert!(error.is_would_block(), "{error:?}");
+                    if a.counters().memory_throttled_writes > throttled {
+                        refused += 1;
+                        waiting = true;
+                    }
+                    break;
+                }
+            }
+        }
+        exchange(
+            &mut a,
+            &mut b,
+            300_000 + step * 1000,
+            hold.then_some(&mut held),
+        );
+        while let Ok(ReadOutcome::Data { len, .. }) = b.try_read(server, &mut out) {
+            received.extend_from_slice(&out[..len]);
+        }
+        if received.len() == data.len() && acked(&a) {
+            break;
+        }
+    }
+    assert_eq!(received, data);
+    assert!(refused > 0, "no write was refused for memory");
+    assert!(a.backend().tx_external() > 0);
+    let charge = a.counters().buffer_bytes;
+    if hold {
+        assert!(
+            resumed > 0,
+            "no refused writer wrote while chunks were held"
+        );
+        assert!(held.iter().any(|&(_, external)| external));
+        let live = chunk::live_dpdk_chunks();
+        assert!(live > 0);
+        for (m, _) in held.drain(..) {
+            unsafe { ntcp_test_tx_free(m) };
+        }
+        // Back in the source, the chunks serve the next writes.
+        let more = &data[..64 * 1024];
+        let mut written = 0;
+        for step in 0..20_000u64 {
+            if written < more.len()
+                && let Ok(receipt) = a.try_write(
+                    client,
+                    &more[written..more.len().min(written + 4096)],
+                    WriteOptions::default(),
+                )
+            {
+                written += receipt.accepted;
+            }
+            exchange(&mut a, &mut b, 30_000_000 + step * 1000, None);
+            while let Ok(ReadOutcome::Data { .. }) = b.try_read(server, &mut out) {}
+            if written == more.len() && acked(&a) {
+                break;
+            }
+        }
+        assert_eq!(chunk::live_dpdk_chunks(), live);
+    }
+    for step in 0..4 {
+        exchange(&mut a, &mut b, 60_000_000 + step, None);
+    }
+    drop(a);
+    drop(b);
+    charge
 }

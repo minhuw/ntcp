@@ -62,6 +62,7 @@ unsafe extern "C" {
         socket: i32,
         error: *mut i32,
     ) -> *mut c_void;
+    fn ntcp_dpdk_pool_in_use(pool: *const c_void) -> u32;
     fn ntcp_dpdk_pool_free(pool: *mut c_void) -> i32;
     fn ntcp_dpdk_port_configure(
         port: u16,
@@ -1382,6 +1383,23 @@ impl HostedQueue {
     /// zero-copy on: `Dpdk::enable_zero_copy` keeps what it enabled.)
     pub fn zero_copy_error(&self) -> Option<&io::Error> {
         self.zero_copy.as_ref()
+    }
+
+    /// See `Dpdk::lease_zero_copy_error`: set by the `enable_zero_copy`
+    /// that turned zero-copy on, on mlx5.
+    pub fn lease_zero_copy_error(&self) -> Option<&io::Error> {
+        self.io.lease_zero_copy_error()
+    }
+
+    /// The mbufs of this queue's pool that are out of it
+    /// (rte_mempool_in_use_count): on its RX and TX rings, prefetched by
+    /// the adapter, held as frames, and sent by reference or with external
+    /// buffers and not yet freed by the device. Mbufs in lcore caches count
+    /// as in the pool. A control-plane call: it reads every lcore's cache.
+    pub fn pool_in_use(&self) -> usize {
+        let pool = self.port.pools[usize::from(self.queue)];
+        // SAFETY: the queue's pool is live while the port is.
+        unsafe { ntcp_dpdk_pool_in_use(pool.as_ptr()) as usize }
     }
 
     /// See `Dpdk::tx_external`.

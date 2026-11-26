@@ -41,6 +41,7 @@ mod segmentation;
 #[path = "shared.rs"]
 mod shared;
 pub use shared::DpdkBuffer;
+use shared::TxRelease;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -368,6 +369,11 @@ pub struct Dpdk {
     // (segmentation::psh_on_last_segment), read with `tso`.
     tso_psh: bool,
     shared_limit: Option<u16>,
+    // How the queue frees external buffers while idle, read with
+    // `shared_limit` (enable_zero_copy).
+    tx_release: TxRelease,
+    // Why payload leases are copied (`lease_zero_copy_error`).
+    lease_zero_copy: Option<io::Error>,
     rx_timestamp: Option<TimestampConfig>,
     tx_scheduling: Option<TimestampConfig>,
     // The device's TCP checksum verdict is read (enable_rx_checksum).
@@ -527,6 +533,8 @@ impl Dpdk {
             tso: None,
             tso_psh: false,
             shared_limit: None,
+            tx_release: TxRelease::Cleanup,
+            lease_zero_copy: None,
             rx_timestamp: None,
             tx_scheduling: None,
             rx_checksum: false,
@@ -852,7 +860,12 @@ impl Dpdk {
                 MergedPart::Chunk { chunk, .. } => {
                     core::ptr::eq(chunk.vtable(), &chunk::DPDK_CHUNK_VTABLE)
                 }
-                MergedPart::Shared(slice) => slice.payload().storage::<DpdkBuffer>().is_some(),
+                // Leases are copied where TX completes on a later burst
+                // (TxRelease::LaterBurst).
+                MergedPart::Shared(slice) => {
+                    self.tx_release == TxRelease::Cleanup
+                        && slice.payload().storage::<DpdkBuffer>().is_some()
+                }
             });
 
         if !(header_fits_head && seg_limit_ok && all_dma_backed) {
