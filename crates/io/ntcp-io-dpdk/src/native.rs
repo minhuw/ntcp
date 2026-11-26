@@ -122,11 +122,29 @@ enum MergedPart<'a> {
     Shared(PayloadSlice<'a>),
 }
 
-impl<'a> MergedPart<'a> {
-    fn bytes(&self) -> &'a [u8] {
-        match *self {
-            Self::Chunk { chunk, offset, len } => chunk.bytes(offset..offset + len),
-            Self::Shared(slice) => slice.bytes(),
+impl From<&TxPart<'_>> for CopyPart {
+    fn from(part: &TxPart<'_>) -> Self {
+        let bytes = part.bytes();
+        Self {
+            ptr: bytes.as_ptr(),
+            length: bytes.len(),
+        }
+    }
+}
+
+fn with_copy_parts<R>(payload: &[TxPart<'_>], copy: impl FnOnce(&[CopyPart]) -> R) -> R {
+    match payload {
+        [] => copy(&[]),
+        [part] if part.is_empty() => copy(&[]),
+        [part] => copy(&[CopyPart::from(part)]),
+        many => {
+            let mut parts = SmallBuf::<CopyPart, INLINE_PARTS>::new();
+            for part in many {
+                if !part.is_empty() {
+                    parts.push(CopyPart::from(part));
+                }
+            }
+            copy(parts.as_slice())
         }
     }
 }
@@ -733,6 +751,149 @@ impl Dpdk {
         TxOutcome::WouldBlock
     }
 
+    // The copy path packs spans into mbufs by byte count. Only external
+    // buffers use a descriptor per span and need to coalesce chunk ranges.
+    fn transmit_copied_packet(
+        &self,
+        packet: &TxPacket<'_>,
+        offload: &TxOffload,
+        max_descriptors: u16,
+    ) -> i32 {
+        let copy = |parts: &[CopyPart]| {
+            // SAFETY: the port, queue and pool are live. The header and all
+            // part ranges borrow initialized bytes for this synchronous copy.
+            unsafe {
+                ntcp_dpdk_packet_transmit_copy(
+                    self.port,
+                    self.tx_queue,
+                    self.pool.as_ptr(),
+                    packet.header.as_ptr(),
+                    packet.header.len(),
+                    parts.as_ptr(),
+                    parts.len(),
+                    offload,
+                    max_descriptors,
+                )
+            }
+        };
+        with_copy_parts(packet.payload, copy)
+    }
+
+    fn transmit_external_packet(
+        &self,
+        packet: &TxPacket<'_>,
+        total_len: usize,
+        offload: &TxOffload,
+        max_descriptors: u16,
+        limit: u16,
+    ) -> Option<i32> {
+        // Skip zero-length parts and merge adjacent TxPart::Chunk slices from
+        // the same TxChunk with contiguous byte ranges (invariant I9).
+        let mut merged = SmallBuf::<MergedPart<'_>, INLINE_PARTS>::new();
+        for &part in packet.payload {
+            if part.is_empty() {
+                continue;
+            }
+            match part {
+                TxPart::Chunk(slice) => {
+                    if let Some(MergedPart::Chunk { chunk, offset, len }) = merged.last_mut()
+                        && core::ptr::eq(*chunk, slice.chunk())
+                        && *offset + *len == slice.offset()
+                    {
+                        *len += slice.len();
+                        continue;
+                    }
+                    merged.push(MergedPart::Chunk {
+                        chunk: slice.chunk(),
+                        offset: slice.offset(),
+                        len: slice.len(),
+                    });
+                }
+                TxPart::Shared(slice) => merged.push(MergedPart::Shared(slice)),
+            }
+        }
+
+        let merged_slice = merged.as_slice();
+        let payload_segs = merged_slice.len();
+        let pad_segs = usize::from(total_len < 60 && offload.mss == 0);
+        let total_segs = 1 + payload_segs + pad_segs;
+        let header_fits_head = !packet.header.is_empty()
+            && packet.header.len() <= usize::from(self.pool_room)
+            && (offload.l3 == 0 || packet.header.len() >= 14 + usize::from(offload.l3) + 20)
+            && (offload.mss == 0
+                || packet.header.len()
+                    >= 14 + usize::from(offload.l3) + usize::from(offload.l4));
+        let seg_limit_ok = total_segs <= usize::from(limit)
+            && (max_descriptors == 0 || total_segs <= usize::from(max_descriptors));
+        let all_dma_backed = payload_segs > 0
+            && merged_slice.iter().all(|part| match part {
+                MergedPart::Chunk { chunk, .. } => {
+                    core::ptr::eq(chunk.vtable(), &chunk::DPDK_CHUNK_VTABLE)
+                }
+                MergedPart::Shared(slice) => slice.payload().storage::<DpdkBuffer>().is_some(),
+            });
+
+        if !(header_fits_head && seg_limit_ok && all_dma_backed) {
+            return None;
+        }
+        let mut ext_parts = SmallBuf::<ExtPart, INLINE_PARTS>::new();
+        for &part in merged_slice {
+            match part {
+                MergedPart::Chunk { chunk, offset, len } => {
+                    ext_parts.push(ExtPart {
+                        kind: EXT_CHUNK,
+                        length: len as u16,
+                        offset: offset as u32,
+                        handle: chunk.context().cast(),
+                        address: ptr::null(),
+                        iova: 0,
+                    });
+                }
+                MergedPart::Shared(slice) => {
+                    let storage = slice.payload().storage::<DpdkBuffer>().unwrap();
+                    let base_offset = slice.payload().offset() + slice.range().start;
+                    debug_assert_eq!(
+                        slice.bytes().as_ptr(),
+                        storage.as_ref().as_ptr().wrapping_add(base_offset)
+                    );
+                    ext_parts.push(ExtPart {
+                        kind: EXT_SHARED,
+                        length: slice.len() as u16,
+                        offset: 0,
+                        handle: ptr::null_mut(),
+                        address: slice.bytes().as_ptr().cast(),
+                        iova: storage.iova + base_offset as u64,
+                    });
+                }
+            }
+        }
+        // Populate Shared leases only after ext_parts storage is finalized,
+        // so C receives and owns every lease on all paths.
+        for (ext, part) in ext_parts.as_mut_slice().iter_mut().zip(merged_slice) {
+            if let MergedPart::Shared(slice) = part {
+                ext.handle = Box::into_raw(Box::new(slice.to_payload())).cast();
+            }
+        }
+        let ext_slice = ext_parts.as_slice();
+        // SAFETY: live borrowed port/queue/pool; `ext_slice` entries point
+        // to live DPDK chunks (owner ref held across this call) or freshly
+        // boxed `Payload` leases over `DpdkBuffer` (all taken by C on every
+        // path).
+        Some(unsafe {
+            ntcp_dpdk_packet_transmit_ext(
+                self.port,
+                self.tx_queue,
+                self.pool.as_ptr(),
+                packet.header.as_ptr(),
+                packet.header.len() as u16,
+                ext_slice.as_ptr(),
+                ext_slice.len() as u16,
+                shared::release,
+                offload,
+            )
+        })
+    }
+
     /// Read-only diagnostic; does not configure or register anything.
     pub fn rx_timestamp_status(&self) -> io::Result<RxTimestampStatus> {
         let (mut supported, mut enabled) = (0, -1);
@@ -1192,143 +1353,14 @@ impl PacketIo for Dpdk {
             return Err(TransmitError::InvalidInput);
         }
 
-        // Skip zero-length parts and merge adjacent TxPart::Chunk slices from
-        // the same TxChunk with contiguous byte ranges (invariant I9).
-        let mut merged = SmallBuf::<MergedPart<'_>, INLINE_PARTS>::new();
-        for &part in packet.payload {
-            if part.is_empty() {
-                continue;
-            }
-            match part {
-                TxPart::Chunk(slice) => {
-                    if let Some(MergedPart::Chunk { chunk, offset, len }) = merged.last_mut()
-                        && core::ptr::eq(*chunk, slice.chunk())
-                        && *offset + *len == slice.offset()
-                    {
-                        *len += slice.len();
-                        continue;
-                    }
-                    merged.push(MergedPart::Chunk {
-                        chunk: slice.chunk(),
-                        offset: slice.offset(),
-                        len: slice.len(),
-                    });
-                }
-                TxPart::Shared(slice) => merged.push(MergedPart::Shared(slice)),
-            }
-        }
-
-        let payload_len = total_len - packet.header.len();
-        let merged_slice = merged.as_slice();
-        let payload_segs = merged_slice.len();
-        let pad_segs = usize::from(total_len < 60 && offload.mss == 0);
-        let total_segs = 1 + payload_segs + pad_segs;
-        let header_fits_head = !packet.header.is_empty()
-            && packet.header.len() <= usize::from(self.pool_room)
-            && (offload.l3 == 0 || packet.header.len() >= 14 + usize::from(offload.l3) + 20)
-            && (offload.mss == 0
-                || packet.header.len()
-                    >= 14 + usize::from(offload.l3) + usize::from(offload.l4));
-        let seg_limit_ok = self.shared_limit.is_some_and(|limit| {
-            total_segs <= usize::from(limit)
-                && (max_descriptors == 0 || total_segs <= usize::from(max_descriptors))
-        });
-        let all_dma_backed = payload_segs > 0
-            && merged_slice.iter().all(|part| match part {
-                MergedPart::Chunk { chunk, .. } => {
-                    core::ptr::eq(chunk.vtable(), &chunk::DPDK_CHUNK_VTABLE)
-                }
-                MergedPart::Shared(slice) => slice.payload().storage::<DpdkBuffer>().is_some(),
+        let external = self
+            .shared_limit
+            .filter(|_| total_len - packet.header.len() > self.tx_copybreak)
+            .and_then(|limit| {
+                self.transmit_external_packet(packet, total_len, &offload, max_descriptors, limit)
             });
-
-        let result = if payload_len > self.tx_copybreak
-            && header_fits_head
-            && seg_limit_ok
-            && all_dma_backed
-        {
-            let mut ext_parts = SmallBuf::<ExtPart, INLINE_PARTS>::new();
-            for &part in merged_slice {
-                match part {
-                    MergedPart::Chunk { chunk, offset, len } => {
-                        ext_parts.push(ExtPart {
-                            kind: EXT_CHUNK,
-                            length: len as u16,
-                            offset: offset as u32,
-                            handle: chunk.context().cast(),
-                            address: ptr::null(),
-                            iova: 0,
-                        });
-                    }
-                    MergedPart::Shared(slice) => {
-                        let storage = slice.payload().storage::<DpdkBuffer>().unwrap();
-                        let base_offset = slice.payload().offset() + slice.range().start;
-                        debug_assert_eq!(
-                            slice.bytes().as_ptr(),
-                            storage.as_ref().as_ptr().wrapping_add(base_offset)
-                        );
-                        ext_parts.push(ExtPart {
-                            kind: EXT_SHARED,
-                            length: slice.len() as u16,
-                            offset: 0,
-                            handle: ptr::null_mut(),
-                            address: slice.bytes().as_ptr().cast(),
-                            iova: storage.iova + base_offset as u64,
-                        });
-                    }
-                }
-            }
-            // Populate Shared leases only after ext_parts storage is finalized,
-            // so C receives and owns every lease on all paths.
-            for (ext, part) in ext_parts.as_mut_slice().iter_mut().zip(merged_slice) {
-                if let MergedPart::Shared(slice) = part {
-                    ext.handle = Box::into_raw(Box::new(slice.to_payload())).cast();
-                }
-            }
-            let ext_slice = ext_parts.as_slice();
-            // SAFETY: live borrowed port/queue/pool; `ext_slice` entries point
-            // to live DPDK chunks (owner ref held across this call) or freshly
-            // boxed `Payload` leases over `DpdkBuffer` (all taken by C on every
-            // path).
-            unsafe {
-                ntcp_dpdk_packet_transmit_ext(
-                    self.port,
-                    self.tx_queue,
-                    self.pool.as_ptr(),
-                    packet.header.as_ptr(),
-                    packet.header.len() as u16,
-                    ext_slice.as_ptr(),
-                    ext_slice.len() as u16,
-                    shared::release,
-                    &offload,
-                )
-            }
-        } else {
-            let mut copy_parts = SmallBuf::<CopyPart, INLINE_PARTS>::new();
-            for part in merged_slice {
-                let bytes = part.bytes();
-                copy_parts.push(CopyPart {
-                    ptr: bytes.as_ptr(),
-                    length: bytes.len(),
-                });
-            }
-            let copy_slice = copy_parts.as_slice();
-            // SAFETY: live borrowed port/queue/pool; `packet.header` and every
-            // `copy_slice` entry are readable for the call and copied before
-            // return.
-            unsafe {
-                ntcp_dpdk_packet_transmit_copy(
-                    self.port,
-                    self.tx_queue,
-                    self.pool.as_ptr(),
-                    packet.header.as_ptr(),
-                    packet.header.len(),
-                    copy_slice.as_ptr(),
-                    copy_slice.len(),
-                    &offload,
-                    max_descriptors,
-                )
-            }
-        };
+        let result = external
+            .unwrap_or_else(|| self.transmit_copied_packet(packet, &offload, max_descriptors));
 
         match result {
             0 => Ok(TxOutcome::WouldBlock),

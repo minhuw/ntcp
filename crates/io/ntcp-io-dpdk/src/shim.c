@@ -918,6 +918,26 @@ int ntcp_dpdk_packet_transmit_copy(uint16_t port, uint16_t queue, void *pool,
             return -EINVAL;
         }
     }
+    // The complete frame normally fits in the head. Set its lengths once
+    // and copy the spans without walking or updating a segment chain.
+    size_t wire_len = offload->mss ? total : RTE_MAX(total, (size_t)60);
+    if (wire_len <= room) {
+        uint8_t *dst = rte_pktmbuf_mtod(head, uint8_t *);
+        if (header_length) {
+            memcpy(dst, header, header_length);
+            dst += header_length;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (parts[i].length) {
+                memcpy(dst, parts[i].ptr, parts[i].length);
+                dst += parts[i].length;
+            }
+        }
+        if (total < wire_len) memset(dst, 0, wire_len - total);
+        head->data_len = (uint16_t)wire_len;
+        head->pkt_len = (uint32_t)wire_len;
+        return prepare_and_send(port, queue, head, offload);
+    }
     struct rte_mbuf *cur = head;
     uint8_t *dst = rte_pktmbuf_mtod(head, uint8_t *);
     size_t cur_rem = room;
