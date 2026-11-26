@@ -1,4 +1,5 @@
 use super::*;
+use crate::host::dpdk_error;
 use ntcp_io::{OwnedPacket, Payload, StablePayloadStorage, ZeroCopyCapabilities};
 
 #[repr(C)]
@@ -12,7 +13,13 @@ unsafe extern "C" {
     fn ntcp_dpdk_reclaim(port: u16, queue: u16, budget: u32) -> i32;
     fn ntcp_dpdk_payload_alloc(length: usize, iova: *mut u64) -> *mut u8;
     fn ntcp_dpdk_payload_free(address: *mut u8);
-    fn ntcp_dpdk_shared_check(port: u16, queue: u16, pool: *mut c_void, limit: *mut u16) -> i32;
+    fn ntcp_dpdk_shared_check(
+        port: u16,
+        queue: u16,
+        pool: *mut c_void,
+        limit: *mut u16,
+        stage: *mut i32,
+    ) -> i32;
     fn ntcp_dpdk_shared_transmit(
         port: u16,
         queue: u16,
@@ -81,6 +88,31 @@ impl Drop for DpdkBuffer {
         unsafe { ntcp_dpdk_payload_free(self.address.as_ptr()) };
     }
 }
+// The error of ntcp_dpdk_shared_check failing with `result` at `stage`
+// (shim.c's NTCP_SHARED_*), the segment limit it read for stage 10.
+fn shared_check_error(stage: i32, result: i32, limit: u16) -> io::Error {
+    if stage == 10 {
+        return dpdk_error(
+            &format!("tx segment limit {limit} is below 3 (header, payload and pad)"),
+            result,
+        );
+    }
+    let context = match stage {
+        1 => "rte_eth_dev_info_get",
+        2 => "tx queue exceeds the device's queue count",
+        3 => "rte_eth_dev_conf_get",
+        4 => "rte_eth_tx_queue_info_get",
+        5 => "device lacks RTE_ETH_TX_OFFLOAD_MULTI_SEGS",
+        6 => "tx queue does not enable RTE_ETH_TX_OFFLOAD_MULTI_SEGS",
+        7 => "device reports no tx segment or descriptor limit",
+        8 => "tx queue enables RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE",
+        9 => "pool data room leaves under 134 octets past headroom",
+        11 => "rte_eth_tx_done_cleanup",
+        _ => unreachable!("ntcp_dpdk_shared_check stage {stage}"),
+    };
+    dpdk_error(context, result)
+}
+
 pub(super) unsafe extern "C" fn release(lease: *mut c_void) {
     // SAFETY: shim takes each Box exactly once, either on failure or mbuf reclaim.
     // Payload release callbacks are required not to panic across this boundary.
@@ -89,15 +121,22 @@ pub(super) unsafe extern "C" fn release(lease: *mut c_void) {
 impl Dpdk {
     /// Validate enabled multi-segment TX, descriptor limits and idle reclaim.
     /// This may reclaim already completed packets. The host keeps port/queue
-    /// configuration unchanged; no offload is enabled here.
+    /// configuration unchanged; no offload is enabled here. The error names
+    /// the check that failed, with its errno.
     pub fn enable_zero_copy(&mut self) -> io::Result<()> {
-        let mut limit = 0;
-        // SAFETY: borrowed objects remain live and output is writable.
+        let (mut limit, mut stage) = (0, 0);
+        // SAFETY: borrowed objects remain live and outputs are writable.
         let result = unsafe {
-            ntcp_dpdk_shared_check(self.port, self.tx_queue, self.pool.as_ptr(), &mut limit)
+            ntcp_dpdk_shared_check(
+                self.port,
+                self.tx_queue,
+                self.pool.as_ptr(),
+                &mut limit,
+                &mut stage,
+            )
         };
         if result < 0 {
-            return Err(io::Error::from_raw_os_error(-result));
+            return Err(shared_check_error(stage, result, limit));
         }
         // Require at least 3 descriptors: 1 header + 1 payload + 1 Ethernet pad
         // (mirrors ntcp_dpdk_shared_check in shim.c).
@@ -221,7 +260,16 @@ pub(super) fn ring_test(io: &mut Dpdk) {
         fn ntcp_test_hold(leave: u32);
         fn ntcp_test_release();
     }
-    assert!(io.enable_zero_copy().is_err()); // ring does not expose queue-info.
+    // The ring PMD has no txq_info_get (rte_eth_ring.c's ops).
+    let error = io.enable_zero_copy().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "rte_eth_tx_queue_info_get: {}",
+            io::Error::from_raw_os_error(95)
+        )
+    );
     assert!(io.zero_copy_capabilities().is_none());
     // Limits below 3 (1 header + 1 payload + 1 Ethernet pad) must never
     // underflow and must report zero-copy unavailable.
@@ -325,4 +373,46 @@ pub(super) fn ring_test(io: &mut Dpdk) {
     assert_eq!(count.load(Ordering::SeqCst), 3);
     assert_eq!(unsafe { ntcp_test_available() }, 1023);
     io.shared_limit = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_check_error_names_the_check() {
+        let (enotsup, einval) = (-95, -22);
+        let expected = [
+            (1, "rte_eth_dev_info_get"),
+            (2, "tx queue exceeds the device's queue count"),
+            (3, "rte_eth_dev_conf_get"),
+            (4, "rte_eth_tx_queue_info_get"),
+            (5, "device lacks RTE_ETH_TX_OFFLOAD_MULTI_SEGS"),
+            (6, "tx queue does not enable RTE_ETH_TX_OFFLOAD_MULTI_SEGS"),
+            (7, "device reports no tx segment or descriptor limit"),
+            (8, "tx queue enables RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE"),
+            (9, "pool data room leaves under 134 octets past headroom"),
+            (
+                10,
+                "tx segment limit 2 is below 3 (header, payload and pad)",
+            ),
+            (11, "rte_eth_tx_done_cleanup"),
+        ];
+        let unsupported = io::Error::from_raw_os_error(95);
+        for (stage, context) in expected {
+            let error = shared_check_error(stage, enotsup, 2);
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{stage}");
+            assert_eq!(error.to_string(), format!("{context}: {unsupported}"));
+        }
+        // The errno is kept, also where it is not ENOTSUP.
+        let error = shared_check_error(2, einval, 0);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "tx queue exceeds the device's queue count: {}",
+                io::Error::from_raw_os_error(22)
+            )
+        );
+    }
 }

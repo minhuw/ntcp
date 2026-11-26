@@ -1101,10 +1101,12 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
             header: &header,
             payload: &parts,
         };
+        let external = io.tx_external();
         assert_eq!(
             io.transmit_packet(&pkt, TransmitRequest::default()).unwrap(),
             TxOutcome::Submitted
         );
+        assert_eq!(io.tx_external(), external + 1);
         // Owner ref (1) + attached extbuf mbuf (1) = 2.
         assert_eq!(chunk::chunk_refcnt(&c), 2);
         let mut info = TestTxInfo::default();
@@ -1200,6 +1202,7 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
         unsafe { ntcp_test_tx_free(m) };
 
         // Exact boundary payload == DEFAULT_TX_COPYBREAK (512): still copy path!
+        let external = io.tx_external();
         let at_break = [TxPart::Chunk(ChunkSlice::new(&c, 0..512).unwrap())];
         assert_eq!(
             io.transmit_packet(
@@ -1213,6 +1216,7 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
             TxOutcome::Submitted
         );
         assert_eq!(chunk::chunk_refcnt(&c), 1);
+        assert_eq!(io.tx_external(), external);
         let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
         assert_eq!(info.pkt_len, 54 + 512);
         for seg in &segs[..info.nb_segs as usize] {
@@ -1234,6 +1238,7 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
             TxOutcome::Submitted
         );
         assert_eq!(chunk::chunk_refcnt(&c), 2);
+        assert_eq!(io.tx_external(), external + 1);
         let m = unsafe { ntcp_test_tx_dequeue(&mut info, segs.as_mut_ptr(), 8) };
         assert_eq!(info.nb_segs, 2);
         assert_eq!(segs[1].external, 1);
@@ -1455,6 +1460,7 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
         ];
         for leave in [0u32, 1, 2] {
             let before = io.device_counters().tx_nombuf;
+            let external = io.tx_external();
             unsafe { ntcp_test_hold(leave) };
             assert_eq!(
                 io.transmit_packet(
@@ -1468,6 +1474,7 @@ unsafe fn chunk_and_transmit_packet_ring_test(io: &mut Dpdk) {
                 TxOutcome::WouldBlock
             );
             assert_eq!(io.device_counters().tx_nombuf, before + 1);
+            assert_eq!(io.tx_external(), external); // Not submitted.
             assert_eq!(chunk::chunk_refcnt(&c), 1);
             assert_eq!(unsafe { ntcp_test_available() }, leave);
             unsafe { ntcp_test_release() };

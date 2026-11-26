@@ -504,28 +504,48 @@ int ntcp_dpdk_reclaim(uint16_t port, uint16_t queue, uint32_t budget) {
     if (!budget) return 0; // DPDK zero means unbounded: never forward it.
     return rte_eth_tx_done_cleanup(port, queue, budget);
 }
-int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, uint16_t *limit) {
+// The check of ntcp_dpdk_shared_check that failed, in `*stage`.
+enum {
+    NTCP_SHARED_INFO = 1, NTCP_SHARED_QUEUE, NTCP_SHARED_CONF, NTCP_SHARED_QUEUE_INFO,
+    NTCP_SHARED_MULTI_SEGS_CAPA, NTCP_SHARED_MULTI_SEGS, NTCP_SHARED_LIMITS,
+    NTCP_SHARED_FAST_FREE, NTCP_SHARED_ROOM, NTCP_SHARED_SEGMENTS, NTCP_SHARED_CLEANUP,
+};
+
+int ntcp_dpdk_shared_check(uint16_t port, uint16_t queue, void *pool, uint16_t *limit,
+                           int *stage) {
     struct rte_eth_dev_info info;
+    *stage = NTCP_SHARED_INFO;
     int result = rte_eth_dev_info_get(port, &info);
     if (result < 0) return result;
+    *stage = NTCP_SHARED_QUEUE;
     if (queue >= info.nb_tx_queues) return -EINVAL;
     struct rte_eth_conf conf;
+    *stage = NTCP_SHARED_CONF;
     result = rte_eth_dev_conf_get(port, &conf);
     if (result < 0) return result;
     struct rte_eth_txq_info qinfo;
+    *stage = NTCP_SHARED_QUEUE_INFO;
     result = rte_eth_tx_queue_info_get(port, queue, &qinfo);
     if (result < 0) return result;
-    if (!(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
-        !((conf.txmode.offloads | qinfo.conf.offloads) & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) ||
-        !info.tx_desc_lim.nb_seg_max || !info.tx_desc_lim.nb_mtu_seg_max || !qinfo.nb_desc ||
-        ((conf.txmode.offloads | qinfo.conf.offloads) & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) ||
-        rte_pktmbuf_data_room_size(pool) < RTE_PKTMBUF_HEADROOM + 134)
+    uint64_t offloads = conf.txmode.offloads | qinfo.conf.offloads;
+    *stage = NTCP_SHARED_MULTI_SEGS_CAPA;
+    if (!(info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS)) return -ENOTSUP;
+    *stage = NTCP_SHARED_MULTI_SEGS;
+    if (!(offloads & RTE_ETH_TX_OFFLOAD_MULTI_SEGS)) return -ENOTSUP;
+    *stage = NTCP_SHARED_LIMITS;
+    if (!info.tx_desc_lim.nb_seg_max || !info.tx_desc_lim.nb_mtu_seg_max || !qinfo.nb_desc)
         return -ENOTSUP;
+    *stage = NTCP_SHARED_FAST_FREE;
+    if (offloads & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) return -ENOTSUP;
+    *stage = NTCP_SHARED_ROOM;
+    if (rte_pktmbuf_data_room_size(pool) < RTE_PKTMBUF_HEADROOM + 134) return -ENOTSUP;
     *limit = RTE_MIN(RTE_MIN(info.tx_desc_lim.nb_seg_max,
                           info.tx_desc_lim.nb_mtu_seg_max), qinfo.nb_desc);
+    *stage = NTCP_SHARED_SEGMENTS;
     if (*limit < 3) return -ENOTSUP;
     // Idle TX must progress without waiting for another packet to be sent.
     // This may reclaim a completed packet but never changes port settings.
+    *stage = NTCP_SHARED_CLEANUP;
     result = ntcp_dpdk_reclaim(port, queue, 1);
     return result < 0 ? result : 0;
 }

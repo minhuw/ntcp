@@ -810,6 +810,23 @@ fn hosted_network_e2e(eal: &'static Eal) {
     let port = Port::start(eal, config).unwrap();
     let q0 = Rc::new(RefCell::new(port.take_queue(0).unwrap().attach().unwrap()));
     let q1 = Rc::new(RefCell::new(port.take_queue(1).unwrap().attach().unwrap()));
+    // The ring PMD has no txq_info_get, so both queues send by copying.
+    let reason = format!(
+        "rte_eth_tx_queue_info_get: {}",
+        std::io::Error::from_raw_os_error(95)
+    );
+    for queue in [&q0, &q1] {
+        let queue = queue.borrow();
+        let error = queue.zero_copy_error().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), reason);
+    }
+    let error = q0.borrow_mut().enable_zero_copy().unwrap_err();
+    assert_eq!(error.to_string(), reason);
+    assert_eq!(
+        q0.borrow().zero_copy_error().map(ToString::to_string),
+        Some(reason)
+    );
 
     let io_a = CrossQueue {
         tx: Rc::clone(&q0),
@@ -904,6 +921,11 @@ fn hosted_network_e2e(eal: &'static Eal) {
     assert_eq!(got_c, s_to_c);
     assert_eq!(a.counters().tcp_checksum_errors, 0);
     assert_eq!(b.counters().tcp_checksum_errors, 0);
+    // Bulk payloads above copybreak were copied too.
+    assert_eq!(
+        (q0.borrow().tx_external(), q1.borrow().tx_external()),
+        (0, 0)
+    );
 
     // Close and drain residual ACKs/FINs so no mbufs remain stranded on rings.
     let _ = a.close(client);

@@ -135,7 +135,7 @@ const RSS_QUERY_ATTEMPTS: usize = 3;
 const LCORE_ID_ANY: u32 = u32::MAX;
 
 // Negative errno from DPDK, with the failed step named.
-fn dpdk_error(context: &str, result: i32) -> io::Error {
+pub(crate) fn dpdk_error(context: &str, result: i32) -> io::Error {
     let errno = result.checked_neg().unwrap_or(5); // EIO
     let source = io::Error::from_raw_os_error(errno);
     let kind = match errno {
@@ -1205,7 +1205,8 @@ impl QueueHandle {
         // one mbuf (Port::start).
         let mut io =
             unsafe { Dpdk::from_borrowed(self.port.port, self.queue, self.queue, pool.as_ptr()) }?;
-        let _ = io.enable_zero_copy();
+        // A queue without zero-copy still sends by copying.
+        let zero_copy = io.enable_zero_copy().err();
         if let Some(clock) = self.port.clock {
             io.enable_rx_timestamps(clock)?;
         }
@@ -1233,6 +1234,7 @@ impl QueueHandle {
             port: self.port.clone(),
             _registration: registration,
             queue: self.queue,
+            zero_copy,
         })
     }
 }
@@ -1312,6 +1314,8 @@ pub struct HostedQueue {
     port: Arc<PortInner>,
     _registration: Registration,
     queue: u16,
+    // Why the last `enable_zero_copy` (attach's, or a later call) failed.
+    zero_copy: Option<io::Error>,
 }
 
 impl HostedQueue {
@@ -1362,8 +1366,27 @@ impl HostedQueue {
     }
 
     /// See `Dpdk::enable_zero_copy`; multi-segment TX is enabled when supported.
+    /// `attach` calls it; this checks again and updates `zero_copy_error`.
     pub fn enable_zero_copy(&mut self) -> io::Result<()> {
-        self.io.enable_zero_copy()
+        let result = self.io.enable_zero_copy();
+        self.zero_copy = result
+            .as_ref()
+            .err()
+            .map(|e| io::Error::new(e.kind(), e.to_string()));
+        result
+    }
+
+    /// Why zero-copy TX is off on this queue: the error of the last
+    /// `enable_zero_copy`, attach's unless called since; None after it
+    /// succeeded. (A failure after a success reports its error, but leaves
+    /// zero-copy on: `Dpdk::enable_zero_copy` keeps what it enabled.)
+    pub fn zero_copy_error(&self) -> Option<&io::Error> {
+        self.zero_copy.as_ref()
+    }
+
+    /// See `Dpdk::tx_external`.
+    pub fn tx_external(&self) -> u64 {
+        self.io.tx_external()
     }
 
     /// See `Dpdk::tx_copybreak`.

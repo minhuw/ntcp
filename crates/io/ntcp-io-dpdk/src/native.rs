@@ -376,6 +376,8 @@ pub struct Dpdk {
     tx_checksum: bool,
     // Transmit attempts that found the pool empty (DeviceCounters).
     tx_nombuf: u64,
+    // Packets `transmit_packet` submitted with external payload buffers.
+    tx_external: u64,
     // Mbufs handed over by reference (`receive_frame`): how many, and
     // their returns, which the adapter's block counts (`MBUF_FRAME`).
     frames_taken: u64,
@@ -530,6 +532,7 @@ impl Dpdk {
             rx_checksum: false,
             tx_checksum: false,
             tx_nombuf: 0,
+            tx_external: 0,
             frames_taken: 0,
             frames: NonNull::from(Box::leak(Box::new(RxFrameCount::new()))),
             frame_truesize: element,
@@ -538,6 +541,12 @@ impl Dpdk {
             rx_frame_budget: None,
             _local: PhantomData,
         })
+    }
+
+    /// Packets `transmit_packet` submitted with payload attached as external
+    /// buffers (zero-copy) rather than copied; the device accepted each.
+    pub fn tx_external(&self) -> u64 {
+        self.tx_external
     }
 
     /// Payload-length threshold at or below which `transmit_packet` copies
@@ -1421,8 +1430,15 @@ impl PacketIo for Dpdk {
             .and_then(|limit| {
                 self.transmit_external_packet(packet, total_len, &offload, max_descriptors, limit)
             });
-        let result = external
-            .unwrap_or_else(|| self.transmit_copied_packet(packet, &offload, max_descriptors));
+        let result = match external {
+            Some(result) => {
+                if result == 1 {
+                    self.tx_external += 1;
+                }
+                result
+            }
+            None => self.transmit_copied_packet(packet, &offload, max_descriptors),
+        };
 
         match result {
             0 => Ok(TxOutcome::WouldBlock),
