@@ -335,19 +335,41 @@ enum PathNextHop {
     Forwarder(ForwarderId),
 }
 
+// Every selected handle in a path key belongs to its link's context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct KeyHandle {
+    slot: usize,
+    generation: NonZeroU64,
+}
+impl KeyHandle {
+    const fn new(handle: Handle) -> Self {
+        Self {
+            slot: handle.slot,
+            generation: handle.generation,
+        }
+    }
+    const fn in_context(self, context: ContextId) -> Handle {
+        Handle {
+            context,
+            slot: self.slot,
+            generation: self.generation,
+        }
+    }
+}
+
 /// Canonical immutable identity, minted only by authoritative route resolution.
 /// A key is provenance, not a perpetual output authorization: validate_selection
 /// must be checked at use. Link MTU and mutable ECN do not change identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct PathKey {
-    source: SourceId,
+    source: KeyHandle,
     source_address: IpAddr,
     destination: IpAddr,
     forwarding_destination: IpAddr,
     dscp: Dscp,
     link: LinkId,
     next_hop: PathNextHop,
-    route: RouteId,
+    route: KeyHandle,
     // The forwarding generation of the Redirect override that chose
     // `next_hop`; 0 for the route's own next hop.
     forwarding: u64,
@@ -368,7 +390,7 @@ impl PathKey {
         self.link.context()
     }
     pub const fn source(&self) -> SourceId {
-        self.source
+        SourceId(self.source.in_context(self.context()))
     }
     pub const fn source_address(&self) -> ScopedAddress {
         self.scoped(self.source_address)
@@ -394,11 +416,11 @@ impl PathKey {
         }
     }
     pub const fn route(&self) -> RouteId {
-        self.route
+        RouteId(self.route.in_context(self.context()))
     }
     pub const fn request(&self) -> PathRequest {
         PathRequest {
-            source: self.source,
+            source: self.source(),
             destination: self.destination(),
             dscp: self.dscp,
         }
@@ -1192,14 +1214,14 @@ impl PathService {
         Ok(ResolvedPath {
             revision: self.revision,
             key: PathKey {
-                source: request.source,
+                source: KeyHandle::new(request.source.0),
                 source_address: source.address,
                 destination: request.destination.address,
                 forwarding_destination: forwarding_destination.address,
                 dscp: request.dscp,
                 link: route.link,
                 next_hop,
-                route: id,
+                route: KeyHandle::new(id.0),
                 forwarding,
             },
             first_hop_mtu: link.mtu,
@@ -1218,7 +1240,7 @@ impl PathService {
         // An SR route generation's segments are immutable: reselect by the
         // final destination and compare the derived S1 with the rest of the
         // key, never matching S1 against the route's destination prefix.
-        let current = if self.route_segments(key.route)?.is_empty() {
+        let current = if self.route_segments(key.route())?.is_empty() {
             self.resolve_via(key.request(), key.forwarding_destination())?
         } else {
             self.resolve(key.request())?

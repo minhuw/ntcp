@@ -138,13 +138,13 @@ impl PathService {
         let dscp = type_of_service.then_some(key.dscp);
         let existing = self.redirects.iter().position(|r| {
             r.is_some_and(|r| {
-                r.route == key.route && r.destination == destination && r.dscp == dscp
+                r.route == key.route() && r.destination == destination && r.dscp == dscp
             })
         });
         let installs = dscp.is_some() || {
             let first_hop = match existing.and_then(|i| self.redirects[i]) {
                 Some(general) => ResolvedNextHop::Address(general.target),
-                None => match self.route(key.route)?.next_hop {
+                None => match self.route(key.route())?.next_hop {
                     NextHop::OnLink => ResolvedNextHop::Address(destination),
                     NextHop::Gateway(g) => ResolvedNextHop::Address(g),
                     NextHop::Forwarder(id) => ResolvedNextHop::Forwarder(id),
@@ -177,7 +177,7 @@ impl PathService {
             dscp.is_none()
                 && Some(i) != index
                 && r.is_some_and(|r| {
-                    r.route == key.route
+                    r.route == key.route()
                         && r.destination == destination
                         && r.dscp.is_some()
                         && r.target == sender
@@ -205,7 +205,7 @@ impl PathService {
             self.set_redirect(
                 i,
                 Some(Redirect {
-                    route: key.route,
+                    route: key.route(),
                     link: key.link,
                     destination,
                     dscp,
@@ -268,7 +268,7 @@ impl PathService {
     // Whether the selection replacing `key` keeps its flow and route and
     // changes only the first hop an override chose.
     pub(super) fn forwarding_transition(&self, key: PathKey) -> bool {
-        let current = if self.route_segments(key.route).is_ok_and(<[_]>::is_empty) {
+        let current = if self.route_segments(key.route()).is_ok_and(<[_]>::is_empty) {
             self.resolve_via(key.request(), key.forwarding_destination())
         } else {
             self.resolve(key.request())

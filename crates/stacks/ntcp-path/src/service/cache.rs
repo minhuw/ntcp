@@ -70,7 +70,7 @@ pub struct PathSnapshot {
     learned_mtu: Option<u32>,
     negative_revision: u64,
     retry_not_before: u64,
-    ipv4_plateaus: Option<Ipv4Plateaus>,
+    ipv4_plateaus: crate::plateaus::SnapshotPlateaus,
     // Administrative restriction of this incarnation's packet budget carried
     // from its route's retained admission state at installation: a cap, not
     // learned network state. Kept through upward sets and clears; only
@@ -129,7 +129,7 @@ impl PathSnapshot {
         self.retry_not_before
     }
     pub const fn ipv4_plateaus(self) -> Option<Ipv4Plateaus> {
-        self.ipv4_plateaus
+        self.ipv4_plateaus.table()
     }
     /// An administrative cap on this incarnation's packet budget that came
     /// from its route's retained restriction when the path was installed
@@ -414,11 +414,10 @@ impl PathService {
                         path.unlearned_mtu =
                             path.unlearned_mtu.max(network.pmtu_estimate().unwrap());
                     }
-                    path.snapshot.ipv4_plateaus = old
-                        .key
-                        .destination
-                        .is_ipv4()
-                        .then_some(self.plateaus);
+                    path.snapshot.ipv4_plateaus = crate::plateaus::SnapshotPlateaus::new(
+                        old.key.destination.is_ipv4(),
+                        self.plateaus,
+                    );
                 }
                 Err(_) => {
                     // Invalidation releases the administrative pin and its
@@ -429,11 +428,11 @@ impl PathService {
                         path.admin = PathAdmin::default();
                     }
                     let key = old.key;
-                    let reason = if self.source_address(key.source).is_err() {
+                    let reason = if self.source_address(key.source()).is_err() {
                         InvalidationReason::SourceRemoved
                     } else if self.link(key.link).is_err() {
                         InvalidationReason::LinkRemoved
-                    } else if self.route(key.route).is_err() {
+                    } else if self.route(key.route()).is_err() {
                         InvalidationReason::RouteRemoved
                     } else {
                         InvalidationReason::SelectionChanged
@@ -567,7 +566,7 @@ impl PathService {
         });
         // Route policy and its conservative admission state survive idle
         // eviction; learned network state does not.
-        let route = self.route_admin(resolved.key.route).unwrap_or_default();
+        let route = self.route_admin(resolved.key.route()).unwrap_or_default();
         let mut snapshot = PathSnapshot {
             stamp: ChangeStamp {
                 path: id,
@@ -580,16 +579,15 @@ impl PathService {
             learned_mtu: None,
             negative_revision: 0,
             retry_not_before: route.hold,
-            ipv4_plateaus: resolved
-                .key
-                .destination
-                .is_ipv4()
-                .then_some(self.plateaus),
+            ipv4_plateaus: crate::plateaus::SnapshotPlateaus::new(
+                resolved.key.destination.is_ipv4(),
+                self.plateaus,
+            ),
             restriction: None,
             admin_estimate: route.policy.estimate,
             discovery_disabled: route.policy.discovery_disabled,
             discovery_revision: 0,
-            ip_header_len: match self.route_segments(resolved.key.route).map_or(0, <[_]>::len) {
+            ip_header_len: match self.route_segments(resolved.key.route()).map_or(0, <[_]>::len) {
                 0 if resolved.key.destination.is_ipv4() => 20,
                 0 => 40,
                 n => 40 + 8 + 16 * (n as u32 + 1),
@@ -606,7 +604,7 @@ impl PathService {
         {
             // The current value restricts this new path: retain it for the
             // route's future paths as a downward set on a live path would.
-            self.retain_route_restriction(resolved.key.route, imposed);
+            self.retain_route_restriction(resolved.key.route(), imposed);
         }
         // The same flow's exact-path policy, carried across a forwarding
         // transition, restricts this incarnation as it did the last one,
@@ -1157,7 +1155,7 @@ impl PathService {
         exact_sent_size: u32,
     ) -> Result<EstimateChange, Error> {
         let snapshot = self.path_snapshot(path)?;
-        let table = snapshot.ipv4_plateaus.ok_or(Error::InvalidArgument)?;
+        let table = snapshot.ipv4_plateaus().ok_or(Error::InvalidArgument)?;
         let candidate = table.legacy_fallback(
             snapshot.pmtu_estimate()?,
             quoted_total,

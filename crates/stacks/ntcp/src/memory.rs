@@ -425,8 +425,13 @@ impl Budget {
             returned: false,
             waiting: false,
         });
-        // The group's pressure replaces this endpoint's own.
-        self.pressure_since = None;
+        // Only this member can change a single-owner group's pressure.
+        // Keep its local state as well, for the per-packet pressure checks.
+        self.pressure_since = if self.shared_counts {
+            None
+        } else {
+            group.pressure_since.load(Ordering::Relaxed).checked_sub(1)
+        };
         let memory = self.memory(own);
         self.raise(0, now, memory);
         Ok(())
@@ -497,9 +502,16 @@ impl Budget {
     }
 
     pub(crate) fn under_pressure(&self) -> bool {
-        match &self.share {
-            Some(share) => share.group.pressure_since.load(Ordering::Relaxed) != 0,
-            None => self.pressure_since.is_some(),
+        if self.shared_counts {
+            self.share
+                .as_ref()
+                .unwrap()
+                .group
+                .pressure_since
+                .load(Ordering::Relaxed)
+                != 0
+        } else {
+            self.pressure_since.is_some()
         }
     }
 
@@ -521,7 +533,7 @@ impl Budget {
         let allocated = self.allocated();
         if allocated > memory.pressure {
             self.enter(now);
-        } else if allocated <= memory.low {
+        } else if (self.shared_counts || self.pressure_since.is_some()) && allocated <= memory.low {
             self.leave(now);
         }
     }
@@ -529,11 +541,6 @@ impl Budget {
     // Return `bytes` at `now`: as __sk_mem_reduce_allocated, pressure ends
     // once the charge falls to `memory.low`.
     pub(crate) fn reduce(&mut self, bytes: usize, now: Instant, own_low: usize) {
-        let low = match &self.share {
-            Some(share) if share.changing_limits => share.group.low.load(Ordering::Relaxed),
-            Some(share) => share.limits.low,
-            None => own_low,
-        };
         self.charged -= bytes;
         if let Some(share) = &mut self.share {
             // sk_memory_allocated_sub: a reserve this far below zero goes
@@ -549,6 +556,16 @@ impl Budget {
                 share.returned = true;
             }
         }
+        // With a single writer our local pressure flag is authoritative.
+        // A return outside pressure has already done all its accounting.
+        if !self.shared_counts && self.pressure_since.is_none() {
+            return;
+        }
+        let low = match &self.share {
+            Some(share) if share.changing_limits => share.group.low.load(Ordering::Relaxed),
+            Some(share) => share.limits.low,
+            None => own_low,
+        };
         if self.allocated() <= low {
             self.leave(now);
         }
@@ -565,6 +582,12 @@ impl Budget {
 
     fn enter(&mut self, now: Instant) {
         if let Some(share) = &self.share {
+            if !self.shared_counts {
+                if self.pressure_since.is_some() {
+                    return;
+                }
+                self.pressure_since = Some(now);
+            }
             share.group.enter(now);
         } else if self.pressure_since.is_none() {
             self.pressure_since = Some(now);
@@ -574,6 +597,9 @@ impl Budget {
 
     fn leave(&mut self, now: Instant) {
         if let Some(share) = &mut self.share {
+            if !self.shared_counts && self.pressure_since.take().is_none() {
+                return;
+            }
             share.returned |= share.group.leave(now);
         } else if let Some(since) = self.pressure_since.take() {
             self.pressure_ticks += now.saturating_sub(since);
@@ -643,11 +669,15 @@ impl Budget {
 
     pub(crate) fn has_group_waiters(&self) -> bool {
         self.share.as_ref().is_some_and(|share| {
-            share
-                .group
-                .owners
-                .iter()
-                .any(|o| o.waiting.load(Ordering::Relaxed))
+            if self.shared_counts {
+                share
+                    .group
+                    .owners
+                    .iter()
+                    .any(|o| o.waiting.load(Ordering::Relaxed))
+            } else {
+                share.waiting
+            }
         })
     }
 }
@@ -673,6 +703,7 @@ impl Budget {
         group.allocated.fetch_sub(published, Ordering::Relaxed);
         group.sockets.fetch_sub(self.sockets, Ordering::Relaxed);
         self.shared_counts = false;
+        self.pressure_since = None;
         if group.summed {
             let own = share.limits;
             group.low.fetch_sub(own.low, Ordering::Relaxed);
@@ -681,11 +712,11 @@ impl Budget {
         }
         let owner = &group.owners[share.owner];
         owner.waiting.store(false, Ordering::SeqCst);
-        owner.taken.store(false, Ordering::Release);
         if group.allocated.load(Ordering::Relaxed) <= group.low.load(Ordering::Relaxed) {
             group.leave(now);
         }
         group.returned();
+        owner.taken.store(false, Ordering::Release);
         true
     }
 }

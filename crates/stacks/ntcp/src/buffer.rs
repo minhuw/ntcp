@@ -25,7 +25,7 @@ const FLAG_MARK_MASK: u8 = FLAG_PUSH | FLAG_EOR;
 // separated only by a PUSH/EOR boundary or an interior split).
 const FLAG_CONTIGUOUS_SHARED: u8 = 1 << 2;
 
-/// Initial entry-deque reservation on first write (8 entries = 512 bytes).
+/// Initial entry-deque reservation on first write.
 pub(crate) const SEND_ENTRY_RESERVE: usize = 8;
 
 /// Spare entry slots kept beyond what a write adds so `collapse_push` and
@@ -47,8 +47,9 @@ enum TxSegData {
 
 #[derive(Debug)]
 struct TxSeg {
-    // Stream position relative to `SendBuffer::head` via `wrapping_sub`.
-    start: u64,
+    // A connection admits less than 2^30 queued bytes. Every live entry's
+    // position relative to `head` is unambiguous across a u32 wrap.
+    start: u32,
     data: TxSegData,
     // Bit 0 = PUSH on last byte of this entry, bit 1 = EOR on last byte.
     flags: u8,
@@ -75,7 +76,7 @@ pub(crate) struct SendBuffer {
     len: usize,
     chunk_bytes: usize,
     capacity: usize,
-    head: u64,
+    head: u32,
     shared_entries: usize,
     // Discontiguous shared Payload spans (Shared entries without
     // `FLAG_CONTIGUOUS_SHARED`), bounded by `MAX_SHARED_SEGMENTS`.
@@ -399,7 +400,7 @@ impl SendBuffer {
                 );
                 let (chunk, off, taken) = pool.append_to_tail_and_dup(input);
                 debug_assert_eq!(taken, n);
-                let start = self.head.wrapping_add(self.len as u64);
+                let start = self.head.wrapping_add(self.len as u32);
                 self.entries.push_back(TxSeg {
                     start,
                     data: TxSegData::Chunk {
@@ -441,7 +442,7 @@ impl SendBuffer {
                     entries.len() < entries.capacity(),
                     "TxSeg entries not reserved before append"
                 );
-                let start = head.wrapping_add(*len_ref as u64);
+                let start = head.wrapping_add(*len_ref as u32);
                 entries.push_back(TxSeg {
                     start,
                     data: TxSegData::Chunk {
@@ -490,9 +491,12 @@ impl SendBuffer {
             return Some(last);
         }
         let head = self.head;
-        let idx = self
+        // Every entry starts immediately after its predecessor. Compare only
+        // the starts, independent of whether an entry owns or borrows data.
+        let past = self
             .entries
-            .partition_point(|seg| seg.start.wrapping_sub(head) as usize + seg.len() <= offset);
+            .partition_point(|seg| seg.start.wrapping_sub(head) as usize <= offset);
+        let idx = past - 1;
         debug_assert!(idx < self.entries.len());
         Some(idx)
     }
@@ -518,7 +522,7 @@ impl SendBuffer {
         let right_len = seg_len - left_len;
         let left_contig = self.entries[idx].flags & FLAG_CONTIGUOUS_SHARED;
         let old_marks = self.entries[idx].flags & FLAG_MARK_MASK;
-        let right_start = self.entries[idx].start.wrapping_add(left_len as u64);
+        let right_start = self.entries[idx].start.wrapping_add(left_len as u32);
         let mut right_flags = old_marks;
         let right_data = match &mut self.entries[idx].data {
             TxSegData::Chunk {
@@ -1121,7 +1125,7 @@ impl SendBuffer {
             } else {
                 self.clear_chunks_slow(pool);
             }
-            self.head = self.head.wrapping_add(count as u64);
+            self.head = self.head.wrapping_add(count as u32);
             return Ok(());
         }
         self.acknowledge_partial(pool, count);
@@ -1150,7 +1154,7 @@ impl SendBuffer {
                 rem -= front_len;
             } else {
                 let front = self.entries.front_mut().unwrap();
-                front.start = front.start.wrapping_add(rem as u64);
+                front.start = front.start.wrapping_add(rem as u32);
                 match &mut front.data {
                     TxSegData::Chunk { offset, len: n, .. } => {
                         *offset += rem as u32;
@@ -1175,7 +1179,7 @@ impl SendBuffer {
             self.shared_spans += 1;
         }
         self.len -= count;
-        self.head = self.head.wrapping_add(count as u64);
+        self.head = self.head.wrapping_add(count as u32);
         if self.has_ptb {
             self.ptb.drop_prefix(count);
         }
@@ -1280,67 +1284,24 @@ impl SendBuffer {
         count
     }
 
-    /// Borrow a single `TxPart` covering `[offset, offset + count)` when all
-    /// requested bytes lie inside one `TxSeg` (the common non-straddling case).
-    /// Fast-paths the front chunk entry inline so callers avoid stack frames
-    /// and out-of-line calls on single-segment sends.
-    #[inline(always)]
-    pub(crate) fn single_tx_part<'a>(
+    /// Borrow a range in the front chunk without building a scatter list.
+    /// Other ranges use the indexed walk in `tx_parts`.
+    #[inline]
+    pub(crate) fn front_tx_part<'a>(
         &'a self,
         arena: &'a ChunkArena,
         offset: usize,
         count: usize,
     ) -> Option<TxPart<'a>> {
-        if count == 0 {
-            return None;
-        }
         let front = self.entries.front()?;
-        if let TxSegData::Chunk {
-            chunk,
-            offset: chunk_off,
-            len,
-        } = &front.data
-            && offset
-                .checked_add(count)
-                .is_some_and(|end| end <= *len as usize)
-        {
-            let start = *chunk_off as usize + offset;
-            return ChunkSlice::new(arena.get(chunk), start..start + count).map(TxPart::Chunk);
-        }
-        self.single_tx_part_slow(arena, offset, count)
-    }
-
-    #[inline(never)]
-    fn single_tx_part_slow<'a>(
-        &'a self,
-        arena: &'a ChunkArena,
-        offset: usize,
-        count: usize,
-    ) -> Option<TxPart<'a>> {
-        let idx = self.entry_at(offset)?;
-        let seg = &self.entries[idx];
-        let rel = offset - self.seg_start(seg);
-        if rel.checked_add(count)? > seg.len() {
+        let TxSegData::Chunk { chunk, offset: start, len } = &front.data else {
+            return None;
+        };
+        if offset.checked_add(count)? > *len as usize {
             return None;
         }
-        match &seg.data {
-            TxSegData::Chunk {
-                chunk,
-                offset: chunk_off,
-                ..
-            } => {
-                let start = *chunk_off as usize + rel;
-                let slice = ChunkSlice::new(arena.get(chunk), start..start + count)
-                    .expect("chunk slice within filled prefix");
-                Some(TxPart::Chunk(slice))
-            }
-            TxSegData::Shared(payload) => {
-                let slice = PayloadSlice::new(payload, rel..rel + count)
-                    .expect("payload slice within bounds");
-                Some(TxPart::Shared(slice))
-            }
-            TxSegData::Released(_) => None,
-        }
+        let start = *start as usize + offset;
+        ChunkSlice::new(arena.get(chunk), start..start + count).map(TxPart::Chunk)
     }
 
     /// Borrow a contiguous byte slice covering `[offset, offset + count)` when
@@ -1413,43 +1374,35 @@ impl SendBuffer {
         if count == 0 {
             return 0;
         }
-        if let Some(part) = self.single_tx_part(arena, offset, count) {
-            out.push(part);
-            return count;
-        }
-        let Some(mut idx) = self.entry_at(offset) else {
+        let Some(first) = self.entry_at(offset) else {
             return 0;
         };
-        let mut at = offset;
+        let mut relative = offset - self.seg_start(&self.entries[first]);
         let mut covered = 0;
-        while covered < count {
-            let seg = &self.entries[idx];
-            let rel = at - self.seg_start(seg);
-            let take = (seg.len() - rel).min(count - covered);
+        for seg in self.entries.range(first..) {
+            let take = (seg.len() - relative).min(count - covered);
             match &seg.data {
-                TxSegData::Chunk {
-                    chunk,
-                    offset: chunk_off,
-                    ..
-                } => {
-                    let start = *chunk_off as usize + rel;
+                TxSegData::Chunk { chunk, offset, .. } => {
+                    let start = *offset as usize + relative;
                     let slice = ChunkSlice::new(arena.get(chunk), start..start + take)
                         .expect("chunk slice within filled prefix");
                     out.push_merged(TxPart::Chunk(slice));
                 }
                 TxSegData::Shared(payload) => {
-                    let slice = PayloadSlice::new(payload, rel..rel + take)
+                    let slice = PayloadSlice::new(payload, relative..relative + take)
                         .expect("payload slice within bounds");
-                    out.push_merged(TxPart::Shared(slice));
+                    out.push(TxPart::Shared(slice));
                 }
                 TxSegData::Released(_) => {
                     debug_assert!(false, "tx_parts from released shared segment");
                     break;
                 }
             }
-            at += take;
             covered += take;
-            idx += 1;
+            if covered == count {
+                break;
+            }
+            relative = 0;
         }
         covered
     }
@@ -1593,7 +1546,7 @@ impl SendBuffer {
                 "TxSeg entries not reserved before write_shared"
             );
             let contiguous = self.continues_shared(&payload);
-            let start = self.head.wrapping_add(self.len as u64);
+            let start = self.head.wrapping_add(self.len as u32);
             self.entries.push_back(TxSeg {
                 start,
                 data: TxSegData::Shared(payload),
@@ -2008,6 +1961,28 @@ mod tests {
         send.write(&mut pool, b"ij");
         assert_eq!(send.copy(pool.arena(), 0, &mut bytes), 5);
         assert_eq!(&bytes[..5], b"defij");
+        send.clear_chunks(&mut pool);
+        pool.release_tail();
+        assert_eq!(pool.live(), 0);
+    }
+
+    #[test]
+    fn live_entry_offsets_survive_stream_position_wrap() {
+        let mut pool = TxPool::heap(64);
+        let mut send = SendBuffer::new(64).unwrap();
+        send.head = u32::MAX - 4;
+        let data = b"abcdefghijklmnopqr";
+        for part in [&data[..3], &data[3..7], &data[7..12], &data[12..]] {
+            assert_eq!(send.write(&mut pool, part), part.len());
+            send.mark_push();
+        }
+        assert_eq!(send.entry_at(6), Some(1));
+        assert_eq!(send.entry_at(8), Some(2));
+        send.acknowledge(&mut pool, 5).unwrap();
+        assert_eq!(send.entry_at(2), Some(1));
+        let mut bytes = [0; 8];
+        assert_eq!(send.copy(pool.arena(), 1, &mut bytes), bytes.len());
+        assert_eq!(&bytes, &data[6..14]);
         send.clear_chunks(&mut pool);
         pool.release_tail();
         assert_eq!(pool.live(), 0);

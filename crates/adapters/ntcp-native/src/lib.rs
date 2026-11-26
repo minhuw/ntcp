@@ -96,9 +96,7 @@ struct Connection {
     released: bool,
     read_cursor: u64,
     trace_count: usize,
-    connected_event: bool,
-    closed_event: bool,
-    readable_event: bool,
+    pending_events: u8,
     read_waiting: bool,
     // Data or the peer's FIN arrived since the connection was last
     // refreshed: it raises Readable whether or not a read is armed, as
@@ -115,6 +113,10 @@ struct Connection {
     // __tcp_sock_set_nodelay pushes.
     nodelay_push: bool,
 }
+// Native notifications already owed, in delivery order.
+const CONNECTED: u8 = 1;
+const CLOSED: u8 = 2;
+const READABLE: u8 = 4;
 // `Connection::tx_mark`'s bit for a hold already counted.
 const HELD: u64 = 1 << 63;
 // The events a refresh raises from the core's state.
@@ -126,6 +128,20 @@ struct Raised {
     readable: Option<bool>,
 }
 impl Connection {
+    fn writable_event(
+        &self,
+        endpoint: &ntcp::Endpoint,
+        stopped: bool,
+        phase_capacity: usize,
+    ) -> bool {
+        self.write_waiting.is_some_and(|request| {
+            !stopped
+                && usize::from(request.scheduled) + usize::from(request.acknowledged)
+                    <= phase_capacity.saturating_sub(self.trace_count)
+                && write_owed(endpoint, self.core, request)
+        })
+    }
+
     // What a refresh of this connection raises, the core's state now
     // `state`. Shared by the refresh and its debug-build cross-check.
     fn raised(&self, stream: ntcp::StreamState<'_>) -> Raised {
@@ -154,6 +170,24 @@ struct Slot<T> {
     generation: u64,
     value: Option<T>,
 }
+
+impl ConnId {
+    fn connection_mut(
+        self,
+        instance: u64,
+        slots: &mut [Slot<Connection>],
+    ) -> Result<&mut Connection> {
+        if self.instance != instance {
+            return Err(Error::InvalidHandle);
+        }
+        slots
+            .get_mut(self.slot)
+            .filter(|s| s.generation == self.generation)
+            .and_then(|s| s.value.as_mut())
+            .ok_or(Error::InvalidHandle)
+    }
+}
+
 struct Listener {
     core: ntcp::ListenerId,
     port: u16,
@@ -1402,14 +1436,7 @@ impl<P: PacketIo> Network<P> {
             .ok_or(Error::InvalidHandle)
     }
     fn conn_mut(&mut self, id: ConnId) -> Result<&mut Connection> {
-        if id.instance != self.instance {
-            return Err(Error::InvalidHandle);
-        }
-        self.connections
-            .get_mut(id.slot)
-            .filter(|s| s.generation == id.generation)
-            .and_then(|s| s.value.as_mut())
-            .ok_or(Error::InvalidHandle)
+        id.connection_mut(self.instance, &mut self.connections)
     }
     fn conn_id(&self, slot: usize) -> ConnId {
         ConnId {
@@ -1459,9 +1486,7 @@ impl<P: PacketIo> Network<P> {
             released: false,
             read_cursor: 0,
             trace_count: 0,
-            connected_event: state == State::Established,
-            closed_event: false,
-            readable_event: false,
+            pending_events: if state == State::Established { CONNECTED } else { 0 },
             read_waiting: true,
             arrived: false,
             write_waiting: None,
@@ -1819,7 +1844,7 @@ impl<P: PacketIo> Network<P> {
     /// as Linux would wake it (see `Event::Writable`).
     pub fn readiness(&mut self, id: ConnId) -> Result<Readiness> {
         self.running()?;
-        let c = self.conn(id)?;
+        let c = id.connection_mut(self.instance, &mut self.connections)?;
         if c.close_requested || c.abort_requested || c.released {
             return Err(Error::InvalidHandle);
         }
@@ -1839,7 +1864,6 @@ impl<P: PacketIo> Network<P> {
         let readable = read_closed || stream.readable_bytes() != 0;
         let open = matches!(state, State::Established | State::CloseWait);
         let writable = open && stream.writable(None, TxTimestampRequest::default());
-        let c = self.conn_mut(id)?;
         if !readable {
             c.read_waiting = true;
         }
@@ -2061,7 +2085,23 @@ impl<P: PacketIo> Network<P> {
     /// ACK and window update the read gives wait for the backend.
     pub fn try_read(&mut self, id: ConnId, out: &mut [u8]) -> Result<ReadOutcome> {
         let mut drained = false;
-        let result = self.read_once(id, out, &mut drained);
+        let result = if self.empty_reader == Some(id) && !out.is_empty() {
+            // The last read held this live stream at the current clock.
+            // Input, output, closure and recycling all invalidate the hint.
+            let c = self.connections[id.slot].value.as_mut().unwrap();
+            debug_assert!(!self.stopped && !c.close_requested && !c.abort_requested && !c.released);
+            debug_assert!(
+                self.endpoint
+                    .stream_io(c.core)
+                    .is_ok_and(|s| s.read_available().is_none())
+            );
+            c.pending_events &= !READABLE;
+            c.read_waiting = true;
+            drained = true;
+            Err(Error::WouldBlock(BlockReason::Receive))
+        } else {
+            self.read_once(id, out, &mut drained)
+        };
         // What the read left to read, or the end of the stream, is queued
         // now, in the order it became ready again. A read that left nothing
         // is queued by the change that next gives it something.
@@ -2085,9 +2125,7 @@ impl<P: PacketIo> Network<P> {
     fn unchanged_by_read(&self, slot: usize) -> bool {
         let c = self.connections[slot].value.as_ref().unwrap();
         let unchanged = c.state == State::Established
-            && !c.connected_event
-            && !c.closed_event
-            && !c.readable_event
+            && c.pending_events == 0
             && c.read_waiting
             && c.write_waiting.is_none();
         debug_assert!(
@@ -2104,7 +2142,7 @@ impl<P: PacketIo> Network<P> {
     // `drained`: the read took everything readable in ESTABLISHED.
     fn read_once(&mut self, id: ConnId, out: &mut [u8], drained: &mut bool) -> Result<ReadOutcome> {
         self.running()?;
-        let c = self.conn(id)?;
+        let c = id.connection_mut(self.instance, &mut self.connections)?;
         if c.close_requested || c.abort_requested || c.released {
             return Err(Error::InvalidHandle);
         }
@@ -2113,32 +2151,13 @@ impl<P: PacketIo> Network<P> {
         }
         let core = c.core;
         let start = c.read_cursor;
-        if self.empty_reader == Some(id) {
-            debug_assert!(
-                self.endpoint
-                    .stream_io(core)
-                    .is_ok_and(|stream| stream.read_available().is_none())
-            );
-            let c = self.conn_mut(id)?;
-            c.readable_event = false;
-            c.read_waiting = true;
-            *drained = true;
-            return Err(Error::WouldBlock(BlockReason::Receive));
-        }
         let reader = self.endpoint.stream_io(core)?;
         let stream = reader.state();
         let state = stream.state();
         if matches!(state, State::SynSent | State::SynReceived) {
             return Err(Error::WouldBlock(BlockReason::Connecting));
         }
-        let Some(c) = self
-            .connections
-            .get_mut(id.slot)
-            .and_then(|s| s.value.as_mut())
-        else {
-            return Err(Error::InvalidHandle);
-        };
-        c.readable_event = false;
+        c.pending_events &= !READABLE;
         c.read_waiting = true;
         let terminal = state == State::Closed;
         let Some(available) = reader.read_available() else {
@@ -2376,7 +2395,7 @@ impl<P: PacketIo> Network<P> {
         self.running()?;
         let c = self.conn_mut(id)?;
         c.close_requested = true;
-        c.readable_event = false;
+        c.pending_events &= !READABLE;
         c.read_waiting = false;
         c.arrived = false;
         c.write_waiting = None;
@@ -2388,7 +2407,7 @@ impl<P: PacketIo> Network<P> {
         self.running()?;
         let c = self.conn_mut(id)?;
         c.abort_requested = true;
-        c.readable_event = false;
+        c.pending_events &= !READABLE;
         c.read_waiting = false;
         c.arrived = false;
         c.write_waiting = None;
@@ -2410,13 +2429,17 @@ impl<P: PacketIo> Network<P> {
         if let Ok(stream) = self.endpoint.stream_state(c.core) {
             let raised = c.raised(stream);
             let state = stream.state();
-            c.connected_event |= raised.connected;
-            c.closed_event |= raised.closed;
+            if raised.connected {
+                c.pending_events |= CONNECTED;
+            }
+            if raised.closed {
+                c.pending_events |= CLOSED;
+            }
             c.state = state;
             c.reason = stream.close_reason();
             if let Some(readable) = raised.readable {
                 c.arrived = false;
-                c.readable_event = readable;
+                c.pending_events = (c.pending_events & !READABLE) | (u8::from(readable) * READABLE);
             }
         }
     }
@@ -2456,9 +2479,7 @@ impl<P: PacketIo> Network<P> {
                             || closing
                             || c.released
                             || c.write_waiting.is_some()
-                            || c.readable_event
-                            || c.connected_event
-                            || c.closed_event
+                            || c.pending_events != 0
                         {
                             self.ready.push(slot);
                         }
@@ -2509,37 +2530,39 @@ impl<P: PacketIo> Network<P> {
         self.refresh_connection(slot);
         let id = self.conn_id(slot);
         let c = self.connections[slot].value.as_mut()?;
-        if c.connected_event {
-            c.connected_event = false;
-            return Some(Event::Connected(id));
-        }
-        if c.closed_event {
-            c.closed_event = false;
-            return Some(Event::Closed {
-                connection: id,
-                reason: c.reason,
-            });
-        }
-        if c.readable_event {
-            c.readable_event = false;
-            c.read_waiting = false;
-            return Some(Event::Readable(id));
-        }
-        if let Some(request) = c.write_waiting {
-            let phases = usize::from(request.scheduled) + usize::from(request.acknowledged);
-            if !self.stopped
-                && phases
-                    <= self
-                        .config
-                        .tx_timestamp_phases
-                        .saturating_sub(c.trace_count)
-                && write_owed(&self.endpoint, c.core, request)
-            {
-                c.write_waiting = None;
-                return Some(Event::Writable(id));
+        let event = if c.pending_events != 0 {
+            // Take the earliest pending event type. Any lower-priority
+            // notifications remain on the socket for the next drain.
+            let pending = c.pending_events;
+            c.pending_events &= pending - 1;
+            if pending & CONNECTED != 0 {
+                Event::Connected(id)
+            } else if pending & CLOSED != 0 {
+                Event::Closed {
+                    connection: id,
+                    reason: c.reason,
+                }
+            } else {
+                c.read_waiting = false;
+                Event::Readable(id)
             }
+        } else if c.writable_event(&self.endpoint, self.stopped, self.config.tx_timestamp_phases) {
+            c.write_waiting = None;
+            Event::Writable(id)
+        } else {
+            return None;
+        };
+        // Leave other events for the next drain. Close maintenance checks
+        // the socket again after its pending notifications have been taken.
+        if c.pending_events != 0
+            || c.writable_event(&self.endpoint, self.stopped, self.config.tx_timestamp_phases)
+        {
+            self.ready.push(slot);
         }
-        None
+        if c.close_requested || c.abort_requested {
+            self.maintain.push(slot);
+        }
+        Some(event)
     }
     /// Gives up to `out.len()` events: the network's own first (passive open
     /// errors, route advice, then NetworkStopped), then at most one per
@@ -2620,20 +2643,6 @@ impl<P: PacketIo> Network<P> {
             };
             out[written] = event;
             written += 1;
-            if slot < connections {
-                if self.connection_has_event(slot) {
-                    self.ready.push(slot);
-                }
-                // A close or abort waits for its connection's events to be
-                // taken.
-                if self.connections[slot]
-                    .value
-                    .as_ref()
-                    .is_some_and(|c| c.close_requested || c.abort_requested)
-                {
-                    self.maintain.push(slot);
-                }
-            }
         }
         let more = !self.events.is_empty() || self.stopped_event || !self.ready.is_empty();
         if !more {
@@ -2681,18 +2690,8 @@ impl<P: PacketIo> Network<P> {
     // Whether next_connection_event would give an event, without taking it.
     fn connection_has_event(&self, slot: usize) -> bool {
         let c = self.connections[slot].value.as_ref().unwrap();
-        c.connected_event
-            || c.closed_event
-            || c.readable_event
-            || c.write_waiting.is_some_and(|request| {
-                !self.stopped
-                    && usize::from(request.scheduled) + usize::from(request.acknowledged)
-                        <= self
-                            .config
-                            .tx_timestamp_phases
-                            .saturating_sub(c.trace_count)
-                    && write_owed(&self.endpoint, c.core, request)
-            })
+        c.pending_events != 0
+            || c.writable_event(&self.endpoint, self.stopped, self.config.tx_timestamp_phases)
     }
     fn stage_timestamp(&mut self) -> bool {
         if self.staged_timestamp.is_some() {

@@ -18,9 +18,14 @@ impl ReservationUndo {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SelectionUndo {
+    Fresh(FreshState),
+    Retry(crate::rack::RetryUndo),
+}
+
 pub(super) struct RepairUndo {
-    rack: Option<crate::rack::RetryUndo>,
-    fresh: Option<FreshState>,
+    selection: SelectionUndo,
     mss: usize,
     receive: crate::rx_queue::RxOutputUndo,
     congestion: Congestion,
@@ -93,7 +98,7 @@ pub(super) struct ControlUndo {
 impl ControlUndo {
     pub(super) fn capture(a: &Connection) -> Self {
         Self {
-            state: RepairUndo::capture_state(a, None, Some(FreshState::capture(a))),
+            state: RepairUndo::capture_state(a, SelectionUndo::Fresh(FreshState::capture(a))),
             connection_state: a.state,
             syn_pending: a.syn_pending,
             syn_retransmissions: a.syn_retransmissions,
@@ -133,7 +138,7 @@ impl FreshState {
 
 impl RepairUndo {
     pub(super) fn is_fresh(&self) -> bool {
-        self.fresh.is_some()
+        matches!(self.selection, SelectionUndo::Fresh(_))
     }
     // Both captures store into `a.repair_undo` only when they keep one, so
     // the common output without an undo copies nothing.
@@ -141,8 +146,7 @@ impl RepairUndo {
         if let Some(rack) = a.rack.retry_undo(start, start.wrapping_add(count as u32)) {
             a.repair_undo = Some(ReservationUndo::Data(Self::capture_state(
                 a,
-                Some(rack),
-                None,
+                SelectionUndo::Retry(rack),
             )));
         }
     }
@@ -167,19 +171,13 @@ impl RepairUndo {
         let fresh = FreshState::capture(a);
         a.repair_undo = Some(ReservationUndo::Data(Self::capture_state(
             a,
-            None,
-            Some(fresh),
+            SelectionUndo::Fresh(fresh),
         )));
     }
 
-    fn capture_state(
-        a: &Connection,
-        rack: Option<crate::rack::RetryUndo>,
-        fresh: Option<FreshState>,
-    ) -> Self {
+    fn capture_state(a: &Connection, selection: SelectionUndo) -> Self {
         Self {
-            rack,
-            fresh,
+            selection,
             mss: a.mss,
             receive: a.receive.output_undo(),
             congestion: a.congestion.clone(),
@@ -409,9 +407,9 @@ impl Connection {
         if self.mss != undo.mss {
             return false;
         }
-        let cancelled = match undo.rack {
-            Some(rack) => self.rack.cancel_retry(selection, rack),
-            None => undo.fresh.is_some() && self.rack.cancel_unsubmitted_fresh(selection),
+        let cancelled = match undo.selection {
+            SelectionUndo::Retry(rack) => self.rack.cancel_retry(selection, rack),
+            SelectionUndo::Fresh(_) => self.rack.cancel_unsubmitted_fresh(selection),
         };
         if !cancelled {
             return false;
@@ -468,7 +466,7 @@ impl Connection {
         self.fast_open_retry = undo.fast_open_retry;
         self.sack_omit = undo.sack_omit;
         self.sack_data_turn = undo.sack_data_turn;
-        if let Some(fresh) = undo.fresh {
+        if let SelectionUndo::Fresh(fresh) = undo.selection {
             self.snd_nxt = fresh.snd_nxt;
             self.snd_sml = fresh.snd_sml;
             self.iw_epoch = fresh.iw_epoch;

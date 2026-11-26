@@ -17,7 +17,8 @@ pub(crate) struct RttEstimator {
     variance: u64,
     rto: u64,
     minimum: u64,
-    timebase: CallerTimebase,
+    resolution: u64,
+    maximum: u64,
 }
 
 // Partial evidence: estimator arithmetic and bounded backoff only. The connection selects
@@ -26,6 +27,14 @@ pub(crate) struct RttEstimator {
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.8.1
 //# The RTO MUST be computed according to the algorithm in [10], including Karn's algorithm
 //# for taking RTT samples (MUST-18).
+// floor((old * (2^SHIFT - 1) + sample) / 2^SHIFT) with full clock
+// range. Splitting each value at SHIFT avoids a double-width multiply.
+#[inline]
+fn smooth<const SHIFT: u32>(old: u64, sample: u64) -> u64 {
+    let mask = (1 << SHIFT) - 1;
+    old - (old >> SHIFT) + (sample >> SHIFT) - u64::from((sample & mask) < (old & mask))
+}
+
 impl RttEstimator {
     //= https://www.rfc-editor.org/rfc/rfc6298#section-2
     //= reason=Initial estimator RTO is MIN_RTO regardless of configured sampled minimum.
@@ -41,7 +50,8 @@ impl RttEstimator {
         assert!((1..=MAX_RTO).contains(&minimum));
         Self {
             minimum: timebase.ticks_from_us(minimum),
-            timebase,
+            resolution: timebase.ticks_from_us(1_000),
+            maximum: timebase.ticks_from_us(MAX_RTO),
             srtt: None,
             variance: 0,
             rto: timebase.ticks_from_us(MIN_RTO),
@@ -122,20 +132,14 @@ impl RttEstimator {
                 rtt_ticks
             }
             Some(old) => {
-                // Widen before averaging: even u64::MAX samples remain accurate.
-                self.variance =
-                    ((3 * self.variance as u128 + old.abs_diff(rtt_ticks) as u128) / 4) as u64;
-                ((7 * old as u128 + rtt_ticks as u128) / 8) as u64
+                self.variance = smooth::<2>(self.variance, old.abs_diff(rtt_ticks));
+                smooth::<3>(old, rtt_ticks)
             }
         };
         self.srtt = Some(srtt);
         self.rto = srtt
-            .saturating_add(
-                self.variance
-                    .saturating_mul(4)
-                    .max(self.timebase.ticks_from_us(1_000)),
-            )
-            .clamp(self.minimum, self.timebase.ticks_from_us(MAX_RTO));
+            .saturating_add(self.variance.saturating_mul(4).max(self.resolution))
+            .clamp(self.minimum, self.maximum);
     }
 
     // Partial evidence: exponential RTO backoff only; congestion-window algorithms are in
@@ -156,10 +160,7 @@ impl RttEstimator {
     //= reason=Estimator exponential doubling capped at 60 seconds; timeout caller invokes this before successful output commits the timer.
     //# (5.5) The host MUST set RTO <- RTO * 2 ("back off the timer").
     pub(crate) fn backoff(&mut self) {
-        self.rto = self
-            .rto
-            .saturating_mul(2)
-            .min(self.timebase.ticks_from_us(MAX_RTO));
+        self.rto = self.rto.saturating_mul(2).min(self.maximum);
     }
 }
 
@@ -2495,6 +2496,23 @@ mod tests {
         rtt.sample(0);
         assert_eq!(rtt.srtt, Some((7 * u64::MAX as u128 / 8) as u64));
         assert_eq!(rtt.rto(), MAX_RTO);
+    }
+
+    #[test]
+    fn smoothing_rounds_down_across_word_boundaries() {
+        let bases = [0, 1 << 32, 1 << 63, u64::MAX - 7];
+        for old_base in bases {
+            for sample_base in bases {
+                for old in old_base..=old_base + 7 {
+                    for sample in sample_base..=sample_base + 7 {
+                        let a = u128::from(old);
+                        let b = u128::from(sample);
+                        assert_eq!(smooth::<2>(old, sample), ((3 * a + b) / 4) as u64);
+                        assert_eq!(smooth::<3>(old, sample), ((7 * a + b) / 8) as u64);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

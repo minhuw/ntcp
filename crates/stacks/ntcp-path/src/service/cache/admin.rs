@@ -292,7 +292,7 @@ impl PathService {
     pub fn path_administration(&self, path: PathId) -> Result<PathAdministration, Error> {
         let cached = self.paths.get(self.context, path.0)?;
         let snapshot = cached.snapshot;
-        let route_policy = self.route_admin(snapshot.key.route).map(|r| r.policy);
+        let route_policy = self.route_admin(snapshot.key.route()).map(|r| r.policy);
         let valid = snapshot.status == PathStatus::Valid;
         Ok(PathAdministration {
             snapshot,
@@ -356,11 +356,11 @@ impl PathService {
             return None;
         }
         let route_policy = self
-            .route_admin(snapshot.key.route)
+            .route_admin(snapshot.key.route())
             .map(|r| r.policy)
             .unwrap_or_default();
         let (route, exact) = match change.target {
-            AdminTarget::Route(route) if snapshot.key.route == route => {
+            AdminTarget::Route(route) if snapshot.key.route() == route => {
                 (change.policy, cached.admin.policy)
             }
             AdminTarget::Path(target) if target == snapshot.path() => {

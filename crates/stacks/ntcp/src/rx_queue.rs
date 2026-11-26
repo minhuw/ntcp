@@ -151,32 +151,100 @@ enum Lend {
     Returned(RxFrame),
 }
 
+// Take a device buffer straight into an empty socket. Its descriptor is
+// local to the receive cursors for both handoff and read, and accepting it
+// needs no allocator. The regular deque owns copied data, out-of-order
+// promotions and subsequent frames, in stream order after this prefix.
+#[derive(Default)]
+struct FrameQueue {
+    first: Option<RxFrame>,
+    rest: VecDeque<RxFrame>,
+}
+
+impl FrameQueue {
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none() && self.rest.is_empty()
+    }
+
+    // The inline slot belongs to the connection. Only overflow storage
+    // adds a separate allocation to the socket's charge.
+    fn capacity(&self) -> usize {
+        self.rest.capacity()
+    }
+
+    fn try_reserve(&mut self, count: usize) -> Result<(), alloc::collections::TryReserveError> {
+        self.rest.try_reserve(count)
+    }
+
+    fn push_back(&mut self, frame: RxFrame) {
+        self.rest.push_back(frame);
+    }
+
+    fn pop_front(&mut self) -> Option<RxFrame> {
+        self.first.take().or_else(|| self.rest.pop_front())
+    }
+
+    fn pop_back(&mut self) -> Option<RxFrame> {
+        self.rest.pop_back().or_else(|| self.first.take())
+    }
+
+    fn front_mut(&mut self) -> Option<&mut RxFrame> {
+        self.first.as_mut().or_else(|| self.rest.front_mut())
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &RxFrame> {
+        self.first.iter().chain(self.rest.iter())
+    }
+
+    fn into_iter(self) -> impl Iterator<Item = RxFrame> {
+        self.first.into_iter().chain(self.rest)
+    }
+
+    fn drain(&mut self, range: core::ops::RangeFrom<usize>) -> impl Iterator<Item = RxFrame> + '_ {
+        let start = range.start.saturating_sub(usize::from(self.first.is_some()));
+        let front = if range.start == 0 {
+            self.first.take()
+        } else {
+            None
+        };
+        front.into_iter().chain(self.rest.drain(start..))
+    }
+}
+
+// Keep the in-order queue and its byte/sequence accounting together. The
+// out-of-order maps, SACK report history and deferred SYN frame are cold on
+// an established stream with no gaps.
+#[repr(C)]
 pub(crate) struct RxQueue {
-    inorder: VecDeque<RxFrame>,
-    ofo: BTreeMap<u64, OfoSeg>,
-    // Start -> end of each maximal run of held out-of-order bytes.
-    runs: BTreeMap<u64, u64>,
-    anchors: BTreeSet<u64>,
-    // Whether ofo, runs or anchors may hold a root leaf: set by every
-    // insertion, cleared once shed finds all three empty.
-    rooted: bool,
+    inorder: FrameQueue,
     // The sequence and stream offset of the first unread byte.
-    read_base: Seq,
     read: u64,
     readable: usize,
-    ofo_bytes: usize,
-    pushed: bool,
-    deferred_syn: Option<DeferredSyn>,
-    fin_sequence: Option<Seq>,
-    eof: bool,
-    latest: Option<Seq>,
-    reported: [Option<Seq>; 4],
-    report_debt: usize,
-    pending_first: Option<Seq>,
-    dsack: Option<(Seq, Seq)>,
     // Running sums over held frames: their truesize, and how many.
     frames: usize,
     entries: usize,
+    read_base: Seq,
+    // Set on insertion. `shed` clears it after releasing all three maps.
+    rooted: bool,
+    pushed: bool,
+    eof: bool,
+    ofo_bytes: usize,
+    fin_sequence: Option<Seq>,
+    latest: Option<Seq>,
+    dsack: Option<(Seq, Seq)>,
+
+    // Start -> end of each maximal run of held out-of-order bytes.
+    runs: BTreeMap<u64, u64>,
+    ofo: BTreeMap<u64, OfoSeg>,
+    anchors: BTreeSet<u64>,
+    reported: [Option<Seq>; 4],
+    report_debt: usize,
+    pending_first: Option<Seq>,
+    deferred_syn: Option<DeferredSyn>,
     lend: Lend,
 }
 
@@ -194,7 +262,7 @@ impl core::fmt::Debug for RxQueue {
 impl RxQueue {
     pub(crate) fn new(start: Seq) -> Self {
         Self {
-            inorder: VecDeque::new(),
+            inorder: FrameQueue::default(),
             ofo: BTreeMap::new(),
             runs: BTreeMap::new(),
             anchors: BTreeSet::new(),
@@ -227,7 +295,7 @@ impl RxQueue {
 
     pub(crate) fn release_spare(&mut self) {
         debug_assert!(self.inorder.is_empty());
-        self.inorder = VecDeque::new();
+        self.inorder = FrameQueue::default();
     }
 
     // What the queue holds less a spare deque (at most DEQUE_RESERVE), as
@@ -428,7 +496,7 @@ impl RxQueue {
                 self.discard(frame);
             }
         }
-        self.inorder = VecDeque::new();
+        self.inorder = FrameQueue::default();
         self.ofo = BTreeMap::new();
         self.runs = BTreeMap::new();
         self.anchors = BTreeSet::new();
@@ -813,7 +881,7 @@ impl RxQueue {
     fn copy_front(&self, out: &mut [u8]) -> usize {
         let count = out.len().min(self.readable);
         let mut copied = 0;
-        for frame in &self.inorder {
+        for frame in self.inorder.iter() {
             if copied == count {
                 break;
             }
@@ -873,7 +941,7 @@ impl RxQueue {
         // a larger one, grown for a burst of small frames, goes at once.
         if self.inorder.is_empty() && self.inorder.capacity() * size_of::<RxFrame>() > DEQUE_RESERVE
         {
-            self.inorder = VecDeque::new();
+            self.inorder = FrameQueue::default();
         }
         self.readable -= count;
         self.read += count as u64;
@@ -1021,23 +1089,37 @@ impl RxQueue {
         push: bool,
     ) -> Option<ReceiveOutcome> {
         debug_assert!(self.can_append() && !self.eof && matches!(self.lend, Lend::None));
-        if bytes.is_empty() || !backing.as_mut()?.retain_slice(bytes) {
+        let frame = backing.as_mut()?;
+        if bytes.is_empty() || !frame.retain_slice(bytes) {
             return None;
         }
-        if self.inorder.try_reserve(1).is_err() {
+        let inline = self.inorder.is_empty() && !frame.is_heap();
+        if !inline && self.inorder.try_reserve(1).is_err() {
             return Some(ReceiveOutcome {
                 refused: true,
                 ..Default::default()
             });
         }
-        Some(self.append_frame(backing.take().unwrap(), push))
+        let frame = backing.take().unwrap();
+        if inline {
+            let outcome = self.account_append(&frame, push);
+            self.inorder.first = Some(frame);
+            Some(outcome)
+        } else {
+            Some(self.append_frame(frame, push))
+        }
     }
 
     fn append_frame(&mut self, frame: RxFrame, push: bool) -> ReceiveOutcome {
+        let outcome = self.account_append(&frame, push);
+        self.inorder.push_back(frame);
+        outcome
+    }
+
+    fn account_append(&mut self, frame: &RxFrame, push: bool) -> ReceiveOutcome {
         let len = frame.len();
         let truesize = frame.truesize();
-        self.hold(&frame);
-        self.inorder.push_back(frame);
+        self.hold(frame);
         self.readable += len;
         self.pushed |= push;
         self.latest = None;
@@ -1497,7 +1579,8 @@ impl RxQueue {
         self.assert_lend_untaken();
         let devices = |frames: &Collapsed| frames.iter().filter(|(_, f, _)| !f.is_heap()).count();
         let mut freed = 0;
-        if let Some(first) = self.inorder.iter().position(|frame| !frame.is_heap()) {
+        let first = self.inorder.iter().position(|frame| !frame.is_heap());
+        if let Some(first) = first {
             let bytes: usize = self.inorder.iter().skip(first).map(|f| f.len()).sum();
             let count = self.inorder.len() - first;
             let mut sources = Collapsed::new();
@@ -1635,7 +1718,7 @@ impl RxQueue {
     pub(crate) fn held_frames(&self) -> alloc::vec::Vec<(u64, usize, usize)> {
         let mut at = self.read;
         let mut held = alloc::vec::Vec::new();
-        for frame in &self.inorder {
+        for frame in self.inorder.iter() {
             held.push((at, frame.len(), frame.truesize()));
             at += frame.len() as u64;
         }
@@ -1664,7 +1747,7 @@ impl RxQueue {
     pub(crate) fn debug_check(&self) {
         let (mut frames, mut entries) = (0, 0);
         let mut readable = 0;
-        for frame in &self.inorder {
+        for frame in self.inorder.iter() {
             assert!(!frame.is_empty());
             frames += frame.truesize();
             entries += 1;
@@ -1835,7 +1918,7 @@ mod tests {
         fn byte_at(&self, seq: Seq) -> Option<u8> {
             let offset = self.offset(seq)?;
             let mut at = self.read;
-            for frame in &self.inorder {
+            for frame in self.inorder.iter() {
                 if offset < at + frame.len() as u64 {
                     return Some(frame[(offset - at) as usize]);
                 }

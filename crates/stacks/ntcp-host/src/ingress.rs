@@ -798,7 +798,7 @@ impl Host {
         outgoing_dscp: u8,
     ) -> Result<InputDisposition, Error> {
         let bytes = tcp.bytes();
-        let (_, destination) = tcp.addresses();
+        let (source, destination) = tcp.addresses();
         let local = crate::LocalDestination {
             link: context.link,
             address: destination,
@@ -835,10 +835,16 @@ impl Host {
             self.plain_ingress = Some((local, port));
         }
         self.make_binding_room(endpoint)?;
-        let disposition = endpoint.input_ipv4_backed_with_path_provider(
+        let disposition = endpoint.input_backed_with_path_provider(
             now,
             context.link,
-            bytes,
+            ntcp::wire::IpMetadata {
+                source: source.into(),
+                destination: destination.into(),
+            },
+            tcp.traffic_class(),
+            None,
+            tcp.payload(),
             frame,
             metadata,
             outgoing_dscp,

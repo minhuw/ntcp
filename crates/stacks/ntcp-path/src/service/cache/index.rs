@@ -99,8 +99,8 @@ impl PathIndex {
             }
             hash.write_u32(address.zone.map_or(NONE, |zone| zone.0.slot as u32));
         }
-        hash.write_u32(key.source.0.slot as u32);
-        hash.write_u32(key.route.0.slot as u32);
+        hash.write_u32(key.source().0.slot as u32);
+        hash.write_u32(key.route().0.slot as u32);
         hash.write_u8(key.dscp.value());
         hash.finish() as usize & (self.heads.len() - 1)
     }

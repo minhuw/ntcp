@@ -1048,3 +1048,35 @@ fn held_backend_frames_collapse_into_heap_frames() {
     packets(&mut b, 0);
     assert_eq!(held(&b, server), 0);
 }
+
+#[test]
+fn device_prefix_survives_overflow_refusal_and_mixed_frame_reads() {
+    let (mut sender, mut receiver, writer, reader) = established(Mode::Copy);
+    let data: Vec<u8> = (0..100).collect();
+    sender.write(writer, &data).unwrap();
+    let parts = packets(&mut sender, 0);
+    assert_eq!(parts.len(), 2);
+    let sizes: Vec<_> = parts
+        .iter()
+        .map(|(ip, bytes)| crate::wire::parse(*ip, bytes).unwrap().payload.len())
+        .collect();
+
+    for (ip, bytes) in &parts {
+        let packet = frame(bytes, 16);
+        crate::allocation_tests::fail_after(0, || {
+            receiver.input_frame(0, *ip, 0, Default::default(), packet, Default::default())
+        })
+        .unwrap();
+        // The first device frame fits in the socket. The second needs an
+        // overflow slot, whose allocation was refused.
+        assert_eq!(receiver.readable_bytes(reader), Ok(sizes[0]));
+        assert_eq!(LIVE.get(), 1);
+    }
+    input(&mut receiver, Mode::Heap(0), 0, parts[1].0, &parts[1].1).unwrap();
+    let mut out = [0; 100];
+    assert_eq!(receiver.read(reader, &mut out[..7]), Ok(7));
+    assert_eq!(LIVE.get(), 1);
+    assert_eq!(receiver.read(reader, &mut out[7..]), Ok(93));
+    assert_eq!(LIVE.get(), 0);
+    assert_eq!(out.as_slice(), data);
+}

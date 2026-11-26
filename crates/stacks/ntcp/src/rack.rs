@@ -315,6 +315,11 @@ pub(crate) struct Rack {
     min_rtt: Option<u64>,
     min_rtt_buckets: [Option<(u64, u64)>; 4],
     min_rtt_epoch: u64,
+    // A sample within these endpoints that cannot improve the current
+    // bucket leaves all four bucket minima and the aggregate unchanged.
+    current_bucket_start: u64,
+    current_bucket_last: u64,
+    current_bucket_min: u64,
     rtt: u64,
     reordering_seen: bool,
     pub(crate) reordering: u32,
@@ -443,6 +448,9 @@ impl Rack {
             min_rtt: None,
             min_rtt_buckets: [None; 4],
             min_rtt_epoch: 0,
+            current_bucket_start: 1,
+            current_bucket_last: 0,
+            current_bucket_min: u64::MAX,
             rtt: 0,
             reordering_seen: false,
             reordering: 3,
@@ -586,6 +594,16 @@ impl Rack {
         if self.latest.is_none() {
             self.rtt = rtt;
         }
+        if now >= self.current_bucket_start && now <= self.current_bucket_last {
+            if rtt >= self.current_bucket_min {
+                return;
+            }
+            self.current_bucket_min = rtt;
+            self.min_rtt_buckets[(self.min_rtt_epoch % 4) as usize] =
+                Some((self.min_rtt_epoch, rtt));
+            self.min_rtt = Some(self.min_rtt.unwrap().min(rtt));
+            return;
+        }
         let epoch = self.timebase.us_from_ticks(now) / MIN_RTT_BUCKET;
         let bucket = &mut self.min_rtt_buckets[(epoch % 4) as usize];
         match bucket {
@@ -599,6 +617,10 @@ impl Rack {
             }
             _ => *bucket = Some((epoch, rtt)),
         }
+        let width = self.timebase.ticks_from_us(MIN_RTT_BUCKET);
+        self.current_bucket_start = epoch.saturating_mul(width);
+        self.current_bucket_last = self.current_bucket_start.saturating_add(width - 1);
+        self.current_bucket_min = bucket.unwrap().1;
         // No other bucket enters or leaves the window within this epoch.
         self.min_rtt = if epoch == self.min_rtt_epoch {
             Some(self.min_rtt.map_or(rtt, |old| old.min(rtt)))

@@ -138,6 +138,7 @@ impl Deadlines {
         self.heap.first().copied()
     }
 
+    #[cfg(test)]
     fn time(&self, index: usize) -> Option<u64> {
         self.positions[index].map(|position| self.heap[position].0)
     }
@@ -275,63 +276,75 @@ impl ConnectionTimers {
     }
 }
 
-// The index can keep an earlier wakeup when a connection moves its timer
-// later or disarms it. Busy polls need only establish that nothing is due.
-// Reconcile stale roots when one may be due or an exact minimum is requested.
+// Index one lower bound per group of adjacent sockets. Rearming or
+// cancelling a timer usually only writes its slot. A group's obsolete
+// minimum is reconciled when a wake or an exact query reaches it.
+const TIMERS_PER_GROUP: usize = 16;
+const NO_TIMER: (u64, usize) = (u64::MAX, END);
+
 pub(crate) struct SocketTimers {
     index: RefCell<ConnectionTimers>,
+    minima: Vec<Cell<(u64, usize)>>,
     deadlines: Vec<Option<u64>>,
-    // No indexed socket can be due before this time. Earlier insertions
-    // lower it immediately. Removing or postponing a timer can leave an
-    // early hint until the next time the index is consulted.
     earliest: Cell<u64>,
 }
 
 impl SocketTimers {
     pub(crate) fn new(capacity: usize) -> Result<Self, ()> {
+        let groups = capacity.div_ceil(TIMERS_PER_GROUP);
+        let mut minima = Vec::new();
+        minima.try_reserve_exact(groups).map_err(|_| ())?;
+        minima.resize(groups, Cell::new(NO_TIMER));
         let mut deadlines = Vec::new();
         deadlines.try_reserve_exact(capacity).map_err(|_| ())?;
         deadlines.resize(capacity, None);
         Ok(Self {
-            index: RefCell::new(ConnectionTimers::new(capacity)?),
+            index: RefCell::new(ConnectionTimers::new(groups)?),
             earliest: Cell::new(u64::MAX),
+            minima,
             deadlines,
         })
     }
 
+    #[inline]
     pub(crate) fn set(&mut self, slot: usize, deadline: Option<u64>) {
         self.deadlines[slot] = deadline;
         if let Some(at) = deadline {
-            self.earliest.set(self.earliest.get().min(at));
-        }
-        let index = self.index.get_mut();
-        if index.current == slot {
-            index.deadline = deadline;
-        } else if let Some(at) = deadline
-            && index.stored.time(slot).is_none_or(|lower| at < lower)
-        {
-            index.set(slot, deadline);
+            let group = slot / TIMERS_PER_GROUP;
+            let key = (at, slot);
+            if key < self.minima[group].get() {
+                self.minima[group].set(key);
+                self.earliest.set(self.earliest.get().min(at));
+                self.index.get_mut().set(group, Some(at));
+            }
         }
     }
 
     fn due_by(&self, through: u64) -> Option<(u64, usize)> {
         let mut index = self.index.borrow_mut();
         loop {
-            let Some((at, slot)) = index.first() else {
+            let Some((at, group)) = index.first() else {
                 self.earliest.set(u64::MAX);
                 return None;
             };
+            self.earliest.set(at);
             if at > through {
-                self.earliest.set(at);
                 return None;
             }
-            let deadline = self.deadlines[slot];
-            if deadline == Some(at) {
-                self.earliest.set(at);
-                return Some((at, slot));
+            let key = self.minima[group].get();
+            debug_assert_eq!(at, key.0);
+            if self.deadlines[key.1] == Some(at) {
+                return Some(key);
             }
-            debug_assert!(deadline.is_none_or(|later| later > at));
-            index.set(slot, deadline);
+            let begin = group * TIMERS_PER_GROUP;
+            let end = (begin + TIMERS_PER_GROUP).min(self.deadlines.len());
+            let next = self.deadlines[begin..end]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &deadline)| deadline.map(|time| (time, begin + i)))
+                .min();
+            self.minima[group].set(next.unwrap_or(NO_TIMER));
+            index.set(group, next.map(|(time, _)| time));
         }
     }
 

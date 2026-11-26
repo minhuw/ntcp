@@ -7,6 +7,40 @@ pub struct Ipv4Plateaus {
     len: u8,
 }
 
+// An IPv4 MTU always fits in a wire length. Snapshots need the policy
+// by value, including custom tables. Zero terminates their positive values
+// and an empty table denotes an IPv6 snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SnapshotPlateaus([u16; Ipv4Plateaus::CAPACITY]);
+
+impl SnapshotPlateaus {
+    pub(crate) fn new(ipv4: bool, table: Ipv4Plateaus) -> Self {
+        let mut packed = [0; Ipv4Plateaus::CAPACITY];
+        if ipv4 {
+            for (slot, &mtu) in packed.iter_mut().zip(table.as_slice()) {
+                *slot = mtu as u16;
+            }
+        }
+        Self(packed)
+    }
+
+    pub(crate) const fn table(self) -> Option<Ipv4Plateaus> {
+        if self.0[0] == 0 {
+            return None;
+        }
+        let mut values = [0; Ipv4Plateaus::CAPACITY];
+        let mut len = 0;
+        while len < values.len() && self.0[len] != 0 {
+            values[len] = self.0[len] as u32;
+            len += 1;
+        }
+        Some(Ipv4Plateaus {
+            values,
+            len: len as u8,
+        })
+    }
+}
+
 impl Ipv4Plateaus {
     pub const CAPACITY: usize = 16;
     /// Exact historical RFC1191 Table 7-1 (576 is not a historical plateau).

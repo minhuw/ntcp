@@ -90,8 +90,15 @@ impl CallerTimebase {
         match self.units_per_second {
             1_000_000 => ticks,
             1_000_000_000 => ticks / 1_000,
-            units => ticks / (units / 1_000_000),
+            units => Self::other_us_from_ticks(ticks, units),
         }
+    }
+
+    // Keeping the general conversion out of line leaves constant divisors
+    // in the validated microsecond and nanosecond paths.
+    #[cold]
+    fn other_us_from_ticks(ticks: u64, units: u64) -> u64 {
+        ticks / (units / 1_000_000)
     }
 
     pub(crate) fn valid(self) -> bool {
@@ -119,16 +126,11 @@ impl TimestampGranularity {
     }
 
     pub(crate) fn tick_in(self, now: Instant, timebase: CallerTimebase) -> u64 {
-        match timebase.units_per_second {
-            1_000_000 => match self {
-                Self::Microseconds => now,
-                Self::Milliseconds => now / 1_000,
-            },
-            1_000_000_000 => match self {
-                Self::Microseconds => now / 1_000,
-                Self::Milliseconds => now / 1_000_000,
-            },
-            _ => now / timebase.ticks_from_us(self.tick_us()),
+        match (timebase.units_per_second, self) {
+            (1_000_000, Self::Microseconds) => now,
+            (1_000_000_000, Self::Milliseconds) => now / 1_000_000,
+            (1_000_000, Self::Milliseconds) | (1_000_000_000, Self::Microseconds) => now / 1_000,
+            (_, granularity) => timebase.us_from_ticks(now) / granularity.tick_us(),
         }
     }
 
@@ -2056,13 +2058,13 @@ impl Connection {
     }
 
     #[inline]
-    pub(crate) fn single_send_tx_part<'a>(
+    pub(crate) fn front_send_tx_part<'a>(
         &'a self,
         arena: &'a ntcp_buffer::ChunkArena,
         offset: usize,
         count: usize,
     ) -> Option<ntcp_buffer::TxPart<'a>> {
-        self.send.single_tx_part(arena, offset, count)
+        self.send.front_tx_part(arena, offset, count)
     }
 
     #[inline]

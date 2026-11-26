@@ -453,7 +453,7 @@ impl FreshTransmit<'_> {
             return Some(f(&packet));
         }
         let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
-        if let Some(part) = slot.connection.single_send_tx_part(
+        if let Some(part) = slot.connection.front_send_tx_part(
             self.endpoint.tx_pool.arena(),
             self.payload_offset,
             self.payload_len,
@@ -481,7 +481,7 @@ impl FreshTransmit<'_> {
         if self.payload_len != 0 {
             let slot = self.endpoint.slots[self.owner.slot].as_ref().unwrap();
             let dst = self.offset + self.header_len;
-            if let Some(part) = slot.connection.single_send_tx_part(
+            if let Some(part) = slot.connection.front_send_tx_part(
                 self.endpoint.tx_pool.arena(),
                 self.payload_offset,
                 self.payload_len,
@@ -1068,32 +1068,88 @@ impl Ipv4Flow {
     }
 }
 
+// Logical table entries. The socket already owns the complete scoped key.
 #[derive(Clone, Copy)]
 enum Entry {
     Empty,
     Deleted,
-    Ipv4(Ipv4Flow, usize),
     Occupied(ScopedTuple, usize),
 }
+
+#[derive(Clone, Copy)]
+enum Bucket {
+    Empty,
+    Deleted,
+    Ipv4(Ipv4Flow, usize),
+    Scoped(usize),
+}
+
 impl Entry {
-    fn occupied(tuple: ScopedTuple, slot: usize) -> Self {
-        match Ipv4Flow::from_tuple(&tuple) {
-            Some(key) => Self::Ipv4(key, slot),
-            None => Self::Occupied(tuple, slot),
+    fn bucket(self) -> Bucket {
+        match self {
+            Self::Empty => Bucket::Empty,
+            Self::Deleted => Bucket::Deleted,
+            Self::Occupied(tuple, slot) => match Ipv4Flow::from_tuple(&tuple) {
+                Some(key) => Bucket::Ipv4(key, slot),
+                None => Bucket::Scoped(slot),
+            },
+        }
+    }
+}
+
+impl Bucket {
+    fn owner(
+        &self,
+        tuple: &ScopedTuple,
+        v4: Option<Ipv4Flow>,
+        slots: &[Option<Slot>],
+    ) -> Option<usize> {
+        match self {
+            Self::Ipv4(key, slot) if Some(*key) == v4 => Some(*slot),
+            Self::Scoped(slot) if v4.is_none() => slots[*slot]
+                .as_ref()
+                .filter(|s| s.connection.scoped_tuple() == *tuple)
+                .map(|_| *slot),
+            _ => None,
         }
     }
 
-    fn owner(&self, tuple: &ScopedTuple, v4: Option<Ipv4Flow>) -> Option<usize> {
+    // Each live, mapped slot has exactly one entry, until it is replaced
+    // or removed. Reclamation can already hold the slot outside the array.
+    fn matches_owner(&self, v4: Option<Ipv4Flow>, owner: usize) -> bool {
         match self {
-            Self::Ipv4(key, slot) if Some(*key) == v4 => Some(*slot),
-            Self::Occupied(key, slot) if key == tuple => Some(*slot),
-            _ => None,
+            Self::Ipv4(key, slot) => Some(*key) == v4 && *slot == owner,
+            Self::Scoped(slot) => v4.is_none() && *slot == owner,
+            _ => false,
         }
+    }
+}
+
+// Store the IPv4 key in the bucket itself. Scoped and IPv6 comparisons
+// consult the full tuple already owned by the socket.
+struct TupleEntries {
+    buckets: Vec<Bucket>,
+}
+
+impl TupleEntries {
+    fn new(count: usize) -> Result<Self, Error> {
+        let mut buckets = Vec::new();
+        buckets.try_reserve_exact(count).map_err(|_| Error::NoMemory)?;
+        buckets.resize(count, Entry::Empty.bucket());
+        Ok(Self { buckets })
+    }
+
+    fn set(&mut self, position: usize, entry: Entry) {
+        self.buckets[position] = entry.bucket();
+    }
+    #[cfg(test)]
+    fn fill(&mut self, entry: Entry) {
+        self.buckets.fill(entry.bucket());
     }
 }
 
 struct TupleTable {
-    entries: Vec<Entry>,
+    entries: TupleEntries,
     // Two remembered buckets per port-indexed set. A pair of flows
     // hashing to one set can both use the checked table entries.
     hints: [Cell<[u16; 2]>; 32],
@@ -1104,13 +1160,8 @@ impl TupleTable {
             .checked_mul(2)
             .and_then(usize::checked_next_power_of_two)
             .ok_or(EndpointError::LimitReached)?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(count)
-            .map_err(|_| Error::NoMemory)?;
-        entries.resize(count, Entry::Empty);
         Ok(Self {
-            entries,
+            entries: TupleEntries::new(count)?,
             hints: [const { Cell::new([0; 2]) }; 32],
         })
     }
@@ -1120,13 +1171,13 @@ impl TupleTable {
     fn hint(&self, tuple: ScopedTuple) -> &Cell<[u16; 2]> {
         self.port_hint(tuple.tuple.local.port(), tuple.tuple.remote.port())
     }
-    fn hinted(&self, hints: [u16; 2], owner: impl Fn(&Entry) -> Option<usize>) -> Option<usize> {
+    fn hinted(&self, hints: [u16; 2], owner: impl Fn(&Bucket) -> Option<usize>) -> Option<usize> {
         let [first, prior] = hints;
-        owner(&self.entries[usize::from(first)]).or_else(|| {
+        owner(&self.entries.buckets[usize::from(first)]).or_else(|| {
             if prior == first {
                 None
             } else {
-                owner(&self.entries[usize::from(prior)])
+                owner(&self.entries.buckets[usize::from(prior)])
             }
         })
     }
@@ -1141,23 +1192,24 @@ impl TupleTable {
     ) -> Option<usize> {
         let hints = self.port_hint(local_port, remote_port).get();
         self.hinted(hints, |entry| {
-            let Entry::Ipv4(key, slot) = entry else {
+            let Bucket::Ipv4(key, slot) = entry else {
                 return None;
             };
             (key.addresses == [local, remote] && key.ports == [local_port, remote_port])
                 .then_some(*slot)
         })
     }
-    fn predicted(&self, tuple: ScopedTuple) -> Option<usize> {
+    fn predicted(&self, tuple: ScopedTuple, slots: &[Option<Slot>]) -> Option<usize> {
         let v4 = Ipv4Flow::from_tuple(&tuple);
-        self.hinted(self.hint(tuple).get(), |entry| entry.owner(&tuple, v4))
+        self.hinted(self.hint(tuple).get(), |entry| entry.owner(&tuple, v4, slots))
     }
-    fn find(&self, hash: usize, tuple: ScopedTuple) -> Option<usize> {
+    fn find(&self, hash: usize, tuple: ScopedTuple, slots: &[Option<Slot>]) -> Option<usize> {
+        let buckets = &self.entries.buckets;
         let v4 = Ipv4Flow::from_tuple(&tuple);
-        for probe in 0..self.entries.len().min(64) {
-            let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            let entry = &self.entries[position];
-            if let Some(slot) = entry.owner(&tuple, v4) {
+        for probe in 0..buckets.len().min(64) {
+            let position = hash.wrapping_add(probe) & (buckets.len() - 1);
+            let entry = &buckets[position];
+            if let Some(slot) = entry.owner(&tuple, v4, slots) {
                 // Truncating a bucket beyond the range of a hint can
                 // only cause the next prediction to miss.
                 let hint = self.hint(tuple);
@@ -1167,7 +1219,7 @@ impl TupleTable {
                 }
                 return Some(slot);
             }
-            if matches!(entry, Entry::Empty) {
+            if matches!(entry, Bucket::Empty) {
                 return None;
             }
         }
@@ -1175,53 +1227,50 @@ impl TupleTable {
     }
     fn insert(&mut self, hash: usize, tuple: ScopedTuple, slot: usize) -> Result<(), EndpointError> {
         // A keyed hash plus a fixed probe budget bounds hostile lookup work.
-        for probe in 0..self.entries.len().min(64) {
-            let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            if matches!(self.entries[position], Entry::Empty | Entry::Deleted) {
-                self.entries[position] = Entry::occupied(tuple, slot);
+        let buckets = &self.entries.buckets;
+        for probe in 0..buckets.len().min(64) {
+            let position = hash.wrapping_add(probe) & (buckets.len() - 1);
+            if matches!(buckets[position], Bucket::Empty | Bucket::Deleted) {
+                self.entries.set(position, Entry::Occupied(tuple, slot));
                 return Ok(());
             }
         }
         Err(EndpointError::LimitReached)
     }
     fn replace(&mut self, hash: usize, tuple: ScopedTuple, old: usize, new: usize) -> bool {
-        let v4 = Ipv4Flow::from_tuple(&tuple);
-        for probe in 0..self.entries.len().min(64) {
-            let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            let entry = &mut self.entries[position];
-            if let Some(slot) = entry.owner(&tuple, v4) {
-                if old != slot {
-                    return false;
-                }
-                *entry = Entry::occupied(tuple, new);
-                return true;
-            }
-            if matches!(entry, Entry::Empty) {
-                return false;
-            }
+        if let Some(position) = self.position_of(hash, tuple, old) {
+            self.entries.set(position, Entry::Occupied(tuple, new));
+            true
+        } else {
+            false
         }
-        false
     }
 
     fn remove(&mut self, hash: usize, tuple: ScopedTuple, owner: usize) {
+        if let Some(position) = self.position_of(hash, tuple, owner) {
+            self.entries.set(position, Entry::Deleted);
+        }
+    }
+
+    fn position_of(&self, hash: usize, tuple: ScopedTuple, owner: usize) -> Option<usize> {
+        let buckets = &self.entries.buckets;
         let v4 = Ipv4Flow::from_tuple(&tuple);
-        for probe in 0..self.entries.len().min(64) {
-            let position = hash.wrapping_add(probe) & (self.entries.len() - 1);
-            let entry = &mut self.entries[position];
-            if let Some(slot) = entry.owner(&tuple, v4) {
-                if slot == owner {
-                    *entry = Entry::Deleted;
-                }
-                return;
+        for probe in 0..buckets.len().min(64) {
+            let position = hash.wrapping_add(probe) & (buckets.len() - 1);
+            let bucket = &buckets[position];
+            if bucket.matches_owner(v4, owner) {
+                return Some(position);
             }
-            if matches!(entry, Entry::Empty) {
-                return;
+            if matches!(bucket, Bucket::Empty) {
+                break;
             }
         }
+        None
     }
 }
 
 struct Slot {
+    generation: u64,
     // Boxed, so a table of `max_connections` slots holds pointers rather
     // than ~10 KB connections, and a connection moves into and out of its
     // slot by pointer.
@@ -1469,8 +1518,7 @@ pub struct Endpoint {
     slots: Vec<Option<Slot>>,
     // The occupied `slots`, for counts over live connections.
     occupied: ReadyQueue,
-    generations: Vec<u64>,
-    free: Vec<usize>,
+    free: Vec<ConnectionId>,
     listeners: Vec<Option<Listener>>,
     listener_generations: Vec<u64>,
     tuples: TupleTable,
@@ -1749,10 +1797,11 @@ impl Endpoint {
         let budget = crate::memory::Budget::new();
         let mut slots = reserved_vec(count)?;
         slots.resize_with(count, || None);
-        let mut generations = reserved_vec(count)?;
-        generations.resize(count, 1);
         let mut free = reserved_vec(count)?;
-        free.extend((0..count).rev());
+        free.extend((0..count).rev().map(|slot| ConnectionId {
+            slot,
+            generation: 1,
+        }));
         let mut reclaims = reserved_vec(count)?;
         reclaims.resize(
             count,
@@ -1856,7 +1905,6 @@ impl Endpoint {
             now,
             last_isn_time: now,
             slots,
-            generations,
             free,
             listeners,
             listener_generations,
@@ -2062,7 +2110,7 @@ impl Endpoint {
             .map_err(|_| Error::NoMemory)?;
         self.now = now;
         for index in 0..self.slots.len() {
-            let reserved = self.is_output_reserved(self.id(index));
+            let reserved = self.slot_output_reserved(index);
             let Some(slot) = self.slots[index].as_mut() else {
                 continue;
             };
@@ -2159,24 +2207,22 @@ impl Endpoint {
     fn id(&self, slot: usize) -> ConnectionId {
         ConnectionId {
             slot,
-            generation: self.generations[slot],
+            generation: self.slots[slot].as_ref().expect("connection ID of a live slot").generation,
         }
     }
     // Internal output ownership outlives application release, but not generation reuse.
     fn retained_slot(&self, id: ConnectionId) -> Result<&Slot, EndpointError> {
-        if self.generations.get(id.slot) != Some(&id.generation) {
-            return Err(EndpointError::InvalidHandle);
-        }
-        self.slots[id.slot]
-            .as_ref()
+        self.slots
+            .get(id.slot)
+            .and_then(Option::as_ref)
+            .filter(|slot| slot.generation == id.generation)
             .ok_or(EndpointError::InvalidHandle)
     }
     fn retained_slot_mut(&mut self, id: ConnectionId) -> Result<&mut Slot, EndpointError> {
-        if self.generations.get(id.slot) != Some(&id.generation) {
-            return Err(EndpointError::InvalidHandle);
-        }
-        self.slots[id.slot]
-            .as_mut()
+        self.slots
+            .get_mut(id.slot)
+            .and_then(Option::as_mut)
+            .filter(|slot| slot.generation == id.generation)
             .ok_or(EndpointError::InvalidHandle)
     }
     fn slot(&self, id: ConnectionId) -> Result<&Slot, EndpointError> {
@@ -2452,7 +2498,7 @@ impl Endpoint {
         }
         let child = self.listeners[index].as_mut().unwrap().children.pop();
         if let Some(id) = child {
-            if self.generations[id.slot] == id.generation && self.slots[id.slot].is_some() {
+            if self.retained_slot(id).is_ok() {
                 // Listener shutdown explicitly abandons unaccepted children.
                 self.slots[id.slot].as_mut().unwrap().listener = None;
                 self.slots[id.slot].as_mut().unwrap().connection.abort();
@@ -3011,7 +3057,8 @@ impl Endpoint {
         connection.local_refusals = self.local_refusals;
         let tuple = connection.scoped_tuple();
         let admission = (|| {
-            let index = *self.free.last().ok_or(EndpointError::LimitReached)?;
+            let id = *self.free.last().ok_or(EndpointError::LimitReached)?;
+            let index = id.slot;
             if self.lookup(tuple) != replaces {
                 return Err(EndpointError::AddressInUse);
             }
@@ -3033,15 +3080,16 @@ impl Endpoint {
                 }
                 None => self.tuples.insert(self.hash(tuple), tuple, index)?,
             }
-            Ok(index)
+            Ok(id)
         })();
-        let index = match admission {
-            Ok(index) => index,
+        let id = match admission {
+            Ok(id) => id,
             Err(error) => {
                 self.recycle_connection(connection);
                 return Err(error);
             }
         };
+        let index = id.slot;
         match replaces {
             Some(Target::Connection(old)) => {
                 // The application sees it CLOSED, as a Linux socket is once
@@ -3063,6 +3111,7 @@ impl Endpoint {
             None
         };
         self.slots[index] = Some(Slot {
+            generation: id.generation,
             fast_open_owner,
             receive_authority: None,
             connection,
@@ -3083,7 +3132,6 @@ impl Endpoint {
             explicit_route: false,
             received_ipv4_options: None,
         });
-        let id = self.id(index);
         if let Some(transaction) = &mut self.factory_transaction {
             debug_assert!(transaction.inserted.is_none());
             transaction.inserted = Some(id);
@@ -4211,20 +4259,19 @@ impl Endpoint {
         let at = (self.reclaimed % self.reclaims.len() as u64) as usize;
         self.reclaims[at] = id;
         self.reclaimed += 1;
-        if let Some(generation) = self.generations[index].checked_add(1) {
-            self.generations[index] = generation;
-            self.free.push(index);
+        if let Some(generation) = id.generation.checked_add(1) {
+            self.free.push(ConnectionId { slot: index, generation });
         }
     }
 
     // The connection or TIME-WAIT record that owns `tuple`. At most one does:
     // a record whose tuple a reopened connection took is not in the index.
     fn lookup(&self, tuple: ScopedTuple) -> Option<Target> {
-        if let Some(index) = self.tuples.predicted(tuple) {
+        if let Some(index) = self.tuples.predicted(tuple, &self.slots) {
             return Some(Target::Connection(index));
         }
         let hash = self.hash(tuple);
-        match self.tuples.find(hash, tuple) {
+        match self.tuples.find(hash, tuple, &self.slots) {
             Some(index) => Some(Target::Connection(index)),
             None => self
                 .time_wait
@@ -4397,7 +4444,7 @@ impl Endpoint {
         );
         // This is the live socket slot. A held reservation owns this slot
         // until it is released, including for a closed connection's reset.
-        let reserved = self.has_output_reservations() && self.reservation_owners[index].is_some();
+        let reserved = self.slot_output_reserved(index);
         debug_assert_eq!(reserved, self.is_output_reserved(self.id(index)));
         if !OFFERED && reserved {
             self.set_deadline(index, None);
@@ -4580,7 +4627,7 @@ impl Endpoint {
         {
             self.progress.push(index);
         }
-        if self.is_output_reserved(self.id(index)) {
+        if self.slot_output_reserved(index) {
             self.set_deadline(index, None);
             return;
         }
@@ -5158,13 +5205,20 @@ impl Endpoint {
         } else {
             None
         };
-        let (receive_room, low, pressure) =
-            self.receive_budget(&self.slots[index].as_ref().unwrap().connection);
+        let slot = self.slots[index].as_ref().unwrap();
+        let pressure = self.budget.under_pressure();
+        // A pure ACK on an established stream does not schedule an incoming
+        // skb. The next data-bearing input takes its own snapshot of room.
+        let needs_room = !PREDICTED || !segment.payload.is_empty()
+            || segment.header.flags != ACK || slot.connection.state() != State::Established;
+        let limits = needs_room.then(|| self.receive_budget(&slot.connection, pressure));
         let slot = self.slots[index].as_mut().unwrap();
         slot.connection.hold_establishment = hold;
         slot.connection.memory_pressure = pressure;
-        slot.connection.receive_room = receive_room;
-        slot.connection.receive_memory_low = low;
+        if let Some((room, low)) = limits {
+            slot.connection.receive_room = room;
+            slot.connection.receive_memory_low = low;
+        }
         slot.received_dscp = Some(traffic_class >> 2);
         let backing = backing.unwrap_or(&mut self.ingress);
         let backing = (!segment.payload.is_empty() && backing.is_some()).then_some(backing);
@@ -5442,6 +5496,28 @@ impl Endpoint {
         let destination = u16::from_be_bytes([bytes[2], bytes[3]]);
         self.tuples
             .predicted_ipv4(local, remote, destination, source)
+            .or_else(|| self.lookup_ipv4_stream(local, remote, destination, source))
+    }
+
+    // A hint collision still has the same connected ingress policy. Look
+    // up the complete tuple in the keyed table before considering listener
+    // admission, TIME-WAIT, or a stateless reply.
+    #[inline(never)]
+    fn lookup_ipv4_stream(
+        &self,
+        local: core::net::Ipv4Addr,
+        remote: core::net::Ipv4Addr,
+        local_port: u16,
+        remote_port: u16,
+    ) -> Option<usize> {
+        let tuple = ScopedTuple {
+            tuple: Tuple {
+                local: SocketAddr::new(IpAddr::V4(local), local_port),
+                remote: SocketAddr::new(IpAddr::V4(remote), remote_port),
+            },
+            zone: None,
+        };
+        self.tuples.find(self.hash(tuple), tuple, &self.slots)
     }
 
     // Tuple prediction compares both transport endpoints. The connection
@@ -5973,22 +6049,20 @@ impl Endpoint {
     // The budget's room for a connection's receive memory: Linux's
     // __sk_mem_raise_allocated for SK_MEM_RECV, which grants a socket below
     // tcp_rmem[0] whatever pressure.
-    fn receive_budget(&self, connection: &Connection) -> (usize, bool, bool) {
+    fn receive_budget(&self, connection: &Connection, pressure: bool) -> (usize, bool) {
         let memory = self.memory();
         let allocated = self.budget.allocated();
-        let pressure = self.budget.under_pressure();
         let mut room = memory.high.saturating_sub(allocated);
         if !connection.receive_below_min() {
             let sockets = self.budget.sockets();
             // A connection's charged storage is part of this endpoint's
             // charge even in a shared group. Walk the socket's allocations
             // only if this upper bound could reach its fair share.
-            let conn_charge = connection
-                .buffer_charge()
-                .saturating_add(connection.send_chunk_bytes());
-            debug_assert!(conn_charge <= self.budget.charged());
             if self.budget.charged().saturating_mul(sockets) >= memory.high
-                && conn_charge.saturating_mul(sockets) >= memory.high
+                && connection
+                    .buffer_charge()
+                    .saturating_add(connection.send_chunk_bytes())
+                    .saturating_mul(sockets) >= memory.high
             {
                 room = if pressure {
                     0
@@ -5997,7 +6071,7 @@ impl Endpoint {
                 };
             }
         }
-        (room, allocated < memory.low, pressure)
+        (room, allocated < memory.low)
     }
 
     // Counts what a connection's receive memory rules did, and records the
@@ -6763,7 +6837,7 @@ impl Endpoint {
         error: crate::NetworkError,
     ) -> Result<bool, EndpointError> {
         let tuple = ScopedTuple::unscoped(tuple);
-        let Some(index) = self.tuples.find(self.hash(tuple), tuple) else {
+        let Some(index) = self.tuples.find(self.hash(tuple), tuple, &self.slots) else {
             return Ok(false);
         };
         self.reject_if_output_reserved(self.id(index))?;
@@ -6832,7 +6906,7 @@ impl Endpoint {
         candidate_mtu: u32,
     ) -> Result<bool, EndpointError> {
         let tuple = ScopedTuple::unscoped(tuple);
-        let Some(index) = self.tuples.find(self.hash(tuple), tuple) else {
+        let Some(index) = self.tuples.find(self.hash(tuple), tuple, &self.slots) else {
             return Ok(false);
         };
         self.reject_if_output_reserved(self.id(index))?;
@@ -6998,7 +7072,7 @@ impl Endpoint {
         }
         self.clock(now)?;
         for index in 0..self.slots.len() {
-            let reserved = self.is_output_reserved(self.id(index));
+            let reserved = self.slot_output_reserved(index);
             if let Some(slot) = &mut self.slots[index] {
                 if reserved {
                     slot.connection.set_reserved_first_hop_mtu(now, mtu)?;
@@ -7266,7 +7340,7 @@ impl Endpoint {
     /// two links name two connections.
     pub fn scoped_connection_id(&self, tuple: ScopedTuple) -> Option<ConnectionId> {
         self.tuples
-            .find(self.hash(tuple), tuple)
+            .find(self.hash(tuple), tuple, &self.slots)
             .map(|index| self.id(index))
     }
 
@@ -7292,8 +7366,7 @@ impl Endpoint {
     // still to send; a released connection's TIME-WAIT is a record, not a
     // connection.
     pub fn connection_exists(&self, id: ConnectionId) -> bool {
-        self.generations.get(id.slot) == Some(&id.generation)
-            && self.slots.get(id.slot).is_some_and(Option::is_some)
+        self.retained_slot(id).is_ok()
     }
 
     pub fn state(&self, id: ConnectionId) -> Result<State, EndpointError> {
@@ -8410,7 +8483,7 @@ impl Endpoint {
     }
 
     pub fn output_selectable(&self, id: ConnectionId) -> bool {
-        if self.generations.get(id.slot) != Some(&id.generation) {
+        if self.retained_slot(id).is_err() {
             return false;
         }
         match self.reservation_of(Some(id)) {
@@ -8451,6 +8524,12 @@ impl Endpoint {
             })
         );
         reserved
+    }
+
+    // Reservation owners are indexed by slot. A held reservation keeps
+    // its connection in that slot until the attempt is released.
+    fn slot_output_reserved(&self, index: usize) -> bool {
+        self.has_output_reservations() && self.reservation_owners[index].is_some()
     }
 
     // The slot holding `owner`'s output; None is the stateless lane.
@@ -8667,7 +8746,7 @@ impl Endpoint {
     /// of it, and moving it to the back leaves it at the head.
     pub fn follows_own_output(&self, id: ConnectionId) -> bool {
         self.output.sole(id.slot)
-            && self.generations.get(id.slot) == Some(&id.generation)
+            && self.retained_slot(id).is_ok()
             && !self.has_output_reservations()
             && self.cleanup.is_empty()
             && !self.stateless_pending()

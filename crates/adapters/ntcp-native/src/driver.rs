@@ -134,9 +134,7 @@ impl<P: PacketIo> Network<P> {
             if let Some(c) = &mut slot.value {
                 // Observation cancellation does not certify non-submission.
                 let _ = self.endpoint.cancel_tx_timestamps(c.core);
-                c.closed_event = true;
-                c.connected_event = false;
-                c.readable_event = false;
+                c.pending_events = CLOSED;
                 c.read_waiting = false;
                 c.write_waiting = None;
                 self.ready.push(index);
@@ -2940,8 +2938,7 @@ impl<P: PacketIo> Network<P> {
             // drain refreshes the connection and queues it here again.
             let c = self.connections[index].value.as_mut().unwrap();
             if matches!(c.state, State::Closed | State::TimeWait)
-                && !c.connected_event
-                && !c.closed_event
+                && c.pending_events & (CONNECTED | CLOSED) == 0
                 && c.trace_count == 0
                 && !self.endpoint.is_output_reserved(core)
             {
