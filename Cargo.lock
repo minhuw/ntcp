@@ -227,6 +227,9 @@ dependencies = [
 [[package]]
 name = "ntcp-ip-common"
 version = "0.0.1"
+dependencies = [
+ "cpufeatures",
+]
 
 [[package]]
 name = "ntcp-ip6"

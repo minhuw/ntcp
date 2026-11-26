@@ -2,6 +2,8 @@
 use core::net::IpAddr;
 
 pub mod ipv6;
+#[cfg(target_arch = "x86_64")]
+mod x86;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -64,6 +66,16 @@ fn checksum_chunked(bytes: &[u8], block_size: usize) -> u16 {
 
 #[inline]
 fn checksum_block(bytes: &[u8], prefix: u64) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 512 && x86::has_avx2() {
+        // SAFETY: the feature test checks CPU and OS support for AVX2.
+        return unsafe { x86::checksum(bytes, prefix) };
+    }
+    checksum_scalar(bytes, prefix)
+}
+
+#[inline]
+fn checksum_scalar(bytes: &[u8], prefix: u64) -> u16 {
     // Sum native words with end-around carry. Two independent chains
     // overlap on long buffers. Each 64-byte run folds its last carry
     // once, with no per-word widening.
@@ -307,6 +319,42 @@ mod tests {
                     checksum_with_sum(&ones[8..8 + len], prefix),
                     reference(&ones[..8 + len])
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_keeps_carries_across_vector_runs() {
+        let mut storage = [0u8; 2 * 65536 + 100];
+        for pattern in [0, 1, 2] {
+            for (i, byte) in storage.iter_mut().enumerate() {
+                *byte = match pattern {
+                    0 => 0,
+                    1 => 255,
+                    _ => (i as u8).wrapping_mul(53).wrapping_add((i >> 8) as u8),
+                };
+            }
+            for prefix in [0, 1, 0x1_ffff, u64::MAX] {
+                for (offset, len) in [
+                    (1, 511),
+                    (3, 512),
+                    (0, 513),
+                    (1, 575),
+                    (7, 577),
+                    (0, 65535),
+                    (5, 65536),
+                    (11, 65537),
+                    (25, 2 * 65536 + 63),
+                ] {
+                    let saved: [u8; 8] = storage[offset..offset + 8].try_into().unwrap();
+                    storage[offset..offset + 8].copy_from_slice(&prefix.to_be_bytes());
+                    let end = offset + 8 + len;
+                    assert_eq!(
+                        checksum_with_sum(&storage[offset + 8..end], prefix),
+                        reference(&storage[offset..end]),
+                    );
+                    storage[offset..offset + 8].copy_from_slice(&saved);
+                }
             }
         }
     }
