@@ -83,9 +83,9 @@ unsafe fn rx_checksum_verdicts(io: &mut Dpdk) {
     }
     io.rx_checksum = false;
 
-    // Enabling RX checksum with unread burst leftovers must discard plain
-    // views so leftovers fall back cleanly to `receive_meta` and read L4
-    // checksum verdicts; setting a budget while enabled must keep views off.
+    // Enabling RX checksum with unread burst leftovers must invalidate their
+    // plain views so leftovers fall back cleanly to `receive_meta` and read
+    // L4 checksum verdicts; views stay on for later bursts and carry them.
     io.set_rx_frame_budget(Some(100));
     assert!(io.rx_views.is_some());
     for kind in 0..4u32 {
@@ -96,9 +96,8 @@ unsafe fn rx_checksum_verdicts(io: &mut Dpdk) {
     let first = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
     assert_eq!(first.l4_checksum, RxChecksum::Unknown);
     assert_eq!(frame.take().unwrap().as_slice(), &[0x42; 64]);
-    // PRIVATE fixture only: mirror `enable_rx_checksum`'s state transition.
-    io.rx_views = None;
-    io.rx_checksum = true;
+    // PRIVATE fixture only: `enable_rx_checksum`'s state transition.
+    io.mark_rx_checksum_enabled();
     for expected in [RxChecksum::Good, RxChecksum::Bad, RxChecksum::Unknown] {
         let mut frame = None;
         let pkt = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
@@ -106,15 +105,109 @@ unsafe fn rx_checksum_verdicts(io: &mut Dpdk) {
         assert_eq!(frame.take().unwrap().as_slice(), &[0x42; 64]);
     }
     io.set_rx_frame_budget(Some(100));
-    assert!(io.rx_views.is_none());
-    unsafe { ntcp_test_l4_checksum(1) };
-    let mut frame = None;
-    let after = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
-    assert_eq!(after.l4_checksum, RxChecksum::Good);
-    drop(frame);
+    assert!(io.rx_views.is_some());
+    for (kind, expected) in [
+        RxChecksum::Unknown,
+        RxChecksum::Good,
+        RxChecksum::Bad,
+        RxChecksum::Unknown,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        unsafe { ntcp_test_l4_checksum(kind as u32) };
+        let mut frame = None;
+        let pkt = io.receive_frame(&mut scratch, &mut frame).unwrap().unwrap();
+        assert_eq!(pkt.l4_checksum, expected);
+        assert_eq!(frame.take().unwrap().as_slice(), &[0x42; 64]);
+    }
+    unsafe { borrowed_checksum_verdicts(io) };
     io.rx_checksum = false;
     io.set_rx_frame_budget(None);
     assert_eq!(unsafe { ntcp_test_available() }, 1023);
+}
+
+// `consume_unannotated_frame` with RX checksum offload on (views kept, see
+// `rx_checksum_verdicts`): a GOOD or UNKNOWN verdict is lent with the frame,
+// a BAD one is deferred to normal receive, which reports it, and a view the
+// opt-in invalidated is never lent. Integration coverage without the opt-in
+// is in tests/borrowed_frame.rs.
+unsafe fn borrowed_checksum_verdicts(io: &mut Dpdk) {
+    assert!(io.rx_checksum && io.rx_views.is_some());
+    let available = unsafe { ntcp_test_available() };
+    // SAFETY: the fixture's EAL, port and pool are live; each call enqueues
+    // one 64-byte mbuf of 0x42 on the ring's RX side.
+    unsafe {
+        for kind in [1, 0, 2, 3] {
+            ntcp_test_l4_checksum(kind);
+        }
+    }
+    let mut seen = None;
+    let lent = io.consume_unannotated_frame(|bytes, checksum| {
+        seen = Some((bytes.to_vec(), checksum));
+        true
+    });
+    assert_eq!(lent, BorrowedFrame::Consumed);
+    assert_eq!(seen.take(), Some((vec![0x42; 64], RxChecksum::Good)));
+    assert_eq!(
+        io.consume_unannotated_frame(|_, checksum| {
+            assert_eq!(checksum, RxChecksum::Unknown);
+            true
+        }),
+        BorrowedFrame::Consumed
+    );
+    // BAD: deferred untouched, then taken normally with its verdict.
+    assert_eq!(
+        io.consume_unannotated_frame(|_, _| unreachable!("BAD is never lent")),
+        BorrowedFrame::Deferred
+    );
+    let mut scratch = [0xa5; 128];
+    let mut frame = None;
+    let mut meta = ReceivedPacket::default();
+    assert!(io.receive_frame_into(&mut scratch, &mut frame, &mut meta).unwrap());
+    assert_eq!(meta.l4_checksum, RxChecksum::Bad);
+    assert_eq!(frame.take().unwrap().as_slice(), &[0x42; 64]);
+    // NONE (a checksum field not final) is lent as Unknown.
+    assert_eq!(
+        io.consume_unannotated_frame(|_, checksum| {
+            assert_eq!(checksum, RxChecksum::Unknown);
+            true
+        }),
+        BorrowedFrame::Consumed
+    );
+    // Views prefetched before the opt-in carry no verdict, and the opt-in
+    // invalidates them rather than lend them as Unknown.
+    io.rx_checksum = false;
+    // SAFETY: as above.
+    unsafe {
+        ntcp_test_l4_checksum(1);
+        ntcp_test_l4_checksum(1);
+    }
+    let mut seen = None;
+    assert_eq!(
+        io.consume_unannotated_frame(|_, checksum| {
+            seen = Some(checksum);
+            false
+        }),
+        BorrowedFrame::Deferred
+    );
+    assert_eq!(seen, Some(RxChecksum::Unknown));
+    io.mark_rx_checksum_enabled();
+    assert_eq!(
+        io.consume_unannotated_frame(|_, _| unreachable!("an invalidated view is never lent")),
+        BorrowedFrame::Deferred
+    );
+    for _ in 0..2 {
+        assert!(io.receive_frame_into(&mut scratch, &mut frame, &mut meta).unwrap());
+        assert_eq!(meta.l4_checksum, RxChecksum::Good);
+        assert_eq!(frame.take().unwrap().as_slice(), &[0x42; 64]);
+    }
+    assert_eq!(
+        io.consume_unannotated_frame(|_, _| unreachable!("empty queue")),
+        BorrowedFrame::Empty
+    );
+    assert_eq!(io.rx_frames_outstanding(), Some(0));
+    assert_eq!(unsafe { ntcp_test_available() }, available);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use ntcp_io::{
-    ClockDescriptor, ClockDomain, DeviceCounters, HeapChunkSource, PacketIo, PacketLayer,
-    PacketTimestamp, PacketTimestamps, PayloadSlice, ReceivedPacket, RxChecksum, RxFrame,
-    RxFrameCount, RxFrameVtable, TcpSegmentationCapabilities, TcpSegmentationError,
+    BorrowedFrame, ClockDescriptor, ClockDomain, DeviceCounters, HeapChunkSource, PacketIo,
+    PacketLayer, PacketTimestamp, PacketTimestamps, PayloadSlice, ReceivedPacket, RxChecksum,
+    RxFrame, RxFrameCount, RxFrameVtable, TcpSegmentationCapabilities, TcpSegmentationError,
     TcpSegmentationRequest, TimestampCapabilities, TimestampPoint, TimestampSource, TimestampUnit,
     TransmitError, TransmitRequest, TransmitTime, TxChunk, TxChunkSource, TxOutcome, TxPacket,
     TxPart, TxSchedulingCapabilities, TxTimestampRequest,
@@ -25,9 +25,9 @@ pub const DEFAULT_TX_COPYBREAK: usize = 512;
 
 const INLINE_PARTS: usize = 32;
 
-// rte_eth_rx_burst requires a count divisible by eight to support every PMD.
-// Use the smallest portable burst to bound prefetching for the one-packet API.
-const RX_BURST_LEN: usize = 8;
+// rte_eth_rx_burst requires a count divisible by eight to support every PMD;
+// 32 matches typical vector PMD batch sizes and amortizes ring polls.
+pub(crate) const RX_BURST_LEN: usize = 32;
 
 // NTCP_DPDK_NOMBUF: a transmit call found the pool empty and kept nothing.
 const NOMBUF: i32 = 2;
@@ -55,6 +55,7 @@ pub(crate) struct TsoConfig {
 struct RxView {
     data: *mut u8,
     length: u16,
+    l4_status: u8,
 }
 
 #[repr(C)]
@@ -239,6 +240,7 @@ unsafe extern "C" {
         packets: *mut *mut c_void,
         count: u16,
         pool: *const c_void,
+        l4_checksum: i32,
         views: *mut RxView,
     ) -> u16;
     fn ntcp_dpdk_packet_free(packet: *mut c_void);
@@ -558,32 +560,44 @@ impl Dpdk {
     /// over by reference either way.
     pub fn set_rx_frame_budget(&mut self, budget: Option<usize>) {
         self.rx_frame_budget = budget;
-        self.rx_views = (budget.is_some() && self.rx_timestamp.is_none() && !self.rx_checksum)
+        self.rx_views = (budget.is_some() && self.rx_timestamp.is_none())
             .then(|| [RxView::default(); RX_BURST_LEN]);
+    }
+
+    fn mark_rx_checksum_enabled(&mut self) {
+        self.rx_checksum = true;
+        if let Some(views) = &mut self.rx_views {
+            for view in &mut views[self.rx_next..self.rx_count] {
+                view.data = ptr::null_mut();
+            }
+        }
+    }
+
+    fn refill_rx_burst(&mut self) -> bool {
+        self.rx_next = 0;
+        // SAFETY: the live queue is exclusively borrowed, `self.pool` is
+        // live, and the packet array (and optional view array) can hold
+        // the requested burst. Each returned mbuf transfers to us.
+        self.rx_count = unsafe {
+            ntcp_dpdk_receive_burst(
+                self.port,
+                self.rx_queue,
+                self.rx_packets.as_mut_ptr(),
+                RX_BURST_LEN as u16,
+                self.pool.as_ptr(),
+                i32::from(self.rx_checksum),
+                self.rx_views
+                    .as_mut()
+                    .map_or(ptr::null_mut(), |views| views.as_mut_ptr()),
+            )
+        } as usize;
+        self.rx_count > 0
     }
 
     // The next received mbuf chain, from the prefetched burst or a new one.
     fn next_packet(&mut self) -> Option<usize> {
-        if self.rx_next == self.rx_count {
-            self.rx_next = 0;
-            // SAFETY: the live queue is exclusively borrowed, `self.pool` is
-            // live, and the packet array (and optional view array) can hold
-            // the requested burst. Each returned mbuf transfers to us.
-            self.rx_count = unsafe {
-                ntcp_dpdk_receive_burst(
-                    self.port,
-                    self.rx_queue,
-                    self.rx_packets.as_mut_ptr(),
-                    RX_BURST_LEN as u16,
-                    self.pool.as_ptr(),
-                    self.rx_views
-                        .as_mut()
-                        .map_or(ptr::null_mut(), |views| views.as_mut_ptr()),
-                )
-            } as usize;
-            if self.rx_count == 0 {
-                return None;
-            }
+        if self.rx_next == self.rx_count && !self.refill_rx_burst() {
+            return None;
         }
         // Only the unread suffix owns mbufs. The next burst overwrites the prefix.
         let index = self.rx_next;
@@ -682,8 +696,7 @@ impl Dpdk {
     pub fn enable_rx_checksum(&mut self) -> io::Result<()> {
         // SAFETY: the borrowed port/queue remain live and unchanged.
         unsafe { rx_checksum_check(self.port, self.rx_queue) }?;
-        self.rx_views = None;
-        self.rx_checksum = true;
+        self.mark_rx_checksum_enabled();
         Ok(())
     }
 
@@ -1130,26 +1143,38 @@ impl PacketIo for Dpdk {
         scratch: &mut [u8],
         frame: &mut Option<RxFrame>,
     ) -> io::Result<Option<ReceivedPacket>> {
+        let mut metadata = ReceivedPacket::default();
+        self.receive_frame_into(scratch, frame, &mut metadata)
+            .map(|received| received.then_some(metadata))
+    }
+
+    fn receive_frame_into(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+        metadata: &mut ReceivedPacket,
+    ) -> io::Result<bool> {
         let Some(index) = self.next_packet() else {
-            return Ok(None);
+            return Ok(false);
         };
         let packet = self.rx_packets[index];
-        // Enabling timestamp or checksum extraction discards the plain
-        // views, so prefetched packets use the settings current at delivery.
+        // Enabling RX timestamps discards views, and enabling RX checksum
+        // invalidates unread leftover views, so prefetched packets use the
+        // settings current at delivery.
         let view = self
             .rx_views
             .as_ref()
             .map(|views| views[index])
             .unwrap_or_default();
-        let (data, length, metadata) = if let Some(data) = NonNull::new(view.data) {
+        let (data, length, received_meta) = if let Some(data) = NonNull::new(view.data) {
             debug_assert!(
-                self.rx_timestamp.is_none() && !self.rx_checksum,
-                "RX views must be disabled when RX timestamps or checksum offload are enabled"
+                self.rx_timestamp.is_none(),
+                "RX views must be disabled when RX timestamps are enabled"
             );
             (
                 data,
                 view.length,
-                self.metadata(usize::from(view.length), 0, 0, 0),
+                self.metadata(usize::from(view.length), 0, 0, i32::from(view.l4_status)),
             )
         } else {
             let config = self.rx_timestamp;
@@ -1169,7 +1194,7 @@ impl PacketIo for Dpdk {
             };
             match status {
                 1 => {
-                    let metadata = self.metadata(
+                    let received_meta = self.metadata(
                         usize::from(received.length),
                         received.timestamp,
                         received.timestamp_valid,
@@ -1178,13 +1203,14 @@ impl PacketIo for Dpdk {
                     (
                         NonNull::new(received.data).expect("an mbuf's data is not null"),
                         received.length,
-                        metadata,
+                        received_meta,
                     )
                 }
                 COPY => {
-                    let metadata = self.copy_packet(packet, scratch)?;
-                    *frame = Some(RxFrame::copy_from_slice(&scratch[..metadata.len]));
-                    return Ok(Some(metadata));
+                    let received_meta = self.copy_packet(packet, scratch)?;
+                    *frame = Some(RxFrame::copy_from_slice(&scratch[..received_meta.len]));
+                    *metadata = received_meta;
+                    return Ok(true);
                 }
                 error => return Err(io::Error::from_raw_os_error(-error)),
             }
@@ -1206,7 +1232,43 @@ impl PacketIo for Dpdk {
                 packet.expose_provenance(),
             )
         });
-        Ok(Some(metadata))
+        *metadata = received_meta;
+        Ok(true)
+    }
+
+    fn consume_unannotated_frame(
+        &mut self,
+        consume: impl FnOnce(&[u8], RxChecksum) -> bool,
+    ) -> BorrowedFrame {
+        if self.rx_views.is_none() {
+            return BorrowedFrame::Deferred;
+        }
+        if self.rx_next == self.rx_count && !self.refill_rx_burst() {
+            return BorrowedFrame::Empty;
+        }
+        let index = self.rx_next;
+        let view = self.rx_views.as_ref().expect("rx_views checked")[index];
+        if view.data.is_null() {
+            return BorrowedFrame::Deferred;
+        }
+        let checksum = match view.l4_status {
+            0 => RxChecksum::Unknown,
+            1 => RxChecksum::Good,
+            _ => return BorrowedFrame::Deferred,
+        };
+        // SAFETY: `direct_frame` and `receive_check` validated a direct,
+        // single-segment, refcnt-1 mbuf of `view.length` initialized bytes at
+        // `view.data`, owned exclusively by `self.rx_packets[index]`.
+        let bytes = unsafe { std::slice::from_raw_parts(view.data, usize::from(view.length)) };
+        if !consume(bytes, checksum) {
+            return BorrowedFrame::Deferred;
+        }
+        self.rx_next += 1;
+        // SAFETY: `self.rx_packets[index]` is a direct, single-segment,
+        // refcnt-1 mbuf exclusively owned by this adapter, and `bytes` is no
+        // longer borrowed.
+        unsafe { ntcp_dpdk_frame_free(self.rx_packets[index]) };
+        BorrowedFrame::Consumed
     }
 
     fn rx_frame_budget(&self) -> Option<usize> {

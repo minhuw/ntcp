@@ -21,10 +21,12 @@ struct rte_mbuf;
 struct ntcp_rx_view {
     void *data;
     uint16_t length;
+    uint8_t l4_status;
 };
 uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
                                  struct rte_mbuf **packets, uint16_t count,
-                                 const void *pool, struct ntcp_rx_view *views);
+                                 const void *pool, int l4_checksum,
+                                 struct ntcp_rx_view *views);
 void ntcp_dpdk_packet_free(void *packet);
 void ntcp_dpdk_frame_free(void *packet);
 int ntcp_dpdk_rx_checksum_check(uint16_t port, uint16_t queue);

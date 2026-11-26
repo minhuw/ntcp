@@ -7,7 +7,7 @@ use ntcp_host::{
     NeighborWake, Owner, Processed, ProcessedEnvelope, Received, Submission, SubmissionTicket,
 };
 use ntcp_io::{
-    ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, RxChecksum,
+    BorrowedFrame, ClockDomain, PacketLayer, PacketTimestamp, ReceivedPacket, RxChecksum,
     TcpSegmentationRequest, TimestampUnit, TransmitError, TransmitRequest, TxOutcome,
 };
 
@@ -880,12 +880,78 @@ impl<P: PacketIo> Network<P> {
             receive_work += taken;
             handoffs = more;
         }
+        // Where the IPv4/TCP fast path below may take a pure ACK while the
+        // backend still holds its frame (`PacketIo::consume_unannotated_frame`):
+        // it carries no data for a socket to keep, so the frame is released
+        // before the next arrival instead of handed over.
+        let borrowed_mac = match self.config.link {
+            Link::Ethernet { local_mac, .. }
+                if self.inlet.is_none() && self.io.layer() == PacketLayer::Ethernet =>
+            {
+                Some(local_mac)
+            }
+            _ => None,
+        };
+        let mut rx_meta = ReceivedPacket::default();
         while receive_work < budget.receive && !self.receive_free.is_empty() {
+            if let Some(local_mac) = borrowed_mac
+                && !self.endpoint.has_output_reservations()
+            {
+                let borrowed = self.io.consume_unannotated_frame(|bytes, checksum| {
+                    let Some((header, ip)) = bytes.split_first_chunk::<14>() else {
+                        return false;
+                    };
+                    if header[12..] != ntcp_ethernet::ETHERTYPE_IPV4.to_be_bytes()
+                        || header[..6] != local_mac
+                    {
+                        return false;
+                    }
+                    let Some(tcp) = ntcp_ip::PlainTcp::parse_header_only(ip) else {
+                        return false;
+                    };
+                    // Unannotated: no timestamps or receive offload size,
+                    // only the device's checksum verdict (`receive_metadata`).
+                    let metadata = ntcp::RxPacketMetadata {
+                        tcp_checksum_verified: checksum == RxChecksum::Good,
+                        ..Default::default()
+                    };
+                    if let Err(error) = self.host.receive_plain_tcp(
+                        &mut self.endpoint,
+                        self.ingress,
+                        now,
+                        tcp,
+                        &mut None,
+                        metadata,
+                        self.config.tcp.dscp,
+                    ) {
+                        Self::record_input_failure(
+                            &mut self.endpoint,
+                            &mut self.host,
+                            &mut self.rx_recorded,
+                            &mut self.drops,
+                            self.now,
+                            &error.into(),
+                            ip,
+                        );
+                    }
+                    true
+                });
+                match borrowed {
+                    // Observed empty: the receive below would poll it again.
+                    BorrowedFrame::Empty => break,
+                    BorrowedFrame::Consumed => {
+                        receive_work += 1;
+                        report.received += 1;
+                        continue;
+                    }
+                    BorrowedFrame::Deferred => {}
+                }
+            }
             let mut arrival = None;
-            let received = self.receive_packet(rx, &mut arrival);
+            let received = self.receive_packet(rx, &mut arrival, &mut rx_meta);
             let packet = match received {
-                Ok(Some(ref packet)) => packet,
-                Ok(None) => break,
+                Ok(true) => &rx_meta,
+                Ok(false) => break,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e)
                     if matches!(
@@ -1610,17 +1676,27 @@ impl<P: PacketIo> Network<P> {
     // backend whose frames are held by reference (`PacketIo::
     // rx_frame_budget`); a copying backend's receive is called as it was,
     // with nothing else on its path.
+    // Its metadata is put in `metadata`: false when none arrived.
     #[inline]
     fn receive_packet(
         &mut self,
         rx: &mut Option<Vec<u8>>,
         arrival: &mut Option<RxFrame>,
-    ) -> io::Result<Option<ReceivedPacket>> {
+        metadata: &mut ReceivedPacket,
+    ) -> io::Result<bool> {
         match self.frame_threshold {
-            None => self
+            None => match self
                 .io
-                .receive_with_metadata(rx.as_deref_mut().unwrap_or(&mut self.rx)),
-            Some(threshold) => self.receive_held(rx, threshold, arrival),
+                .receive_with_metadata(rx.as_deref_mut().unwrap_or(&mut self.rx))
+            {
+                Ok(Some(packet)) => {
+                    *metadata = packet;
+                    Ok(true)
+                }
+                Ok(None) => Ok(false),
+                Err(error) => Err(error),
+            },
+            Some(threshold) => self.receive_held(rx, threshold, arrival, metadata),
         }
     }
     // The next received frame of a backend whose frames are held by
@@ -1633,15 +1709,17 @@ impl<P: PacketIo> Network<P> {
         rx: &mut Option<Vec<u8>>,
         threshold: usize,
         arrival: &mut Option<RxFrame>,
-    ) -> io::Result<Option<ReceivedPacket>> {
-        // Matched in place: `?` would first move the whole result (the
-        // metadata is over 128 bytes, so a memcpy call), on every receive,
-        // the empty ones included. The frame is put in `arrival` itself.
-        let received = self
-            .io
-            .receive_frame(rx.as_deref_mut().unwrap_or(&mut self.rx), arrival);
-        if !matches!(received, Ok(Some(_))) {
-            return received;
+        metadata: &mut ReceivedPacket,
+    ) -> io::Result<bool> {
+        // Received in place: the metadata is over 128 bytes, and moving it
+        // out in a result would cost a memcpy call on every receive. The
+        // frame is put in `arrival` itself.
+        if !self.io.receive_frame_into(
+            rx.as_deref_mut().unwrap_or(&mut self.rx),
+            arrival,
+            metadata,
+        )? {
+            return Ok(false);
         }
         let Some(frame) = arrival else {
             return Err(io::Error::new(
@@ -1677,7 +1755,7 @@ impl<P: PacketIo> Network<P> {
             }
             self.frame_slack = threshold.saturating_sub(out);
         }
-        received
+        Ok(true)
     }
     // `fragment`: a member of shared flows keyed the packet as a fragment.
     // `held`: the frame `frame` lies in, if the backend handed one over.
@@ -2043,11 +2121,33 @@ impl<P: PacketIo> Network<P> {
     // reason the error stands for, unless the layer that refused it recorded
     // it already.
     #[cold]
-    #[inline(never)]
     fn input_failed(&mut self, error: &Error, packet: &[u8]) {
-        let recorded = core::mem::take(&mut self.rx_recorded)
-            | self.endpoint.drops_mut().take_error_recorded()
-            | self.host.drops_mut().take_error_recorded();
+        Self::record_input_failure(
+            &mut self.endpoint,
+            &mut self.host,
+            &mut self.rx_recorded,
+            &mut self.drops,
+            self.now,
+            error,
+            packet,
+        );
+    }
+    // `input_failed` on the fields it reads, for input that runs while the
+    // backend is borrowed (`PacketIo::consume_unannotated_frame`).
+    #[cold]
+    #[inline(never)]
+    fn record_input_failure(
+        endpoint: &mut Endpoint,
+        host: &mut Host,
+        rx_recorded: &mut bool,
+        drops: &mut ntcp::DropRecorder,
+        now: Instant,
+        error: &Error,
+        packet: &[u8],
+    ) {
+        let recorded = core::mem::take(rx_recorded)
+            | endpoint.drops_mut().take_error_recorded()
+            | host.drops_mut().take_error_recorded();
         if recorded {
             return;
         }
@@ -2064,7 +2164,9 @@ impl<P: PacketIo> Network<P> {
             Error::Unsupported(_) => DropReason::UnhandledProto,
             _ => DropReason::NotSpecified,
         };
-        self.drop_ip(reason, packet);
+        drops.record(reason, now, packet.len(), || {
+            ntcp::DropSubject::of_ip_packet(packet)
+        });
     }
     // Destination processing and dispatch of one complete datagram. `held`:
     // the frame it arrived in, if the backend handed one over.

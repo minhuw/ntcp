@@ -159,7 +159,8 @@ static inline int direct_frame(struct rte_mbuf *m, const void *pool) {
 
 uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
                                  struct rte_mbuf **packets, uint16_t count,
-                                 const void *pool, struct ntcp_rx_view *views) {
+                                 const void *pool, int l4_checksum,
+                                 struct ntcp_rx_view *views) {
     uint16_t received = rte_eth_rx_burst(port, queue, packets, count);
     if (views) {
         for (uint16_t i = 0; i < received; ++i) {
@@ -167,6 +168,15 @@ uint16_t ntcp_dpdk_receive_burst(uint16_t port, uint16_t queue,
             if (direct_frame(m, pool) && receive_check(m, NTCP_DPDK_MAX_PACKET_LEN) == 0) {
                 views[i].data = rte_pktmbuf_mtod(m, void *);
                 views[i].length = m->data_len;
+                uint8_t l4_status = NTCP_L4_UNKNOWN;
+                if (l4_checksum) {
+                    switch (m->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_MASK) {
+                    case RTE_MBUF_F_RX_L4_CKSUM_GOOD: l4_status = NTCP_L4_GOOD; break;
+                    case RTE_MBUF_F_RX_L4_CKSUM_BAD: l4_status = NTCP_L4_BAD; break;
+                    default: break;
+                    }
+                }
+                views[i].l4_status = l4_status;
             } else {
                 views[i].data = NULL;
             }

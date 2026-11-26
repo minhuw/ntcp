@@ -7,14 +7,15 @@
 //! (see `eal_args`).
 
 use crate::native::{
-    Dpdk, driver_name, pool_geometry, rx_checksum_check, tso_check, tx_checksum_check,
+    Dpdk, RX_BURST_LEN, driver_name, pool_geometry, rx_checksum_check, tso_check, tx_checksum_check,
 };
 use ntcp_io::{
-    ClockDescriptor, ClockDomain, DeviceCounters, OwnedPacket, PacketIo, PacketLayer, Payload,
-    ReceivedPacket, RxFrame, TcpSegmentationCapabilities, TcpSegmentationError,
-    TcpSegmentationRequest, TimestampCapabilities, TimestampUnit, TransmitError, TransmitRequest,
-    TransmitTime, TxChunkSource, TxOutcome, TxPacket, TxSchedulingCapabilities, TxSchedulingError,
-    TxTimestampCompletion, TxTimestampRequest, ZeroCopyCapabilities,
+    BorrowedFrame, ClockDescriptor, ClockDomain, DeviceCounters, OwnedPacket, PacketIo,
+    PacketLayer, Payload, ReceivedPacket, RxChecksum, RxFrame, TcpSegmentationCapabilities,
+    TcpSegmentationError, TcpSegmentationRequest, TimestampCapabilities, TimestampUnit,
+    TransmitError, TransmitRequest, TransmitTime, TxChunkSource, TxOutcome, TxPacket,
+    TxSchedulingCapabilities, TxSchedulingError, TxTimestampCompletion, TxTimestampRequest,
+    ZeroCopyCapabilities,
 };
 use std::{
     cell::Cell,
@@ -430,11 +431,12 @@ pub struct PortConfig {
     /// (`PacketIo::receive_frame`): a Network holds each until its
     /// application reads the data, charging the mbuf's 2368 octets to the
     /// connection. Its frame budget (`PacketIo::rx_frame_budget`) is F =
-    /// `mbufs_per_queue` - `rx_desc` - 2 x `tx_desc` - 1.5 x cache x
-    /// `queues` (the pool's cache is min(256, mbufs / 2); each queue's
-    /// worker may free this queue's mbufs, through a shared-flow handoff,
-    /// into its own cache): 12,927 with the defaults and one queue, 30.6 MB
-    /// of mbufs. Past 3/4 F out, a Network copies arrivals instead of
+    /// `mbufs_per_queue` - `rx_desc` - 32 - 2 x `tx_desc` - 1.5 x cache x
+    /// `queues` (32 the adapter's prefetched receive burst; the pool's
+    /// cache is min(256, mbufs / 2); each queue's worker may free this
+    /// queue's mbufs, through a shared-flow handoff, into its own cache):
+    /// 12,895 with the defaults and one queue, 30.5 MB of mbufs. Past 3/4 F
+    /// out, a Network copies arrivals instead of
     /// holding them, so readers that stop cannot drain the pool; frames
     /// held long show as `DeviceCounters::rx_nombuf` and `rx_missed` only
     /// when the pool is sized below that. A scatter chain (`mtu` beyond
@@ -1237,16 +1239,17 @@ impl QueueHandle {
 
 // The receive frames a consumer of a queue may hold by reference
 // (`PacketIo::rx_frame_budget`), F: the queue's pool of `mbufs` less the
-// mbufs posted to its RX ring, twice its TX ring (frames the device has
-// yet to send, and the reference and header mbufs of a frame sent by
-// reference), and what the mempool caches of the lcores that may free its
-// mbufs keep from it: each holds up to 1.5 x `cache` before it flushes
+// mbufs posted to its RX ring, the burst the adapter prefetched from it
+// (`RX_BURST_LEN`), twice its TX ring (frames the device has yet to send,
+// and the reference and header mbufs of a frame sent by reference), and
+// what the mempool caches of the lcores that may free its mbufs keep from
+// it: each holds up to 1.5 x `cache` before it flushes
 // (CALC_CACHE_FLUSHTHRESH), and `lcores` of them may, the workers of every
 // queue of the port, which free this queue's mbufs when a member of shared
 // flows hands one of its frames to another. At the default geometry, one
-// queue: 16383 - 1024 - 2 x 1024 - 384 = 12,927.
+// queue: 16383 - 1024 - 32 - 2 x 1024 - 384 = 12,895.
 fn rx_frame_budget(mbufs: u32, rx_desc: u16, tx_desc: u16, cache: u32, lcores: usize) -> usize {
-    let rings = u64::from(rx_desc) + 2 * u64::from(tx_desc);
+    let rings = u64::from(rx_desc) + RX_BURST_LEN as u64 + 2 * u64::from(tx_desc);
     let caches = u64::from(cache) * 3 / 2 * lcores as u64;
     u64::from(mbufs).saturating_sub(rings + caches) as usize
 }
@@ -1456,6 +1459,20 @@ impl PacketIo for HostedQueue {
         frame: &mut Option<RxFrame>,
     ) -> io::Result<Option<ReceivedPacket>> {
         self.io.receive_frame(scratch, frame)
+    }
+    fn receive_frame_into(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+        metadata: &mut ReceivedPacket,
+    ) -> io::Result<bool> {
+        self.io.receive_frame_into(scratch, frame, metadata)
+    }
+    fn consume_unannotated_frame(
+        &mut self,
+        consume: impl FnOnce(&[u8], RxChecksum) -> bool,
+    ) -> BorrowedFrame {
+        self.io.consume_unannotated_frame(consume)
     }
     fn rx_frame_budget(&self) -> Option<usize> {
         self.io.rx_frame_budget()
@@ -1684,9 +1701,9 @@ mod tests {
     #[test]
     fn frame_budget_leaves_the_rings_and_the_lcore_caches() {
         // PortConfig::new: one queue, its pool's cache 256.
-        assert_eq!(rx_frame_budget(16383, 1024, 1024, 256, 1), 12_927);
+        assert_eq!(rx_frame_budget(16383, 1024, 1024, 256, 1), 12_895);
         // Four queues: each worker's cache may hold this queue's mbufs.
-        assert_eq!(rx_frame_budget(16383, 1024, 1024, 256, 4), 11_775);
+        assert_eq!(rx_frame_budget(16383, 1024, 1024, 256, 4), 11_743);
         // Rings and caches beyond the pool leave nothing to hold.
         assert_eq!(rx_frame_budget(4095, 1024, 1024, 256, 4), 0);
     }

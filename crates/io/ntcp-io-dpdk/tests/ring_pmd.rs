@@ -404,19 +404,19 @@ unsafe fn buffered_receive_ownership(port: u16, pool: *mut c_void) {
         let queued;
         {
             let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
-            for sequence in 0..16u8 {
+            for sequence in 0..40u8 {
                 assert_eq!(io.transmit(&[sequence; 64]).unwrap(), TxOutcome::Submitted);
                 ntcp_test_loopback();
             }
             assert_eq!(io.receive(&mut out).unwrap(), Some(64));
             assert_eq!(&out[..64], &[0; 64]);
             queued = ntcp_test_rx_count();
-            assert!(queued > 0 && queued < 15);
+            assert!(queued > 0 && queued < 39);
         }
         assert_eq!(ntcp_test_rx_count(), queued);
         assert_eq!(ntcp_test_available(), 1023 - queued);
         let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
-        for sequence in (16 - queued) as u8..16 {
+        for sequence in (40 - queued) as u8..40 {
             assert_eq!(io.receive(&mut out).unwrap(), Some(64));
             assert_eq!(&out[..64], &[sequence; 64]);
         }
@@ -529,8 +529,8 @@ fn make_pattern_packet(seed: u8, len: usize) -> Vec<u8> {
 
 // Views-on (`set_rx_frame_budget(Some)`) vs views-off (`None`, both copy path
 // and non-view `receive_frame`) must yield identical bytes, metadata, counts,
-// and return every mbuf to the pool across full 8-packet bursts, multi-burst
-// traffic (>8 packets), and short-burst leftovers.
+// and return every mbuf to the pool across full 32-packet bursts, multi-burst
+// traffic (>32 packets), and short-burst leftovers.
 unsafe fn rx_views_equivalence(port: u16, pool: *mut c_void) {
     #[derive(Clone, Copy)]
     enum RxMode {
@@ -602,16 +602,18 @@ unsafe fn rx_views_equivalence(port: u16, pool: *mut c_void) {
     }
 
     unsafe {
-        // 1. Exact 8-packet full burst of varied single-segment sizes.
+        // 1. Exact 32-packet full burst of varied single-segment sizes.
         let full_burst: Vec<Vec<u8>> = [1, 14, 60, 64, 96, 126, 127, 128]
             .into_iter()
+            .cycle()
+            .take(32)
             .enumerate()
             .map(|(i, len)| make_pattern_packet(i as u8 + 1, len))
             .collect();
 
-        // 2. >8 packets across multiple bursts (19 packets = 8 + 8 + 3),
+        // 2. >32 packets across multiple bursts (40 packets = 32 + 8),
         // mixing direct single-segment and chained multi-segment frames.
-        let multi_burst: Vec<Vec<u8>> = (0..19usize)
+        let multi_burst: Vec<Vec<u8>> = (0..40usize)
             .map(|i| {
                 let len = match i % 5 {
                     0 => 64,
@@ -634,8 +636,8 @@ unsafe fn rx_views_equivalence(port: u16, pool: *mut c_void) {
             .collect();
 
         let scenarios: &[&[Wave<'_>]] = &[
-            &[(&full_burst, 8)],
-            &[(&multi_burst, 19)],
+            &[(&full_burst, 32)],
+            &[(&multi_burst, 40)],
             &[(&short_first, 2), (&short_second, 9)],
         ];
 
@@ -757,10 +759,10 @@ unsafe fn rx_views_toggles_with_leftovers(port: u16, pool: *mut c_void) {
 unsafe fn drop_with_leftovers_and_outstanding_frames(port: u16, pool: *mut c_void) {
     unsafe {
         let mut scratch = vec![0xa5; MAX_PACKET_LEN];
-        // 12 packets: first 3 are direct (64B) and will be held; next 5 are
-        // prefetched leftovers in the first 8-packet burst (mix of 1-seg 64B
+        // 36 packets: first 3 are direct (64B) and will be held; next 29 are
+        // prefetched leftovers in the first 32-packet burst (mix of 1-seg 64B
         // and 2-seg 129B); last 4 stay on the rx ring beyond the burst.
-        let packets: Vec<Vec<u8>> = (0..12u8)
+        let packets: Vec<Vec<u8>> = (0..36u8)
             .map(|i| {
                 let len = if i == 4 || i == 6 { 129 } else { 64 };
                 make_pattern_packet(20 + i, len)
@@ -773,21 +775,21 @@ unsafe fn drop_with_leftovers_and_outstanding_frames(port: u16, pool: *mut c_voi
             for p in &packets {
                 assert_eq!(ntcp_test_inject(p.as_ptr(), p.len() as u32), 0);
             }
-            // 10 single-seg (10 mbufs) + 2 two-seg (4 mbufs) = 14 mbufs out.
-            assert_eq!(ntcp_test_available(), 1023 - 14);
+            // 34 single-seg (34 mbufs) + 2 two-seg (4 mbufs) = 38 mbufs out.
+            assert_eq!(ntcp_test_available(), 1023 - 38);
             for p in &packets[..3] {
                 let rec = io.receive_whole(&mut scratch).unwrap().unwrap();
                 assert_eq!(rec.frame.as_slice(), p.as_slice());
                 assert!(!rec.frame.is_heap());
                 held.push(rec.frame);
             }
-            // Burst of 8 prefetched: 3 held, 5 unread leftovers (3x1-seg + 2x2-seg = 7 mbufs),
-            // 4 still queued in the rx ring (4 mbufs).
+            // Burst of 32 prefetched: 3 held, 29 unread leftovers (27x1-seg + 2x2-seg = 31
+            // mbufs), 4 still queued in the rx ring (4 mbufs).
             assert_eq!(ntcp_test_rx_count(), 4);
             assert_eq!(io.rx_frames_outstanding(), Some(3));
-            assert_eq!(ntcp_test_available(), 1023 - 14);
+            assert_eq!(ntcp_test_available(), 1023 - 38);
         }
-        // `Dpdk` dropped: 7 leftover mbufs freed immediately; 3 held + 4 queued remain.
+        // `Dpdk` dropped: 31 leftover mbufs freed immediately; 3 held + 4 queued remain.
         assert_eq!(ntcp_test_rx_count(), 4);
         assert_eq!(ntcp_test_available(), 1023 - 7);
 
@@ -811,7 +813,7 @@ unsafe fn drop_with_leftovers_and_outstanding_frames(port: u16, pool: *mut c_voi
         // Drain the 4 packets that remained on the rx ring.
         let mut io = Dpdk::from_borrowed(port, 0, 0, pool).unwrap();
         io.set_rx_frame_budget(Some(100));
-        for p in &packets[8..12] {
+        for p in &packets[32..36] {
             let rec = io.receive_whole(&mut scratch).unwrap().unwrap();
             assert_eq!(rec.frame.as_slice(), p.as_slice());
         }

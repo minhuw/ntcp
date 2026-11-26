@@ -296,6 +296,17 @@ impl<'a> PlainTcp<'a> {
         Some(Self { bytes })
     }
 
+    /// A plain datagram whose TCP header occupies the entire IP payload.
+    /// The transport still validates the TCP checksum, options and flags.
+    #[inline]
+    pub fn parse_header_only(bytes: &'a [u8]) -> Option<Self> {
+        let tcp_words = bytes.get(IP_HEADER + 12)? >> 4;
+        if tcp_words < 5 || bytes.len() != IP_HEADER + usize::from(tcp_words) * 4 {
+            return None;
+        }
+        Self::parse(bytes)
+    }
+
     pub fn bytes(self) -> &'a [u8] {
         self.bytes
     }

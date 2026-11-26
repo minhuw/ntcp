@@ -660,8 +660,8 @@ impl Drop for TempFile {
     }
 }
 
-// A hosted queue's frame budget is its pool less the rings and its lcore
-// cache (one queue), and its frames are the pool's mbufs, charged the
+// A hosted queue's frame budget is its pool less the rings, the adapter's
+// prefetched receive burst and its lcore cache (one queue), and its frames are the pool's mbufs, charged the
 // pool's element: held until they drop, the queue gone or not, after
 // which the port's pool is full and freed.
 fn held_frames(eal: &'static Eal) {
@@ -671,8 +671,8 @@ fn held_frames(eal: &'static Eal) {
     config.mbufs_per_queue = 4095;
     let port = Port::start(eal, config).unwrap();
     let mut queue = port.take_queue(0).unwrap().attach().unwrap();
-    // 4095 - 64 - 2 x 64 - 1.5 x 256.
-    assert_eq!(queue.rx_frame_budget(), Some(3519));
+    // 4095 - 64 - 32 - 2 x 64 - 1.5 x 256.
+    assert_eq!(queue.rx_frame_budget(), Some(3487));
     let (mut size, mut object) = (0, 0);
     // SAFETY: EAL is initialized; outputs are writable.
     assert_eq!(
@@ -681,10 +681,10 @@ fn held_frames(eal: &'static Eal) {
     );
     assert_eq!((size, object), (4095, 2368));
     let mut scratch = vec![0; 4096];
-    // Multi-burst (>8 packets) HostedQueue equivalence: views-on `receive_frame`
+    // Multi-burst (>32 packets) HostedQueue equivalence: views-on `receive_frame`
     // matches `receive_with_metadata` in bytes and metadata and returns all mbufs.
-    let burst: Vec<Vec<u8>> = (0..12u8)
-        .map(|i| frame(i + 1, 60 + usize::from(i) * 100))
+    let burst: Vec<Vec<u8>> = (0..40u8)
+        .map(|i| frame(i + 1, 60 + usize::from(i % 12) * 100))
         .collect();
     let mut by_view = Vec::new();
     for sent in &burst {

@@ -278,7 +278,7 @@ pub enum RxChecksum {
     Bad,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ReceivedPacket {
     pub len: usize,
     pub timestamps: PacketTimestamps,
@@ -288,6 +288,21 @@ pub struct ReceivedPacket {
     // The device's verdict on this packet's transport checksum; Unknown
     // unless the backend reports one.
     pub l4_checksum: RxChecksum,
+}
+
+/// Result of attempting to inspect and synchronously consume the front
+/// receive frame via [`PacketIo::consume_unannotated_frame`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BorrowedFrame {
+    /// The receive queue was polled and had no packet available.
+    Empty,
+    /// The front frame was accepted by the closure and released.
+    Consumed,
+    /// The front frame was not consumed (backend does not support borrowed
+    /// views, frame carries unsupported annotations or `RxChecksum::Bad`,
+    /// or the closure returned `false`). Call `receive_frame_into` /
+    /// `receive_frame` to take it normally.
+    Deferred,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -611,6 +626,39 @@ pub trait PacketIo {
         })?;
         *frame = Some(RxFrame::copy_from_slice(bytes));
         Ok(Some(metadata))
+    }
+
+    /// Receive into caller-owned frame and metadata slots. A successful
+    /// reception replaces all metadata, including any previous timestamps.
+    /// Returns false when the queue is empty.
+    fn receive_frame_into(
+        &mut self,
+        scratch: &mut [u8],
+        frame: &mut Option<RxFrame>,
+        metadata: &mut ReceivedPacket,
+    ) -> io::Result<bool> {
+        let Some(packet) = self.receive_frame(scratch, frame)? else {
+            return Ok(false);
+        };
+        *metadata = packet;
+        Ok(true)
+    }
+
+    /// Inspect the front direct receive frame when it carries no annotations
+    /// other than an optional hardware L4 checksum verdict (`RxChecksum::Unknown`
+    /// or `RxChecksum::Good`). If the consumer handles its bytes synchronously
+    /// and returns `true`, the backend releases the frame and returns
+    /// [`BorrowedFrame::Consumed`]. Returning `false` leaves the front packet
+    /// available to normal receive ([`BorrowedFrame::Deferred`]). Returns
+    /// [`BorrowedFrame::Empty`] only when the receive queue was observed empty.
+    fn consume_unannotated_frame(
+        &mut self,
+        _consume: impl FnOnce(&[u8], RxChecksum) -> bool,
+    ) -> BorrowedFrame
+    where
+        Self: Sized,
+    {
+        BorrowedFrame::Deferred
     }
 
     // The frame budget F of a backend that receives into a fixed pool of
@@ -1125,5 +1173,57 @@ mod tests {
         assert_eq!(source.chunk_size(), HeapChunkSource::DEFAULT_CHUNK_SIZE);
         assert_eq!(source.allocate().unwrap().capacity(), 16 * 1024);
         assert_eq!(minimal.0, vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn receive_frame_into_and_consume_unannotated_frame_defaults() {
+        struct Queue {
+            packets: std::collections::VecDeque<(Vec<u8>, RxChecksum)>,
+        }
+        impl PacketIo for Queue {
+            fn layer(&self) -> PacketLayer {
+                PacketLayer::Ethernet
+            }
+            fn receive(&mut self, _: &mut [u8]) -> io::Result<Option<usize>> {
+                unreachable!()
+            }
+            fn receive_with_metadata(
+                &mut self,
+                out: &mut [u8],
+            ) -> io::Result<Option<ReceivedPacket>> {
+                let Some((bytes, l4_checksum)) = self.packets.pop_front() else {
+                    return Ok(None);
+                };
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(Some(ReceivedPacket {
+                    len: bytes.len(),
+                    l4_checksum,
+                    ..Default::default()
+                }))
+            }
+            fn transmit(&mut self, _: &[u8]) -> io::Result<TxOutcome> {
+                Ok(TxOutcome::Submitted)
+            }
+        }
+        let mut io = Queue {
+            packets: std::collections::VecDeque::from([(vec![1, 2, 3, 4], RxChecksum::Good)]),
+        };
+        assert_eq!(
+            io.consume_unannotated_frame(|_, _| unreachable!("default defers without polling")),
+            BorrowedFrame::Deferred
+        );
+        let mut scratch = [0u8; 16];
+        let mut frame = None;
+        let mut meta = ReceivedPacket {
+            len: 99,
+            l4_checksum: RxChecksum::Bad,
+            ..Default::default()
+        };
+        assert!(io.receive_frame_into(&mut scratch, &mut frame, &mut meta).unwrap());
+        assert_eq!(meta.len, 4);
+        assert_eq!(meta.l4_checksum, RxChecksum::Good);
+        assert_eq!(frame.take().unwrap().as_slice(), &[1, 2, 3, 4]);
+        assert!(!io.receive_frame_into(&mut scratch, &mut frame, &mut meta).unwrap());
+        assert!(frame.is_none());
     }
 }

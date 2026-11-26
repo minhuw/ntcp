@@ -32,7 +32,9 @@ int ntcp_test_init(void) {
     char *args[] = {"ntcp-test", mapping, "--no-huge", "--no-pci", "--in-memory",
                     prefix, "--no-telemetry", "-m", "64"};
     if (rte_eal_init(RTE_DIM(args), args) < 0) return -2;
-    rx = rte_ring_create("ntcp_rx", 32, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
+    // Room past one 32-packet RX burst, so packets can stay queued behind
+    // an adapter's prefetch.
+    rx = rte_ring_create("ntcp_rx", 64, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
     tx = rte_ring_create("ntcp_tx", 8, SOCKET_ID_ANY, RING_F_SP_ENQ | RING_F_SC_DEQ);
     pool = rte_pktmbuf_pool_create("ntcp_pool", 1023, 0, 0, 256, SOCKET_ID_ANY);
     if (!rx || !tx || !pool) {

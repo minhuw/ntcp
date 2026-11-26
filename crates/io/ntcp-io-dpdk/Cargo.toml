@@ -35,6 +35,10 @@ required-features = ["test-pmd"]
 name = "host_pmd"
 required-features = ["test-pmd"]
 
+[[test]]
+name = "borrowed_frame"
+required-features = ["test-pmd"]
+
 [[example]]
 name = "dpdk_echo"
 required-features = ["native"]
