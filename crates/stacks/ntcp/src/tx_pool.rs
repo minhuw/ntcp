@@ -124,6 +124,13 @@ impl TxSource {
         }
     }
 
+    fn allocate_for_write(&mut self, bytes: usize) -> Option<ntcp_buffer::TxChunk> {
+        match self {
+            Self::Heap(source) => source.allocate_for_write(bytes),
+            Self::Custom(source) => source.allocate_for_write(bytes),
+        }
+    }
+
     #[inline]
     fn allocate(&mut self) -> Option<ntcp_buffer::TxChunk> {
         match self {
@@ -286,8 +293,8 @@ impl TxPool {
     }
 
     /// Peak additional bytes needed to append `copy_bytes` into this pool.
-    /// Exact for single-page growths (including `copy_bytes == 1`) and a tight
-    /// upper bound for multi-page growths.
+    /// Counts one arena slot per ordinary allocation unit. Contiguous heap
+    /// extents may require fewer slots.
     pub(crate) fn growth_bytes(&self, copy_bytes: usize) -> usize {
         let extra = copy_bytes.saturating_sub(self.tail_remaining());
         if extra == 0 {
@@ -384,8 +391,9 @@ impl TxPool {
     ) -> usize {
         let mut total = 0;
         while !bytes.is_empty() {
+            let mut private = false;
             if self.tail.is_none() {
-                let Some(chunk) = self.source.allocate() else {
+                let Some(chunk) = self.source.allocate_for_write(bytes.len()) else {
                     break;
                 };
                 let rem = chunk.remaining() as u32;
@@ -393,6 +401,7 @@ impl TxPool {
                     break;
                 }
                 let cap = chunk.capacity();
+                private = cap > self.source.chunk_size();
                 let Ok(handle) = self.arena.try_insert(chunk) else {
                     break;
                 };
@@ -409,8 +418,10 @@ impl TxPool {
             debug_assert!(taken > 0);
             self.tail_remaining -= taken as u32;
             emit(&mut self.arena, &tail, offset, taken as u32);
-            if full {
-                debug_assert_eq!(self.tail_remaining, 0);
+            if full || private {
+                // Only an ordinary unit remains the shared fragment. The
+                // write owns its extent until its last queued byte is freed.
+                self.tail_remaining = 0;
                 self.release(tail);
             } else {
                 self.tail = Some(tail);
@@ -717,5 +728,61 @@ mod tests {
         buf.push(TxPart::Chunk(ChunkSlice::new(&c1, 0..1).unwrap()));
         assert_eq!(buf.len(), 1);
         assert_eq!(buf.as_slice()[0].bytes(), b"0");
+    }
+
+    #[test]
+    fn multi_unit_heap_write_is_contiguous_and_not_retained_as_tail() {
+        let mut pool = TxPool::heap(16 * 1024);
+        let payload = alloc::vec![0x5au8; 40 * 1024];
+        let est = pool.growth_bytes(payload.len());
+        let before = pool.storage_bytes();
+
+        let mut large_refs = Vec::new();
+        let n = pool.append_into(&payload, |arena, tail, off, len| {
+            large_refs.push((arena.dup(tail), off, len));
+        });
+        assert_eq!(n, payload.len());
+        assert_eq!(large_refs.len(), 1, "write should fit in one contiguous extent");
+        assert_eq!(large_refs[0].1, 0);
+        assert_eq!(large_refs[0].2 as usize, payload.len());
+        assert_eq!(pool.arena().get(&large_refs[0].0).capacity(), 48 * 1024);
+        assert_eq!(pool.live(), 1);
+        assert_eq!(
+            pool.tail_remaining(),
+            0,
+            "private multi-unit extent must not remain pinned as shared tail"
+        );
+        assert!(!pool.has_idle_tail());
+        let actual = pool.storage_bytes() - before;
+        assert!(
+            est >= actual,
+            "growth_bytes estimate {est} < actual {actual}"
+        );
+
+        // A subsequent small write allocates an ordinary 16 KiB shared tail chunk
+        // rather than appending into the 48 KiB private extent.
+        let mut small_refs = Vec::new();
+        let m = pool.append_into(b"tiny", |arena, tail, off, len| {
+            small_refs.push((arena.dup(tail), off, len));
+        });
+        assert_eq!(m, 4);
+        assert_eq!(small_refs.len(), 1);
+        assert!(!pool.same_chunk(&large_refs[0].0, &small_refs[0].0));
+        assert_eq!(pool.arena().get(&small_refs[0].0).capacity(), 16 * 1024);
+        assert_eq!(pool.tail_remaining(), 16 * 1024 - 4);
+
+        // Releasing the large write immediately frees the 48 KiB extent even
+        // while the small write's shared tail remains live.
+        for (h, _, _) in large_refs {
+            pool.release(h);
+        }
+        assert_eq!(pool.live(), 1);
+        assert_eq!(pool.chunk_bytes(), 16 * 1024);
+
+        for (h, _, _) in small_refs {
+            pool.release(h);
+        }
+        pool.shrink();
+        assert_eq!(pool.live(), 0);
     }
 }

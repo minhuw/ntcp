@@ -280,6 +280,13 @@ pub trait TxChunkSource: Send {
     /// An empty chunk, or None when the source has none free now (a device
     /// pool ran dry); nothing was taken.
     fn allocate(&mut self) -> Option<TxChunk>;
+    /// An empty chunk for an admitted copying write of `bytes` bytes. A
+    /// source may combine ordinary allocation units into a contiguous
+    /// extent. Its capacity in units must fit the rounded-up write, so
+    /// the caller's fixed-unit storage bound still covers it.
+    fn allocate_for_write(&mut self, _bytes: usize) -> Option<TxChunk> {
+        self.allocate()
+    }
 }
 
 /// Heap chunks: the source for every backend that copies on transmit.
@@ -309,6 +316,22 @@ impl TxChunkSource for HeapChunkSource {
     }
     fn allocate(&mut self) -> Option<TxChunk> {
         TxChunk::try_heap(self.chunk_size)
+    }
+
+    fn allocate_for_write(&mut self, bytes: usize) -> Option<TxChunk> {
+        // An admitted write can share whole units in one allocation, up to
+        // one IP packet's worth of retained payload after a partial ACK.
+        if bytes > self.chunk_size && self.chunk_size != 0 {
+            let units = bytes
+                .div_ceil(self.chunk_size)
+                .min((1 << 16) / self.chunk_size);
+            if units > 1
+                && let Some(chunk) = TxChunk::try_heap(units * self.chunk_size)
+            {
+                return Some(chunk);
+            }
+        }
+        self.allocate()
     }
 }
 
@@ -383,5 +406,42 @@ mod tests {
 
         assert!(TxChunk::try_heap(usize::MAX).is_none());
         assert!(HeapChunkSource::new(usize::MAX).allocate().is_none());
+    }
+
+    #[test]
+    fn heap_source_allocate_for_write_combines_units_up_to_64kib() {
+        let mut source = HeapChunkSource::default();
+        assert_eq!(source.chunk_size(), 16 * 1024);
+
+        // <= chunk_size returns a single unit.
+        assert_eq!(source.allocate_for_write(0).unwrap().capacity(), 16 * 1024);
+        assert_eq!(
+            source.allocate_for_write(16 * 1024).unwrap().capacity(),
+            16 * 1024
+        );
+
+        // 16..64 KiB returns a contiguous multi-unit extent rounded up to whole units.
+        assert_eq!(
+            source.allocate_for_write(16 * 1024 + 1).unwrap().capacity(),
+            32 * 1024
+        );
+        assert_eq!(
+            source.allocate_for_write(40 * 1024).unwrap().capacity(),
+            48 * 1024
+        );
+        assert_eq!(
+            source.allocate_for_write(64 * 1024).unwrap().capacity(),
+            64 * 1024
+        );
+
+        // > 64 KiB caps at 64 KiB.
+        assert_eq!(
+            source.allocate_for_write(128 * 1024).unwrap().capacity(),
+            64 * 1024
+        );
+
+        // Zero chunk_size falls back cleanly to single zero-byte chunk.
+        let mut zero = HeapChunkSource::new(0);
+        assert_eq!(zero.allocate_for_write(4096).unwrap().capacity(), 0);
     }
 }
