@@ -91,6 +91,7 @@ unsafe extern "C" {
         port: u16,
         dst: u32,
         l4: u8,
+        proto: u8,
         priority: u32,
         queue: u16,
         flow: *mut *mut c_void,
@@ -165,7 +166,17 @@ fn flow_error(context: &str, result: i32, message: &[c_char]) -> io::Error {
 // classified NONF_IPV4_TCP or NONF_IPV4_UDP, never matches it. mlx5 matches
 // every IPv4 packet with it (flow_dv_translate_item_ipv4 leaves ip_protocol
 // unmasked). rte_flow cannot tell which, so every device gets the three.
+// The TCP and UDP rules also match the protocol in the IPv4 item where the
+// PMD takes it (`validate_ipv4`).
 const IPV4_RULES: [u8; 3] = [6, 17, 0];
+
+// One rule of `IPV4_RULES`: the IP protocol of its L4 item (0: none), and
+// the IPv4 next_proto_id it matches (0: any, else `l4`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ipv4Rule {
+    l4: u8,
+    proto: u8,
+}
 
 // rte_flow priority of the `steer_ipv4` rules, behind `steer_tcp_port`'s 0;
 // 0 on a PMD that refuses it. The refusal cannot be recognised by its error:
@@ -174,10 +185,12 @@ const IPV4_RULES: [u8; 3] = [6, 17, 0];
 // error returned. So any refusal of the first rule is retried once at 0.
 const ADDRESS_PRIORITY: u32 = 1;
 
-fn ipv4_pattern(l4: u8) -> &'static str {
-    match l4 {
-        6 => "eth / ipv4 / tcp",
-        17 => "eth / ipv4 / udp",
+fn ipv4_pattern(rule: Ipv4Rule) -> &'static str {
+    match (rule.l4, rule.proto) {
+        (6, 6) => "eth / ipv4 proto tcp / tcp",
+        (6, _) => "eth / ipv4 / tcp",
+        (17, 17) => "eth / ipv4 proto udp / udp",
+        (17, _) => "eth / ipv4 / udp",
         _ => "eth / ipv4",
     }
 }
@@ -190,8 +203,8 @@ struct Refusal {
 // The flow API calls of `install_ipv4`, apart so that its all-or-nothing
 // installation runs without a device.
 trait Ipv4Rules {
-    fn validate(&mut self, l4: u8, priority: u32) -> Result<(), Refusal>;
-    fn create(&mut self, l4: u8, priority: u32) -> Result<NonNull<c_void>, Refusal>;
+    fn validate(&mut self, rule: Ipv4Rule, priority: u32) -> Result<(), Refusal>;
+    fn create(&mut self, rule: Ipv4Rule, priority: u32) -> Result<NonNull<c_void>, Refusal>;
     fn destroy(&mut self, flow: NonNull<c_void>) -> i32;
 }
 
@@ -202,7 +215,7 @@ struct DeviceIpv4Rules {
 }
 
 impl DeviceIpv4Rules {
-    fn call(&self, l4: u8, priority: u32, flow: *mut *mut c_void) -> Result<(), Refusal> {
+    fn call(&self, rule: Ipv4Rule, priority: u32, flow: *mut *mut c_void) -> Result<(), Refusal> {
         // The shim's priority-refused flag is not trusted (`ADDRESS_PRIORITY`).
         let (mut _refused, mut message) = (0, [0; 128]);
         // SAFETY: started port; buffer capacity is passed; flow is null or
@@ -211,7 +224,8 @@ impl DeviceIpv4Rules {
             ntcp_dpdk_flow_ipv4(
                 self.port,
                 u32::from(self.dst).to_be(),
-                l4,
+                rule.l4,
+                rule.proto,
                 priority,
                 self.queue,
                 flow,
@@ -228,7 +242,7 @@ impl DeviceIpv4Rules {
         } else {
             "rte_flow_create"
         };
-        let context = format!("{step} ({} priority {priority})", ipv4_pattern(l4));
+        let context = format!("{step} ({} priority {priority})", ipv4_pattern(rule));
         Err(Refusal {
             error: flow_error(&context, result, &message),
         })
@@ -236,13 +250,13 @@ impl DeviceIpv4Rules {
 }
 
 impl Ipv4Rules for DeviceIpv4Rules {
-    fn validate(&mut self, l4: u8, priority: u32) -> Result<(), Refusal> {
-        self.call(l4, priority, std::ptr::null_mut())
+    fn validate(&mut self, rule: Ipv4Rule, priority: u32) -> Result<(), Refusal> {
+        self.call(rule, priority, std::ptr::null_mut())
     }
 
-    fn create(&mut self, l4: u8, priority: u32) -> Result<NonNull<c_void>, Refusal> {
+    fn create(&mut self, rule: Ipv4Rule, priority: u32) -> Result<NonNull<c_void>, Refusal> {
         let mut flow = std::ptr::null_mut();
-        self.call(l4, priority, &mut flow)?;
+        self.call(rule, priority, &mut flow)?;
         NonNull::new(flow).ok_or_else(|| Refusal {
             error: io::Error::other("rte_flow_create returned no flow"),
         })
@@ -252,6 +266,40 @@ impl Ipv4Rules for DeviceIpv4Rules {
         // SAFETY: flow created on this still-started port, destroyed once.
         unsafe { ntcp_dpdk_flow_destroy(self.port, flow.as_ptr()) }
     }
+}
+
+// A refusal of the rule itself (EINVAL, or no support for it), not of the
+// request to install it.
+fn refused_specification(refusal: &Refusal) -> bool {
+    matches!(
+        refusal.error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    )
+}
+
+// Validate rule `l4` of `IPV4_RULES` at priority with the protocol in the
+// IPv4 item or, where that specification is refused, with the L4 item
+// alone. ixgbe ignores an L4 item without spec and mask, so without the
+// protocol its three rules are one ntuple filter and the second creation
+// fails (EEXIST). i40e's flow director has no protocol in the TCP and UDP
+// input sets (valid_fdir_inset_table), so it takes the L4 item alone.
+fn validate_ipv4(rules: &mut impl Ipv4Rules, l4: u8, priority: u32) -> Result<Ipv4Rule, Refusal> {
+    let full = Ipv4Rule { l4, proto: l4 };
+    let refusal = match rules.validate(full, priority) {
+        Ok(()) => return Ok(full),
+        Err(refusal) if l4 != 0 && refused_specification(&refusal) => refusal,
+        Err(refusal) => return Err(refusal),
+    };
+    let bare = Ipv4Rule { l4, proto: 0 };
+    rules
+        .validate(bare, priority)
+        .map(|()| bare)
+        .map_err(|at_bare| Refusal {
+            error: io::Error::new(
+                at_bare.error.kind(),
+                format!("{}; {}", at_bare.error, refusal.error),
+            ),
+        })
 }
 
 // Validate every rule of `IPV4_RULES`, then create them, all or none: a
@@ -265,10 +313,10 @@ fn install_ipv4(rules: &mut impl Ipv4Rules) -> io::Result<Vec<NonNull<c_void>>> 
         _ => refusal.error,
     };
     let (first, rest) = (IPV4_RULES[0], &IPV4_RULES[1..]);
-    let priority = match rules.validate(first, ADDRESS_PRIORITY) {
-        Ok(()) => ADDRESS_PRIORITY,
-        Err(at_address) => match rules.validate(first, 0) {
-            Ok(()) => 0,
+    let (priority, rule) = match validate_ipv4(rules, first, ADDRESS_PRIORITY) {
+        Ok(rule) => (ADDRESS_PRIORITY, rule),
+        Err(at_address) => match validate_ipv4(rules, first, 0) {
+            Ok(rule) => (0, rule),
             Err(at_0) => {
                 let error = unsupported(at_0);
                 return Err(io::Error::new(
@@ -281,12 +329,13 @@ fn install_ipv4(rules: &mut impl Ipv4Rules) -> io::Result<Vec<NonNull<c_void>>> 
             }
         },
     };
+    let mut chosen = vec![rule];
     for &l4 in rest {
-        rules.validate(l4, priority).map_err(unsupported)?;
+        chosen.push(validate_ipv4(rules, l4, priority).map_err(unsupported)?);
     }
-    let mut flows = Vec::with_capacity(IPV4_RULES.len());
-    for &l4 in &IPV4_RULES {
-        match rules.create(l4, priority) {
+    let mut flows = Vec::with_capacity(chosen.len());
+    for &rule in &chosen {
+        match rules.create(rule, priority) {
             Ok(flow) => flows.push(flow),
             Err(refusal) => {
                 let kept: Vec<i32> = flows
@@ -825,9 +874,14 @@ impl Port {
     /// ETH / IPV4 dst / TCP, ETH / IPV4 dst / UDP and ETH / IPV4 dst, each →
     /// QUEUE. A PMD may match the L3-only rule only for packets without an
     /// L4 header it parses (i40e: ICMP and other protocols, not TCP or
-    /// UDP), so it alone could steer nothing of a TCP connection. All three
-    /// are validated first, then created; any refusal returns the error with
-    /// none of them installed (Unsupported for a refused specification).
+    /// UDP), so it alone could steer nothing of a TCP connection. The TCP and
+    /// UDP rules also match the protocol in the IPv4 item: ixgbe ignores an
+    /// L4 item without spec, so without it the three are one ntuple filter.
+    /// Where that specification is refused (i40e: the protocol is not in its
+    /// TCP or UDP flow director input set), the L4 item alone is used. All
+    /// three are validated first, then created; any other refusal returns the
+    /// error with none of them installed (Unsupported for a refused
+    /// specification).
     /// They use rte_flow priority 1, behind `steer_tcp_port`, or 0 on a PMD
     /// that refuses the first rule at 1 (i40e). The rules are destroyed when the
     /// `Flow` drops, always before the port stops.
@@ -1568,10 +1622,16 @@ mod tests {
 
     #[derive(Debug, PartialEq)]
     enum Call {
-        Validate(u8, u32),
-        Create(u8, u32),
+        Validate(Ipv4Rule, u32),
+        Create(Ipv4Rule, u32),
         Destroy(usize),
     }
+
+    const TCP: Ipv4Rule = Ipv4Rule { l4: 6, proto: 6 };
+    const UDP: Ipv4Rule = Ipv4Rule { l4: 17, proto: 17 };
+    const IP: Ipv4Rule = Ipv4Rule { l4: 0, proto: 0 };
+    const BARE_TCP: Ipv4Rule = Ipv4Rule { l4: 6, proto: 0 };
+    const BARE_UDP: Ipv4Rule = Ipv4Rule { l4: 17, proto: 0 };
 
     // A flow API that refuses what `refuse` picks, with an errno, and fails
     // the destructions listed.
@@ -1605,12 +1665,12 @@ mod tests {
     }
 
     impl<F: FnMut(&Call) -> Option<i32>> Ipv4Rules for Script<F> {
-        fn validate(&mut self, l4: u8, priority: u32) -> Result<(), Refusal> {
-            self.answer(Call::Validate(l4, priority))
+        fn validate(&mut self, rule: Ipv4Rule, priority: u32) -> Result<(), Refusal> {
+            self.answer(Call::Validate(rule, priority))
         }
 
-        fn create(&mut self, l4: u8, priority: u32) -> Result<NonNull<c_void>, Refusal> {
-            self.answer(Call::Create(l4, priority))?;
+        fn create(&mut self, rule: Ipv4Rule, priority: u32) -> Result<NonNull<c_void>, Refusal> {
+            self.answer(Call::Create(rule, priority))?;
             self.created += 1;
             Ok(NonNull::new(self.created as *mut c_void).unwrap())
         }
@@ -1626,11 +1686,13 @@ mod tests {
         }
     }
 
+    const ENOMEM: i32 = -12;
     const EINVAL: i32 = -22;
     const ENOSYS: i32 = -38;
 
     #[test]
     fn ipv4_rules_cover_tcp_udp_and_the_rest_behind_port_rules() {
+        // The TCP and UDP rules match the protocol in the IPv4 item too.
         let mut rules = script(|_| None);
         let flows = install_ipv4(&mut rules).unwrap();
         assert_eq!(flows.len(), 3);
@@ -1638,12 +1700,12 @@ mod tests {
         assert_eq!(
             rules.calls,
             [
-                Validate(6, 1),
-                Validate(17, 1),
-                Validate(0, 1),
-                Create(6, 1),
-                Create(17, 1),
-                Create(0, 1),
+                Validate(TCP, 1),
+                Validate(UDP, 1),
+                Validate(IP, 1),
+                Create(TCP, 1),
+                Create(UDP, 1),
+                Create(IP, 1),
             ]
         );
     }
@@ -1661,13 +1723,92 @@ mod tests {
         assert_eq!(
             rules.calls,
             [
-                Validate(6, 1),
-                Validate(6, 0),
-                Validate(17, 0),
-                Validate(0, 0),
-                Create(6, 0),
-                Create(17, 0),
-                Create(0, 0),
+                Validate(TCP, 1),
+                Validate(BARE_TCP, 1),
+                Validate(TCP, 0),
+                Validate(UDP, 0),
+                Validate(IP, 0),
+                Create(TCP, 0),
+                Create(UDP, 0),
+                Create(IP, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv4_rules_fall_back_to_the_bare_l4_item_where_the_protocol_is_refused() {
+        // Each rule falls back on its own.
+        let mut rules = script(|call| match call {
+            Call::Validate(UDP, _) => Some(EINVAL),
+            _ => None,
+        });
+        install_ipv4(&mut rules).unwrap();
+        use Call::*;
+        assert_eq!(
+            rules.calls,
+            [
+                Validate(TCP, 1),
+                Validate(UDP, 1),
+                Validate(BARE_UDP, 1),
+                Validate(IP, 1),
+                Create(TCP, 1),
+                Create(BARE_UDP, 1),
+                Create(IP, 1),
+            ]
+        );
+        // i40e: priority 1 refused, and the protocol in the TCP and UDP
+        // input sets.
+        let mut rules = script(|call| match call {
+            Call::Validate(_, 1) => Some(EINVAL),
+            Call::Validate(rule, _) if rule.proto != 0 => Some(EINVAL),
+            _ => None,
+        });
+        install_ipv4(&mut rules).unwrap();
+        assert_eq!(
+            rules.calls,
+            [
+                Validate(TCP, 1),
+                Validate(BARE_TCP, 1),
+                Validate(TCP, 0),
+                Validate(BARE_TCP, 0),
+                Validate(UDP, 0),
+                Validate(BARE_UDP, 0),
+                Validate(IP, 0),
+                Create(BARE_TCP, 0),
+                Create(BARE_UDP, 0),
+                Create(IP, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv4_rules_refused_otherwise_do_not_fall_back() {
+        // Only a refused specification falls back to the bare L4 item.
+        let mut rules = script(|call| match call {
+            Call::Validate(UDP, _) => Some(ENOMEM),
+            _ => None,
+        });
+        let error = install_ipv4(&mut rules).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(
+            rules.calls,
+            [Call::Validate(TCP, 1), Call::Validate(UDP, 1)]
+        );
+        // Nor does the bare L4 item's refusal pass for the protocol's.
+        let mut rules = script(|call| match call {
+            Call::Validate(UDP, _) => Some(EINVAL),
+            Call::Validate(BARE_UDP, _) => Some(ENOMEM),
+            _ => None,
+        });
+        let error = install_ipv4(&mut rules).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert!(error.to_string().contains("; scripted"), "{error}");
+        assert_eq!(
+            rules.calls,
+            [
+                Call::Validate(TCP, 1),
+                Call::Validate(UDP, 1),
+                Call::Validate(BARE_UDP, 1),
             ]
         );
     }
@@ -1676,26 +1817,46 @@ mod tests {
     fn ipv4_rules_refused_in_validation_install_nothing() {
         // The first rule refused at both priorities: both errors reported.
         let mut rules = script(|call| match call {
-            Call::Validate(6, _) => Some(EINVAL),
+            Call::Validate(rule, _) if rule.l4 == 6 => Some(EINVAL),
             _ => None,
         });
         let error = install_ipv4(&mut rules).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("at priority 1:"), "{error}");
-        assert_eq!(rules.calls, [Call::Validate(6, 1), Call::Validate(6, 0)]);
+        use Call::*;
+        assert_eq!(
+            rules.calls,
+            [
+                Validate(TCP, 1),
+                Validate(BARE_TCP, 1),
+                Validate(TCP, 0),
+                Validate(BARE_TCP, 0),
+            ]
+        );
         // One rule of the set refused: none is created.
         let mut rules = script(|call| match call {
-            Call::Validate(17, _) => Some(EINVAL),
+            Call::Validate(rule, _) if rule.l4 == 17 => Some(EINVAL),
             _ => None,
         });
         let error = install_ipv4(&mut rules).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(rules.calls, [Call::Validate(6, 1), Call::Validate(17, 1)]);
+        assert_eq!(
+            rules.calls,
+            [Validate(TCP, 1), Validate(UDP, 1), Validate(BARE_UDP, 1)]
+        );
         // No flow API (the ring PMD).
         let mut rules = script(|_| Some(ENOSYS));
         let error = install_ipv4(&mut rules).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(rules.calls, [Call::Validate(6, 1), Call::Validate(6, 0)]);
+        assert_eq!(
+            rules.calls,
+            [
+                Validate(TCP, 1),
+                Validate(BARE_TCP, 1),
+                Validate(TCP, 0),
+                Validate(BARE_TCP, 0),
+            ]
+        );
     }
 
     #[test]
@@ -1703,7 +1864,7 @@ mod tests {
         // i40e checks a pctype's input set against its rules only when
         // creating (i40e_flow_set_fdir_inset).
         let mut rules = script(|call| match call {
-            Call::Create(0, _) => Some(EINVAL),
+            Call::Create(IP, _) => Some(EINVAL),
             _ => None,
         });
         let error = install_ipv4(&mut rules).unwrap_err();
@@ -1712,9 +1873,9 @@ mod tests {
         assert_eq!(
             rules.calls[3..],
             [
-                Call::Create(6, 1),
-                Call::Create(17, 1),
-                Call::Create(0, 1),
+                Call::Create(TCP, 1),
+                Call::Create(UDP, 1),
+                Call::Create(IP, 1),
                 Call::Destroy(2),
                 Call::Destroy(1),
             ]
@@ -1724,7 +1885,7 @@ mod tests {
     #[test]
     fn ipv4_rules_left_installed_are_reported() {
         let mut rules = script(|call| match call {
-            Call::Create(0, _) => Some(EINVAL),
+            Call::Create(IP, _) => Some(EINVAL),
             _ => None,
         });
         rules.destroy_fails = vec![1];

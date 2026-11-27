@@ -1292,20 +1292,25 @@ int ntcp_dpdk_port_driver(uint16_t port, char *name, size_t capacity) {
     return 0;
 }
 
-// ETH / IPV4 (exact destination) [/ TCP or UDP, any header] -> QUEUE at
-// priority. dst is in network byte order; l4 is 0 (no L4 item), IPPROTO_TCP
-// or IPPROTO_UDP. With flow NULL the rule is only validated, otherwise
-// created into *flow. Returns 0 or a negative errno; on failure
-// *priority_refused tells whether the PMD refused the priority attribute
-// (RTE_FLOW_ERROR_TYPE_ATTR_PRIORITY).
-int ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint8_t l4, uint32_t priority,
-                        uint16_t queue, void **flow, int *priority_refused, char *message,
-                        size_t capacity) {
+// ETH / IPV4 (exact destination[, protocol]) [/ TCP or UDP, any header] ->
+// QUEUE at priority. dst is in network byte order; l4 is 0 (no L4 item),
+// IPPROTO_TCP or IPPROTO_UDP; proto is 0 (any) or l4, matched as the IPv4
+// next_proto_id under a full mask. ixgbe ignores an L4 item without spec
+// and mask, so only proto tells its rules apart (cons_parse_ntuple_filter).
+// With flow NULL the rule is only validated, otherwise created into *flow.
+// Returns 0 or a negative errno; on failure *priority_refused tells whether
+// the PMD refused the priority attribute (RTE_FLOW_ERROR_TYPE_ATTR_PRIORITY).
+int ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint8_t l4, uint8_t proto,
+                        uint32_t priority, uint16_t queue, void **flow,
+                        int *priority_refused, char *message, size_t capacity) {
     if (l4 != 0 && l4 != IPPROTO_TCP && l4 != IPPROTO_UDP) return -EINVAL;
+    if (proto != 0 && proto != l4) return -EINVAL;
     struct rte_flow_attr attr = { .ingress = 1, .priority = priority };
     struct rte_flow_item_ipv4 spec = {0}, mask = {0};
     spec.hdr.dst_addr = dst;
     mask.hdr.dst_addr = UINT32_MAX;
+    spec.hdr.next_proto_id = proto;
+    mask.hdr.next_proto_id = proto ? UINT8_MAX : 0;
     struct rte_flow_item pattern[] = {
         { .type = RTE_FLOW_ITEM_TYPE_ETH },
         { .type = RTE_FLOW_ITEM_TYPE_IPV4, .spec = &spec, .mask = &mask },

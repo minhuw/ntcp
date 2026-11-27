@@ -157,9 +157,9 @@ void ntcp_dpdk_port_release(uint16_t port, uint64_t owner, int started);
 int ntcp_dpdk_read_clock(uint16_t port, uint64_t *clock);
 int ntcp_dpdk_port_mac(uint16_t port, uint8_t mac[6]);
 int ntcp_dpdk_port_driver(uint16_t port, char *name, size_t capacity);
-int ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint8_t l4, uint32_t priority,
-                        uint16_t queue, void **flow, int *priority_refused, char *message,
-                        size_t capacity);
+int ntcp_dpdk_flow_ipv4(uint16_t port, uint32_t dst, uint8_t l4, uint8_t proto,
+                        uint32_t priority, uint16_t queue, void **flow,
+                        int *priority_refused, char *message, size_t capacity);
 void *ntcp_dpdk_flow_tcp_port(uint16_t port, uint32_t dst, uint16_t dst_port,
                               uint16_t mask, uint16_t queue, int *error, int *stage,
                               char *message, size_t capacity);
