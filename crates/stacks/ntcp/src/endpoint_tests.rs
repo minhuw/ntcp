@@ -1441,7 +1441,13 @@ fn syn_received_reset_preserves_passive_listener_but_closes_active_open() {
     );
     assert_eq!(a.state(client).unwrap(), State::Closed);
     assert_eq!(a.close_reason(client).unwrap(), Some(CloseReason::Reset));
-    assert!(a.buffer_bytes() > 0); // Active terminal status belongs to its caller.
+    // Active terminal status belongs to its caller; the reset freed the
+    // send storage its SYN held.
+    assert!(a.connection_exists(client));
+    assert_eq!(a.buffer_bytes(), 0);
+    a.release(client).unwrap();
+    assert!(packets(&mut a, 0).is_empty());
+    assert!(!a.connection_exists(client));
 }
 
 #[test]
@@ -5658,6 +5664,92 @@ fn an_abort_frees_its_send_storage_before_its_reset_is_sent() {
     assert_eq!(retransmitted.as_deref(), Some(b"kept".as_slice()));
     assert!(!a.connection_exists(client));
     assert_eq!(a.buffer_bytes(), peer_charge + a.tx_pool_bytes());
+}
+
+// An established client with six received bytes unread, and a write whose
+// initial window left unacknowledged (never delivered) and whose rest
+// waits unsent; its transport info then.
+fn unacknowledged_and_unsent() -> (
+    Endpoint,
+    Endpoint,
+    ConnectionId,
+    ConnectionId,
+    TransportInfo,
+) {
+    let (mut a, mut b, listener, client) = endpoints();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    b.write(server, b"unread").unwrap();
+    pump(&mut a, &mut b, 0);
+    assert_eq!(a.write(client, &[7; 1024]).unwrap(), 1024);
+    assert!(!packets(&mut a, 0).is_empty());
+    let info = a.transport_info(client).unwrap();
+    assert!(info.unacked != 0 && info.notsent_bytes != 0 && info.send_used == 1024);
+    (a, b, client, server, info)
+}
+
+// A connection a reset or a timeout ended, its send queue purged: it holds
+// only what it received, readable until the application releases it, and
+// no tuple, as before; its release reclaims it.
+fn check_send_purged(a: &mut Endpoint, now: u64, client: ConnectionId, before: TransportInfo) {
+    let (local, remote) = addresses();
+    let after = a.transport_info(client).unwrap();
+    assert_eq!((after.send_used, after.notsent_bytes), (0, 0));
+    assert!(after.buffer_charge < before.buffer_charge);
+    assert_eq!(a.buffer_bytes(), after.buffer_charge + a.tx_pool_bytes());
+    assert_eq!(a.terminal_readable_bytes(client), Ok(6));
+    assert_eq!(a.next_deadline(), None);
+    assert!(a.connection_exists(client));
+    assert_eq!(a.connection_id(Tuple { local, remote }), None);
+    let mut bytes = [0; 8];
+    assert_eq!(a.read_terminal(client, &mut bytes), Ok(6));
+    assert_eq!(&bytes[..6], b"unread");
+    a.release(client).unwrap();
+    assert!(packets(a, now).is_empty());
+    assert!(!a.connection_exists(client));
+    assert_eq!(a.buffer_bytes(), 0);
+}
+
+// A reset received frees the connection's queued and unacknowledged bytes,
+// send ring and ledgers at once, as Linux's tcp_reset purges the write
+// queue (tcp_write_queue_purge) before tcp_done, not when the application
+// releases the connection.
+#[test]
+fn a_received_reset_frees_send_storage_before_release() {
+    let (mut a, mut b, client, server, before) = unacknowledged_and_unsent();
+    let charged = a.buffer_bytes();
+    b.abort(server).unwrap();
+    let reset = packets(&mut b, 0);
+    assert_eq!(reset.len(), 1);
+    deliver(&mut a, 0, reset);
+    assert_eq!(a.close_reason(client), Ok(Some(CloseReason::Reset)));
+    assert!(a.buffer_bytes() < charged);
+    check_send_purged(&mut a, 0, client, before);
+}
+
+// A user timeout (R2) frees the connection's queued and unacknowledged
+// bytes, send ring and ledgers at once, as Linux's tcp_write_err purges the
+// write queue (tcp_write_queue_purge) before tcp_done, not when the
+// application releases the connection.
+#[test]
+fn a_user_timeout_frees_send_storage_before_release() {
+    let (mut a, _b, client, _, before) = unacknowledged_and_unsent();
+    a.set_user_timeout(client, 1_000_000).unwrap();
+    let mut charged = a.buffer_bytes();
+    let mut now = 0;
+    for _ in 0..64 {
+        if a.close_reason(client) != Ok(None) {
+            break;
+        }
+        charged = a.buffer_bytes();
+        // Every retransmission is lost.
+        now = a.next_deadline().unwrap();
+        a.on_timeout(now, 64).unwrap();
+        packets(&mut a, now);
+    }
+    assert_eq!(a.close_reason(client), Ok(Some(CloseReason::TimedOut)));
+    assert!(a.buffer_bytes() < charged);
+    check_send_purged(&mut a, now, client, before);
 }
 
 #[test]

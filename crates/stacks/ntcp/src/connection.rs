@@ -1297,8 +1297,9 @@ pub(crate) struct Connection {
     // inspect a drained queue for reclamation only above its reserve.
     large_send_ring: bool,
     large_ledgers: bool,
-    // An abort left the send queue and ledgers for Endpoint::refresh to
-    // free (`purge_send_queue`), which needs the owner's TxPool.
+    // An abort, reset, timeout or hard error left the send queue and
+    // ledgers for Endpoint::refresh to free (`purge_send_queue`), which
+    // needs the owner's TxPool.
     send_purge_pending: bool,
     // The receive direction's limits, as the send direction's: whether it
     // is tuned and the window_clamp DRS may raise it to (tcp_rmem[2]).
@@ -5827,7 +5828,7 @@ impl Connection {
     //# received from the remote side, then the local application MUST be informed
     //# whether it closed normally or was aborted (MUST-12).
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
-    //= reason=Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset; explicit release governs terminal handle storage.
+    //= reason=Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset and frees the send queue; received data and the terminal handle go at explicit release.
     //# If the RST bit is set, then any outstanding RECEIVEs and SEND should receive "reset"
     //# responses. All segment queues should be flushed. Users should also receive an
     //# unsolicited general "connection reset" signal. Enter the CLOSED state, delete the TCB,
@@ -5878,10 +5879,17 @@ impl Connection {
         self.reason = Some(reason);
         self.send.release_shared();
         self.events.closed(reason);
-        if reason == CloseReason::Aborted {
-            self.send_purge_pending = true;
-        } else {
+        if reason != CloseReason::Aborted {
             self.pending_rst = None;
+        }
+        // Only a normal close keeps its send queue until release, as
+        // Linux's tcp_done and tcp_close do; the queue is empty there but
+        // after a close in SYN-SENT. Every other end purges it at once:
+        // tcp_disconnect at an abort, tcp_done_with_error at a reset
+        // (tcp_reset), a timeout (tcp_write_err) and a hard error
+        // (tcp_v4_err).
+        if reason != CloseReason::Normal {
+            self.send_purge_pending = true;
         }
         self.syn_pending = false;
         self.ack_pending = false;
@@ -6493,17 +6501,19 @@ impl Connection {
         self.rack.allocation_bytes() + self.scoreboard.storage_bytes()
     }
 
-    // Whether an abort left the send queue and ledgers to free.
+    // Whether a terminal other than a normal close left the send queue and
+    // ledgers to free.
     pub(crate) fn send_purge_pending(&self) -> bool {
         self.send_purge_pending
     }
 
-    // Linux's tcp_write_queue_purge at an abort (tcp_disconnect, tcp_reset,
-    // tcp_write_err): the queued and unacknowledged bytes, their send ring
-    // and both ledgers go now, not when the slot is reclaimed. The reset
-    // `abort` scheduled keeps only its sequence and the tuple. A chunk a
-    // device still transmits from stays alive through the device's own
-    // reference (`TxChunkVtable`), as at an ACK that frees its entry.
+    // Linux's tcp_write_queue_purge at an abort (tcp_disconnect), a reset
+    // (tcp_reset), a timeout (tcp_write_err) or a hard error (tcp_v4_err):
+    // the queued and unacknowledged bytes, their send ring and both ledgers
+    // go now, not when the slot is reclaimed. A reset `abort` scheduled
+    // keeps only its sequence and the tuple. A chunk a device still
+    // transmits from stays alive through the device's own reference
+    // (`TxChunkVtable`), as at an ACK that frees its entry.
     pub(crate) fn purge_send_queue(&mut self, pool: &mut TxPool) {
         debug_assert!(self.send_purge_pending && self.state == State::Closed);
         self.send_purge_pending = false;
@@ -14766,7 +14776,7 @@ impl Connection {
     }
 
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
-    //= reason=Default SYN/data R2 terminal behavior; storage reclaimed by release, timer servicing belongs to driver; explicit application stall timeout is separate.
+    //= reason=Default SYN/data R2 terminal behavior; the send queue is freed at the timeout, received data and the terminal handle at release; timer servicing belongs to driver; explicit application stall timeout is separate.
     //# For any state if the user timeout expires, flush all queues, signal the user "error:
     //# connection aborted due to user timeout" in general and for any outstanding calls, delete
     //# the TCB, enter the CLOSED state, and return.

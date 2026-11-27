@@ -4530,11 +4530,14 @@ impl Endpoint {
             .as_ref()
             .is_some_and(|slot| slot.connection.send_purge_pending())
         {
-            // An abort's send storage returns to the budget now, whatever
-            // the reset it still owes waits for; the settles below take
-            // the send ring, PTB marks and chunks. No reservation holds the
-            // connection: abort and close wait for its end, and a failed
-            // reservation is cleared before this refresh.
+            // The send storage of a connection an abort, reset, timeout or
+            // hard error ended returns to the budget now, whatever a reset
+            // it still owes waits for; the settles below take the send
+            // ring, PTB marks and chunks. No reservation holds the
+            // connection: abort, close, input and network errors wait for
+            // its end, its timers do not run while it is held, and a
+            // reservation that fails or expires the connection is cleared
+            // before this refresh.
             debug_assert!(!self.slot_output_reserved(index));
             let connection = &mut self.slots[index].as_mut().unwrap().connection;
             let old = connection.buffer_charge();

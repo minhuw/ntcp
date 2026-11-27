@@ -10591,7 +10591,7 @@ fn simultaneous_open_and_lost_final_ack() {
 #[test]
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8
 //= type=test
-//= reason=Default SYN/data R2 terminal behavior; storage reclaimed by release, timer servicing belongs to driver; explicit application stall timeout is separate.
+//= reason=Default SYN/data R2 terminal behavior; the send queue is freed at the timeout, received data and the terminal handle at release; timer servicing belongs to driver; explicit application stall timeout is separate.
 //# For any state if the user timeout expires, flush all queues, signal the user "error:
 //# connection aborted due to user timeout" in general and for any outstanding calls, delete
 //# the TCB, enter the CLOSED state, and return.
@@ -14060,7 +14060,7 @@ fn rfc5961_ack_bounds_are_inclusive_and_reject_all_incoming_side_effects() {
 //# drop the unacceptable segment and stop processing further.
 //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4
 //= type=test
-//= reason=Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset; explicit release governs terminal handle storage.
+//= reason=Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset and frees the send queue; received data and the terminal handle go at explicit release.
 //# If the RST bit is set, then any outstanding RECEIVEs and SEND should receive "reset"
 //# responses. All segment queues should be flushed. Users should also receive an
 //# unsolicited general "connection reset" signal. Enter the CLOSED state, delete the TCB,

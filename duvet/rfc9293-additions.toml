@@ -435,7 +435,7 @@ start the time-wait timer, turn off the other timers; otherwise, enter the
 CLOSING state.
 '''
 
-# BASE-041: Default SYN/data R2 terminal behavior; storage reclaimed by release, timer servicing belongs to driver; explicit application stall timeout is separate.
+# BASE-041: Default SYN/data R2 terminal behavior; the send queue is freed at the timeout, received data and the terminal handle at release; timer servicing belongs to driver; explicit application stall timeout is separate.
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.8"
 level = "MUST"
@@ -579,7 +579,7 @@ be flushed. And in the active OPEN case, enter the CLOSED state and delete the
 TCB, and return.
 '''
 
-# BASE-055: Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset; explicit release governs terminal handle storage.
+# BASE-055: Exact-sequence inbound reset terminates, cancels all protocol output/deadlines, reports Reset and frees the send queue; received data and the terminal handle go at explicit release.
 [[spec]]
 target = "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
 level = "MUST"
