@@ -151,6 +151,7 @@ int ntcp_dpdk_port_configure(uint16_t port, const struct ntcp_port_config *confi
                              uint8_t *checksums);
 int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
                                uint16_t tx_desc, int socket, void *pool);
+int ntcp_dpdk_port_queue_stats_map(uint16_t port, uint16_t queues);
 int ntcp_dpdk_port_start(uint16_t port);
 int ntcp_dpdk_port_stats(uint16_t port, uint64_t *rx_nombuf, uint64_t *imissed);
 void ntcp_dpdk_port_release(uint16_t port, uint64_t owner, int started);

@@ -82,6 +82,7 @@ unsafe extern "C" {
         socket: i32,
         pool: *mut c_void,
     ) -> i32;
+    fn ntcp_dpdk_port_queue_stats_map(port: u16, queues: u16) -> i32;
     fn ntcp_dpdk_port_start(port: u16) -> i32;
     fn ntcp_dpdk_port_stats(port: u16, rx_nombuf: *mut u64, imissed: *mut u64) -> i32;
     fn ntcp_dpdk_port_release(port: u16, owner: u64, started: i32);
@@ -779,6 +780,11 @@ impl Port {
             if result < 0 {
                 return Err(dpdk_error(&format!("queue {queue} setup"), result));
             }
+        }
+        // SAFETY: configured port with every queue set up.
+        let result = unsafe { ntcp_dpdk_port_queue_stats_map(port, config.queues) };
+        if result < 0 {
+            return Err(dpdk_error("queue stats mapping", result));
         }
         // SAFETY: fully configured port.
         let result = unsafe { ntcp_dpdk_port_start(port) };

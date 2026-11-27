@@ -1241,6 +1241,25 @@ int ntcp_dpdk_port_queue_setup(uint16_t port, uint16_t queue, uint16_t rx_desc,
     return rte_eth_tx_queue_setup(port, queue, tx_desc, socket, &txconf);
 }
 
+// Per-queue hardware counters on PMDs that count every queue in counter 0
+// until queue i is mapped to counter i (ixgbe). Before start: ixgbe writes the
+// saved mapping at every start. 16 is ethdev's RTE_ETHDEV_QUEUE_STAT_CNTRS
+// (ethdev_driver.h only) and the counter count of ixgbe and txgbe, which mask
+// or refuse a higher index. -ENOTSUP (no op: mlx5, ring, null) and -ENOSYS
+// (ixgbe 82598, txgbe VF) mean there is nothing to map.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations" // No replacement.
+int ntcp_dpdk_port_queue_stats_map(uint16_t port, uint16_t queues) {
+    for (uint16_t i = 0; i < queues && i < 16; i++) {
+        int result = rte_eth_dev_set_rx_queue_stats_mapping(port, i, i);
+        if (!result) result = rte_eth_dev_set_tx_queue_stats_mapping(port, i, i);
+        if (result == -ENOTSUP || result == -ENOSYS) return 0;
+        if (result < 0) return result;
+    }
+    return 0;
+}
+#pragma GCC diagnostic pop
+
 int ntcp_dpdk_port_start(uint16_t port) { return rte_eth_dev_start(port); }
 
 // The port's receive buffer shortage (rte_eth_stats rx_nombuf, imissed).
