@@ -41,7 +41,8 @@ enum TxSegData {
     },
     Shared(Payload),
     // Shared payload dropped eagerly on `release_shared()` at connection
-    // termination while preserving `SendBuffer::len()` until reclaim.
+    // termination while preserving `SendBuffer::len()` until an abort's
+    // purge or reclaim.
     Released(u32),
 }
 

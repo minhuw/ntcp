@@ -1297,6 +1297,9 @@ pub(crate) struct Connection {
     // inspect a drained queue for reclamation only above its reserve.
     large_send_ring: bool,
     large_ledgers: bool,
+    // An abort left the send queue and ledgers for Endpoint::refresh to
+    // free (`purge_send_queue`), which needs the owner's TxPool.
+    send_purge_pending: bool,
     // The receive direction's limits, as the send direction's: whether it
     // is tuned and the window_clamp DRS may raise it to (tcp_rmem[2]).
     receive_tuned: bool,
@@ -1781,6 +1784,7 @@ impl Connection {
             send_max: send_sizes.max,
             send_expand_pending: false,
             refresh_work: false,
+            send_purge_pending: false,
             large_send_ring: false,
             large_ledgers,
             receive_tuned,
@@ -5874,7 +5878,9 @@ impl Connection {
         self.reason = Some(reason);
         self.send.release_shared();
         self.events.closed(reason);
-        if reason != CloseReason::Aborted {
+        if reason == CloseReason::Aborted {
+            self.send_purge_pending = true;
+        } else {
             self.pending_rst = None;
         }
         self.syn_pending = false;
@@ -6485,6 +6491,27 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn ledger_bytes(&self) -> usize {
         self.rack.allocation_bytes() + self.scoreboard.storage_bytes()
+    }
+
+    // Whether an abort left the send queue and ledgers to free.
+    pub(crate) fn send_purge_pending(&self) -> bool {
+        self.send_purge_pending
+    }
+
+    // Linux's tcp_write_queue_purge at an abort (tcp_disconnect, tcp_reset,
+    // tcp_write_err): the queued and unacknowledged bytes, their send ring
+    // and both ledgers go now, not when the slot is reclaimed. The reset
+    // `abort` scheduled keeps only its sequence and the tuple. A chunk a
+    // device still transmits from stays alive through the device's own
+    // reference (`TxChunkVtable`), as at an ACK that frees its entry.
+    pub(crate) fn purge_send_queue(&mut self, pool: &mut TxPool) {
+        debug_assert!(self.send_purge_pending && self.state == State::Closed);
+        self.send_purge_pending = false;
+        self.send.clear_chunks(pool);
+        self.send.release();
+        self.rack.purge();
+        self.scoreboard.release();
+        self.large_ledgers = false;
     }
 
     // Frees both ledgers' storage (`ledgers_reclaimable`); nothing
@@ -8180,7 +8207,7 @@ impl Connection {
     //# Send a reset segment:
     //# <SEQ=SND.NXT><CTL=RST>
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
-    //= reason=Terminal state cancels queued work; Endpoint defers storage reclamation until the reset is generated.
+    //= reason=Terminal state cancels queued work; the send queue is freed at the abort, and only the reset's sequence and tuple wait for its output.
     //# All queued SENDs and RECEIVEs should be given "connection reset"
     //# notification; all segments queued for transmission (except for the
     //# RST formed above) or retransmission should be flushed. Delete the
@@ -8189,7 +8216,7 @@ impl Connection {
     //= reason=CLOSING, LAST-ACK and TIME-WAIT terminate without scheduling a reset.
     //# Respond with "ok" and delete the TCB, enter CLOSED state, and return.
     //= https://www.rfc-editor.org/rfc/rfc9293#section-3.10.5
-    //= reason=Aborted closes the connection and invalidates reads/writes; Endpoint release reclaims storage after reset output drains.
+    //= reason=Aborted closes the connection and invalidates reads/writes; queued sends are freed at the abort, received data at Endpoint release, which reclaims the slot after reset output drains.
     //# All queued SENDs and RECEIVEs should be given "connection reset"
     //# notification.  Delete the TCB, enter CLOSED state, and return.
     pub(crate) fn abort(&mut self) {
@@ -8215,6 +8242,19 @@ impl Connection {
             self.reset_reply = false;
             self.terminal(CloseReason::Aborted);
         }
+    }
+
+    // Frees the receive queues of a CLOSED connection its application
+    // released, as Linux's tcp_close frees unread data: no terminal read
+    // can follow. RCV.NXT stays for a reset still owed.
+    pub(crate) fn discard_receive(&mut self) {
+        debug_assert_eq!(self.state, State::Closed);
+        let next = self.receive.next();
+        self.receive.clear();
+        self.receive
+            .reset_start(next)
+            .expect("cleared receive buffer");
+        self.receive_used = 0;
     }
 
     pub(crate) fn unsubmitted_active_open(&self) -> bool {

@@ -4528,6 +4528,22 @@ impl Endpoint {
         let reset_cooldown = self.config.connection.timebase.ticks_from_us(60_000_000);
         if self.slots[index]
             .as_ref()
+            .is_some_and(|slot| slot.connection.send_purge_pending())
+        {
+            // An abort's send storage returns to the budget now, whatever
+            // the reset it still owes waits for; the settles below take
+            // the send ring, PTB marks and chunks. No reservation holds the
+            // connection: abort and close wait for its end, and a failed
+            // reservation is cleared before this refresh.
+            debug_assert!(!self.slot_output_reserved(index));
+            let connection = &mut self.slots[index].as_mut().unwrap().connection;
+            let old = connection.buffer_charge();
+            connection.purge_send_queue(&mut self.tx_pool);
+            let new = connection.buffer_charge();
+            self.recharge(old, new);
+        }
+        if self.slots[index]
+            .as_ref()
             .is_some_and(|slot| slot.connection.send_expand_pending())
         {
             // tcp_should_expand_sndbuf: neither under memory pressure nor
@@ -7390,6 +7406,11 @@ impl Endpoint {
             + slot.connection.rx_timestamps.storage_bytes();
         slot.connection.tx_timestamps = Default::default();
         slot.connection.rx_timestamps = Default::default();
+        // Nothing reads a released connection: what it received goes now,
+        // not after a reset the device may hold back (refresh settles it).
+        if state == State::Closed {
+            slot.connection.discard_receive();
+        }
         slot.released = true;
         self.events.remove(id.slot);
         // A released connection writes no more.

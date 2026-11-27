@@ -1571,7 +1571,8 @@ fn listener_cleanup_retries_unaccepted_child_reset() {
         b.poll_transmit(0, &mut [0; 1], 1),
         Err(EndpointError::Connection(Error::OutputTooSmall))
     );
-    assert!(b.buffer_bytes() > 0);
+    // The child's storage went at the abort; only its reset waits.
+    assert_eq!(b.buffer_bytes(), 0);
     let replies = packets(&mut b, 0);
     assert_eq!(replies.len(), 1);
     assert_ne!(
@@ -5377,7 +5378,7 @@ fn an_aborted_active_open_frees_its_tuple_once_the_reset_is_sent() {
             0
         );
         assert_eq!(a.next_deadline(), None);
-        assert_eq!(a.buffer_bytes() == 0, release);
+        assert_eq!(a.buffer_bytes(), 0);
         deliver(&mut b, 1_000, reset);
         assert_eq!(b.close_reason(server), Ok(Some(CloseReason::Reset)));
         b.release(server).unwrap();
@@ -5412,7 +5413,7 @@ fn terminal_reset_holds_the_tuple_until_generated_and_frees_it_after() {
             b.accept(listener).unwrap();
             let own = a.listen(local, 1).unwrap(); // Reached once the reset is out.
             let tuple = Tuple { local, remote };
-            let charge = a.buffer_bytes();
+            assert!(a.buffer_bytes() > 0);
             a.abort(id).unwrap();
             assert_eq!(a.state(id), Ok(State::Closed));
             assert_eq!(a.next_deadline(), None);
@@ -5458,7 +5459,8 @@ fn terminal_reset_holds_the_tuple_until_generated_and_frees_it_after() {
                     a.connect(now, local, remote),
                     Err(EndpointError::AddressInUse)
                 );
-                assert_eq!(a.buffer_bytes(), charge);
+                // The tuple, not the storage: the abort freed that.
+                assert_eq!(a.buffer_bytes(), 0);
             }
             assert!(
                 a.poll_transmit(1_000, &mut [0; 64], 0)
@@ -5477,7 +5479,7 @@ fn terminal_reset_holds_the_tuple_until_generated_and_frees_it_after() {
             assert!(!a.has_pending_output());
             assert_eq!(a.connection_id(tuple), None);
             assert_eq!(a.connection_exists(id), !released);
-            assert_eq!(a.buffer_bytes(), if released { 0 } else { charge });
+            assert_eq!(a.buffer_bytes(), 0);
             // Late segments meet the listener: an ACK is reset, a reset is
             // dropped, a SYN opens a connection.
             for flags in [wire::ACK, wire::RST, wire::SYN] {
@@ -5544,20 +5546,21 @@ fn a_sent_reset_returns_its_slot_and_bytes_at_once() {
             b.accept(listener).unwrap();
             a.abort(id).unwrap();
             a.release(id).unwrap();
-            // Before its reset goes out the connection keeps its slot and bytes.
-            assert_eq!(a.buffer_bytes(), charge);
+            // Before its reset goes out the connection keeps its slot, but
+            // its bytes went back at the abort.
+            assert_eq!(a.buffer_bytes(), 0);
             let mut other = local;
             other.set_port(local.port() + 1);
-            if slots == 1 || byte_slots == 1 {
-                // Out of slots, or else of buffer budget.
+            if slots == 1 {
                 assert_eq!(
                     a.connect(0, other, remote),
-                    Err(if slots == 1 {
-                        EndpointError::LimitReached
-                    } else {
-                        EndpointError::Connection(Error::NoMemory)
-                    })
+                    Err(EndpointError::LimitReached)
                 );
+            } else {
+                // The budget the aborted connection held opens another.
+                let early = a.connect(0, other, remote).unwrap();
+                a.abort(early).unwrap();
+                a.release(early).unwrap();
             }
             packets(&mut a, 0);
             assert_eq!(a.buffer_bytes(), 0);
@@ -5579,6 +5582,82 @@ fn a_sent_reset_returns_its_slot_and_bytes_at_once() {
         Endpoint::new(cfg, [1; 32], 0, test_policy),
         Err(EndpointError::Connection(Error::InvalidArgument))
     ));
+}
+
+// An abort frees the connection's queued and unacknowledged bytes, send
+// ring and ledgers at once, as Linux's tcp_disconnect purges the write
+// queue (tcp_write_queue_purge), before the reset it owes is sent: that
+// keeps only its sequence, SND.NXT, and the tuple. A chunk another
+// connection's queue shares stays theirs. What the connection received
+// stays readable until the application releases it, which frees it.
+#[test]
+fn an_abort_frees_its_send_storage_before_its_reset_is_sent() {
+    let (local, remote) = addresses();
+    let (mut a, mut b, listener, client) = endpoints();
+    let mut other = local;
+    other.set_port(local.port() + 1);
+    let peer = a.connect(0, other, remote).unwrap();
+    pump(&mut a, &mut b, 0);
+    let server = b.accept(listener).unwrap();
+    b.accept(listener).unwrap();
+    b.write(server, b"unread").unwrap();
+    pump(&mut a, &mut b, 0);
+    // `peer` takes the owner's shared tail chunk first, `client` the rest
+    // of it; `client` sends a flight the peer never acknowledges and
+    // queues the remainder behind it.
+    a.write(peer, b"kept").unwrap();
+    assert_eq!(a.write(client, &[7; 1024]).unwrap(), 1024);
+    let flight = packets(&mut a, 0);
+    let snd_nxt = flight
+        .iter()
+        .map(|(ip, bytes)| wire::parse(*ip, bytes).unwrap())
+        .filter(|segment| segment.header.source_port == local.port())
+        .map(|segment| {
+            segment
+                .header
+                .sequence
+                .wrapping_add(segment.payload.len() as u32)
+        })
+        .max()
+        .unwrap();
+    let info = a.transport_info(client).unwrap();
+    assert!(info.send_used == 1024 && info.buffer_charge > 0);
+    assert_eq!(a.tx_pool_live(), 1);
+
+    a.abort(client).unwrap();
+    // Before the reset is generated, only the received bytes are charged.
+    let received = a.transport_info(client).unwrap();
+    assert_eq!(received.send_used, 0);
+    assert_eq!(a.terminal_readable_bytes(client), Ok(6));
+    let peer_charge = a.transport_info(peer).unwrap().buffer_charge;
+    assert_eq!(
+        a.buffer_bytes(),
+        received.buffer_charge + peer_charge + a.tx_pool_bytes()
+    );
+    a.release(client).unwrap();
+    assert!(a.connection_exists(client));
+    assert_eq!(a.buffer_bytes(), peer_charge + a.tx_pool_bytes());
+    // The shared chunk lives on with `peer`'s bytes.
+    assert_eq!(a.tx_pool_live(), 1);
+
+    let at = a.next_deadline().unwrap();
+    a.on_timeout(at, 64).unwrap();
+    let mut reset = None;
+    let mut retransmitted = None;
+    for (ip, bytes) in packets(&mut a, at) {
+        let segment = wire::parse(ip, &bytes).unwrap();
+        if segment.header.source_port == local.port() {
+            assert!(reset.is_none());
+            assert_eq!(segment.header.flags & wire::RST, wire::RST);
+            reset = Some(segment.header.sequence);
+        } else if !segment.payload.is_empty() {
+            retransmitted = Some(segment.payload.to_vec());
+        }
+    }
+    assert_eq!(reset, Some(snd_nxt));
+    assert_eq!(retransmitted.as_deref(), Some(b"kept".as_slice()));
+    assert!(!a.connection_exists(client));
+    assert_eq!(a.buffer_bytes(), peer_charge + a.tx_pool_bytes());
 }
 
 #[test]
@@ -5673,7 +5752,8 @@ fn reset_failed_child_unlinks_backlog_before_output_and_frees_after_it() {
         })
         .is_some()
     );
-    assert_eq!(b.buffer_bytes(), 2 * connection_charge(&config()));
+    // The failed child, its reset still owed, holds no storage.
+    assert_eq!(b.buffer_bytes(), connection_charge(&config()));
     assert_eq!(
         b.accept(listener),
         Err(EndpointError::Connection(Error::WouldBlock))
@@ -6395,15 +6475,18 @@ fn buffer_quotas_live_resize_retention_failure_and_reclamation() {
     assert_eq!(a.buffer_bytes(), original_charge);
     a.set_buffer_capacities(client, 128, 128).unwrap();
     assert_eq!(a.buffer_capacities(client), Ok((128, 128)));
-    let grown_charge = a.buffer_bytes();
     pump(&mut a, &mut b, 0);
     let mut bytes = [0; 512];
     assert_eq!(b.read(server, &mut bytes), Ok(512));
     assert_eq!(&bytes, payload.as_slice());
-    // The retained allocations stay charged until the reset is sent.
+    assert!(a.transport_info(client).unwrap().buffer_charge > 0);
+    // The abort frees the retained allocations before its reset is sent;
+    // the owner's shared TxPool tail stays while it has connections.
     a.abort(client).unwrap();
+    assert_eq!(a.transport_info(client).unwrap().buffer_charge, 0);
     a.release(client).unwrap();
-    assert_eq!(a.buffer_bytes(), grown_charge);
+    assert!(a.connection_exists(client));
+    assert_eq!(a.buffer_bytes(), a.tx_pool_bytes());
     packets(&mut a, 0);
     assert!(!a.connection_exists(client));
     assert_eq!(a.buffer_bytes(), 0);
@@ -6747,12 +6830,11 @@ fn tx_timestamp_terminal_cancellation_release_and_reused_generation() {
             }
         }
         a.release(client).unwrap();
-        // Release frees even undrained records; the connection, its reset
-        // still to send, keeps the send ring and ledgers its write allocated.
-        assert_eq!(
-            a.buffer_bytes(),
-            base_charge + first_write_charge(&config(), 3)
-        );
+        // Release frees even undrained records, and the abort freed the
+        // send ring and ledgers: the connection, its reset still to send,
+        // keeps no storage. Only the owner's shared TxPool tail remains.
+        assert!(base_charge > 0);
+        assert_eq!(a.buffer_bytes(), a.tx_pool_bytes());
         assert_eq!(
             a.next_tx_timestamp(client),
             Err(EndpointError::InvalidHandle)

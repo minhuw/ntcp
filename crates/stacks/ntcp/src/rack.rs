@@ -679,6 +679,21 @@ impl Rack {
         self.verify();
     }
 
+    // Frees every entry at an abort, as Linux's tcp_write_queue_purge
+    // frees the retransmission queue (packets_out = 0): nothing is sent or
+    // acknowledged again. The connection's statistics and the ledger's
+    // validity stay, for what TCP_INFO reports of the closed connection.
+    pub(crate) fn purge(&mut self) {
+        self.intervals.clear();
+        self.tally = Tally::default();
+        self.dirty_len = 0;
+        self.ptb_some_len = 0;
+        self.ptb_some_all = false;
+        self.departure_selection = None;
+        self.deadline = None;
+        self.release();
+    }
+
     pub(crate) fn abandon(&mut self, boundary: Seq) {
         self.intervals.clear();
         self.tally = Tally::default();

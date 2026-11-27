@@ -1026,8 +1026,10 @@ fn option_application_failure_releases_connect_and_accept_records() {
     assert_eq!(b.execute(listen, Op::Accept(0)).unwrap_err(), EINVAL);
     assert_eq!(b.sockets.len(), 1);
     assert!(b.child_timeouts.is_empty());
-    // The failed child owes a reset: release must retain it until output.
-    assert_ne!(b.endpoint.buffer_bytes(), 0);
+    // The failed child owes a reset: release must retain it until output,
+    // though not its storage, which its abort freed.
+    assert!(b.endpoint.has_pending_output());
+    assert_eq!(b.endpoint.buffer_bytes(), 0);
     pump(&mut a, &mut b);
     // Its reset sent, the released record is reclaimed rather than leaked.
     assert_eq!(b.endpoint.buffer_bytes(), 0);
