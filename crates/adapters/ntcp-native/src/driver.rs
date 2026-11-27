@@ -2971,7 +2971,11 @@ impl<P: PacketIo> Network<P> {
             if self.endpoint.is_output_reserved(core) {
                 self.maintain.push(index);
             }
-            if abort {
+            // An abort is carried out once. A later pass, before the Closed
+            // event that lets the connection be released is drained, finds
+            // it CLOSED, and the frame it holds then is the reset the abort
+            // owes, which waits for backend room like any other frame.
+            if abort && self.endpoint.state(core)? != State::Closed {
                 if self.tx_pending != 0 || self.tx_held != 0 {
                     let mut next = 0;
                     while let Some(frame) = next_live(&self.tx_frames, next) {
